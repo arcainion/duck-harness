@@ -72,9 +72,11 @@ The duck can use:
 - `last_action_result` for fields such as `board_changed`, `level_completed`,
   `game_over`, `run_complete`, and `reward`
 - `experience` for the controller phase, opaque state identity, state visits,
-  tried/no-op actions, short-cycle detection, and suggested probes
+  tried/no-op actions, short-cycle detection, outcome-aware action rankings,
+  and suggested probes
 - `strategy` plus `record_strategy(...)` for bounded goal, hypothesis, evidence,
-  confidence, open-question, and next-test memory within one game run
+  confidence, open-question, next-test, expected-outcome, fallback, and
+  contradiction memory within one game run
 
 The raw numeric grid is intentionally hidden from the Python tool. The preferred
 view is `current_frame.segmentation`; `current_frame.ascii` is there for small
@@ -124,7 +126,16 @@ Useful sections in `configs/inference.json`:
 - `analyzer.*`: duck sampling/tool settings. This key is still named
   `analyzer` for compatibility with existing code and configs. The inference
   controller is configured by `strategy_enabled`, `same_state_noop_limit`,
-  `stagnation_window`, and `cycle_window`; missing keys preserve legacy behavior.
+  `stagnation_window`, and `cycle_window`. `strategy_policy` accepts `legacy`
+  or the opt-in `outcome_aware` policy; missing keys preserve legacy behavior.
+  The outcome-aware volatility detector can be tuned with `volatile_window`,
+  `volatile_min_samples`, and `volatile_ratio`.
+
+Try the candidate policy without changing the checked-in default:
+
+```bash
+LOCAL_ANALYZER_STRATEGY_POLICY=outcome_aware make interactive
+```
 - `chat.*`: direct chat probing with `make chat`.
 - `viewer.port`: default viewer port.
 - `multimodal.*`: image context for the current grid.

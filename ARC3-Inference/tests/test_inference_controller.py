@@ -4,7 +4,9 @@ import os
 from unittest import TestCase, mock
 
 from inference.agent.inference_controller import (
+    OUTCOME_AWARE_POLICY,
     InferenceControllerConfig,
+    action_family,
     action_guard_reason,
     build_experience_snapshot,
     frame_fingerprint,
@@ -42,6 +44,27 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(config.same_state_noop_limit, 2)
         self.assertEqual(config.stagnation_window, 12)
         self.assertEqual(config.cycle_window, 8)
+        self.assertEqual(config.policy, "legacy")
+
+    def test_environment_enables_and_bounds_outcome_aware_policy(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOCAL_ANALYZER_STRATEGY_ENABLED": "true",
+                "LOCAL_ANALYZER_STRATEGY_POLICY": "outcome-aware",
+                "LOCAL_ANALYZER_VOLATILE_WINDOW": "1",
+                "LOCAL_ANALYZER_VOLATILE_MIN_SAMPLES": "1",
+                "LOCAL_ANALYZER_VOLATILE_RATIO": "2",
+            },
+            clear=True,
+        ):
+            config = InferenceControllerConfig.from_env()
+
+        self.assertTrue(config.outcome_aware)
+        self.assertEqual(config.policy, OUTCOME_AWARE_POLICY)
+        self.assertEqual(config.volatile_window, 2)
+        self.assertEqual(config.volatile_min_samples, 2)
+        self.assertEqual(config.volatile_ratio, 1.0)
 
     def test_two_exact_noops_guard_the_third_trial(self) -> None:
         state = _frame(1, step=0)
@@ -101,3 +124,97 @@ class InferenceControllerTests(TestCase):
         self.assertNotEqual(metadata["before_state_id"], metadata["after_state_id"])
         self.assertEqual(metadata["controller_phase"], "progress")
 
+    def test_outcome_aware_masks_repeatedly_volatile_cells(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            same_state_noop_limit=2,
+            volatile_window=8,
+            volatile_min_samples=4,
+            volatile_ratio=0.75,
+        )
+        frames = [
+            Frame(grid=((value, 9),), step=index, level=1)
+            for index, value in enumerate((1, 2, 3, 4, 5))
+        ]
+        history = [HistoryEntry(action="", frame=frames[0])] + [
+            HistoryEntry(action="SPACE", frame=frame) for frame in frames[1:]
+        ]
+
+        snapshot = build_experience_snapshot(history, frames[-1], ["SPACE"], config)
+
+        self.assertEqual(snapshot["volatile_cells"], 1)
+        self.assertEqual(snapshot["latest_outcome"], "volatile_only")
+        self.assertEqual(snapshot["unique_behavioral_states"], 1)
+        self.assertEqual(snapshot["phase"], "recover")
+
+    def test_outcome_aware_ranks_untried_before_noop_actions(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        a = _frame(1, step=0)
+        b = _frame(2, step=1)
+        history = [
+            HistoryEntry(action="", frame=a),
+            HistoryEntry(action="RIGHT", frame=b),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=2)),
+            HistoryEntry(action="UP", frame=_frame(1, step=3)),
+        ]
+
+        snapshot = build_experience_snapshot(
+            history, history[-1].frame, ["RIGHT", "UP", "DOWN"], config
+        )
+
+        ranked = snapshot["ranked_actions"]
+        self.assertEqual(ranked[0]["action"], "DOWN")
+        self.assertEqual(ranked[0]["priority"], 1)
+        self.assertEqual(ranked[-1]["action"], "UP")
+        self.assertEqual(ranked[-1]["no_ops"], 1)
+
+    def test_mouse_family_keeps_coordinate_search_open(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        state = _frame(1, step=0)
+        history = [
+            HistoryEntry(action="", frame=state),
+            HistoryEntry(action="MOUSE(row=1, col=1)", frame=_frame(1, step=1)),
+        ]
+
+        snapshot = build_experience_snapshot(history, history[-1].frame, ["MOUSE"], config)
+
+        self.assertEqual(action_family("MOUSE(row=3, col=4)"), "MOUSE")
+        self.assertTrue(snapshot["ranked_actions"][0]["parameterized"])
+        self.assertEqual(snapshot["ranked_actions"][0]["priority"], 1)
+        self.assertIsNone(
+            action_guard_reason(history, history[-1].frame, "MOUSE(row=2, col=2)", config)
+        )
+
+    def test_outcome_metadata_reports_level_progress(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        before = _frame(1, step=0)
+        after = _frame(2, step=1, level=2)
+
+        metadata = transition_metadata(
+            before, after, [HistoryEntry(action="", frame=before)], "SPACE", config
+        )
+
+        self.assertEqual(metadata["outcome_class"], "level_progress")
+        self.assertEqual(metadata["controller_policy"], OUTCOME_AWARE_POLICY)
+        self.assertEqual(metadata["action_rank"], 1)
+
+    def test_snapshot_payloads_remain_bounded(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            recent_transition_limit=3,
+        )
+        history = [HistoryEntry(action="", frame=_frame(0, step=0))]
+        for step in range(1, 20):
+            history.append(HistoryEntry(action="RIGHT", frame=_frame(step, step=step)))
+
+        snapshot = build_experience_snapshot(
+            history,
+            history[-1].frame,
+            ["UP", "DOWN", "LEFT", "RIGHT", "SPACE", "MOUSE", "RESET"],
+            config,
+        )
+
+        self.assertLessEqual(len(snapshot["recent_transitions"]), 3)
+        self.assertLessEqual(len(snapshot["ranked_actions"]), 6)

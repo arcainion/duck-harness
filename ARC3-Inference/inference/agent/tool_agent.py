@@ -6,35 +6,41 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import requests
 
 from inference.agent.action_names import to_engine_action, to_model_action
+from inference.agent.inference_controller import (
+    InferenceControllerConfig,
+    action_family,
+    build_experience_snapshot,
+    normalize_action_key,
+)
 from inference.agent.prompts import (
     COMPACT_TOOL_SESSION_ADDENDUM,
     GAME_OVERVIEW_ADDENDUM,
+    MULTIMODAL_CONTEXT_ADDENDUM,
     PYTHON_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
-    MULTIMODAL_CONTEXT_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
     VISUAL_GAME_ADDENDUM,
 )
-
+from inference.agent.python_tool_sandbox import run_sandboxed_python
+from inference.agent.runtime_state import (
+    RUNTIME_STATE_FILENAME,
+    Frame,
+    HistoryEntry,
+    load_runtime_state,
+)
 from inference.agent.vision_context import (
     current_grid_image_enabled,
     current_grid_image_part,
 )
-
-from inference.agent.python_tool_sandbox import run_sandboxed_python
-from inference.agent.inference_controller import (
-    InferenceControllerConfig,
-    build_experience_snapshot,
-)
-from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
 from inference.utils.openai_compat import build_chat_payload, build_headers
 
 log = logging.getLogger(__name__)
@@ -912,7 +918,7 @@ class ToolAgent:
         self,
         *,
         model: str = _DEFAULT_ANALYZER_MODEL,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
         save_request_logs: bool = False,
         api_key: str | None = None,
         base_url: str | None = None,
@@ -995,10 +1001,25 @@ class ToolAgent:
             return _normalize_summary_text(value, max_chars=max_chars)[:max_chars]
 
         persisted = dict(self._strategy_memory)
-        for key in ("goal", "hypothesis", "open_question", "next_test"):
+        for key in ("goal", "hypothesis", "open_question", "next_test", "fallback"):
             value = short_text(update.get(key))
             if value:
                 persisted[key] = value
+
+        test_action = short_text(update.get("test_action"), 80)
+        if test_action:
+            persisted["test_action"] = normalize_action_key(test_action)
+        expected_outcome = str(update.get("expected_outcome") or "").strip().lower()
+        if expected_outcome in {
+            "no_change",
+            "state_change",
+            "new_state",
+            "level_progress",
+            "unknown",
+        }:
+            persisted["expected_outcome"] = expected_outcome
+        if test_action or expected_outcome:
+            persisted.pop("prediction_result", None)
 
         raw_evidence = update.get("evidence")
         if isinstance(raw_evidence, (list, tuple)):
@@ -1009,6 +1030,16 @@ class ToolAgent:
             evidence = [single_evidence] if single_evidence else []
         if evidence:
             persisted["evidence"] = evidence
+
+        raw_contradictions = update.get("contradictions")
+        if isinstance(raw_contradictions, (list, tuple)):
+            contradictions = [short_text(item, 160) for item in raw_contradictions]
+            contradictions = [item for item in contradictions if item][:3]
+        else:
+            single_contradiction = short_text(raw_contradictions, 160)
+            contradictions = [single_contradiction] if single_contradiction else []
+        if contradictions:
+            persisted["contradictions"] = contradictions
 
         try:
             if update.get("confidence") is not None:
@@ -1038,6 +1069,61 @@ class ToolAgent:
         if persisted.get("next_test"):
             self._summarized_knowledge["current_plan"] = str(persisted["next_test"])
         return dict(self._strategy_memory)
+
+    def _evaluate_strategy_prediction(
+        self, action_result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        existing = action_result.get("prediction_result")
+        if isinstance(existing, dict):
+            self._strategy_memory["prediction_result"] = dict(existing)
+            return dict(existing)
+        test_action = normalize_action_key(self._strategy_memory.get("test_action", ""))
+        expected = str(self._strategy_memory.get("expected_outcome") or "").strip()
+        if not test_action or not expected:
+            return None
+        candidates = [
+            item
+            for item in action_result.get("steps") or []
+            if isinstance(item, dict)
+        ]
+        candidates.append(action_result)
+        observed = next(
+            (
+                item
+                for item in candidates
+                if normalize_action_key(item.get("action_display", "")) == test_action
+                or (
+                    test_action == "MOUSE"
+                    and action_family(item.get("action_display", "")) == "MOUSE"
+                )
+            ),
+            None,
+        )
+        if observed is None:
+            return None
+        actual = str(observed.get("outcome_class") or "unknown")
+        if not observed.get("executed", action_result.get("executed")) or expected == "unknown":
+            status = "inconclusive"
+        else:
+            matched = {
+                "no_change": not bool(observed.get("board_changed")),
+                "state_change": bool(observed.get("board_changed")),
+                "new_state": bool(observed.get("novel_state")),
+                "level_progress": bool(
+                    observed.get("level_completed")
+                    or observed.get("run_complete")
+                    or float(observed.get("reward") or 0.0) > 0.0
+                ),
+            }.get(expected)
+            status = "supported" if matched else "contradicted"
+        result = {
+            "status": status,
+            "action": normalize_action_key(observed.get("action_display", test_action)),
+            "expected": expected,
+            "actual": actual,
+        }
+        self._strategy_memory["prediction_result"] = result
+        return result
 
     @property
     def total_tokens(self) -> int:
@@ -1283,31 +1369,39 @@ class ToolAgent:
                 "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
                 "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
                 "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
-                "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test; this survives fresh Python snippets within this run.",
+                "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test; optionally include test_action, expected_outcome, fallback, and contradictions so the next result can falsify the plan. This survives fresh Python snippets within this run.",
             ]
         )
         if experience_snapshot and experience_snapshot.get("enabled"):
             compact_experience = {
                 key: experience_snapshot.get(key)
                 for key in (
+                    "policy",
                     "phase",
                     "state_id",
+                    "behavioral_state_id",
                     "state_visits",
                     "unique_states",
+                    "unique_behavioral_states",
+                    "volatile_cells",
                     "actions_observed",
                     "no_op_streak",
+                    "behavioral_no_op_streak",
                     "stagnation_actions",
                     "cycle_period",
+                    "latest_outcome",
+                    "recovery_reasons",
                     "tried_here",
                     "suggested_actions",
                     "discouraged_actions",
+                    "ranked_actions",
                 )
             }
             lines.extend(
                 [
                     "Deterministic experience controller snapshot:",
                     json.dumps(compact_experience, separators=(",", ":"), sort_keys=True),
-                    "Follow the controller phase: orient with one compact inspection, explore with a controlled probe, continue progress when evidence supports it, and abandon the current hypothesis in recover. Never retry a discouraged action in the same visible state.",
+                    "Follow the controller phase and ranked action evidence: orient with one compact inspection, explore with a controlled falsifiable probe, continue progress when evidence supports it, and abandon or revise the current hypothesis in recover. Never retry a discouraged exact action in the same visible state; semantic cycle warnings remain advisory when backtracking is necessary.",
                 ]
             )
         lines.append(
@@ -1512,14 +1606,25 @@ class ToolAgent:
         }
         for controller_key in (
             "guarded",
+            "guard_reason_code",
             "loop_detected",
+            "cycle_risk",
             "cycle_period",
+            "controller_policy",
             "controller_phase",
+            "controller_reason_codes",
             "no_op_streak",
+            "behavioral_no_op_streak",
             "stagnation_actions",
             "before_state_id",
             "after_state_id",
+            "behavioral_before_state_id",
+            "behavioral_after_state_id",
             "novel_state",
+            "outcome_class",
+            "action_rank",
+            "action_rank_reason",
+            "prediction_result",
         ):
             if controller_key in payload:
                 compact[controller_key] = payload.get(controller_key)
@@ -1630,10 +1735,22 @@ class ToolAgent:
                         last_action_result=compact_payload,
                     ),
                 }
-            raw_payload = self._step_env_callback({"actions": normalized_actions})
+            raw_payload = self._step_env_callback(
+                {
+                    "actions": normalized_actions,
+                    "strategy_prediction": {
+                        key: self._strategy_memory.get(key)
+                        for key in ("test_action", "expected_outcome")
+                        if self._strategy_memory.get(key)
+                    },
+                }
+            )
             if not isinstance(raw_payload, dict):
                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
             compact_payload = self._compact_action_result(raw_payload)
+            prediction_result = self._evaluate_strategy_prediction(compact_payload)
+            if prediction_result is not None:
+                compact_payload["prediction_result"] = prediction_result
             next_valid_actions = raw_payload.get("valid_actions")
             if isinstance(next_valid_actions, list):
                 self._current_valid_actions = _normalize_valid_actions(next_valid_actions)

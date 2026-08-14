@@ -5,8 +5,9 @@ import hashlib
 import json
 import re
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 
 _EVENT_NAME_RE = re.compile(r"^(?P<game>.+)_p(?P<pass>\d+)_events\.jsonl$")
@@ -45,7 +46,11 @@ def summarize_event_file(path: Path) -> dict[str, Any]:
     loop_interventions = 0
     terminal_violations = 0
     unique_states: set[str] = set()
+    unique_behavioral_states: set[str] = set()
     phase_counts: Counter[str] = Counter()
+    outcome_counts: Counter[str] = Counter()
+    prediction_counts: Counter[str] = Counter()
+    guard_reason_counts: Counter[str] = Counter()
     previous_action = ""
     previous_no_op = False
     terminal_seen = False
@@ -54,10 +59,20 @@ def summarize_event_file(path: Path) -> dict[str, Any]:
         state_id = _fallback_state_id(event)
         if state_id:
             unique_states.add(state_id)
+        behavioral_state_id = str(
+            event.get("behavioral_after_state_id")
+            or event.get("behavioral_state_id")
+            or ""
+        ).strip()
+        if behavioral_state_id:
+            unique_behavioral_states.add(behavioral_state_id)
         loop_interventions += int(
             bool(event.get("guarded"))
             or str(event.get("stop_reason") or "") in {"loop_guard", "loop_detected"}
         )
+        guard_reason = str(event.get("guard_reason_code") or "").strip()
+        if guard_reason:
+            guard_reason_counts[guard_reason] += 1
         if event.get("type") != "action":
             continue
         actions += 1
@@ -69,6 +84,14 @@ def summarize_event_file(path: Path) -> dict[str, Any]:
         phase = str(event.get("controller_phase") or "").strip()
         if phase:
             phase_counts[phase] += 1
+        outcome = str(event.get("outcome_class") or "").strip()
+        if outcome:
+            outcome_counts[outcome] += 1
+        prediction = event.get("prediction_result")
+        if isinstance(prediction, dict):
+            prediction_status = str(prediction.get("status") or "").strip()
+            if prediction_status:
+                prediction_counts[prediction_status] += 1
         if terminal_seen and action != "RESET":
             terminal_violations += 1
         if action == "RESET":
@@ -88,9 +111,13 @@ def summarize_event_file(path: Path) -> dict[str, Any]:
         "rewarding_actions": rewarding_actions,
         "rewarding_action_rate": rewarding_actions / actions if actions else 0.0,
         "unique_states_observed": len(unique_states),
+        "unique_behavioral_states_observed": len(unique_behavioral_states),
         "loop_interventions": loop_interventions,
         "terminal_state_violations": terminal_violations,
         "phase_counts": dict(sorted(phase_counts.items())),
+        "outcome_counts": dict(sorted(outcome_counts.items())),
+        "prediction_counts": dict(sorted(prediction_counts.items())),
+        "guard_reason_counts": dict(sorted(guard_reason_counts.items())),
     }
 
 
@@ -103,19 +130,29 @@ def _combine(items: list[dict[str, Any]]) -> dict[str, Any]:
             "repeated_no_ops",
             "rewarding_actions",
             "unique_states_observed",
+            "unique_behavioral_states_observed",
             "loop_interventions",
             "terminal_state_violations",
         )
     }
     phases: Counter[str] = Counter()
+    outcomes: Counter[str] = Counter()
+    predictions: Counter[str] = Counter()
+    guard_reasons: Counter[str] = Counter()
     for item in items:
         phases.update(item.get("phase_counts") or {})
+        outcomes.update(item.get("outcome_counts") or {})
+        predictions.update(item.get("prediction_counts") or {})
+        guard_reasons.update(item.get("guard_reason_counts") or {})
     actions = totals["actions"]
     totals["no_op_rate"] = totals["no_op_actions"] / actions if actions else 0.0
     totals["rewarding_action_rate"] = (
         totals["rewarding_actions"] / actions if actions else 0.0
     )
     totals["phase_counts"] = dict(sorted(phases.items()))
+    totals["outcome_counts"] = dict(sorted(outcomes.items()))
+    totals["prediction_counts"] = dict(sorted(predictions.items()))
+    totals["guard_reason_counts"] = dict(sorted(guard_reasons.items()))
     totals["trace_count"] = len(items)
     return totals
 

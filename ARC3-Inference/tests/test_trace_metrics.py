@@ -18,6 +18,8 @@ class TraceMetricsTests(TestCase):
                 "board_changed": False,
                 "reward": 0,
                 "after_state_id": "a",
+                "behavioral_after_state_id": "stable-a",
+                "outcome_class": "exact_noop",
                 "controller_phase": "explore",
             },
             {
@@ -26,12 +28,15 @@ class TraceMetricsTests(TestCase):
                 "board_changed": False,
                 "reward": 0,
                 "after_state_id": "a",
+                "behavioral_after_state_id": "stable-a",
+                "outcome_class": "volatile_only",
                 "controller_phase": "recover",
             },
             {
                 "type": "controller",
                 "guarded": True,
                 "stop_reason": "loop_guard",
+                "guard_reason_code": "repeated_exact_noop",
                 "after_state_id": "a",
             },
             {
@@ -40,6 +45,9 @@ class TraceMetricsTests(TestCase):
                 "board_changed": True,
                 "reward": 0.5,
                 "after_state_id": "b",
+                "behavioral_after_state_id": "stable-b",
+                "outcome_class": "level_progress",
+                "prediction_result": {"status": "supported"},
                 "controller_phase": "progress",
             },
         ]
@@ -59,7 +67,16 @@ class TraceMetricsTests(TestCase):
         self.assertEqual(summary["repeated_no_ops"], 1)
         self.assertEqual(summary["rewarding_actions"], 1)
         self.assertEqual(summary["unique_states_observed"], 3)
+        self.assertEqual(summary["unique_behavioral_states_observed"], 2)
         self.assertEqual(summary["loop_interventions"], 1)
         self.assertEqual(
             summary["phase_counts"], {"explore": 1, "progress": 1, "recover": 1}
+        )
+        self.assertEqual(
+            summary["outcome_counts"],
+            {"exact_noop": 1, "level_progress": 1, "volatile_only": 1},
+        )
+        self.assertEqual(summary["prediction_counts"], {"supported": 1})
+        self.assertEqual(
+            summary["guard_reason_counts"], {"repeated_exact_noop": 1}
         )

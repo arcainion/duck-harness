@@ -13,11 +13,12 @@ import re
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import arcengine
 import taaf.game
@@ -30,14 +31,17 @@ from inference.agent.action_names import (
 )
 from inference.agent.inference_controller import (
     InferenceControllerConfig,
+    action_family,
     action_guard_reason,
+    action_guard_reason_code,
     frame_fingerprint,
+    normalize_action_key,
     transition_metadata,
 )
 from inference.agent.runtime_state import (
+    RUNTIME_STATE_FILENAME,
     Frame,
     HistoryEntry,
-    RUNTIME_STATE_FILENAME,
     write_runtime_state,
 )
 from inference.agent.tool_agent import ToolAgent
@@ -140,6 +144,41 @@ def _format_action_display(
         data = _model_mouse_action_data(action_data)
         return f"MOUSE(row={data['row']}, col={data['col']})"
     return to_model_action(action_name)
+
+
+def _evaluate_strategy_prediction(
+    prediction: dict[str, Any] | None, payload: dict[str, Any]
+) -> dict[str, str] | None:
+    if not isinstance(prediction, dict):
+        return None
+    test_action = normalize_action_key(prediction.get("test_action", ""))
+    expected = str(prediction.get("expected_outcome") or "").strip().lower()
+    actual_action = normalize_action_key(payload.get("action_display", ""))
+    if not test_action or not expected or not (
+        actual_action == test_action
+        or (test_action == "MOUSE" and action_family(actual_action) == "MOUSE")
+    ):
+        return None
+    if not payload.get("executed") or expected == "unknown":
+        status = "inconclusive"
+    else:
+        matched = {
+            "no_change": not bool(payload.get("board_changed")),
+            "state_change": bool(payload.get("board_changed")),
+            "new_state": bool(payload.get("novel_state")),
+            "level_progress": bool(
+                payload.get("level_completed")
+                or payload.get("run_complete")
+                or float(payload.get("reward") or 0.0) > 0.0
+            ),
+        }.get(expected)
+        status = "supported" if matched else "contradicted"
+    return {
+        "status": status,
+        "action": actual_action,
+        "expected": expected,
+        "actual": str(payload.get("outcome_class") or "unknown"),
+    }
 
 
 def _is_engine_game_over(game: taaf.game.Game) -> bool:
@@ -448,11 +487,21 @@ class _HarnessGameSession:
                 "batch_size": payload.get("batch_size"),
                 "before_state_id": payload.get("before_state_id"),
                 "after_state_id": payload.get("after_state_id"),
+                "behavioral_before_state_id": payload.get("behavioral_before_state_id"),
+                "behavioral_after_state_id": payload.get("behavioral_after_state_id"),
                 "novel_state": payload.get("novel_state"),
+                "outcome_class": payload.get("outcome_class"),
                 "loop_detected": payload.get("loop_detected"),
+                "cycle_risk": payload.get("cycle_risk"),
                 "cycle_period": payload.get("cycle_period"),
+                "controller_policy": payload.get("controller_policy"),
                 "controller_phase": payload.get("controller_phase"),
+                "controller_reason_codes": payload.get("controller_reason_codes"),
+                "action_rank": payload.get("action_rank"),
+                "action_rank_reason": payload.get("action_rank_reason"),
+                "prediction_result": payload.get("prediction_result"),
                 "no_op_streak": payload.get("no_op_streak"),
+                "behavioral_no_op_streak": payload.get("behavioral_no_op_streak"),
                 "stagnation_actions": payload.get("stagnation_actions"),
             }
         )
@@ -618,6 +667,9 @@ class _HarnessGameSession:
             _format_action_display(action.id.name, dict(action.data))
             for action in requested_actions
         ]
+        strategy_prediction = arguments.get("strategy_prediction")
+        if not isinstance(strategy_prediction, dict):
+            strategy_prediction = None
 
         for batch_index, action in enumerate(requested_actions, start=1):
             if self.should_stop():
@@ -638,6 +690,12 @@ class _HarnessGameSession:
                 self.controller_config,
             )
             if guard_reason is not None:
+                guard_reason_code = action_guard_reason_code(
+                    self.history_entries,
+                    self.current_frame(),
+                    action_display,
+                    self.controller_config,
+                )
                 stop_reason = "loop_guard"
                 current = self.current_frame()
                 self.viewer_events.append(
@@ -649,8 +707,11 @@ class _HarnessGameSession:
                         "analysis_step": self.analysis_step,
                         "action_display": action_display,
                         "guarded": True,
+                        "guard_reason_code": guard_reason_code,
                         "loop_detected": True,
+                        "controller_policy": self.controller_config.policy,
                         "controller_phase": "recover",
+                        "controller_reason_codes": [guard_reason_code] if guard_reason_code else [],
                         "stop_reason": stop_reason,
                         "stop_detail": guard_reason,
                     }
@@ -672,8 +733,11 @@ class _HarnessGameSession:
                     "game_over": False,
                     "run_complete": False,
                     "guarded": True,
+                    "guard_reason_code": guard_reason_code,
                     "loop_detected": True,
+                    "controller_policy": self.controller_config.policy,
                     "controller_phase": "recover",
+                    "controller_reason_codes": [guard_reason_code] if guard_reason_code else [],
                     "requested_count": batch_size,
                     "executed_count": 0,
                     "stopped_early": True,
@@ -691,6 +755,7 @@ class _HarnessGameSession:
                     action,
                     batch_index=batch_index,
                     batch_size=batch_size,
+                    strategy_prediction=strategy_prediction,
                     flush_viewer_payload=False,
                 )
             except Exception as exc:
@@ -710,7 +775,7 @@ class _HarnessGameSession:
             if payload.get("level_completed"):
                 stop_reason = "level_completed"
                 break
-            if payload.get("loop_detected"):
+            if payload.get("loop_detected") and not self.controller_config.outcome_aware:
                 stop_reason = "loop_detected"
                 break
 
@@ -736,16 +801,26 @@ class _HarnessGameSession:
                     "action_display",
                     "before_state_id",
                     "after_state_id",
+                    "behavioral_before_state_id",
+                    "behavioral_after_state_id",
                     "board_changed",
                     "novel_state",
+                    "outcome_class",
                     "reward",
                     "level_completed",
                     "game_over",
                     "run_complete",
                     "loop_detected",
+                    "cycle_risk",
                     "cycle_period",
+                    "controller_policy",
                     "controller_phase",
+                    "controller_reason_codes",
+                    "action_rank",
+                    "action_rank_reason",
+                    "prediction_result",
                     "no_op_streak",
+                    "behavioral_no_op_streak",
                     "stagnation_actions",
                 )
                 if key in item
@@ -771,6 +846,7 @@ class _HarnessGameSession:
         *,
         batch_index: int,
         batch_size: int,
+        strategy_prediction: dict[str, Any] | None = None,
         generated_tokens: int | None = None,
         flush_viewer_payload: bool = True,
     ) -> dict[str, Any]:
@@ -841,6 +917,9 @@ class _HarnessGameSession:
                     self.controller_config,
                 )
             )
+        prediction_result = _evaluate_strategy_prediction(strategy_prediction, payload)
+        if prediction_result is not None:
+            payload["prediction_result"] = prediction_result
         self._append_action_viewer_event(payload, current_frame)
         if flush_viewer_payload:
             self.write_viewer_payload()
