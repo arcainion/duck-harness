@@ -14,6 +14,8 @@ def _run(code: str) -> dict:
             "history": [],
             "valid_actions": [],
             "last_action_result": {},
+            "experience": {"phase": "orient"},
+            "strategy": {},
         },
         action_handler=lambda actions: {"action_result": {}, "state": {}},
     )
@@ -45,3 +47,32 @@ class PythonToolSandboxTests(TestCase):
         response = _run("import fractions\nresult = fractions.sys.version")
 
         self.assertIn("Module-valued attribute 'sys' is not allowed", response["error"])
+
+    def test_sandbox_exposes_experience_and_persists_strategy_updates(self) -> None:
+        updates: list[dict] = []
+
+        def persist(update: dict) -> dict:
+            updates.append(update)
+            return {"goal": str(update.get("goal")), "confidence": 0.75}
+
+        response = run_sandboxed_python(
+            code=(
+                "saved = record_strategy(goal='reach target', evidence=['moved'], confidence=0.75)\n"
+                "result = [experience['phase'], saved['goal'], strategy['confidence']]"
+            ),
+            timeout_seconds=5,
+            initial_state={
+                "current_frame": None,
+                "history": [],
+                "valid_actions": [],
+                "last_action_result": {},
+                "experience": {"phase": "orient"},
+                "strategy": {},
+            },
+            action_handler=lambda actions: {"action_result": {}, "state": {}},
+            strategy_handler=persist,
+        )
+
+        self.assertEqual(response["error"], "")
+        self.assertEqual(response["result"], ["orient", "reach target", 0.75])
+        self.assertEqual(updates[0]["evidence"], ["moved"])

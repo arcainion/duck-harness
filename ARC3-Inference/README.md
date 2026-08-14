@@ -71,6 +71,10 @@ The duck can use:
 - `valid_actions` for the current action set
 - `last_action_result` for fields such as `board_changed`, `level_completed`,
   `game_over`, `run_complete`, and `reward`
+- `experience` for the controller phase, opaque state identity, state visits,
+  tried/no-op actions, short-cycle detection, and suggested probes
+- `strategy` plus `record_strategy(...)` for bounded goal, hypothesis, evidence,
+  confidence, open-question, and next-test memory within one game run
 
 The raw numeric grid is intentionally hidden from the Python tool. The preferred
 view is `current_frame.segmentation`; `current_frame.ascii` is there for small
@@ -87,7 +91,8 @@ The model-facing actions are:
 Every Python tool call starts fresh. It can import a small allowlist of standard
 library modules, print compact summaries, assign a final value to `result`, and
 call `action(...)` once or many times. The tool call timeout defaults to 30
-seconds.
+seconds. Batched action results include a bounded `steps` list so each action can
+be attributed to its individual before/after state and outcome.
 
 ## Configuration
 
@@ -117,7 +122,9 @@ Useful sections in `configs/inference.json`:
   and source dataset are usually per run.
 - `server.*`: vLLM model-serving settings.
 - `analyzer.*`: duck sampling/tool settings. This key is still named
-  `analyzer` for compatibility with existing code and configs.
+  `analyzer` for compatibility with existing code and configs. The inference
+  controller is configured by `strategy_enabled`, `same_state_noop_limit`,
+  `stagnation_window`, and `cycle_window`; missing keys preserve legacy behavior.
 - `chat.*`: direct chat probing with `make chat`.
 - `viewer.port`: default viewer port.
 - `multimodal.*`: image context for the current grid.

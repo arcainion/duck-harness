@@ -28,6 +28,12 @@ from inference.agent.action_names import (
     to_model_action,
     to_model_actions,
 )
+from inference.agent.inference_controller import (
+    InferenceControllerConfig,
+    action_guard_reason,
+    frame_fingerprint,
+    transition_metadata,
+)
 from inference.agent.runtime_state import (
     Frame,
     HistoryEntry,
@@ -182,6 +188,9 @@ class _HarnessGameSession:
     analysis_step: int = 0
     last_engine_action: str | None = None
     token_baseline: int = 0
+    controller_config: InferenceControllerConfig = field(
+        default_factory=InferenceControllerConfig.from_env
+    )
     _viewer_events_flushed: int = field(default=0, init=False, repr=False)
 
     def current_frame(self) -> Frame:
@@ -379,6 +388,7 @@ class _HarnessGameSession:
         return {
             "board": [list(row) for row in frame.grid],
             "board_ascii": frame.ascii,
+            "state_id": frame_fingerprint(frame),
             "score": int(self.game.current_state.levels_completed),
             "state": raw_state.name,
             "level": frame.level,
@@ -436,6 +446,14 @@ class _HarnessGameSession:
                 "run_complete": payload.get("run_complete"),
                 "batch_index": payload.get("batch_index"),
                 "batch_size": payload.get("batch_size"),
+                "before_state_id": payload.get("before_state_id"),
+                "after_state_id": payload.get("after_state_id"),
+                "novel_state": payload.get("novel_state"),
+                "loop_detected": payload.get("loop_detected"),
+                "cycle_period": payload.get("cycle_period"),
+                "controller_phase": payload.get("controller_phase"),
+                "no_op_streak": payload.get("no_op_streak"),
+                "stagnation_actions": payload.get("stagnation_actions"),
             }
         )
 
@@ -612,6 +630,62 @@ class _HarnessGameSession:
                     break
                 return self._error_payload(message)
 
+            action_display = _format_action_display(action.id.name, dict(action.data))
+            guard_reason = action_guard_reason(
+                self.history_entries,
+                self.current_frame(),
+                action_display,
+                self.controller_config,
+            )
+            if guard_reason is not None:
+                stop_reason = "loop_guard"
+                current = self.current_frame()
+                self.viewer_events.append(
+                    {
+                        **self._base_viewer_event(current),
+                        "type": "controller",
+                        "title": "Loop Guard",
+                        "action_num": self.action_count,
+                        "analysis_step": self.analysis_step,
+                        "action_display": action_display,
+                        "guarded": True,
+                        "loop_detected": True,
+                        "controller_phase": "recover",
+                        "stop_reason": stop_reason,
+                        "stop_detail": guard_reason,
+                    }
+                )
+                self.write_viewer_payload()
+                if executed_payloads:
+                    break
+                guarded_payload = {
+                    "executed": False,
+                    "action_num": self.action_count,
+                    "level": current.level,
+                    "score": int(self.game.current_state.levels_completed),
+                    "reward": 0.0,
+                    "state": self.game.current_state.raw.state.name,
+                    "valid_actions": to_model_actions(_engine_action_names(self.game)),
+                    "board_changed": False,
+                    "done": False,
+                    "level_completed": False,
+                    "game_over": False,
+                    "run_complete": False,
+                    "guarded": True,
+                    "loop_detected": True,
+                    "controller_phase": "recover",
+                    "requested_count": batch_size,
+                    "executed_count": 0,
+                    "stopped_early": True,
+                    "stop_reason": stop_reason,
+                    "stop_detail": guard_reason,
+                    "requested_actions": requested_displays,
+                    "executed_actions": [],
+                    "steps": [],
+                    **self.timing_payload(),
+                }
+                return guarded_payload
+
             try:
                 payload = self._execute_action(
                     action,
@@ -636,6 +710,9 @@ class _HarnessGameSession:
             if payload.get("level_completed"):
                 stop_reason = "level_completed"
                 break
+            if payload.get("loop_detected"):
+                stop_reason = "loop_detected"
+                break
 
         if not executed_payloads:
             return self._error_payload("No action was executed.")
@@ -649,6 +726,30 @@ class _HarnessGameSession:
         final_payload["requested_actions"] = requested_displays
         final_payload["executed_actions"] = [
             str(item.get("action_display") or item.get("action_name") or "")
+            for item in executed_payloads
+        ]
+        final_payload["steps"] = [
+            {
+                key: item.get(key)
+                for key in (
+                    "action_num",
+                    "action_display",
+                    "before_state_id",
+                    "after_state_id",
+                    "board_changed",
+                    "novel_state",
+                    "reward",
+                    "level_completed",
+                    "game_over",
+                    "run_complete",
+                    "loop_detected",
+                    "cycle_period",
+                    "controller_phase",
+                    "no_op_streak",
+                    "stagnation_actions",
+                )
+                if key in item
+            }
             for item in executed_payloads
         ]
         final_payload["board_changed"] = any(
@@ -674,6 +775,8 @@ class _HarnessGameSession:
         flush_viewer_payload: bool = True,
     ) -> dict[str, Any]:
         previous_grid = _grid_from_state(self.game.current_state)
+        previous_frame = self.current_frame()
+        prior_history = list(self.history_entries)
         previous_completed = int(self.game.current_state.levels_completed)
         if generated_tokens is None:
             current_tokens = _analyzer_reported_tokens(self.analyzer)
@@ -728,6 +831,16 @@ class _HarnessGameSession:
             "batch_size": batch_size,
             **self.timing_payload(),
         }
+        if self.controller_config.enabled:
+            payload.update(
+                transition_metadata(
+                    previous_frame,
+                    current_frame,
+                    prior_history,
+                    action_display,
+                    self.controller_config,
+                )
+            )
         self._append_action_viewer_event(payload, current_frame)
         if flush_viewer_payload:
             self.write_viewer_payload()

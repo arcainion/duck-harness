@@ -400,6 +400,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             runtime_globals["last_action"] = last_transition.action if last_transition is not None else None
             runtime_globals["valid_actions"] = [str(item) for item in state_payload.get("valid_actions", [])]
             runtime_globals["last_action_result"] = action_result
+            runtime_globals["experience"] = dict(state_payload.get("experience") or {})
+            runtime_globals["strategy"] = dict(state_payload.get("strategy") or {})
 
         def action(actions):
             normalized_actions = _normalize_actions(actions)
@@ -414,7 +416,33 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             _refresh_state(reply.get("state") or {})
             return action_result
 
+        def record_strategy(
+            *,
+            goal=None,
+            hypothesis=None,
+            evidence=None,
+            confidence=None,
+            open_question=None,
+            next_test=None,
+        ):
+            update = {
+                "goal": goal,
+                "hypothesis": hypothesis,
+                "evidence": evidence,
+                "confidence": confidence,
+                "open_question": open_question,
+                "next_test": next_test,
+            }
+            _send({"type": "strategy", "update": _json_safe(update)})
+            reply = _recv()
+            if reply.get("type") != "strategy_result":
+                raise RuntimeError("Invalid strategy response from sandbox host.")
+            persisted = dict(reply.get("strategy") or {})
+            runtime_globals["strategy"] = persisted
+            return persisted
+
         runtime_globals["action"] = action
+        runtime_globals["record_strategy"] = record_strategy
         _refresh_state(initial.get("state") or {})
 
         try:
@@ -539,9 +567,11 @@ def run_sandboxed_python(
     timeout_seconds: int,
     initial_state: dict[str, Any],
     action_handler: Callable[[list[dict[str, Any]]], dict[str, Any]],
+    strategy_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="rgb_python_tool_") as sandbox_dir:
         host_action_results: list[dict[str, Any]] = []
+        host_strategy_updates: list[dict[str, Any]] = []
         command, isolated_cwd = _sandbox_command()
         try:
             process = subprocess.Popen(
@@ -648,6 +678,26 @@ def run_sandboxed_python(
                 )
                 continue
 
+            if msg_type == "strategy":
+                if strategy_handler is None:
+                    persisted_strategy: dict[str, Any] = {}
+                else:
+                    try:
+                        persisted_strategy = strategy_handler(
+                            dict(message.get("update") or {})
+                        )
+                    except Exception:  # noqa: BLE001
+                        persisted_strategy = {}
+                host_strategy_updates.append(dict(persisted_strategy))
+                _send_json_line(
+                    process.stdin,
+                    {
+                        "type": "strategy_result",
+                        "strategy": persisted_strategy,
+                    },
+                )
+                continue
+
             if msg_type in {"final", "error"}:
                 _wait_for_process_exit(process)
                 return {
@@ -655,6 +705,7 @@ def run_sandboxed_python(
                     "result": message.get("result"),
                     "error": str(message.get("error", "") or ""),
                     "action_results": list(message.get("action_results") or host_action_results),
+                    "strategy_updates": list(host_strategy_updates),
                 }
 
             _wait_for_process_exit(process)

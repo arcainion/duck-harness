@@ -30,6 +30,10 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import run_sandboxed_python
+from inference.agent.inference_controller import (
+    InferenceControllerConfig,
+    build_experience_snapshot,
+)
 from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
 from inference.utils.openai_compat import build_chat_payload, build_headers
 
@@ -154,8 +158,8 @@ _RESPONSE_META_MAX_CHARS = 4000
 _PYTHON_TOOL_DESCRIPTION = (
     "Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: "
     "`current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, "
-    "`valid_actions`, `last_action_result`, "
-    "and `action(actions)` for executing one or more real environment actions. "
+    "`valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, "
+    "`record_strategy(...)`, and `action(actions)` for executing one or more real environment actions. "
     "`current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, and `.level`; "
     "`history[-1].frame` is the current post-action frame, not the previous frame. "
     "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
@@ -955,6 +959,8 @@ class ToolAgent:
         self._last_step_summary: dict[str, Any] | None = None
         self._last_action_result: dict[str, Any] | None = None
         self._summarized_knowledge = _empty_world_model()
+        self._controller_config = InferenceControllerConfig.from_env()
+        self._strategy_memory: dict[str, Any] = {}
 
     def _headers(self) -> dict[str, str]:
         api_key = (
@@ -982,6 +988,56 @@ class ToolAgent:
             self._last_step_summary = None
             self._last_action_result = None
             self._summarized_knowledge = _empty_world_model()
+            self._strategy_memory = {}
+
+    def _record_strategy(self, update: dict[str, Any]) -> dict[str, Any]:
+        def short_text(value: Any, max_chars: int = 280) -> str:
+            return _normalize_summary_text(value, max_chars=max_chars)[:max_chars]
+
+        persisted = dict(self._strategy_memory)
+        for key in ("goal", "hypothesis", "open_question", "next_test"):
+            value = short_text(update.get(key))
+            if value:
+                persisted[key] = value
+
+        raw_evidence = update.get("evidence")
+        if isinstance(raw_evidence, (list, tuple)):
+            evidence = [short_text(item, 160) for item in raw_evidence]
+            evidence = [item for item in evidence if item][:5]
+        else:
+            single_evidence = short_text(raw_evidence, 160)
+            evidence = [single_evidence] if single_evidence else []
+        if evidence:
+            persisted["evidence"] = evidence
+
+        try:
+            if update.get("confidence") is not None:
+                persisted["confidence"] = max(
+                    0.0, min(1.0, float(update.get("confidence")))
+                )
+        except (TypeError, ValueError):
+            pass
+
+        self._strategy_memory = persisted
+        if persisted.get("goal"):
+            self._summarized_knowledge["goal_model"] = str(persisted["goal"])
+        if persisted.get("hypothesis"):
+            confidence = persisted.get("confidence")
+            suffix = f" (confidence={confidence:.2f})" if isinstance(confidence, float) else ""
+            self._summarized_knowledge["world_model"] = (
+                f"{persisted['hypothesis']}{suffix}"
+            )
+        if persisted.get("evidence"):
+            self._summarized_knowledge["recent_findings"] = "; ".join(
+                str(item) for item in persisted["evidence"]
+            )
+        if persisted.get("open_question"):
+            self._summarized_knowledge["open_questions"] = str(
+                persisted["open_question"]
+            )
+        if persisted.get("next_test"):
+            self._summarized_knowledge["current_plan"] = str(persisted["next_test"])
+        return dict(self._strategy_memory)
 
     @property
     def total_tokens(self) -> int:
@@ -1166,6 +1222,7 @@ class ToolAgent:
         current_frame: Frame | None = None,
         history_entries: list[HistoryEntry] | None = None,
         previous_step_summary: dict[str, Any] | None = None,
+        experience_snapshot: dict[str, Any] | None = None,
     ) -> str:
         history_entries = history_entries or []
         current_step = max(current_frame.step if current_frame is not None else 0, max(0, action_num)) + 1
@@ -1220,15 +1277,39 @@ class ToolAgent:
             [
                 state_line,
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, and `action(actions)`.",
+                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, `record_strategy(...)`, and `action(actions)`.",
                 "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
                 "Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.",
                 "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
                 "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
                 "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
-                "Below you are provided with the current world model from the previous turn. The default behavior is to copy it and add or remove things based on the evidence that you gathered. BEFORE EXECUTING NEW ACTIONS YOU MUST ALWAYS GIVE THE REVISED VERSION OF THE WORLD MODEL.",
+                "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test; this survives fresh Python snippets within this run.",
             ]
         )
+        if experience_snapshot and experience_snapshot.get("enabled"):
+            compact_experience = {
+                key: experience_snapshot.get(key)
+                for key in (
+                    "phase",
+                    "state_id",
+                    "state_visits",
+                    "unique_states",
+                    "actions_observed",
+                    "no_op_streak",
+                    "stagnation_actions",
+                    "cycle_period",
+                    "tried_here",
+                    "suggested_actions",
+                    "discouraged_actions",
+                )
+            }
+            lines.extend(
+                [
+                    "Deterministic experience controller snapshot:",
+                    json.dumps(compact_experience, separators=(",", ":"), sort_keys=True),
+                    "Follow the controller phase: orient with one compact inspection, explore with a controlled probe, continue progress when evidence supports it, and abandon the current hypothesis in recover. Never retry a discouraged action in the same visible state.",
+                ]
+            )
         lines.append(
             "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, "
             "but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`."
@@ -1245,7 +1326,7 @@ class ToolAgent:
             )
         lines.extend(
             [
-                "When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.",
+                "When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. Batch only a short sequence supported by observed action effects; use single probes while orienting, exploring, or recovering.",
                 "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.",
                 "If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.",
                 TOOL_CALL_FORMAT_GUIDANCE,
@@ -1429,6 +1510,22 @@ class ToolAgent:
             "run_complete": bool(payload.get("run_complete")),
             "action_display": payload.get("action_display") or payload.get("action_name"),
         }
+        for controller_key in (
+            "guarded",
+            "loop_detected",
+            "cycle_period",
+            "controller_phase",
+            "no_op_streak",
+            "stagnation_actions",
+            "before_state_id",
+            "after_state_id",
+            "novel_state",
+        ):
+            if controller_key in payload:
+                compact[controller_key] = payload.get(controller_key)
+        steps = payload.get("steps")
+        if isinstance(steps, list):
+            compact["steps"] = [dict(item) for item in steps[:12] if isinstance(item, dict)]
         executed_actions = payload.get("executed_actions")
         if isinstance(executed_actions, list) and executed_actions:
             compact["executed_actions"] = [str(action).strip() for action in executed_actions if str(action).strip()]
@@ -1483,6 +1580,13 @@ class ToolAgent:
                 "current_frame": current_frame_payload,
                 "history": _ascii_history_view_payload(refreshed_history),
                 "valid_actions": sanitized_actions,
+                "experience": build_experience_snapshot(
+                    refreshed_history,
+                    refreshed_frame,
+                    sanitized_actions,
+                    self._controller_config,
+                ),
+                "strategy": dict(self._strategy_memory),
                 "last_action_result": (
                     dict(persisted_action_result)
                     if isinstance(persisted_action_result, dict)
@@ -1549,6 +1653,7 @@ class ToolAgent:
             timeout_seconds=self._python_timeout,
             initial_state=_serialized_runtime_state(),
             action_handler=_handle_action,
+            strategy_handler=self._record_strategy,
         )
 
         action_results = [
@@ -1724,12 +1829,19 @@ class ToolAgent:
         analyzer_log = transcript_path or (state_path.parent / f"{state_path.stem}_analyzer.txt")
         prompt_log = _resolve_prompt_log_path(state_path)
         current_frame, history_entries = load_runtime_state(state_path)
+        experience_snapshot = build_experience_snapshot(
+            history_entries,
+            current_frame,
+            self._current_valid_actions,
+            self._controller_config,
+        )
         user_prompt = self._build_user_prompt(
             action_num,
             valid_actions=valid_actions,
             current_frame=current_frame,
             history_entries=history_entries,
             previous_step_summary=self._last_step_summary,
+            experience_snapshot=experience_snapshot,
         )
         display_action_num = _display_action_number(action_num)
 

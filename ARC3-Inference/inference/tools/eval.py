@@ -19,6 +19,7 @@ import taaf.benchmark
 import taaf.game
 
 from inference.utils.run_artifacts import is_selectable_run_dir_name, run_dir_sort_key
+from inference.tools.trace_metrics import summarize_run_traces
 
 DEFAULT_CONFIG_PATH = "configs/eval.json"
 RUN_CONFIG_FILENAME = "run_config.json"
@@ -556,6 +557,16 @@ def _aggregate_runs_for_output(run_name: str, runs: list[RunEvaluation]) -> dict
                 "completion_rate": completion_rate,
                 "trial_count": len(trial_games),
                 "score_source": _score_source_label([game.score_source for game in trial_games]),
+                "action_count_mean": _mean([float(game.action_count) for game in trial_games]),
+                "generated_tokens_mean": _mean(
+                    [float(game.generated_tokens) for game in trial_games]
+                ),
+                "tokens_per_completed_level": (
+                    sum(game.generated_tokens for game in trial_games)
+                    / sum(game.levels_completed for game in trial_games)
+                    if sum(game.levels_completed for game in trial_games) > 0
+                    else None
+                ),
             }
         )
 
@@ -586,8 +597,32 @@ def save_run_evaluations(summary: EvaluationSummary, *, run_dirs: list[Path]) ->
         if not relevant_runs:
             continue
         output_path = run_dir / EVALUATION_FILE_NAME
+        payload = _aggregate_runs_for_output(base_run_name, relevant_runs)
+        trace_summary = summarize_run_traces(run_dir)
+        trace_games = trace_summary.get("games") or {}
+        for game_payload in payload.get("games", []):
+            game_id = str(game_payload.get("game_id") or "")
+            if game_id in trace_games:
+                game_payload["inference_metrics"] = trace_games[game_id]
+        overall_metrics = dict(trace_summary.get("overall") or {})
+        all_games = [game for run in relevant_runs for game in run.games]
+        total_tokens = sum(game.generated_tokens for game in all_games)
+        total_actions = sum(game.action_count for game in all_games)
+        total_levels = sum(game.levels_completed for game in all_games)
+        overall_metrics.update(
+            {
+                "generated_tokens": total_tokens,
+                "tokens_per_action": (
+                    total_tokens / total_actions if total_actions else None
+                ),
+                "tokens_per_completed_level": (
+                    total_tokens / total_levels if total_levels else None
+                ),
+            }
+        )
+        payload["inference_metrics"] = overall_metrics
         output_path.write_text(
-            json.dumps(_aggregate_runs_for_output(base_run_name, relevant_runs), indent=2),
+            json.dumps(payload, indent=2),
             encoding="utf-8",
         )
         saved_paths.append(output_path)

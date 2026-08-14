@@ -60,9 +60,13 @@
     "top_p": 0.95,
     "top_k": 20,
     "timeout": 120,
-    "tool_steps": 0,
+    "tool_steps": 8,
     "tool_timeout": 30,
     "tool_output_tokens": 1024,
+    "strategy_enabled": true,
+    "same_state_noop_limit": 2,
+    "stagnation_window": 12,
+    "cycle_window": 8,
     "save_request_logs": false
   },
   "chat": {
