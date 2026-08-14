@@ -28,6 +28,20 @@ make view          # opens the bundled ../example-run at http://127.0.0.1:8011
 
 > `make install` does the same base sync **plus** the `server` extra (vLLM + Torch, multi-GB, GPU-only) — needed to actually run the harness, not to view.
 
+## WSL 2 setup
+
+Run the project from Ubuntu under WSL 2 so the harness, process controls, and Makefiles use their native Linux environment:
+
+```bash
+cd /mnt/h/duck-harness/ARC3-Inference
+uv sync --locked --extra dev
+
+cd ../tufa-arc-agi-framework
+uv sync --locked
+```
+
+Install `bubblewrap` (`sudo apt install bubblewrap`) if it is not already present. The analyzer's Python tool automatically uses it on Linux for a read-only filesystem and isolated network/process namespaces. Keep separate `.venv` directories in each package; they are ignored by Git.
+
 ## Run it yourself
 
 The harness plays through a local vLLM server or OpenRouter — see [`ARC3-Inference/README.md`](ARC3-Inference/README.md). The Kaggle notebook at the repo root reproduces a full competition run on Kaggle hardware.

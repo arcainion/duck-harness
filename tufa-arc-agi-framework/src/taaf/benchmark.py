@@ -97,6 +97,8 @@ class Benchmark:
         """
         assert self.solver is not None, "Benchmark.solver must be set before run()"
         assert self.games, "Benchmark.games must be non-empty before run()"
+        if self._solver_task is not None:
+            raise RuntimeError("Benchmark.run() is already in progress")
         if self.game_weights is not None:
             if len(self.game_weights) != len(self.games):
                 raise ValueError(
@@ -106,8 +108,7 @@ class Benchmark:
                 if w < 0:
                     raise ValueError(f"game_weights[{i}] = {w} must be >= 0")
 
-        self.start_time = datetime.now()
-        self.end_time = None
+        self._reset_run_state()
 
         # Capture launcher-side git overview for diagnostics. Skip if a
         # deploy target already wrote it: on a Slurm worker the
@@ -247,6 +248,14 @@ class Benchmark:
 
         if caller_cancelled:
             raise asyncio.CancelledError()
+
+    def _reset_run_state(self) -> None:
+        """Discard state owned by a completed invocation of ``run``."""
+        self.game_runs = []
+        self.solver_label = ""
+        self._deadline_fired = False
+        self.start_time = datetime.now()
+        self.end_time = None
 
     def request_stop(self) -> None:
         """Cancel the in-flight solver task, triggering ``run()``'s
@@ -425,17 +434,18 @@ class Benchmark:
         cls,
         path: Path,
         *,
-        with_intermediate_states: bool = True,
+        with_intermediate_states: bool = False,
         with_games: bool = False,
         with_solver: bool = False,
     ) -> Benchmark:
         """Reconstruct a Benchmark from its JSON snapshot (R2.14).
 
-        Each ``with_*`` flag attaches a sibling sidecar pickle:
+        Each ``with_*`` flag attaches a sibling sidecar pickle. These flags
+        must only be enabled for artifacts from a trusted source because
+        Python pickle loading can execute arbitrary code:
 
-        - ``with_intermediate_states`` (default True): the per-step
-          frames sidecar. Safe to leave on (taaf / arcengine / numpy
-          only) and needed for movies + level-step curves.
+        - ``with_intermediate_states``: the per-step frames sidecar, needed
+          for movies + level-step curves.
         - ``with_games`` / ``with_solver``: re-run payloads. Require
           the user's ``Game`` / ``Solver`` subclasses to be importable.
 

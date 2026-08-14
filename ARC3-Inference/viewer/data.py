@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,7 +52,8 @@ _ARC_COLOR_MAP = {
     14: "#4FCC30FF",
     15: "#A356D6FF",
 }
-_RUN_PAYLOAD_CACHE: dict[tuple[str, str, tuple[Any, ...]], dict[str, Any]] = {}
+_RUN_PAYLOAD_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_RUN_PAYLOAD_CACHE_LOCK = threading.RLock()
 _PASS_INDEX_RE = re.compile(r"_p(?P<pass_index>\d+)_viewer_data\.json$")
 _TOOL_CODE_PARAMETER_RE = re.compile(
     r"<parameter=code>\s*(.*?)\s*</parameter>",
@@ -75,6 +77,33 @@ _RUNTIME_VALUE_SYMBOLS = {
     "valid_actions",
     "last_action_result",
 }
+
+
+def _cached_payload(cache_key: tuple[Any, ...]) -> dict[str, Any] | None:
+    with _RUN_PAYLOAD_CACHE_LOCK:
+        return _RUN_PAYLOAD_CACHE.get(cache_key)
+
+
+def _store_cached_payload(
+    cache_key: tuple[Any, ...],
+    payload: dict[str, Any],
+    *,
+    scope_length: int,
+) -> dict[str, Any]:
+    """Atomically install a payload and discard stale entries in its scope."""
+    with _RUN_PAYLOAD_CACHE_LOCK:
+        cached = _RUN_PAYLOAD_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        stale_keys = [
+            key
+            for key in _RUN_PAYLOAD_CACHE
+            if key[:scope_length] == cache_key[:scope_length] and key != cache_key
+        ]
+        for stale_key in stale_keys:
+            _RUN_PAYLOAD_CACHE.pop(stale_key, None)
+        _RUN_PAYLOAD_CACHE[cache_key] = payload
+        return payload
 _RUNTIME_CALL_SYMBOLS = {
     "action",
     "board_lines",
@@ -142,16 +171,14 @@ def load_run_summary(*, runs_dir: str | Path = "runs", run_dir: str | Path | Non
         "summary",
         _run_dir_fingerprint(resolved_run_dir),
     )
-    cached = _RUN_PAYLOAD_CACHE.get(cache_key)
+    cached = _cached_payload(cache_key)
     if cached is None:
         cached = {
             "source": "viewer_data",
             "arc_palette": _arc_palette(),
             "games": _load_game_summaries(resolved_run_dir),
         }
-        for existing_key in [key for key in _RUN_PAYLOAD_CACHE if key[:2] == cache_key[:2] and key != cache_key]:
-            _RUN_PAYLOAD_CACHE.pop(existing_key, None)
-        _RUN_PAYLOAD_CACHE[cache_key] = cached
+        cached = _store_cached_payload(cache_key, cached, scope_length=2)
 
     return {
         "run_name": resolved_run_dir.name,
@@ -177,7 +204,7 @@ def load_run_payload(
         "compact" if compact else "full",
         _run_dir_fingerprint(resolved_run_dir),
     )
-    cached = _RUN_PAYLOAD_CACHE.get(cache_key)
+    cached = _cached_payload(cache_key)
     if cached is None:
         artifacts = _load_game_artifacts(resolved_run_dir)
         cached = {
@@ -185,9 +212,7 @@ def load_run_payload(
             "arc_palette": _arc_palette(),
             "games": [artifact.compact if compact else artifact.full for artifact in artifacts],
         }
-        for existing_key in [key for key in _RUN_PAYLOAD_CACHE if key[:2] == cache_key[:2] and key != cache_key]:
-            _RUN_PAYLOAD_CACHE.pop(existing_key, None)
-        _RUN_PAYLOAD_CACHE[cache_key] = cached
+        cached = _store_cached_payload(cache_key, cached, scope_length=2)
 
     return {
         "run_name": resolved_run_dir.name,
@@ -215,12 +240,10 @@ def load_game_payload(
         "compact-game",
         _run_dir_fingerprint(resolved_run_dir),
     )
-    cached = _RUN_PAYLOAD_CACHE.get(cache_key)
+    cached = _cached_payload(cache_key)
     if cached is None:
         cached = _load_game_artifact(resolved_run_dir, path).compact
-        for existing_key in [key for key in _RUN_PAYLOAD_CACHE if key[:2] == cache_key[:2] and key != cache_key]:
-            _RUN_PAYLOAD_CACHE.pop(existing_key, None)
-        _RUN_PAYLOAD_CACHE[cache_key] = cached
+        cached = _store_cached_payload(cache_key, cached, scope_length=2)
     return cached
 
 
@@ -239,12 +262,10 @@ def load_game_shell_payload(
         "game-shell",
         _run_dir_fingerprint(resolved_run_dir),
     )
-    cached = _RUN_PAYLOAD_CACHE.get(cache_key)
+    cached = _cached_payload(cache_key)
     if cached is None:
         cached = _load_game_shell(resolved_run_dir, path)
-        for existing_key in [key for key in _RUN_PAYLOAD_CACHE if key[:2] == cache_key[:2] and key != cache_key]:
-            _RUN_PAYLOAD_CACHE.pop(existing_key, None)
-        _RUN_PAYLOAD_CACHE[cache_key] = cached
+        cached = _store_cached_payload(cache_key, cached, scope_length=2)
     return cached
 
 
@@ -267,12 +288,10 @@ def load_game_step_payload(
         "game-step",
         _run_dir_fingerprint(resolved_run_dir),
     )
-    cached = _RUN_PAYLOAD_CACHE.get(cache_key)
+    cached = _cached_payload(cache_key)
     if cached is None:
         cached = _load_game_step(resolved_run_dir, path, step_index)
-        for existing_key in [key for key in _RUN_PAYLOAD_CACHE if key[:3] == cache_key[:3] and key != cache_key]:
-            _RUN_PAYLOAD_CACHE.pop(existing_key, None)
-        _RUN_PAYLOAD_CACHE[cache_key] = cached
+        cached = _store_cached_payload(cache_key, cached, scope_length=3)
     return cached
 
 

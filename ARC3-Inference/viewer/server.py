@@ -28,9 +28,6 @@ class _ResponseBody:
 def _index_html_path() -> Path:
     return Path(__file__).resolve().parent / "index.html"
 
-def _index_html_path() -> Path:
-    return Path(__file__).resolve().parent / "index.html"
-
 
 def _load_index_html() -> str:
     return _index_html_path().read_text(encoding="utf-8")
@@ -45,17 +42,25 @@ def _requested_run_dir(*, runs_dir: Path, default_run_dir: Path | None, requeste
     if not requested_name:
         return default_run_dir
 
-    candidate = Path(requested_name)
-    if candidate.is_absolute():
-        return candidate
-
     if runs_dir.is_dir() and is_selectable_run_dir_name(runs_dir.name) and requested_name == runs_dir.name:
         return runs_dir
 
     if default_run_dir is not None and requested_name == default_run_dir.name:
         return default_run_dir
 
-    return runs_dir / requested_name
+    # The query parameter is a run *name*, not a path. Do not let an
+    # unauthenticated viewer request escape the configured runs directory.
+    candidate_name = Path(requested_name)
+    if candidate_name.is_absolute() or candidate_name.name != requested_name:
+        raise FileNotFoundError(f"Run {requested_name!r} is not available")
+    if not is_selectable_run_dir_name(requested_name):
+        raise FileNotFoundError(f"Run {requested_name!r} is not available")
+
+    runs_root = runs_dir.resolve()
+    candidate = (runs_root / requested_name).resolve()
+    if candidate.parent != runs_root:
+        raise FileNotFoundError(f"Run {requested_name!r} is not available")
+    return candidate
 
 
 class _ViewerHandler(BaseHTTPRequestHandler):

@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import queue
+import shutil
 import signal
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from inference.utils.grid_utils import ARC_COLOR_CHARS
 
 _SANDBOX_BOOTSTRAP = textwrap.dedent(
     r"""
+    import ast
     import builtins
     import contextlib
     import io
@@ -27,6 +29,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     import os
     import sys
     import traceback
+    import types
 
     try:
         import resource
@@ -49,11 +52,9 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "itertools",
         "json",
         "math",
-        "operator",
         "random",
         "re",
         "statistics",
-        "string",
     }
     SAFE_BUILTINS = {
         "abs",
@@ -68,7 +69,6 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "chr",
         "complex",
         "dict",
-        "dir",
         "divmod",
         "enumerate",
         "Exception",
@@ -76,13 +76,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "float",
         "format",
         "frozenset",
-        "getattr",
-        "hasattr",
         "hash",
         "hex",
         "int",
         "isinstance",
-        "issubclass",
         "iter",
         "len",
         "list",
@@ -105,11 +102,27 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "sum",
         "tuple",
         "TypeError",
-        "type",
         "ValueError",
         "RuntimeError",
         "zip",
     }
+    SAFE_MODULE_CACHE = {}
+
+
+    class SafeModule:
+        # Expose public non-module attributes from an approved module.
+
+        def __init__(self, module):
+            object.__setattr__(self, "_module", module)
+
+        def __getattribute__(self, name):
+            if str(name).startswith("_"):
+                raise AttributeError("Private module attributes are not allowed.")
+            module = object.__getattribute__(self, "_module")
+            value = getattr(module, name)
+            if isinstance(value, types.ModuleType):
+                raise AttributeError(f"Module-valued attribute '{name}' is not allowed.")
+            return value
 
 
     def _send(payload):
@@ -243,10 +256,44 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
 
     def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-        root = str(name or "").split(".", 1)[0]
-        if root not in SAFE_MODULES:
+        module_name = str(name or "")
+        if level != 0 or module_name not in SAFE_MODULES:
             raise ImportError(f"Module '{name}' is not allowed in the sandbox.")
-        return builtins.__import__(name, globals, locals, fromlist, level)
+        module = builtins.__import__(name, globals, locals, (), level)
+        for imported_name in fromlist or ():
+            if (
+                imported_name == "*"
+                or str(imported_name).startswith("_")
+                or not hasattr(module, imported_name)
+                or isinstance(getattr(module, imported_name), types.ModuleType)
+            ):
+                raise ImportError(f"Name '{imported_name}' is not allowed from module '{name}'.")
+        proxy = SAFE_MODULE_CACHE.get(module_name)
+        if proxy is None:
+            proxy = SafeModule(module)
+            SAFE_MODULE_CACHE[module_name] = proxy
+        return proxy
+
+
+    def _validate_user_code(code):
+        # Reject Python object-graph escape primitives before execution.
+        tree = ast.parse(code, filename="<python_tool>", mode="exec")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+                raise ValueError(f"Private attribute access is not allowed: {node.attr}")
+            if isinstance(node, ast.Name) and node.id.startswith("_"):
+                raise ValueError(f"Private names are not allowed: {node.id}")
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name.startswith("_"):
+                raise ValueError(f"Private definitions are not allowed: {node.name}")
+            if isinstance(node, ast.arg) and node.arg.startswith("_"):
+                raise ValueError(f"Private argument names are not allowed: {node.arg}")
+            if isinstance(node, ast.keyword) and node.arg is not None and node.arg.startswith("_"):
+                raise ValueError(f"Private keyword arguments are not allowed: {node.arg}")
+            if isinstance(node, ast.alias):
+                bound_name = node.asname or node.name.split(".", 1)[0]
+                if node.name.startswith("_") or bound_name.startswith("_"):
+                    raise ValueError(f"Private imports are not allowed: {node.name}")
+        return tree
 
 
     def _set_limits(timeout_seconds):
@@ -255,6 +302,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         cpu_limit = max(1, int(timeout_seconds)) + 1
         for limit, value in (
             (getattr(resource, "RLIMIT_CPU", None), cpu_limit),
+            (getattr(resource, "RLIMIT_AS", None), 512 * 1024 * 1024),
             (getattr(resource, "RLIMIT_FSIZE", None), 1_000_000),
             (getattr(resource, "RLIMIT_NOFILE", None), 32),
         ):
@@ -370,7 +418,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         _refresh_state(initial.get("state") or {})
 
         try:
-            compiled = compile(str(initial.get("code", "")), "<python_tool>", "exec")
+            parsed = _validate_user_code(str(initial.get("code", "")))
+            compiled = compile(parsed, "<python_tool>", "exec")
             with contextlib.redirect_stdout(stdout):
                 exec(compiled, runtime_globals, runtime_globals)
             _send(
@@ -420,6 +469,40 @@ def _send_json_line(handle: Any, payload: dict[str, Any]) -> None:
     handle.flush()
 
 
+def _sandbox_command() -> tuple[list[str], str | None]:
+    python_command = [sys.executable, "-I", "-S", "-c", _SANDBOX_BOOTSTRAP]
+    bubblewrap = shutil.which("bwrap") if os.name == "posix" else None
+    if bubblewrap is None:
+        return python_command, None
+    return (
+        [
+            bubblewrap,
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-net",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--dir",
+            "/tmp/work",
+            "--chdir",
+            "/tmp/work",
+            "--",
+            *python_command,
+        ],
+        "/tmp/work",
+    )
+
+
 def _kill_process_group(process: subprocess.Popen[str]) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -432,17 +515,22 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
 
 def _wait_for_process_exit(process: subprocess.Popen[str], *, timeout: float = 1.0) -> None:
     try:
-        process.wait(timeout=timeout)
-        return
-    except subprocess.TimeoutExpired:
-        _kill_process_group(process)
-    except OSError:
-        return
+        try:
+            process.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+        except OSError:
+            return
 
-    try:
-        process.wait(timeout=timeout)
-    except (subprocess.TimeoutExpired, OSError):
-        pass
+        try:
+            process.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    finally:
+        for handle in (process.stdin, process.stdout, process.stderr):
+            if handle is not None:
+                handle.close()
 
 
 def run_sandboxed_python(
@@ -454,9 +542,10 @@ def run_sandboxed_python(
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="rgb_python_tool_") as sandbox_dir:
         host_action_results: list[dict[str, Any]] = []
+        command, isolated_cwd = _sandbox_command()
         try:
             process = subprocess.Popen(
-                [sys.executable, "-I", "-S", "-c", _SANDBOX_BOOTSTRAP],
+                command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -490,7 +579,7 @@ def run_sandboxed_python(
             {
                 "code": code,
                 "timeout_seconds": timeout_seconds,
-                "sandbox_cwd": sandbox_dir,
+                "sandbox_cwd": isolated_cwd or sandbox_dir,
                 "state": initial_state,
                 "color_chars": ARC_COLOR_CHARS,
             },
