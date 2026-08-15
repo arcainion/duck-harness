@@ -112,3 +112,36 @@ class PythonToolSandboxTests(TestCase):
         response = _run("result = objectives({'op':'initialize'})['error']['code']")
         self.assertEqual(response["error"], "")
         self.assertEqual(response["result"], "disabled")
+
+    def test_sandbox_can_transactionally_replan_current_branch(self) -> None:
+        reducer = ObjectiveReducer(enabled=True)
+
+        def state() -> dict:
+            return {
+                "current_frame": None,
+                "history": [],
+                "valid_actions": [],
+                "last_action_result": {},
+                "experience": {},
+                "strategy": {},
+                "objectives": reducer.snapshot(),
+            }
+
+        response = run_sandboxed_python(
+            code=(
+                "root = objectives({'op':'initialize','description':'win','success_criterion':'progress'})\n"
+                "objectives({'op':'reduce','objective_id':root['active_objective_id'],'children':[{'description':'old a','success_criterion':'a'},{'description':'old b','success_criterion':'b'}]})\n"
+                "update = {'request_id':'sandbox-replan-v1','op':'replan','objective_id':'obj-1','reason':'new evidence','children':[{'description':'new plan','success_criterion':'done'}]}\n"
+                "changed = objectives(update)\n"
+                "replayed = objectives(update)\n"
+                "result = [changed['active_objective_id'], len(objective_state['discarded_branches']), replayed['replayed']]"
+            ),
+            timeout_seconds=5,
+            initial_state=state(),
+            action_handler=lambda actions: {"action_result": {}, "state": state()},
+            objective_handler=reducer.apply,
+            state_provider=state,
+        )
+
+        self.assertEqual(response["error"], "")
+        self.assertEqual(response["result"], ["obj-4", 1, True])

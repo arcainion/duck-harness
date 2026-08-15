@@ -1010,14 +1010,43 @@ class ToolAgent:
     def objective_snapshot(self) -> dict[str, Any]:
         return self._objective_reducer.snapshot()
 
-    def archive_objectives(self, reason: str) -> dict[str, Any] | None:
-        raw_evidence = self._strategy_memory.get("evidence") or []
-        lesson = (
-            "; ".join(str(item) for item in raw_evidence)
-            if isinstance(raw_evidence, list)
-            else str(raw_evidence)
+    def archive_objectives(
+        self, reason: str, *, successful: bool | None = None
+    ) -> dict[str, Any] | None:
+        lesson_parts: list[str] = []
+        hypothesis = _normalize_summary_text(self._strategy_memory.get("hypothesis"))
+        if hypothesis:
+            lesson_parts.append(f"Hypothesis: {hypothesis[:100]}")
+        for label, key in (("Evidence", "evidence"), ("Contradictions", "contradictions")):
+            raw_items = self._strategy_memory.get(key) or []
+            items = raw_items if isinstance(raw_items, list) else [raw_items]
+            compact = "; ".join(
+                text
+                for item in items[-2:]
+                if (text := _normalize_summary_text(item, max_chars=100))
+            )
+            if compact:
+                lesson_parts.append(f"{label}: {compact}")
+        prediction = self._strategy_memory.get("prediction_result")
+        if isinstance(prediction, dict):
+            prediction_text = "/".join(
+                str(prediction.get(key) or "-").strip()
+                for key in ("status", "action", "expected", "actual")
+            )
+            lesson_parts.append(f"Prediction: {prediction_text[:100]}")
+        lesson = " | ".join(lesson_parts)
+        transition_reason = str(reason).strip().lower()
+        archive = self._objective_reducer.archive(
+            reason=reason, lesson=lesson, successful=successful
         )
-        return self._objective_reducer.archive(reason=reason, lesson=lesson)
+        if transition_reason in {
+            "game_reset",
+            "level_transition",
+            "run_complete",
+        }:
+            self._strategy_memory = {}
+            self._summarized_knowledge = _empty_world_model()
+        return archive
 
     def _record_strategy(self, update: dict[str, Any]) -> dict[str, Any]:
         def short_text(value: Any, max_chars: int = 280) -> str:
@@ -1029,20 +1058,25 @@ class ToolAgent:
             if value:
                 persisted[key] = value
 
+        prediction_fields_updated = (
+            "test_action" in update or "expected_outcome" in update
+        )
         test_action = short_text(update.get("test_action"), 80)
-        if test_action:
-            persisted["test_action"] = normalize_action_key(test_action)
         expected_outcome = str(update.get("expected_outcome") or "").strip().lower()
-        if expected_outcome in {
+        valid_expected_outcomes = {
             "no_change",
             "state_change",
             "new_state",
             "level_progress",
             "unknown",
-        }:
-            persisted["expected_outcome"] = expected_outcome
-        if test_action or expected_outcome:
+        }
+        if prediction_fields_updated:
+            persisted.pop("test_action", None)
+            persisted.pop("expected_outcome", None)
             persisted.pop("prediction_result", None)
+        if test_action and expected_outcome in valid_expected_outcomes:
+            persisted["test_action"] = normalize_action_key(test_action)
+            persisted["expected_outcome"] = expected_outcome
 
         raw_evidence = update.get("evidence")
         if isinstance(raw_evidence, (list, tuple)):
@@ -1099,6 +1133,8 @@ class ToolAgent:
         existing = action_result.get("prediction_result")
         if isinstance(existing, dict):
             self._strategy_memory["prediction_result"] = dict(existing)
+            self._strategy_memory.pop("test_action", None)
+            self._strategy_memory.pop("expected_outcome", None)
             return dict(existing)
         test_action = normalize_action_key(self._strategy_memory.get("test_action", ""))
         expected = str(self._strategy_memory.get("expected_outcome") or "").strip()
@@ -1146,6 +1182,8 @@ class ToolAgent:
             "actual": actual,
         }
         self._strategy_memory["prediction_result"] = result
+        self._strategy_memory.pop("test_action", None)
+        self._strategy_memory.pop("expected_outcome", None)
         return result
 
     @property
@@ -1399,7 +1437,7 @@ class ToolAgent:
                 "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
                 "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
                 "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
-                "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test; optionally include test_action, expected_outcome, fallback, and contradictions so the next result can falsify the plan. This survives fresh Python snippets within this run.",
+                "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test. Declare test_action and expected_outcome together for a one-shot prediction; the matching result consumes that pair, so declare a fresh pair for another test. This survives fresh Python snippets within this run.",
             ]
         )
         if self._objective_reduction_enabled:
@@ -1416,9 +1454,16 @@ class ToolAgent:
                     ]
                 )
             else:
-                lines.append(
-                    "No actionable objective leaf exists. Use `objectives({...})` to initialize or repair the objective tree before calling `action(...)`."
-                )
+                blocking_id = objective_snapshot.get("blocking_objective_id")
+                blocking_reason = objective_snapshot.get("blocking_reason")
+                if blocking_id:
+                    lines.append(
+                        f"Objective tree blocked at {blocking_id}: {blocking_reason} Use `revise` on that leaf before calling `action(...)`."
+                    )
+                else:
+                    lines.append(
+                        "No actionable objective leaf exists. Use `objectives({...})` to initialize or repair the objective tree before calling `action(...)`."
+                    )
         if experience_snapshot and experience_snapshot.get("enabled"):
             compact_experience = {
                 key: experience_snapshot.get(key)
@@ -1792,17 +1837,32 @@ class ToolAgent:
                     ),
                 }
             if self._objective_reduction_enabled and active_objective_id is None:
+                objective_snapshot = self._objective_reducer.snapshot()
+                blocking_id = objective_snapshot.get("blocking_objective_id")
+                blocking_reason = objective_snapshot.get("blocking_reason")
+                blocking_status = objective_snapshot.get("blocking_status")
                 compact_payload = {
                     "executed": False,
                     "requested_count": len(normalized_actions),
                     "executed_count": 0,
                     "error": {
-                        "code": "objective_required",
-                        "message": "Initialize or repair the objective tree before acting.",
+                        "code": (
+                            "objective_failed"
+                            if blocking_status == "failed"
+                            else "objective_review_required"
+                            if blocking_id
+                            else "objective_required"
+                        ),
+                        "message": (
+                            f"Revise blocked objective {blocking_id}: {blocking_reason}"
+                            if blocking_id
+                            else "Initialize or repair the objective tree before acting."
+                        ),
                     },
+                    "blocking_objective_id": blocking_id,
                     "objective_id": None,
                     "objective_path": [],
-                    "objective_snapshot": self._objective_reducer.snapshot(),
+                    "objective_snapshot": objective_snapshot,
                 }
                 self._last_action_result = dict(compact_payload)
                 return {
@@ -1836,12 +1896,17 @@ class ToolAgent:
                 self._current_valid_actions = _normalize_valid_actions(next_valid_actions)
             if compact_payload.get("executed") and _terminal_action_reason(compact_payload):
                 terminal_action_result = compact_payload
-            if compact_payload.get("executed") and active_objective_id is not None:
+            if active_objective_id is not None and normalized_actions:
                 self._objective_reducer.record_outcome(active_objective_id, compact_payload)
-            if compact_payload.get("level_completed"):
-                raw_evidence = self._strategy_memory.get("evidence") or []
-                lesson = "; ".join(str(item) for item in raw_evidence) if isinstance(raw_evidence, list) else str(raw_evidence)
-                self._objective_reducer.archive(reason="level_transition", lesson=lesson)
+            if compact_payload.get("level_completed") or compact_payload.get("run_complete"):
+                self.archive_objectives(
+                    (
+                        "run_complete"
+                        if compact_payload.get("run_complete")
+                        else "level_transition"
+                    ),
+                    successful=True,
+                )
             compact_payload["objective_snapshot"] = self._objective_reducer.snapshot()
             self._last_action_result = dict(compact_payload)
             return {

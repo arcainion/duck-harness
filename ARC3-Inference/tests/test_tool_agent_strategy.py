@@ -65,6 +65,29 @@ class ToolAgentStrategyTests(TestCase):
         self.assertLessEqual(len(saved["contradictions"]), 3)
         self.assertEqual(result["status"], "supported")
         self.assertEqual(agent._strategy_memory["prediction_result"], result)
+        self.assertNotIn("test_action", agent._strategy_memory)
+        self.assertNotIn("expected_outcome", agent._strategy_memory)
+        self.assertIsNone(
+            agent._evaluate_strategy_prediction(
+                {
+                    "executed": True,
+                    "action_display": "SPACE",
+                    "outcome_class": "level_progress",
+                }
+            )
+        )
+
+    def test_partial_prediction_update_cannot_reuse_a_stale_counterpart(self) -> None:
+        agent = self._agent()
+        agent._record_strategy(
+            {"test_action": "LEFT", "expected_outcome": "no_change"}
+        )
+
+        updated = agent._record_strategy({"test_action": "RIGHT"})
+
+        self.assertNotIn("test_action", updated)
+        self.assertNotIn("expected_outcome", updated)
+        self.assertNotIn("prediction_result", updated)
 
     def test_prompt_contains_bounded_controller_summary_not_raw_grid(self) -> None:
         agent = self._agent()
@@ -127,6 +150,7 @@ class ToolAgentStrategyTests(TestCase):
         self.assertIn("Active objective (obj-1): Complete the level", prompt)
         self.assertIn("Active success criterion: level progress", prompt)
         self.assertIn("Orchestrated objective reduction", agent._system_prompt)
+        self.assertIn("`replan`", agent._system_prompt)
 
     def test_disabled_agent_keeps_objective_prompt_out(self) -> None:
         with patch.dict("os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "false"}):
@@ -204,3 +228,252 @@ class ToolAgentStrategyTests(TestCase):
         self.assertEqual(received[0]["objective_id"], "obj-1")
         self.assertEqual(received[0]["objective_path"], ["Reach target"])
         self.assertEqual(node["attempts"], 1)
+
+    def test_repeated_controller_rejections_force_objective_review(self) -> None:
+        with patch.dict("os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "true"}):
+            agent = self._agent()
+        calls: list[dict] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1,),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            agent._ensure_session(state_path)
+            agent._current_valid_actions = ["LEFT"]
+            agent._objective_reducer.apply(
+                {
+                    "op": "initialize",
+                    "description": "Reach target",
+                    "success_criterion": "progress",
+                }
+            )
+
+            def reject(payload: dict) -> dict:
+                calls.append(payload)
+                return {
+                    "executed": False,
+                    "requested_count": 1,
+                    "executed_count": 0,
+                    "valid_actions": ["LEFT"],
+                    "error": {"code": "cycle_guard", "message": "cycle blocked"},
+                }
+
+            agent._step_env_callback = reject
+            for _ in range(3):
+                agent._run_python_tool(state_path, {"code": "result = action(['LEFT'])"})
+            blocked_dispatch = agent._run_python_tool(
+                state_path, {"code": "result = action(['LEFT'])"}
+            )
+
+        node = agent.objective_snapshot["graph"]["nodes"][0]
+        payload = json.loads(blocked_dispatch.content)["result"]
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(node["attempts"], 0)
+        self.assertEqual(node["rejected_action_requests"], 3)
+        self.assertEqual(node["rejection_streak"], 3)
+        self.assertEqual(payload["error"]["code"], "objective_review_required")
+        self.assertEqual(payload["blocking_objective_id"], "obj-1")
+
+    def test_repeated_prediction_contradictions_force_objective_review(self) -> None:
+        with patch.dict("os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "true"}):
+            agent = self._agent()
+        calls: list[dict] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1,),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            agent._ensure_session(state_path)
+            agent._current_valid_actions = ["LEFT"]
+            agent._objective_reducer.apply(
+                {
+                    "op": "initialize",
+                    "description": "Test movement model",
+                    "success_criterion": "prediction supported",
+                }
+            )
+            agent._record_strategy(
+                {"test_action": "LEFT", "expected_outcome": "no_change"}
+            )
+
+            def changed(payload: dict) -> dict:
+                calls.append(payload)
+                return {
+                    "executed": True,
+                    "action_display": "LEFT",
+                    "executed_count": 1,
+                    "board_changed": True,
+                    "novel_state": True,
+                    "outcome_class": "novel",
+                    "valid_actions": ["LEFT"],
+                }
+
+            agent._step_env_callback = changed
+            agent._run_python_tool(state_path, {"code": "result = action(['LEFT'])"})
+            agent._run_python_tool(state_path, {"code": "result = action(['LEFT'])"})
+            agent._record_strategy(
+                {"test_action": "LEFT", "expected_outcome": "no_change"}
+            )
+            agent._run_python_tool(state_path, {"code": "result = action(['LEFT'])"})
+            blocked_dispatch = agent._run_python_tool(
+                state_path, {"code": "result = action(['LEFT'])"}
+            )
+
+        node = agent.objective_snapshot["graph"]["nodes"][0]
+        payload = json.loads(blocked_dispatch.content)["result"]
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(node["attempts"], 3)
+        self.assertEqual(node["prediction_contradictions"], 2)
+        self.assertEqual(node["prediction_contradiction_streak"], 2)
+        self.assertEqual(payload["error"]["code"], "objective_review_required")
+
+    def test_no_progress_review_gate_identifies_leaf_to_revise(self) -> None:
+        with patch.dict("os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "true"}):
+            agent = self._agent()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1,),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            agent._ensure_session(state_path)
+            agent._current_valid_actions = ["LEFT"]
+            agent._objective_reducer.apply(
+                {
+                    "op": "initialize",
+                    "description": "Reach target",
+                    "success_criterion": "progress",
+                }
+            )
+            for _ in range(3):
+                agent._objective_reducer.record_outcome(
+                    "obj-1",
+                    {"outcome_class": "exact_noop", "board_changed": False},
+                )
+            dispatch = agent._run_python_tool(
+                state_path, {"code": "result = action(['LEFT'])"}
+            )
+
+        payload = json.loads(dispatch.content)["result"]
+        self.assertEqual(payload["error"]["code"], "objective_review_required")
+        self.assertEqual(payload["blocking_objective_id"], "obj-1")
+
+    def test_run_completion_archives_objectives_as_successful(self) -> None:
+        with patch.dict("os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "true"}):
+            agent = self._agent()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1,),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            agent._ensure_session(state_path)
+            agent._current_valid_actions = ["LEFT"]
+            agent._objective_reducer.apply(
+                {
+                    "op": "initialize",
+                    "description": "Complete game",
+                    "success_criterion": "run complete",
+                }
+            )
+            agent._record_strategy(
+                {
+                    "hypothesis": "This level-specific rule will become stale",
+                    "test_action": "LEFT",
+                    "expected_outcome": "state_change",
+                    "evidence": ["final level evidence"],
+                }
+            )
+            agent._step_env_callback = lambda payload: {
+                "executed": True,
+                "action_num": 1,
+                "level": 1,
+                "score": 1,
+                "reward": 1,
+                "state": "WIN",
+                "valid_actions": [],
+                "board_changed": True,
+                "done": True,
+                "level_completed": False,
+                "game_over": False,
+                "run_complete": True,
+                "action_display": "LEFT",
+                "executed_count": 1,
+            }
+            dispatch = agent._run_python_tool(
+                state_path, {"code": "result = action(['LEFT'])"}
+            )
+
+        snapshot = agent.objective_snapshot
+        self.assertTrue(dispatch.step_executed)
+        self.assertIsNone(snapshot["graph"]["root_id"])
+        self.assertEqual(snapshot["archives"][-1]["reason"], "run_complete")
+        self.assertTrue(snapshot["archives"][-1]["successful"])
+        self.assertIn("Hypothesis: This level-specific rule", snapshot["archives"][-1]["lesson"])
+        self.assertIn("Evidence: final level evidence", snapshot["archives"][-1]["lesson"])
+        self.assertEqual(agent._strategy_memory, {})
+        self.assertFalse(any(agent._summarized_knowledge.values()))
+
+    def test_level_transition_and_game_reset_clear_transition_scoped_reasoning(self) -> None:
+        for reason in ("level_transition", "game_reset"):
+            with patch.dict(
+                "os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "true"}
+            ):
+                agent = self._agent()
+            agent._objective_reducer.apply(
+                {
+                    "op": "initialize",
+                    "description": "Complete current level",
+                    "success_criterion": "level transition",
+                }
+            )
+            agent._record_strategy(
+                {
+                    "goal": "old level goal",
+                    "hypothesis": "old level hypothesis",
+                    "test_action": "LEFT",
+                    "expected_outcome": "no_change",
+                    "evidence": [f"lesson from {reason}"],
+                }
+            )
+
+            archive = agent.archive_objectives(
+                reason, successful=reason == "level_transition"
+            )
+
+            self.assertIsNotNone(archive)
+            self.assertIn("Hypothesis: old level hypothesis", archive["lesson"])
+            self.assertIn(f"Evidence: lesson from {reason}", archive["lesson"])
+            self.assertEqual(agent._strategy_memory, {})
+            self.assertFalse(any(agent._summarized_knowledge.values()))
+            self.assertIsNone(agent.objective_snapshot["graph"]["root_id"])
+
+    def test_transition_cleanup_does_not_require_an_objective_archive(self) -> None:
+        with patch.dict(
+            "os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "false"}
+        ):
+            agent = self._agent()
+        agent._record_strategy(
+            {
+                "goal": "stale goal",
+                "hypothesis": "stale hypothesis",
+                "test_action": "LEFT",
+                "expected_outcome": "no_change",
+            }
+        )
+
+        archive = agent.archive_objectives("game_reset")
+
+        self.assertIsNone(archive)
+        self.assertEqual(agent._strategy_memory, {})
+        self.assertFalse(any(agent._summarized_knowledge.values()))
