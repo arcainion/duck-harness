@@ -21,10 +21,12 @@ from inference.agent.inference_controller import (
     build_experience_snapshot,
     normalize_action_key,
 )
+from inference.agent.objective_reduction import ObjectiveReducer
 from inference.agent.prompts import (
     COMPACT_TOOL_SESSION_ADDENDUM,
     GAME_OVERVIEW_ADDENDUM,
     MULTIMODAL_CONTEXT_ADDENDUM,
+    OBJECTIVE_REDUCTION_ADDENDUM,
     PYTHON_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
@@ -357,7 +359,7 @@ def _format_model_response_meta(
     return "\n".join(lines)
 
 
-def _build_system_prompt(*, tool_output_tokens: int) -> str:
+def _build_system_prompt(*, tool_output_tokens: int, objective_reduction_enabled: bool = False) -> str:
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
@@ -366,6 +368,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
     prompt += VISUAL_GAME_ADDENDUM
     prompt += PYTHON_ADDENDUM
     prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(tool_output_tokens=tool_output_tokens)
+    if objective_reduction_enabled:
+        prompt += OBJECTIVE_REDUCTION_ADDENDUM
     return prompt
 
 
@@ -948,8 +952,13 @@ class ToolAgent:
         self._tool_output_tokens = max(64, _LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS)
         self._tool_output_chars = max(256, self._tool_output_tokens * 4)
         self._save_request_logs = bool(save_request_logs)
+        self._objective_reduction_enabled = _get_env_bool(
+            "LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED", False
+        )
+        self._objective_reducer = ObjectiveReducer(enabled=self._objective_reduction_enabled)
         self._system_prompt = _build_system_prompt(
             tool_output_tokens=self._tool_output_tokens,
+            objective_reduction_enabled=self._objective_reduction_enabled,
         )
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
@@ -995,6 +1004,20 @@ class ToolAgent:
             self._last_action_result = None
             self._summarized_knowledge = _empty_world_model()
             self._strategy_memory = {}
+            self._objective_reducer = ObjectiveReducer(enabled=self._objective_reduction_enabled)
+
+    @property
+    def objective_snapshot(self) -> dict[str, Any]:
+        return self._objective_reducer.snapshot()
+
+    def archive_objectives(self, reason: str) -> dict[str, Any] | None:
+        raw_evidence = self._strategy_memory.get("evidence") or []
+        lesson = (
+            "; ".join(str(item) for item in raw_evidence)
+            if isinstance(raw_evidence, list)
+            else str(raw_evidence)
+        )
+        return self._objective_reducer.archive(reason=reason, lesson=lesson)
 
     def _record_strategy(self, update: dict[str, Any]) -> dict[str, Any]:
         def short_text(value: Any, max_chars: int = 280) -> str:
@@ -1359,11 +1382,18 @@ class ToolAgent:
         if observed_max_level > current_level:
             state_line += f" out of observed max level {observed_max_level} so far"
         state_line += "."
+        python_runtime_line = (
+            "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, `record_strategy(...)`, and `action(actions)`."
+        )
+        if self._objective_reduction_enabled:
+            python_runtime_line = (
+                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, `record_strategy(...)`, `objective_state`, `objectives(update)`, and `action(actions)`."
+            )
         lines.extend(
             [
                 state_line,
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, `record_strategy(...)`, and `action(actions)`.",
+                python_runtime_line,
                 "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
                 "Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.",
                 "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
@@ -1372,6 +1402,23 @@ class ToolAgent:
                 "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test; optionally include test_action, expected_outcome, fallback, and contradictions so the next result can falsify the plan. This survives fresh Python snippets within this run.",
             ]
         )
+        if self._objective_reduction_enabled:
+            objective_snapshot = self._objective_reducer.snapshot()
+            active_id = objective_snapshot.get("active_objective_id")
+            active_path = objective_snapshot.get("active_path_descriptions") or []
+            active_criterion = objective_snapshot.get("active_success_criterion")
+            if active_id:
+                lines.extend(
+                    [
+                        f"Active objective ({active_id}): {' > '.join(str(item) for item in active_path)}.",
+                        f"Active success criterion: {active_criterion}.",
+                        "The active leaf is authoritative for action selection; flat strategy goal/next_test text is supporting context only.",
+                    ]
+                )
+            else:
+                lines.append(
+                    "No actionable objective leaf exists. Use `objectives({...})` to initialize or repair the objective tree before calling `action(...)`."
+                )
         if experience_snapshot and experience_snapshot.get("enabled"):
             compact_experience = {
                 key: experience_snapshot.get(key)
@@ -1437,7 +1484,11 @@ class ToolAgent:
                 "type": "function",
                 "function": {
                     "name": "python",
-                    "description": _PYTHON_TOOL_DESCRIPTION,
+                    "description": _PYTHON_TOOL_DESCRIPTION + (
+                        " Objective reduction is enabled: inspect `objective_state` and call `objectives(update)` before acting."
+                        if self._objective_reduction_enabled
+                        else ""
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -1692,6 +1743,7 @@ class ToolAgent:
                     self._controller_config,
                 ),
                 "strategy": dict(self._strategy_memory),
+                "objectives": self._objective_reducer.snapshot(),
                 "last_action_result": (
                     dict(persisted_action_result)
                     if isinstance(persisted_action_result, dict)
@@ -1703,9 +1755,10 @@ class ToolAgent:
 
         def _handle_action(actions: list[dict[str, Any]]) -> dict[str, Any]:
             nonlocal terminal_action_result
-            if self._step_env_callback is None:
-                raise RuntimeError("action(actions) is not available in this session.")
             normalized_actions = self._normalize_python_actions(actions)
+            active_objective = self._objective_reducer.active_node
+            active_objective_id = active_objective.id if active_objective is not None else None
+            active_objective_path = self._objective_reducer.active_path_descriptions()
             if terminal_action_result is not None:
                 reason = _terminal_action_reason(terminal_action_result) or "terminal_state"
                 compact_payload = {
@@ -1726,6 +1779,9 @@ class ToolAgent:
                     "stopped_early": True,
                     "stop_reason": f"previous_{reason}",
                     "stop_detail": _terminal_action_stop_detail(reason),
+                    "objective_id": terminal_action_result.get("objective_id") or active_objective_id,
+                    "objective_path": terminal_action_result.get("objective_path") or active_objective_path,
+                    "objective_snapshot": self._objective_reducer.snapshot(),
                 }
                 self._last_action_result = dict(compact_payload)
                 return {
@@ -1735,6 +1791,26 @@ class ToolAgent:
                         last_action_result=compact_payload,
                     ),
                 }
+            if self._objective_reduction_enabled and active_objective_id is None:
+                compact_payload = {
+                    "executed": False,
+                    "requested_count": len(normalized_actions),
+                    "executed_count": 0,
+                    "error": {
+                        "code": "objective_required",
+                        "message": "Initialize or repair the objective tree before acting.",
+                    },
+                    "objective_id": None,
+                    "objective_path": [],
+                    "objective_snapshot": self._objective_reducer.snapshot(),
+                }
+                self._last_action_result = dict(compact_payload)
+                return {
+                    "action_result": compact_payload,
+                    "state": _serialized_runtime_state(last_action_result=compact_payload),
+                }
+            if self._step_env_callback is None:
+                raise RuntimeError("action(actions) is not available in this session.")
             raw_payload = self._step_env_callback(
                 {
                     "actions": normalized_actions,
@@ -1743,11 +1819,15 @@ class ToolAgent:
                         for key in ("test_action", "expected_outcome")
                         if self._strategy_memory.get(key)
                     },
+                    "objective_id": active_objective_id,
+                    "objective_path": active_objective_path,
                 }
             )
             if not isinstance(raw_payload, dict):
                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
             compact_payload = self._compact_action_result(raw_payload)
+            compact_payload["objective_id"] = active_objective_id
+            compact_payload["objective_path"] = active_objective_path
             prediction_result = self._evaluate_strategy_prediction(compact_payload)
             if prediction_result is not None:
                 compact_payload["prediction_result"] = prediction_result
@@ -1756,6 +1836,13 @@ class ToolAgent:
                 self._current_valid_actions = _normalize_valid_actions(next_valid_actions)
             if compact_payload.get("executed") and _terminal_action_reason(compact_payload):
                 terminal_action_result = compact_payload
+            if compact_payload.get("executed") and active_objective_id is not None:
+                self._objective_reducer.record_outcome(active_objective_id, compact_payload)
+            if compact_payload.get("level_completed"):
+                raw_evidence = self._strategy_memory.get("evidence") or []
+                lesson = "; ".join(str(item) for item in raw_evidence) if isinstance(raw_evidence, list) else str(raw_evidence)
+                self._objective_reducer.archive(reason="level_transition", lesson=lesson)
+            compact_payload["objective_snapshot"] = self._objective_reducer.snapshot()
             self._last_action_result = dict(compact_payload)
             return {
                 "action_result": compact_payload,
@@ -1771,6 +1858,8 @@ class ToolAgent:
             initial_state=_serialized_runtime_state(),
             action_handler=_handle_action,
             strategy_handler=self._record_strategy,
+            objective_handler=self._objective_reducer.apply,
+            state_provider=_serialized_runtime_state,
         )
 
         action_results = [
@@ -1779,6 +1868,13 @@ class ToolAgent:
             if isinstance(item, dict)
         ]
         payload: dict[str, Any] = {"tool": "python"}
+        objective_updates = [
+            item
+            for item in sandbox_result.get("objective_updates") or []
+            if isinstance(item, dict)
+        ]
+        if objective_updates:
+            payload["objective_updates"] = objective_updates
         rendered_stdout = str(sandbox_result.get("stdout", "") or "")
         rendered_error = str(sandbox_result.get("error", "") or "")
         if rendered_error:

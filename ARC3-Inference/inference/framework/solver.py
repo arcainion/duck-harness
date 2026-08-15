@@ -46,6 +46,8 @@ from inference.agent.runtime_state import (
 )
 from inference.agent.tool_agent import ToolAgent
 from inference.framework.kaggle import (
+    DEFAULT_EXPECTED_GPU_COUNT,
+    DEFAULT_EXPECTED_GPU_TYPE,
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
@@ -447,6 +449,7 @@ class _HarnessGameSession:
                 "analysis_step": None,
                 "action_display": "RESET",
                 "reward": 0.0,
+                "objective_snapshot": getattr(self.analyzer, "objective_snapshot", None),
             }
         )
 
@@ -462,6 +465,7 @@ class _HarnessGameSession:
                 "action_num": self.action_count,
                 "analysis_step": analysis_step,
                 "transcript": transcript,
+                "objective_snapshot": getattr(self.analyzer, "objective_snapshot", None),
             }
         )
 
@@ -503,6 +507,10 @@ class _HarnessGameSession:
                 "no_op_streak": payload.get("no_op_streak"),
                 "behavioral_no_op_streak": payload.get("behavioral_no_op_streak"),
                 "stagnation_actions": payload.get("stagnation_actions"),
+                "objective_id": payload.get("objective_id"),
+                "objective_path": payload.get("objective_path"),
+                "objective_snapshot": payload.get("objective_snapshot")
+                or getattr(self.analyzer, "objective_snapshot", None),
             }
         )
 
@@ -533,6 +541,7 @@ class _HarnessGameSession:
             "lastEvent": last_event,
             "viewer_steps": [],
             "replay_url": self.analysis_html_relpath,
+            "objectiveState": getattr(self.analyzer, "objective_snapshot", None),
         }
         if run is not None:
             payload.update(
@@ -670,6 +679,13 @@ class _HarnessGameSession:
         strategy_prediction = arguments.get("strategy_prediction")
         if not isinstance(strategy_prediction, dict):
             strategy_prediction = None
+        objective_id = str(arguments.get("objective_id") or "").strip() or None
+        raw_objective_path = arguments.get("objective_path")
+        objective_path = (
+            [str(item) for item in raw_objective_path]
+            if isinstance(raw_objective_path, list)
+            else []
+        )
 
         for batch_index, action in enumerate(requested_actions, start=1):
             if self.should_stop():
@@ -714,6 +730,8 @@ class _HarnessGameSession:
                         "controller_reason_codes": [guard_reason_code] if guard_reason_code else [],
                         "stop_reason": stop_reason,
                         "stop_detail": guard_reason,
+                        "objective_id": objective_id,
+                        "objective_path": objective_path,
                     }
                 )
                 self.write_viewer_payload()
@@ -756,6 +774,8 @@ class _HarnessGameSession:
                     batch_index=batch_index,
                     batch_size=batch_size,
                     strategy_prediction=strategy_prediction,
+                    objective_id=objective_id,
+                    objective_path=objective_path,
                     flush_viewer_payload=False,
                 )
             except Exception as exc:
@@ -822,6 +842,8 @@ class _HarnessGameSession:
                     "no_op_streak",
                     "behavioral_no_op_streak",
                     "stagnation_actions",
+                    "objective_id",
+                    "objective_path",
                 )
                 if key in item
             }
@@ -837,6 +859,9 @@ class _HarnessGameSession:
         return final_payload
 
     def _execute_auto_reset(self) -> None:
+        archive_objectives = getattr(self.analyzer, "archive_objectives", None)
+        if callable(archive_objectives):
+            archive_objectives("game_reset")
         action = arcengine.ActionInput(id=arcengine.GameAction.RESET, data={})
         self._execute_action(action, batch_index=1, batch_size=1, generated_tokens=0)
 
@@ -847,6 +872,8 @@ class _HarnessGameSession:
         batch_index: int,
         batch_size: int,
         strategy_prediction: dict[str, Any] | None = None,
+        objective_id: str | None = None,
+        objective_path: list[str] | None = None,
         generated_tokens: int | None = None,
         flush_viewer_payload: bool = True,
     ) -> dict[str, Any]:
@@ -905,6 +932,8 @@ class _HarnessGameSession:
             "action_display": action_display,
             "batch_index": batch_index,
             "batch_size": batch_size,
+            "objective_id": objective_id,
+            "objective_path": list(objective_path or []),
             **self.timing_payload(),
         }
         if self.controller_config.enabled:
@@ -958,6 +987,12 @@ class HarnessSolver(Solver):
     )
     kaggle_vllm_tensor_parallel_size: int = field(
         default=DEFAULT_VLLM_TENSOR_PARALLEL_SIZE, repr=False
+    )
+    kaggle_expected_gpu_type: str = field(
+        default=DEFAULT_EXPECTED_GPU_TYPE, repr=False
+    )
+    kaggle_expected_gpu_count: int = field(
+        default=DEFAULT_EXPECTED_GPU_COUNT, repr=False
     )
     kaggle_wheelhouse_stamp_text: str = field(
         default=DEFAULT_WHEELHOUSE_STAMP_TEXT, repr=False
@@ -1067,6 +1102,8 @@ class HarnessSolver(Solver):
             vllm_port=self.kaggle_vllm_port,
             max_model_len=self.kaggle_vllm_max_model_len,
             tensor_parallel_size=self.kaggle_vllm_tensor_parallel_size,
+            expected_gpu_type=self.kaggle_expected_gpu_type,
+            expected_gpu_count=self.kaggle_expected_gpu_count,
             wheelhouse_stamp_text=self.kaggle_wheelhouse_stamp_text,
         )
 

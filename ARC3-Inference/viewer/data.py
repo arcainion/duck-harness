@@ -612,6 +612,8 @@ def _compact_saved_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
     compact["eventCount"] = int(compact.get("eventCount") or len(viewer_steps))
     if isinstance(payload.get("lastEvent"), dict) and payload.get("lastEvent"):
         compact["lastEvent"] = dict(payload["lastEvent"])
+    if isinstance(payload.get("objectiveState"), dict):
+        compact["objectiveState"] = dict(payload["objectiveState"])
     runtime_usage = _stored_runtime_usage_summary(compact)
     if runtime_usage is None:
         runtime_usage = _runtime_usage_summary(viewer_steps=viewer_steps)
@@ -722,6 +724,8 @@ def _summary_from_compact_payload(compact_payload: dict[str, Any]) -> dict[str, 
     last_event = compact_payload.get("lastEvent")
     if isinstance(last_event, dict) and last_event:
         game["lastEvent"] = dict(last_event)
+    if isinstance(compact_payload.get("objectiveState"), dict):
+        game["objectiveState"] = dict(compact_payload["objectiveState"])
     return game
 
 
@@ -743,6 +747,8 @@ def _compact_game_payload(
     last_event = _compact_last_event_summary(normalized_events[-1] if normalized_events else None)
     if last_event is not None:
         game["lastEvent"] = last_event
+    if isinstance(payload.get("objectiveState"), dict):
+        game["objectiveState"] = dict(payload["objectiveState"])
     game.update(_runtime_usage_summary(viewer_steps=viewer_steps, normalized_events=normalized_events))
     return game
 

@@ -551,6 +551,22 @@
       display: none;
     }
 
+    .objective-wrap:empty {
+      display: none;
+    }
+
+    .objective-path {
+      color: var(--ink);
+      font-size: 0.88rem;
+      line-height: 1.45;
+    }
+
+    .objective-evidence {
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.4;
+    }
+
     canvas {
       display: block;
       max-width: 100%;
@@ -650,6 +666,7 @@
             <pre id="ascii-board" class="ascii-board" hidden></pre>
           </div>
           <div class="runtime-usage-wrap" id="runtime-usage"></div>
+          <div class="objective-wrap" id="objective-state"></div>
         </div>
       </aside>
     </div>
@@ -688,6 +705,7 @@
     const canvasEl = document.getElementById("board-canvas");
     const asciiBoardEl = document.getElementById("ascii-board");
     const runtimeUsageEl = document.getElementById("runtime-usage");
+    const objectiveStateEl = document.getElementById("objective-state");
 
     document.getElementById("reload-button").addEventListener("click", () => {
       loadPayload(currentRunName, { preserveSelection: true, silent: false });
@@ -824,6 +842,8 @@
         lastStepState: lastStep?.state || "",
         lastStepLevel: lastStep?.level ?? null,
         lastStepContext,
+        activeObjectiveId: game.objectiveState?.active_objective_id || "",
+        objectiveArchiveCount: game.objectiveState?.archives?.length || 0,
       });
     }
 
@@ -882,6 +902,7 @@
         eventsListEl.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
         boardSummaryEl.innerHTML = "";
         runtimeUsageEl.innerHTML = "";
+        objectiveStateEl.innerHTML = "";
         clearBoard();
         asciiBoardEl.hidden = false;
         asciiBoardEl.textContent = "No run data available yet.\nRun `make run` first, then reload the viewer.";
@@ -957,6 +978,7 @@
           eventsListEl.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
           boardSummaryEl.innerHTML = "";
           runtimeUsageEl.innerHTML = "";
+          objectiveStateEl.innerHTML = "";
           clearBoard();
           asciiBoardEl.hidden = false;
           asciiBoardEl.textContent = "No game data available for this selection.";
@@ -1058,6 +1080,7 @@
         levelCountEl.textContent = "0 levels";
         boardSummaryEl.innerHTML = "";
         runtimeUsageEl.innerHTML = "";
+        objectiveStateEl.innerHTML = "";
         clearBoard();
         return;
       }
@@ -1073,6 +1096,7 @@
         levelCountEl.textContent = "0 levels";
         boardSummaryEl.innerHTML = "";
         runtimeUsageEl.innerHTML = "";
+        objectiveStateEl.innerHTML = "";
         clearBoard();
         return;
       }
@@ -1619,6 +1643,7 @@
         </div>
       `;
       runtimeUsageEl.innerHTML = renderToolUsageSummary(game);
+      objectiveStateEl.innerHTML = renderObjectiveState(game.objectiveState);
 
       renderBoard(event);
     }
@@ -1658,6 +1683,31 @@
               </div>
             `).join("")}
           </div>
+        </div>
+      `;
+    }
+
+    function renderObjectiveState(state) {
+      if (!state || !state.enabled) {
+        return "";
+      }
+      const graphNodes = Array.isArray(state.graph?.nodes) ? state.graph.nodes : [];
+      const nodeById = new Map(graphNodes.map((node) => [node.id, node]));
+      const pathIds = Array.isArray(state.active_path) ? state.active_path : [];
+      const path = pathIds.map((id) => nodeById.get(id)?.description || id);
+      const active = nodeById.get(state.active_objective_id);
+      const evidence = Array.isArray(active?.evidence) ? active.evidence.slice(-2) : [];
+      const archives = Array.isArray(state.archives) ? state.archives : [];
+      return `
+        <div class="tool-usage-block">
+          <div class="tool-usage-header">
+            <div class="tool-usage-title">Objective Reduction</div>
+            <div class="tool-usage-total">${escapeHtml(active ? active.status : "blocked")}</div>
+          </div>
+          <div class="objective-path">${escapeHtml(path.length ? path.join(" › ") : "No active objective")}</div>
+          <div class="objective-evidence">${escapeHtml(active?.success_criterion || "Initialize or revise the objective tree before acting.")}</div>
+          ${evidence.length ? `<div class="objective-evidence">Evidence: ${escapeHtml(evidence.join("; "))}</div>` : ""}
+          ${archives.length ? `<div class="objective-evidence">Archived levels: ${escapeHtml(String(archives.length))}</div>` : ""}
         </div>
       `;
     }

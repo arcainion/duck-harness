@@ -46,6 +46,7 @@ class SolverControllerTests(TestCase):
             data={},
         )
         calls: list[int] = []
+        objective_calls: list[tuple[str | None, list[str]]] = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -66,6 +67,7 @@ class SolverControllerTests(TestCase):
 
             def execute(*args, **kwargs):
                 calls.append(1)
+                objective_calls.append((kwargs.get("objective_id"), kwargs.get("objective_path")))
                 return {
                     "executed": True,
                     "action_num": 1,
@@ -87,13 +89,20 @@ class SolverControllerTests(TestCase):
                 }
 
             session._execute_action = execute
-            result = session.step_env({"actions": ["UP", "UP"]})
+            result = session.step_env(
+                {
+                    "actions": ["UP", "UP"],
+                    "objective_id": "obj-2",
+                    "objective_path": ["Complete level", "Reach target"],
+                }
+            )
 
         self.assertEqual(len(calls), 1)
         self.assertTrue(result["stopped_early"])
         self.assertEqual(result["stop_reason"], "level_completed")
         self.assertEqual(result["steps"][0]["before_state_id"], "a")
         self.assertEqual(result["steps"][0]["after_state_id"], "b")
+        self.assertEqual(objective_calls, [("obj-2", ["Complete level", "Reach target"])])
 
     def test_prediction_result_is_structured(self) -> None:
         result = _evaluate_strategy_prediction(

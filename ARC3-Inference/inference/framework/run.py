@@ -28,7 +28,10 @@ import taaf.deploy_slurm
 import taaf.game
 import taaf.game_api
 
-from inference.framework.kaggle import DUCK_HARNESS_PUBLIC_GAME_IDS
+from inference.framework.kaggle import (
+    DUCK_HARNESS_PUBLIC_GAME_IDS,
+    duck_kaggle_vllm_config_for_accelerator,
+)
 from inference.framework.solver import HarnessSolver
 from inference.utils.run_artifacts import save_git_info, setup_experiment_directory
 
@@ -413,6 +416,9 @@ def _make_solver(
         _validate_local_server_config(args)
     local_server_count = max(1, int(args.slurm_gpu_count)) if start_local_server else 1
     effective_concurrency = _effective_concurrent_jobs(args)
+    kaggle_vllm_config = duck_kaggle_vllm_config_for_accelerator(
+        getattr(args, "kaggle_accelerator", None)
+    )
     return HarnessSolver(
         label=args.agent,
         model=args.model,
@@ -440,6 +446,10 @@ def _make_solver(
             args, "slurm_local_server_tensor_parallel_size", None
         ),
         local_server_count=local_server_count,
+        kaggle_vllm_max_model_len=kaggle_vllm_config.max_model_len,
+        kaggle_vllm_tensor_parallel_size=kaggle_vllm_config.tensor_parallel_size,
+        kaggle_expected_gpu_type=kaggle_vllm_config.expected_gpu_type,
+        kaggle_expected_gpu_count=kaggle_vllm_config.expected_gpu_count,
     )
 
 

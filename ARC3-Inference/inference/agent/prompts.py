@@ -117,3 +117,14 @@ COMPACT_TOOL_SESSION_ADDENDUM = (
     "- Tool responses are capped to about {tool_output_tokens} tokens. If a response is cut off, the tool result will tell you that.\n"
     "- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.\n"
 )
+
+OBJECTIVE_REDUCTION_ADDENDUM = (
+    "\n\nOrchestrated objective reduction:\n"
+    "- Objective reduction is enabled. `objective_state` contains the validated objective tree and active leaf.\n"
+    "- Before any real action, call `objectives({...})` to initialize a root and, when useful, reduce it into ordered required children.\n"
+    "- Supported operations are `initialize`, `reduce`, `complete`, `fail`, and `revise`. Each returns `ok`, the active objective id/path, the graph, and a structured error.\n"
+    "- `action(...)` is rejected unless the tree has an active pending leaf. Actions are automatically attributed to that leaf.\n"
+    "- Complete a leaf only when its success criterion has evidence. Fail and revise a contradicted leaf instead of silently changing goals.\n"
+    "- Ordered children are all required. The runtime selects the first unresolved depth-first leaf and rolls completion up when all siblings complete.\n"
+    "- After an objective or action call, `objective_state` refreshes immediately. A confirmed level transition archives the tree and requires a fresh root on the new scene.\n"
+)

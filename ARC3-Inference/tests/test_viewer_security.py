@@ -62,3 +62,11 @@ class ViewerSecurityTests(TestCase):
 
         with data._RUN_PAYLOAD_CACHE_LOCK:
             self.assertEqual(len(data._RUN_PAYLOAD_CACHE), 1)
+
+    def test_objective_panel_escapes_model_authored_fields(self) -> None:
+        index_html = (Path(__file__).parents[1] / "viewer" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('escapeHtml(path.length ? path.join(" › ")', index_html)
+        self.assertIn("escapeHtml(active?.success_criterion", index_html)
+        self.assertIn('escapeHtml(evidence.join("; "))', index_html)

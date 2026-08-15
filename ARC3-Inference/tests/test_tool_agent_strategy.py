@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import tempfile
+from pathlib import Path
 from unittest import TestCase
+from unittest.mock import patch
 
 from inference.agent.inference_controller import InferenceControllerConfig
-from inference.agent.runtime_state import Frame, HistoryEntry
+from inference.agent.runtime_state import Frame, HistoryEntry, write_runtime_state
 from inference.agent.tool_agent import ToolAgent
 
 
@@ -105,3 +109,98 @@ class ToolAgentStrategyTests(TestCase):
         self.assertNotIn("recent_transitions", prompt)
         self.assertNotIn("[[1, 2], [3, 4]]", prompt)
         self.assertLess(len(prompt), 10_000)
+
+    def test_objective_reduction_prompt_is_opt_in_and_active_leaf_is_authoritative(self) -> None:
+        with patch.dict("os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "true"}):
+            agent = self._agent()
+        created = agent._objective_reducer.apply(
+            {
+                "op": "initialize",
+                "description": "Complete the level",
+                "success_criterion": "level progress",
+            }
+        )
+        frame = Frame(grid=((1,),), step=0, level=1)
+        prompt = agent._build_user_prompt(0, valid_actions=["LEFT"], current_frame=frame)
+
+        self.assertTrue(created["ok"])
+        self.assertIn("Active objective (obj-1): Complete the level", prompt)
+        self.assertIn("Active success criterion: level progress", prompt)
+        self.assertIn("Orchestrated objective reduction", agent._system_prompt)
+
+    def test_disabled_agent_keeps_objective_prompt_out(self) -> None:
+        with patch.dict("os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "false"}):
+            agent = self._agent()
+        self.assertNotIn("Orchestrated objective reduction", agent._system_prompt)
+
+    def test_objective_gate_blocks_actions_until_a_leaf_exists(self) -> None:
+        with patch.dict("os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "true"}):
+            agent = self._agent()
+        calls: list[list[dict]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1,),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            agent._ensure_session(state_path)
+            agent._current_valid_actions = ["LEFT"]
+            agent._step_env_callback = lambda payload: calls.append(payload) or {}
+            dispatch = agent._run_python_tool(state_path, {"code": "result = action(['LEFT'])"})
+
+        payload = json.loads(dispatch.content)
+        self.assertFalse(dispatch.step_executed)
+        self.assertEqual(payload["result"]["error"]["code"], "objective_required")
+        self.assertEqual(calls, [])
+
+    def test_action_is_attributed_and_recorded_on_active_objective(self) -> None:
+        with patch.dict("os.environ", {"LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED": "true"}):
+            agent = self._agent()
+        received: list[dict] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1,),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            agent._ensure_session(state_path)
+            agent._current_valid_actions = ["LEFT"]
+            agent._objective_reducer.apply(
+                {
+                    "op": "initialize",
+                    "description": "Reach target",
+                    "success_criterion": "board changes",
+                }
+            )
+
+            def step(payload: dict) -> dict:
+                received.append(payload)
+                return {
+                    "executed": True,
+                    "action_num": 1,
+                    "level": 1,
+                    "score": 0,
+                    "reward": 0,
+                    "state": "NOT_FINISHED",
+                    "valid_actions": ["LEFT"],
+                    "board_changed": True,
+                    "done": False,
+                    "level_completed": False,
+                    "game_over": False,
+                    "run_complete": False,
+                    "action_display": "LEFT",
+                    "executed_count": 1,
+                }
+
+            agent._step_env_callback = step
+            dispatch = agent._run_python_tool(state_path, {"code": "result = action(['LEFT'])"})
+
+        node = agent.objective_snapshot["graph"]["nodes"][0]
+        self.assertTrue(dispatch.step_executed)
+        self.assertEqual(received[0]["objective_id"], "obj-1")
+        self.assertEqual(received[0]["objective_path"], ["Reach target"])
+        self.assertEqual(node["attempts"], 1)

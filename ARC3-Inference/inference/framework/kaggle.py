@@ -13,6 +13,9 @@ DEFAULT_SERVED_MODEL_NAME = "vrfai/Qwen3.6-27B-FP8"
 DEFAULT_VLLM_PORT = 1234
 DEFAULT_VLLM_MAX_MODEL_LEN = 65536
 DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 1
+DEFAULT_EXPECTED_GPU_TYPE = "rtx-pro-6000"
+DEFAULT_EXPECTED_GPU_COUNT = 1
+T4_VLLM_MAX_MODEL_LEN = 8192
 DEFAULT_WHEELHOUSE_STAMP_TEXT = "vllm==0.19.0 torch==2.10.0 flashinfer==0.6.6\n"
 
 # The 25 official ARC-AGI-3 games. The first 16 are the original Kaggle duck
@@ -56,7 +59,27 @@ class DuckKaggleVllmConfig:
     vllm_port: int = DEFAULT_VLLM_PORT
     max_model_len: int = DEFAULT_VLLM_MAX_MODEL_LEN
     tensor_parallel_size: int = DEFAULT_VLLM_TENSOR_PARALLEL_SIZE
+    expected_gpu_type: str = DEFAULT_EXPECTED_GPU_TYPE
+    expected_gpu_count: int = DEFAULT_EXPECTED_GPU_COUNT
     wheelhouse_stamp_text: str = DEFAULT_WHEELHOUSE_STAMP_TEXT
+
+
+def duck_kaggle_vllm_config_for_accelerator(
+    accelerator: str | None,
+) -> DuckKaggleVllmConfig:
+    """Return the vLLM profile matching Kaggle's accelerator allocation."""
+
+    normalized = "".join(character for character in str(accelerator or "").lower() if character.isalnum())
+    if normalized == "nvidiateslat4":
+        # Kaggle's NvidiaTeslaT4 shape exposes two 16 GiB T4s. The 27B FP8
+        # model must be sharded across both, with a bounded KV-cache budget.
+        return DuckKaggleVllmConfig(
+            max_model_len=T4_VLLM_MAX_MODEL_LEN,
+            tensor_parallel_size=2,
+            expected_gpu_type="t4",
+            expected_gpu_count=2,
+        )
+    return DuckKaggleVllmConfig()
 
 
 def duck_kaggle_dataset_sources(
@@ -98,7 +121,10 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         # here so the agent's prompt budget on Kaggle is the JSON value, not
         # vllm's max-model-len. Falls back to max_model_len if unset.
         "__ANALYZER_CONTEXT_WINDOW__": repr(
-            int(os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW") or cfg.max_model_len)
+            min(
+                int(os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW") or cfg.max_model_len),
+                int(cfg.max_model_len),
+            )
         ),
         # Remaining JSON-driven analyzer/multimodal config: the launcher's
         # Makefile exports each from inference.json; embed the launcher value
@@ -112,6 +138,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__LOCAL_ANALYZER_TOOL_TIMEOUT__": repr(os.environ.get("LOCAL_ANALYZER_TOOL_TIMEOUT", "30")),
         "__LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS__": repr(os.environ.get("LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS", "1024")),
         "__LOCAL_ANALYZER_STRATEGY_ENABLED__": repr(os.environ.get("LOCAL_ANALYZER_STRATEGY_ENABLED", "false")),
+        "__LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED__": repr(os.environ.get("LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED", "false")),
         "__LOCAL_ANALYZER_STRATEGY_POLICY__": repr(os.environ.get("LOCAL_ANALYZER_STRATEGY_POLICY", "legacy")),
         "__LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT__": repr(os.environ.get("LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT", "2")),
         "__LOCAL_ANALYZER_STAGNATION_WINDOW__": repr(os.environ.get("LOCAL_ANALYZER_STAGNATION_WINDOW", "12")),
@@ -127,6 +154,8 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__MULTIMODAL_CONTEXT__": repr(os.environ.get("MULTIMODAL_CONTEXT", "current_grid")),
         "__MULTIMODAL_UPSCALE__": repr(os.environ.get("MULTIMODAL_UPSCALE", "4")),
         "__VLLM_TENSOR_PARALLEL_SIZE__": repr(int(cfg.tensor_parallel_size)),
+        "__EXPECTED_GPU_TYPE__": repr(str(cfg.expected_gpu_type)),
+        "__EXPECTED_GPU_COUNT__": repr(int(cfg.expected_gpu_count)),
         "__WHEELHOUSE_STAMP_TEXT__": repr(cfg.wheelhouse_stamp_text),
     }
     script = _DUCK_VLLM_SETUP_SCRIPT
@@ -168,6 +197,8 @@ VLLM_BASE_URL = f'http://{VLLM_HOST}:{VLLM_PORT}/v1'
 VLLM_MAX_MODEL_LEN = __VLLM_MAX_MODEL_LEN__
 ANALYZER_CONTEXT_WINDOW = __ANALYZER_CONTEXT_WINDOW__
 VLLM_TENSOR_PARALLEL_SIZE = __VLLM_TENSOR_PARALLEL_SIZE__
+EXPECTED_GPU_TYPE = __EXPECTED_GPU_TYPE__
+EXPECTED_GPU_COUNT = __EXPECTED_GPU_COUNT__
 WORKING_DIR = Path(os.environ['TAAF_KAGGLE_WORKING_DIR'])
 SITE_PACKAGES = WORKING_DIR / 'vllm-site-packages'
 VLLM_SERVER_LOG = WORKING_DIR / 'vllm-openai-server.log'
@@ -175,7 +206,7 @@ VLLM_SERVER_PID = WORKING_DIR / 'vllm-openai-server.pid'
 INSTALL_STAMP = SITE_PACKAGES / f'.{WHEELHOUSE_SLUG}'
 STAMP_TEXT = __WHEELHOUSE_STAMP_TEXT__
 
-GPU_NAME_PATTERNS = {'rtx-pro-6000': ('rtx pro 6000',), 'h100': ('h100',), 'l4': ('l4',)}
+GPU_NAME_PATTERNS = {'rtx-pro-6000': ('rtx pro 6000',), 'h100': ('h100',), 'l4': ('l4',), 't4': ('t4',)}
 
 
 def taaf_kaggle_input_paths() -> dict[str, Path]:
@@ -210,8 +241,8 @@ def assert_expected_cuda_gpu() -> None:
     assert result.returncode == 0, f'nvidia-smi failed: {result.stderr.strip()}'
     gpu_names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     assert gpu_names, 'nvidia-smi did not report any CUDA GPUs.'
-    expected_gpu_type = os.getenv('KAGGLE_GPU_TYPE', 'rtx-pro-6000').strip().lower()
-    expected_count = os.getenv('KAGGLE_GPU_COUNT', '1')
+    expected_gpu_type = os.getenv('KAGGLE_GPU_TYPE', EXPECTED_GPU_TYPE).strip().lower()
+    expected_count = os.getenv('KAGGLE_GPU_COUNT', str(EXPECTED_GPU_COUNT))
     if expected_count.isdigit():
         assert len(gpu_names) == int(expected_count), f'Expected {expected_count} CUDA GPU(s), found {gpu_names}'
     patterns = GPU_NAME_PATTERNS.get(expected_gpu_type, (expected_gpu_type.replace('-', ' '),))
@@ -287,28 +318,36 @@ def request_json(url: str, payload: dict | None = None, timeout: int = 30) -> di
         return json.loads(response.read().decode('utf-8'))
 
 
-def tail_server_log(lines: int = 80) -> str:
+def read_server_log() -> str:
     if not VLLM_SERVER_LOG.exists():
-        return ''
-    return '\n'.join(VLLM_SERVER_LOG.read_text(encoding='utf-8', errors='replace').splitlines()[-lines:])
+        return '(vLLM server log file was not created)'
+    return VLLM_SERVER_LOG.read_text(encoding='utf-8', errors='replace')
 
 
-def wait_for_vllm_server(timeout_seconds: int = 900) -> None:
+def server_failure_message(reason: str) -> str:
+    return f'{reason}\nComplete vLLM server log:\n{read_server_log()}'
+
+
+def wait_for_vllm_server(process: subprocess.Popen[str], timeout_seconds: int = 900) -> None:
     deadline = time.monotonic() + timeout_seconds
     url = f'{VLLM_BASE_URL}/models'
     while time.monotonic() < deadline:
-        if VLLM_SERVER_PID.exists():
-            try:
-                os.kill(int(VLLM_SERVER_PID.read_text().strip()), 0)
-            except OSError as exc:
-                raise RuntimeError(f'vLLM server process is not alive: {exc}\n{tail_server_log()}') from exc
+        returncode = process.poll()
+        if returncode is not None:
+            raise RuntimeError(
+                server_failure_message(
+                    f'vLLM server exited with code {returncode} before becoming ready at {url}.'
+                )
+            )
         try:
             models = request_json(url, timeout=5)
             print('vLLM server ready:', models, flush=True)
             return
         except Exception:
             time.sleep(5)
-    raise TimeoutError(f'Timed out waiting for vLLM server at {url}.\nLast server log lines:\n{tail_server_log()}')
+    raise TimeoutError(
+        server_failure_message(f'Timed out waiting for vLLM server at {url} after {timeout_seconds} seconds.')
+    )
 
 
 def start_vllm_server() -> None:
@@ -346,7 +385,10 @@ def start_vllm_server() -> None:
     print('Starting vLLM OpenAI server:', ' '.join(cmd), flush=True)
     process = subprocess.Popen(cmd, env=vllm_env(), stdout=log_handle, stderr=subprocess.STDOUT, text=True)
     VLLM_SERVER_PID.write_text(str(process.pid), encoding='utf-8')
-    wait_for_vllm_server()
+    try:
+        wait_for_vllm_server(process)
+    finally:
+        log_handle.close()
 
 
 def run_vllm_api_smoke_test() -> None:
@@ -392,6 +434,7 @@ setup_env = {
     'LOCAL_ANALYZER_TOOL_TIMEOUT': __LOCAL_ANALYZER_TOOL_TIMEOUT__,
     'LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS': __LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS__,
     'LOCAL_ANALYZER_STRATEGY_ENABLED': __LOCAL_ANALYZER_STRATEGY_ENABLED__,
+    'LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED': __LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED__,
     'LOCAL_ANALYZER_STRATEGY_POLICY': __LOCAL_ANALYZER_STRATEGY_POLICY__,
     'LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT': __LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT__,
     'LOCAL_ANALYZER_STAGNATION_WINDOW': __LOCAL_ANALYZER_STAGNATION_WINDOW__,

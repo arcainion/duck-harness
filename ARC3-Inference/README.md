@@ -130,12 +130,53 @@ Useful sections in `configs/inference.json`:
   or the opt-in `outcome_aware` policy; missing keys preserve legacy behavior.
   The outcome-aware volatility detector can be tuned with `volatile_window`,
   `volatile_min_samples`, and `volatile_ratio`.
+  `objective_reduction_enabled` opt-ins to deterministic ordered objective
+  reduction and defaults to `false`.
 
 Try the candidate policy without changing the checked-in default:
 
 ```bash
 LOCAL_ANALYZER_STRATEGY_POLICY=outcome_aware make interactive
 ```
+
+Enable orchestrated objective reduction without editing the config:
+
+```bash
+LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED=true make interactive
+```
+
+When enabled, sandboxed Python receives `objective_state` and the
+`objectives(update)` function. Initialize a root before acting, reduce it into
+ordered required children, and complete, fail, or revise the active leaf as
+evidence changes:
+
+```python
+root = objectives({
+    "op": "initialize",
+    "description": "Complete the current level",
+    "success_criterion": "The environment reports level progress",
+})
+objectives({
+    "op": "reduce",
+    "objective_id": root["active_objective_id"],
+    "children": [
+        {
+            "description": "Infer the action model",
+            "success_criterion": "An observed transition matches a prediction",
+        },
+        {
+            "description": "Execute the shortest supported plan",
+            "success_criterion": "The environment reports level progress",
+        },
+    ],
+})
+```
+
+Operations are transactional and return `ok`, `operation`, the active id/path,
+the graph, and a stable structured error. With reduction enabled,
+`action(...)` is rejected until a pending leaf is active. Actions are attributed
+to that leaf, their outcomes are recorded on it, and a confirmed level
+transition archives the current tree before requiring a new root.
 - `chat.*`: direct chat probing with `make chat`.
 - `viewer.port`: default viewer port.
 - `multimodal.*`: image context for the current grid.
