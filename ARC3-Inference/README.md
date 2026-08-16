@@ -70,10 +70,14 @@ The duck can use:
   before/after reasoning
 - `valid_actions` for the current action set
 - `last_action_result` for fields such as `board_changed`, `level_completed`,
-  `game_over`, `run_complete`, and `reward`
+  `game_over`, `run_complete`, `reward`, and a bounded `animation` summary that
+  preserves transient motion evidence even when the final board looks unchanged
 - `experience` for the controller phase, opaque state identity, state visits,
   tried/no-op actions, short-cycle detection, outcome-aware action rankings,
-  and suggested probes
+  suggested probes, and verified local transition models that expose when the
+  same state-action pair has produced consistent or contradictory results
+- phase-specific action budgets: one-action probes while orienting, exploring,
+  or recovering, and short batches only after the controller detects progress
 - `strategy` plus `record_strategy(...)` for bounded goal, hypothesis, evidence,
   confidence, open-question, next-test, expected-outcome, fallback, and
   contradiction memory within one game run
@@ -95,6 +99,8 @@ library modules, print compact summaries, assign a final value to `result`, and
 call `action(...)` once or many times. The tool call timeout defaults to 30
 seconds. Batched action results include a bounded `steps` list so each action can
 be attributed to its individual before/after state and outcome.
+Each batch is capped at 12 entries at both the sandbox and solver boundaries;
+larger batches are rejected before any environment action executes.
 
 ## Configuration
 
@@ -130,170 +136,11 @@ Useful sections in `configs/inference.json`:
   or the opt-in `outcome_aware` policy; missing keys preserve legacy behavior.
   The outcome-aware volatility detector can be tuned with `volatile_window`,
   `volatile_min_samples`, and `volatile_ratio`.
-  `objective_reduction_enabled` opt-ins to deterministic ordered objective
-  reduction and defaults to `false`.
 
 Try the candidate policy without changing the checked-in default:
 
 ```bash
 LOCAL_ANALYZER_STRATEGY_POLICY=outcome_aware make interactive
-```
-
-Enable orchestrated objective reduction without editing the config:
-
-```bash
-LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED=true make interactive
-```
-
-When enabled, sandboxed Python receives `objective_state` and the
-`objectives(update)` function. Initialize a root before acting, reduce it into
-ordered required children, and complete, fail, or revise the active leaf as
-evidence changes:
-
-```python
-root = objectives({
-    "op": "initialize",
-    "description": "Complete the current level",
-    "success_criterion": "The environment reports level progress",
-})
-objectives({
-    "op": "reduce",
-    "objective_id": root["active_objective_id"],
-    "children": [
-        {
-            "description": "Infer the action model",
-            "success_criterion": "An observed transition matches a prediction",
-        },
-        {
-            "description": "Execute the shortest supported plan",
-            "success_criterion": "The environment reports level progress",
-        },
-    ],
-})
-```
-
-Operations are transactional and return `ok`, `operation`, the active id/path,
-the graph, and a stable structured error. With reduction enabled,
-`action(...)` is rejected until a pending leaf is active. Actions are attributed
-to that leaf, their outcomes are recorded on it, and a confirmed level
-transition archives the current tree before requiring a new root.
-
-Explicit `complete` and `fail` operations require evidence or at least one
-executed action outcome. Controller-rejected requests are still attributed to
-the active leaf but do not inflate its executed-attempt count. Three consecutive
-rejections, or three consecutive executed no-progress actions, mark the active
-leaf for review and block further actions. In that state,
-`objective_state['blocking_objective_id']` and `blocking_reason` identify the
-leaf that must be revised. Confirmed level and run completion archives are
-marked successful even when some lower-level exploratory nodes remain pending.
-When a graph exists, its archive captures a compact handoff containing the
-current hypothesis, recent evidence and contradictions, and the last evaluated
-prediction. Level transitions, run completion, and game resets then clear flat
-strategy predictions and summarized hypotheses even when objective reduction is
-disabled or no root was initialized, so the next scene cannot inherit stale
-execution steering.
-
-Completion has a stricter evidence gate than failure. Without explicit model
-evidence, an executed outcome must positively support success through confirmed
-level/run progress, positive reward, a novel behavioral state, or a supported
-strategy prediction. No-ops, volatile-only changes, revisits, and contradicted
-predictions cannot implicitly certify a leaf. The current active leaf exposes
-`active_completion_ready` in `objective_state`.
-
-Strategy predictions are one-shot. `test_action` and `expected_outcome` must be
-declared together, and the pair is consumed when its matching result is
-evaluated. Repeating an action without declaring a new prediction therefore
-cannot duplicate support or contradiction evidence, and a partial prediction
-update cannot combine with a stale counterpart.
-
-When `strategy(...)` declares a test action and expected outcome, its evaluated
-prediction is also attributed to the active leaf. Two consecutive contradicted
-predictions trigger review even if the actions changed the board; a later
-non-contradicted evaluation clears the streak. This prevents visually active but falsified plans
-from consuming the full generic attempt budget before the model re-plans.
-
-A `revise` call can clear a failed or reviewed leaf only when it materially
-changes the description, success criterion, or bounded attempt budget. Merely
-resubmitting the same text or adding evidence cannot reset recovery counters.
-Evidence-only revisions remain valid for an ordinary pending leaf and append to
-its audit record without opening a new attempt window.
-
-Each leaf has a lifetime ceiling of five material revisions. The current
-`revision_count` is exposed in objective snapshots, discarded-branch audits,
-archives, and the viewer. Once exhausted, the leaf must be completed or failed,
-or its parent decomposition must be replaced with `replan`.
-
-Use `replan` when evidence invalidates more than one remaining leaf. It targets
-a pending ancestor on the active or blocking path, preserves its already
-completed child prefix, and atomically replaces the unresolved suffix:
-
-```python
-objectives({
-    "op": "replan",
-    "objective_id": "obj-1",
-    "reason": "The board is a selector puzzle, not navigation",
-    "children": [
-        {
-            "description": "Infer selector state transitions",
-            "success_criterion": "A selector-state prediction is confirmed",
-        },
-        {
-            "description": "Select the goal configuration",
-            "success_criterion": "The environment reports level progress",
-        },
-    ],
-})
-```
-
-Replanning is transactional, can only affect the current focus path, and keeps
-a bounded `discarded_branches` audit in `objective_state` and level archives.
-
-Objective mutations also accept an optional stable `request_id`:
-
-```python
-objectives({
-    "request_id": "level-2-selector-replan-v1",
-    "op": "replan",
-    "objective_id": "obj-1",
-    "reason": "Navigation hypothesis contradicted",
-    "children": [
-        {
-            "description": "Test selector transitions",
-            "success_criterion": "A selector prediction is confirmed",
-        },
-    ],
-})
-```
-
-The objective API validates JSON types without coercion. Text fields, IDs,
-reasons, request IDs, and evidence entries must be strings; `children` and
-`evidence` must be lists; and `attempt_budget` must be a JSON integer rather
-than a boolean, float, or numeric string. Type errors return stable validation
-codes and leave the graph unchanged.
-
-Repeating the same request returns `replayed: true` without another mutation.
-Using the key for different content returns `idempotency_conflict`. The bounded
-`operation_events` journal records successful and rejected operations with
-monotonic sequence numbers, focus changes, affected objectives, and error codes;
-the journal is copied into archives and reset for the next objective tree.
-
-Roots and child specifications accept an optional `attempt_budget` from 1 to
-20; the default is 6. Each leaf tracks both lifetime `attempts` and
-`attempts_since_revision`. Reaching the budget blocks the leaf for review even
-if actions continue finding novel states, preventing open-ended exploration
-that never satisfies the declared criterion. A `revise` operation resets only
-the revision-scoped counter, preserves lifetime history, and may assign a new
-budget. Review blocks further environment actions, but the reviewed leaf may
-still be completed or failed from the evidence produced by its final attempt:
-
-```python
-objectives({
-    "op": "revise",
-    "objective_id": objective_state["blocking_objective_id"],
-    "description": "Search the smaller evidence-backed region",
-    "attempt_budget": 4,
-    "evidence": ["The previous six probes did not satisfy the criterion"],
-})
 ```
 - `chat.*`: direct chat probing with `make chat`.
 - `viewer.port`: default viewer port.

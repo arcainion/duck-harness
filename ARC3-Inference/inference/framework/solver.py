@@ -25,6 +25,7 @@ import taaf.game
 from taaf.solver import Solver
 
 from inference.agent.action_names import (
+    MAX_ACTION_BATCH,
     to_engine_action,
     to_model_action,
     to_model_actions,
@@ -34,6 +35,7 @@ from inference.agent.inference_controller import (
     action_family,
     action_guard_reason,
     action_guard_reason_code,
+    build_experience_snapshot,
     frame_fingerprint,
     normalize_action_key,
     transition_metadata,
@@ -46,8 +48,6 @@ from inference.agent.runtime_state import (
 )
 from inference.agent.tool_agent import ToolAgent
 from inference.framework.kaggle import (
-    DEFAULT_EXPECTED_GPU_COUNT,
-    DEFAULT_EXPECTED_GPU_TYPE,
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
@@ -60,6 +60,7 @@ from inference.framework.kaggle import (
     duck_kaggle_setup_command,
     duck_kaggle_teardown_command,
 )
+from inference.utils.grid_utils import ARC_COLOR_CHARS
 from inference.utils.viewer_artifacts import (
     append_raw_events_sidecar,
     reset_raw_events_sidecar,
@@ -108,6 +109,111 @@ def _grid_from_state(state: taaf.game.GameState | None) -> tuple[tuple[int, ...]
     data = state.frame.data
     rows = data.tolist() if hasattr(data, "tolist") else data
     return tuple(tuple(int(cell) for cell in row) for row in rows)
+
+
+def _grid_from_data(data: Any) -> tuple[tuple[int, ...], ...]:
+    rows = data.tolist() if hasattr(data, "tolist") else data
+    if not isinstance(rows, (list, tuple)):
+        return ()
+    return tuple(
+        tuple(int(cell) for cell in row)
+        for row in rows
+        if isinstance(row, (list, tuple))
+    )
+
+
+def _summarize_animation(
+    before_grid: tuple[tuple[int, ...], ...],
+    state: taaf.game.GameState,
+) -> dict[str, Any]:
+    """Compress action animation into bounded temporal evidence for the model."""
+    raw_frames = getattr(getattr(state, "raw", None), "frame", None)
+    frames = (
+        [_grid_from_data(data) for data in raw_frames]
+        if isinstance(raw_frames, (list, tuple))
+        else []
+    )
+    frames = [frame for frame in frames if frame]
+    if not frames:
+        frames = [_grid_from_state(state)]
+
+    changed_frame_count = 0
+    total_changed_cells = 0
+    peak_changed_cells = 0
+    changed_coordinates: set[tuple[int, int]] = set()
+    transition_counts: dict[tuple[int | None, int | None], int] = {}
+
+    previous = before_grid
+    for current in frames:
+        rows = max(len(previous), len(current))
+        cols = max(
+            max((len(row) for row in previous), default=0),
+            max((len(row) for row in current), default=0),
+        )
+        step_changes = 0
+        for row in range(rows):
+            for col in range(cols):
+                old = previous[row][col] if row < len(previous) and col < len(previous[row]) else None
+                new = current[row][col] if row < len(current) and col < len(current[row]) else None
+                if old == new:
+                    continue
+                step_changes += 1
+                changed_coordinates.add((row, col))
+                pair = (old, new)
+                transition_counts[pair] = transition_counts.get(pair, 0) + 1
+        if step_changes:
+            changed_frame_count += 1
+            total_changed_cells += step_changes
+            peak_changed_cells = max(peak_changed_cells, step_changes)
+        previous = current
+
+    final_grid = frames[-1]
+    final_changed_coordinates: set[tuple[int, int]] = set()
+    rows = max(len(before_grid), len(final_grid))
+    cols = max(
+        max((len(row) for row in before_grid), default=0),
+        max((len(row) for row in final_grid), default=0),
+    )
+    for row in range(rows):
+        for col in range(cols):
+            old = before_grid[row][col] if row < len(before_grid) and col < len(before_grid[row]) else None
+            new = final_grid[row][col] if row < len(final_grid) and col < len(final_grid[row]) else None
+            if old != new:
+                final_changed_coordinates.add((row, col))
+
+    def color_name(value: int | None) -> str:
+        if value is None:
+            return "outside"
+        return ARC_COLOR_CHARS[max(0, min(15, int(value)))]
+
+    dominant_transitions = [
+        {"from": color_name(pair[0]), "to": color_name(pair[1]), "count": count}
+        for pair, count in sorted(
+            transition_counts.items(), key=lambda item: (-item[1], str(item[0]))
+        )[:6]
+    ]
+    motion_bbox = None
+    if changed_coordinates:
+        changed_rows = [row for row, _ in changed_coordinates]
+        changed_cols = [col for _, col in changed_coordinates]
+        motion_bbox = [
+            min(changed_rows),
+            min(changed_cols),
+            max(changed_rows),
+            max(changed_cols),
+        ]
+
+    return {
+        "frame_count": len(frames),
+        "intermediate_frame_count": max(0, len(frames) - 1),
+        "changed_frame_count": changed_frame_count,
+        "total_changed_cells": total_changed_cells,
+        "peak_changed_cells": peak_changed_cells,
+        "final_changed_cells": len(final_changed_coordinates),
+        "transient_changed_cells": len(changed_coordinates - final_changed_coordinates),
+        "motion_bbox": motion_bbox,
+        "dominant_color_transitions": dominant_transitions,
+    }
 
 
 def _level_number(game: taaf.game.Game) -> int:
@@ -449,7 +555,6 @@ class _HarnessGameSession:
                 "analysis_step": None,
                 "action_display": "RESET",
                 "reward": 0.0,
-                "objective_snapshot": getattr(self.analyzer, "objective_snapshot", None),
             }
         )
 
@@ -465,7 +570,6 @@ class _HarnessGameSession:
                 "action_num": self.action_count,
                 "analysis_step": analysis_step,
                 "transcript": transcript,
-                "objective_snapshot": getattr(self.analyzer, "objective_snapshot", None),
             }
         )
 
@@ -507,10 +611,6 @@ class _HarnessGameSession:
                 "no_op_streak": payload.get("no_op_streak"),
                 "behavioral_no_op_streak": payload.get("behavioral_no_op_streak"),
                 "stagnation_actions": payload.get("stagnation_actions"),
-                "objective_id": payload.get("objective_id"),
-                "objective_path": payload.get("objective_path"),
-                "objective_snapshot": payload.get("objective_snapshot")
-                or getattr(self.analyzer, "objective_snapshot", None),
             }
         )
 
@@ -541,7 +641,6 @@ class _HarnessGameSession:
             "lastEvent": last_event,
             "viewer_steps": [],
             "replay_url": self.analysis_html_relpath,
-            "objectiveState": getattr(self.analyzer, "objective_snapshot", None),
         }
         if run is not None:
             payload.update(
@@ -578,6 +677,11 @@ class _HarnessGameSession:
                 return None, "`actions` must be a JSON array of action objects."
             if not raw_actions:
                 return None, "`actions` must contain at least one action."
+            if len(raw_actions) > MAX_ACTION_BATCH:
+                return (
+                    None,
+                    f"`actions` may contain at most {MAX_ACTION_BATCH} actions.",
+                )
         else:
             if not has_single:
                 return None, "step_env requires `action` or `actions`."
@@ -665,6 +769,29 @@ class _HarnessGameSession:
         requested_actions, error = self._normalize_actions(arguments)
         if error is not None or requested_actions is None:
             return self._error_payload(error or "Could not parse action request.")
+        if self.controller_config.outcome_aware:
+            snapshot = build_experience_snapshot(
+                self.history_entries,
+                self.current_frame(),
+                _engine_action_names(self.game),
+                self.controller_config,
+            )
+            action_budget = max(1, int(snapshot.get("action_budget") or 1))
+            if len(requested_actions) > action_budget:
+                phase = str(snapshot.get("phase") or "explore")
+                payload = self._error_payload(
+                    f"The {phase} phase permits at most {action_budget} action(s) "
+                    "in one batch. Use a smaller falsifiable step."
+                )
+                payload.update(
+                    {
+                        "requested_count": len(requested_actions),
+                        "executed_count": 0,
+                        "controller_phase": phase,
+                        "phase_action_budget": action_budget,
+                    }
+                )
+                return payload
         if self.should_stop() or _is_engine_game_over(self.game):
             return self._terminal_payload(requested_actions)
 
@@ -679,15 +806,21 @@ class _HarnessGameSession:
         strategy_prediction = arguments.get("strategy_prediction")
         if not isinstance(strategy_prediction, dict):
             strategy_prediction = None
-        objective_id = str(arguments.get("objective_id") or "").strip() or None
-        raw_objective_path = arguments.get("objective_path")
-        objective_path = (
-            [str(item) for item in raw_objective_path]
-            if isinstance(raw_objective_path, list)
-            else []
-        )
 
         for batch_index, action in enumerate(requested_actions, start=1):
+            if batch_index > 1 and self.controller_config.outcome_aware:
+                current_snapshot = build_experience_snapshot(
+                    self.history_entries,
+                    self.current_frame(),
+                    _engine_action_names(self.game),
+                    self.controller_config,
+                )
+                current_budget = max(
+                    1, int(current_snapshot.get("action_budget") or 1)
+                )
+                if batch_index > current_budget:
+                    stop_reason = "phase_action_budget"
+                    break
             if self.should_stop():
                 stop_reason = "stopped"
                 break
@@ -730,8 +863,6 @@ class _HarnessGameSession:
                         "controller_reason_codes": [guard_reason_code] if guard_reason_code else [],
                         "stop_reason": stop_reason,
                         "stop_detail": guard_reason,
-                        "objective_id": objective_id,
-                        "objective_path": objective_path,
                     }
                 )
                 self.write_viewer_payload()
@@ -774,8 +905,6 @@ class _HarnessGameSession:
                     batch_index=batch_index,
                     batch_size=batch_size,
                     strategy_prediction=strategy_prediction,
-                    objective_id=objective_id,
-                    objective_path=objective_path,
                     flush_viewer_payload=False,
                 )
             except Exception as exc:
@@ -839,11 +968,10 @@ class _HarnessGameSession:
                     "action_rank",
                     "action_rank_reason",
                     "prediction_result",
+                    "animation",
                     "no_op_streak",
                     "behavioral_no_op_streak",
                     "stagnation_actions",
-                    "objective_id",
-                    "objective_path",
                 )
                 if key in item
             }
@@ -855,13 +983,15 @@ class _HarnessGameSession:
         final_payload["stopped_early"] = len(executed_payloads) < batch_size
         if stop_reason is not None:
             final_payload["stop_reason"] = stop_reason
+            if stop_reason == "phase_action_budget":
+                final_payload["stop_detail"] = (
+                    "The controller phase changed and no longer supports the "
+                    "remaining queued actions."
+                )
         self.write_viewer_payload()
         return final_payload
 
     def _execute_auto_reset(self) -> None:
-        archive_objectives = getattr(self.analyzer, "archive_objectives", None)
-        if callable(archive_objectives):
-            archive_objectives("game_reset")
         action = arcengine.ActionInput(id=arcengine.GameAction.RESET, data={})
         self._execute_action(action, batch_index=1, batch_size=1, generated_tokens=0)
 
@@ -872,8 +1002,6 @@ class _HarnessGameSession:
         batch_index: int,
         batch_size: int,
         strategy_prediction: dict[str, Any] | None = None,
-        objective_id: str | None = None,
-        objective_path: list[str] | None = None,
         generated_tokens: int | None = None,
         flush_viewer_payload: bool = True,
     ) -> dict[str, Any]:
@@ -932,8 +1060,7 @@ class _HarnessGameSession:
             "action_display": action_display,
             "batch_index": batch_index,
             "batch_size": batch_size,
-            "objective_id": objective_id,
-            "objective_path": list(objective_path or []),
+            "animation": _summarize_animation(previous_grid, new_state),
             **self.timing_payload(),
         }
         if self.controller_config.enabled:
@@ -987,12 +1114,6 @@ class HarnessSolver(Solver):
     )
     kaggle_vllm_tensor_parallel_size: int = field(
         default=DEFAULT_VLLM_TENSOR_PARALLEL_SIZE, repr=False
-    )
-    kaggle_expected_gpu_type: str = field(
-        default=DEFAULT_EXPECTED_GPU_TYPE, repr=False
-    )
-    kaggle_expected_gpu_count: int = field(
-        default=DEFAULT_EXPECTED_GPU_COUNT, repr=False
     )
     kaggle_wheelhouse_stamp_text: str = field(
         default=DEFAULT_WHEELHOUSE_STAMP_TEXT, repr=False
@@ -1102,8 +1223,6 @@ class HarnessSolver(Solver):
             vllm_port=self.kaggle_vllm_port,
             max_model_len=self.kaggle_vllm_max_model_len,
             tensor_parallel_size=self.kaggle_vllm_tensor_parallel_size,
-            expected_gpu_type=self.kaggle_expected_gpu_type,
-            expected_gpu_count=self.kaggle_expected_gpu_count,
             wheelhouse_stamp_text=self.kaggle_wheelhouse_stamp_text,
         )
 

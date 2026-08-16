@@ -4,6 +4,9 @@ from __future__ import annotations
 from typing import Iterable
 
 
+MAX_ACTION_BATCH = 12
+
+
 ENGINE_TO_MODEL_ACTION = {
     "ACTION1": "UP",
     "ACTION2": "DOWN",

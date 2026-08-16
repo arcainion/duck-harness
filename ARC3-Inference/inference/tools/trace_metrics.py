@@ -43,6 +43,8 @@ def summarize_event_file(path: Path) -> dict[str, Any]:
     no_ops = 0
     repeated_no_ops = 0
     rewarding_actions = 0
+    multi_frame_actions = 0
+    transient_animation_actions = 0
     loop_interventions = 0
     terminal_violations = 0
     unique_states: set[str] = set()
@@ -81,6 +83,14 @@ def summarize_event_file(path: Path) -> dict[str, Any]:
         no_ops += int(no_op)
         repeated_no_ops += int(no_op and previous_no_op and action == previous_action)
         rewarding_actions += int(float(event.get("reward") or 0.0) > 0.0)
+        animation = event.get("animation")
+        if isinstance(animation, dict):
+            multi_frame_actions += int(
+                int(animation.get("intermediate_frame_count") or 0) > 0
+            )
+            transient_animation_actions += int(
+                int(animation.get("transient_changed_cells") or 0) > 0
+            )
         phase = str(event.get("controller_phase") or "").strip()
         if phase:
             phase_counts[phase] += 1
@@ -110,6 +120,12 @@ def summarize_event_file(path: Path) -> dict[str, Any]:
         "repeated_no_ops": repeated_no_ops,
         "rewarding_actions": rewarding_actions,
         "rewarding_action_rate": rewarding_actions / actions if actions else 0.0,
+        "multi_frame_actions": multi_frame_actions,
+        "multi_frame_action_rate": multi_frame_actions / actions if actions else 0.0,
+        "transient_animation_actions": transient_animation_actions,
+        "transient_animation_action_rate": (
+            transient_animation_actions / actions if actions else 0.0
+        ),
         "unique_states_observed": len(unique_states),
         "unique_behavioral_states_observed": len(unique_behavioral_states),
         "loop_interventions": loop_interventions,
@@ -129,6 +145,8 @@ def _combine(items: list[dict[str, Any]]) -> dict[str, Any]:
             "no_op_actions",
             "repeated_no_ops",
             "rewarding_actions",
+            "multi_frame_actions",
+            "transient_animation_actions",
             "unique_states_observed",
             "unique_behavioral_states_observed",
             "loop_interventions",
@@ -148,6 +166,12 @@ def _combine(items: list[dict[str, Any]]) -> dict[str, Any]:
     totals["no_op_rate"] = totals["no_op_actions"] / actions if actions else 0.0
     totals["rewarding_action_rate"] = (
         totals["rewarding_actions"] / actions if actions else 0.0
+    )
+    totals["multi_frame_action_rate"] = (
+        totals["multi_frame_actions"] / actions if actions else 0.0
+    )
+    totals["transient_animation_action_rate"] = (
+        totals["transient_animation_actions"] / actions if actions else 0.0
     )
     totals["phase_counts"] = dict(sorted(phases.items()))
     totals["outcome_counts"] = dict(sorted(outcomes.items()))

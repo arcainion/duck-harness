@@ -58,7 +58,7 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- `last_action_frame` is the post-action frame for `last_action`; it matches `current_frame` after a real action.\n"
     "- `transitions` is a chronological list of actual action transitions, excluding the initial seeded frame. Each transition exposes `.action`, `.before_frame`, `.after_frame`, `.frame` (alias of `.after_frame`), and `.result`.\n"
     "- `last_transition` is `transitions[-1]` or `None`. Its `.result` mirrors `last_action_result`; older transitions may have an empty `.result`. For before/after diffs, compare `last_transition.before_frame` to `last_transition.after_frame`; do not compare `current_frame` to `history[-1].frame`.\n"
-    "- `last_action_result` is the persisted result dict from the most recent `action(...)` call. It remains available across later Python inspection calls that do not call `action(...)`, and is `{}` before any action result exists. Read transition metadata from fields/keys such as `last_action_result['board_changed']`, `last_action_result['done']`, `last_action_result['level_completed']`, `last_action_result['game_over']`, `last_action_result['run_complete']`, `last_action_result['reward']`, and `last_action_result['valid_actions']`.\n"
+    "- `last_action_result` is the persisted result dict from the most recent `action(...)` call. It remains available across later Python inspection calls that do not call `action(...)`, and is `{}` before any action result exists. Read transition metadata from fields/keys such as `last_action_result['board_changed']`, `last_action_result['done']`, `last_action_result['level_completed']`, `last_action_result['game_over']`, `last_action_result['run_complete']`, `last_action_result['reward']`, and `last_action_result['valid_actions']`. Its bounded `animation` summary reports transient changed cells, motion bounds, and dominant letter-coded color transitions across all frames returned by the action.\n"
     "- `valid_actions` is the current list of valid action names.\n"
     "- `experience` is a read-only compact controller snapshot with the current phase, opaque state id, visits, tried/no-op actions, recent transitions, cycle/stagnation signals, and suggested probes. It never contains the raw numeric grid.\n"
     "- `strategy` is the latest structured strategy memory recorded during this run.\n"
@@ -100,7 +100,7 @@ PYTHON_ADDENDUM = (
     "- After every action, verify whether gameplay objects changed or whether only a timer, progress bar, or remaining-step bar moved. Do not treat HUD-only changes as evidence that the move worked.\n"
     "- Use `print(...)` for compact summaries, or assign a final compact object to `result`.\n"
     "- Call `action(...)` inside Python rather than returning action text in the chat.\n"
-    "- `action(...)` accepts an ordered list of one or more actions. Batch only a short sequence whose effects are supported by evidence; otherwise use a single probe so outcomes remain attributable.\n"
+    "- `action(...)` accepts an ordered list of 1-12 actions. Batch only a short sequence whose effects are supported by evidence; otherwise use a single probe so outcomes remain attributable.\n"
     "- You can also call `action(...)` multiple times in one Python snippet, including inside loops. Each call updates the preloaded variables before execution continues.\n"
     "- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.\n"
 )
@@ -116,24 +116,4 @@ COMPACT_TOOL_SESSION_ADDENDUM = (
     "- Each `python` tool call has a hard time limit of 30 seconds.\n"
     "- Tool responses are capped to about {tool_output_tokens} tokens. If a response is cut off, the tool result will tell you that.\n"
     "- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.\n"
-)
-
-OBJECTIVE_REDUCTION_ADDENDUM = (
-    "\n\nOrchestrated objective reduction:\n"
-    "- Objective reduction is enabled. `objective_state` contains the validated objective tree and active leaf.\n"
-    "- Before any real action, call `objectives({...})` to initialize a root and, when useful, reduce it into ordered required children.\n"
-    "- Supported operations are `initialize`, `reduce`, `complete`, `fail`, `revise`, and `replan`. Each returns `ok`, the active objective id/path, the graph, and a structured error.\n"
-    "- Use exact JSON types: operation, ids, descriptions, criteria, reasons, request ids, and evidence items are strings; `children` and `evidence` are lists; `attempt_budget` is an integer (not a boolean, float, or numeric string). Malformed calls are rejected without coercion.\n"
-    "- `action(...)` is rejected unless the tree has an active pending leaf. Actions are automatically attributed to that leaf.\n"
-    "- Complete a leaf only when its success criterion has evidence. Without explicit evidence, the runtime accepts only supportive outcomes such as level progress, novelty, positive reward, or a supported prediction; no-ops and contradicted predictions cannot certify success.\n"
-    "- After three consecutive no-progress actions, the runtime blocks that leaf for review. Inspect `objective_state['blocking_objective_id']` and `blocking_reason`, then call `revise` before acting again.\n"
-    "- Controller-rejected requests do not consume executed attempts, but they are attributed separately. Three consecutive rejections block the leaf for review so you must change the action or revise the objective instead of retrying a forbidden/cycling request.\n"
-    "- Strategy predictions are one-shot: declare `test_action` and `expected_outcome` together before each test. Two separately declared contradicted predictions block the leaf for review even when the board changed; a later non-contradicted evaluation clears the streak.\n"
-    "- Clearing a failed/reviewed leaf with `revise` requires a material change to its description, success criterion, or attempt budget. Evidence-only updates on an ordinary pending leaf are retained but do not reset any recovery counters.\n"
-    "- Each leaf permits at most five material revisions across its lifetime. When exhausted, complete/fail it with evidence or replan its parent instead of cycling through equivalent variants.\n"
-    "- If evidence invalidates a larger decomposition, call `replan` on an ancestor in the active/blocking path with a reason and replacement children. Completed prefix children are preserved and discarded branches remain in the audit trail.\n"
-    "- For retryable mutations, include a stable `request_id`. Reusing it with the same operation safely replays the result; reusing it for different content is rejected. `objective_state['operation_events']` is the bounded lifecycle journal.\n"
-    "- Every node has an `attempt_budget` (default 6, maximum 20). Exhausting it blocks further actions even during productive exploration. Resolve the reviewed leaf with evidence-backed `complete`/`fail`, or `revise` to start a new attempt window while preserving lifetime attempts.\n"
-    "- Ordered children are all required. The runtime selects the first unresolved depth-first leaf and rolls completion up when all siblings complete.\n"
-    "- After an objective or action call, `objective_state` refreshes immediately. A confirmed level transition archives the tree, clears level-scoped strategy/hypothesis state, and requires a fresh root on the new scene.\n"
 )

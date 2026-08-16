@@ -14,19 +14,17 @@ from urllib.parse import urlparse, urlunparse
 
 import requests
 
-from inference.agent.action_names import to_engine_action, to_model_action
+from inference.agent.action_names import MAX_ACTION_BATCH, to_engine_action, to_model_action
 from inference.agent.inference_controller import (
     InferenceControllerConfig,
     action_family,
     build_experience_snapshot,
     normalize_action_key,
 )
-from inference.agent.objective_reduction import ObjectiveReducer
 from inference.agent.prompts import (
     COMPACT_TOOL_SESSION_ADDENDUM,
     GAME_OVERVIEW_ADDENDUM,
     MULTIMODAL_CONTEXT_ADDENDUM,
-    OBJECTIVE_REDUCTION_ADDENDUM,
     PYTHON_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
@@ -359,7 +357,7 @@ def _format_model_response_meta(
     return "\n".join(lines)
 
 
-def _build_system_prompt(*, tool_output_tokens: int, objective_reduction_enabled: bool = False) -> str:
+def _build_system_prompt(*, tool_output_tokens: int) -> str:
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
@@ -368,8 +366,6 @@ def _build_system_prompt(*, tool_output_tokens: int, objective_reduction_enabled
     prompt += VISUAL_GAME_ADDENDUM
     prompt += PYTHON_ADDENDUM
     prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(tool_output_tokens=tool_output_tokens)
-    if objective_reduction_enabled:
-        prompt += OBJECTIVE_REDUCTION_ADDENDUM
     return prompt
 
 
@@ -952,13 +948,8 @@ class ToolAgent:
         self._tool_output_tokens = max(64, _LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS)
         self._tool_output_chars = max(256, self._tool_output_tokens * 4)
         self._save_request_logs = bool(save_request_logs)
-        self._objective_reduction_enabled = _get_env_bool(
-            "LOCAL_ANALYZER_OBJECTIVE_REDUCTION_ENABLED", False
-        )
-        self._objective_reducer = ObjectiveReducer(enabled=self._objective_reduction_enabled)
         self._system_prompt = _build_system_prompt(
             tool_output_tokens=self._tool_output_tokens,
-            objective_reduction_enabled=self._objective_reduction_enabled,
         )
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
@@ -1004,49 +995,6 @@ class ToolAgent:
             self._last_action_result = None
             self._summarized_knowledge = _empty_world_model()
             self._strategy_memory = {}
-            self._objective_reducer = ObjectiveReducer(enabled=self._objective_reduction_enabled)
-
-    @property
-    def objective_snapshot(self) -> dict[str, Any]:
-        return self._objective_reducer.snapshot()
-
-    def archive_objectives(
-        self, reason: str, *, successful: bool | None = None
-    ) -> dict[str, Any] | None:
-        lesson_parts: list[str] = []
-        hypothesis = _normalize_summary_text(self._strategy_memory.get("hypothesis"))
-        if hypothesis:
-            lesson_parts.append(f"Hypothesis: {hypothesis[:100]}")
-        for label, key in (("Evidence", "evidence"), ("Contradictions", "contradictions")):
-            raw_items = self._strategy_memory.get(key) or []
-            items = raw_items if isinstance(raw_items, list) else [raw_items]
-            compact = "; ".join(
-                text
-                for item in items[-2:]
-                if (text := _normalize_summary_text(item, max_chars=100))
-            )
-            if compact:
-                lesson_parts.append(f"{label}: {compact}")
-        prediction = self._strategy_memory.get("prediction_result")
-        if isinstance(prediction, dict):
-            prediction_text = "/".join(
-                str(prediction.get(key) or "-").strip()
-                for key in ("status", "action", "expected", "actual")
-            )
-            lesson_parts.append(f"Prediction: {prediction_text[:100]}")
-        lesson = " | ".join(lesson_parts)
-        transition_reason = str(reason).strip().lower()
-        archive = self._objective_reducer.archive(
-            reason=reason, lesson=lesson, successful=successful
-        )
-        if transition_reason in {
-            "game_reset",
-            "level_transition",
-            "run_complete",
-        }:
-            self._strategy_memory = {}
-            self._summarized_knowledge = _empty_world_model()
-        return archive
 
     def _record_strategy(self, update: dict[str, Any]) -> dict[str, Any]:
         def short_text(value: Any, max_chars: int = 280) -> str:
@@ -1058,25 +1006,20 @@ class ToolAgent:
             if value:
                 persisted[key] = value
 
-        prediction_fields_updated = (
-            "test_action" in update or "expected_outcome" in update
-        )
         test_action = short_text(update.get("test_action"), 80)
+        if test_action:
+            persisted["test_action"] = normalize_action_key(test_action)
         expected_outcome = str(update.get("expected_outcome") or "").strip().lower()
-        valid_expected_outcomes = {
+        if expected_outcome in {
             "no_change",
             "state_change",
             "new_state",
             "level_progress",
             "unknown",
-        }
-        if prediction_fields_updated:
-            persisted.pop("test_action", None)
-            persisted.pop("expected_outcome", None)
-            persisted.pop("prediction_result", None)
-        if test_action and expected_outcome in valid_expected_outcomes:
-            persisted["test_action"] = normalize_action_key(test_action)
+        }:
             persisted["expected_outcome"] = expected_outcome
+        if test_action or expected_outcome:
+            persisted.pop("prediction_result", None)
 
         raw_evidence = update.get("evidence")
         if isinstance(raw_evidence, (list, tuple)):
@@ -1133,8 +1076,6 @@ class ToolAgent:
         existing = action_result.get("prediction_result")
         if isinstance(existing, dict):
             self._strategy_memory["prediction_result"] = dict(existing)
-            self._strategy_memory.pop("test_action", None)
-            self._strategy_memory.pop("expected_outcome", None)
             return dict(existing)
         test_action = normalize_action_key(self._strategy_memory.get("test_action", ""))
         expected = str(self._strategy_memory.get("expected_outcome") or "").strip()
@@ -1182,8 +1123,6 @@ class ToolAgent:
             "actual": actual,
         }
         self._strategy_memory["prediction_result"] = result
-        self._strategy_memory.pop("test_action", None)
-        self._strategy_memory.pop("expected_outcome", None)
         return result
 
     @property
@@ -1420,56 +1359,26 @@ class ToolAgent:
         if observed_max_level > current_level:
             state_line += f" out of observed max level {observed_max_level} so far"
         state_line += "."
-        python_runtime_line = (
-            "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, `record_strategy(...)`, and `action(actions)`."
-        )
-        if self._objective_reduction_enabled:
-            python_runtime_line = (
-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, `record_strategy(...)`, `objective_state`, `objectives(update)`, and `action(actions)`."
-            )
         lines.extend(
             [
                 state_line,
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-                python_runtime_line,
+                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, `record_strategy(...)`, and `action(actions)`.",
                 "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
                 "Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.",
-                "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
+                "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one. Inspect `last_action_result['animation']` for bounded temporal evidence that may have disappeared from the final frame.",
                 "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
                 "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
-                "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test. Declare test_action and expected_outcome together for a one-shot prediction; the matching result consumes that pair, so declare a fresh pair for another test. This survives fresh Python snippets within this run.",
+                "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test; optionally include test_action, expected_outcome, fallback, and contradictions so the next result can falsify the plan. This survives fresh Python snippets within this run.",
             ]
         )
-        if self._objective_reduction_enabled:
-            objective_snapshot = self._objective_reducer.snapshot()
-            active_id = objective_snapshot.get("active_objective_id")
-            active_path = objective_snapshot.get("active_path_descriptions") or []
-            active_criterion = objective_snapshot.get("active_success_criterion")
-            if active_id:
-                lines.extend(
-                    [
-                        f"Active objective ({active_id}): {' > '.join(str(item) for item in active_path)}.",
-                        f"Active success criterion: {active_criterion}.",
-                        "The active leaf is authoritative for action selection; flat strategy goal/next_test text is supporting context only.",
-                    ]
-                )
-            else:
-                blocking_id = objective_snapshot.get("blocking_objective_id")
-                blocking_reason = objective_snapshot.get("blocking_reason")
-                if blocking_id:
-                    lines.append(
-                        f"Objective tree blocked at {blocking_id}: {blocking_reason} Use `revise` on that leaf before calling `action(...)`."
-                    )
-                else:
-                    lines.append(
-                        "No actionable objective leaf exists. Use `objectives({...})` to initialize or repair the objective tree before calling `action(...)`."
-                    )
         if experience_snapshot and experience_snapshot.get("enabled"):
             compact_experience = {
                 key: experience_snapshot.get(key)
                 for key in (
                     "policy",
                     "phase",
+                    "action_budget",
                     "state_id",
                     "behavioral_state_id",
                     "state_visits",
@@ -1487,13 +1396,15 @@ class ToolAgent:
                     "suggested_actions",
                     "discouraged_actions",
                     "ranked_actions",
+                    "transition_models_here",
+                    "model_conflicts_here",
                 )
             }
             lines.extend(
                 [
                     "Deterministic experience controller snapshot:",
                     json.dumps(compact_experience, separators=(",", ":"), sort_keys=True),
-                    "Follow the controller phase and ranked action evidence: orient with one compact inspection, explore with a controlled falsifiable probe, continue progress when evidence supports it, and abandon or revise the current hypothesis in recover. Never retry a discouraged exact action in the same visible state; semantic cycle warnings remain advisory when backtracking is necessary.",
+                    "Follow the controller phase, `action_budget`, and ranked action evidence: orient with one compact inspection, explore with a controlled falsifiable probe, continue progress when evidence supports it, and abandon or revise the current hypothesis in recover. Treat `transition_models_here` as a tiny executable world model: verified deterministic entries may be used for short planning, while contradictions mean the state abstraction or hypothesis is incomplete. Never retry a discouraged exact action in the same visible state; semantic cycle warnings remain advisory when backtracking is necessary.",
                 ]
             )
         lines.append(
@@ -1529,11 +1440,7 @@ class ToolAgent:
                 "type": "function",
                 "function": {
                     "name": "python",
-                    "description": _PYTHON_TOOL_DESCRIPTION + (
-                        " Objective reduction is enabled: inspect `objective_state` and call `objectives(update)` before acting."
-                        if self._objective_reduction_enabled
-                        else ""
-                    ),
+                    "description": _PYTHON_TOOL_DESCRIPTION,
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -1659,6 +1566,10 @@ class ToolAgent:
             )
         if not items:
             raise ValueError("action(actions) requires at least one action.")
+        if len(items) > MAX_ACTION_BATCH:
+            raise ValueError(
+                f"action(actions) accepts at most {MAX_ACTION_BATCH} actions per batch."
+            )
 
         normalized: list[dict[str, Any]] = []
         for index, item in enumerate(items, start=1):
@@ -1721,6 +1632,7 @@ class ToolAgent:
             "action_rank",
             "action_rank_reason",
             "prediction_result",
+            "animation",
         ):
             if controller_key in payload:
                 compact[controller_key] = payload.get(controller_key)
@@ -1729,13 +1641,39 @@ class ToolAgent:
             compact["steps"] = [dict(item) for item in steps[:12] if isinstance(item, dict)]
         executed_actions = payload.get("executed_actions")
         if isinstance(executed_actions, list) and executed_actions:
-            compact["executed_actions"] = [str(action).strip() for action in executed_actions if str(action).strip()]
+            compact["executed_actions"] = [
+                str(action).strip()
+                for action in executed_actions[:MAX_ACTION_BATCH]
+                if str(action).strip()
+            ]
         elif compact.get("action_display"):
             compact["executed_actions"] = [str(compact["action_display"]).strip()]
-        batch_size = int(payload.get("requested_count") or payload.get("executed_count") or 1)
+        try:
+            batch_size = min(
+                MAX_ACTION_BATCH,
+                max(
+                    1,
+                    int(
+                        payload.get("requested_count")
+                        or payload.get("executed_count")
+                        or 1
+                    ),
+                ),
+            )
+        except (TypeError, ValueError):
+            batch_size = 1
         if batch_size > 1 or bool(payload.get("stopped_early")):
-            compact["requested_count"] = payload.get("requested_count", batch_size)
-            compact["executed_count"] = payload.get("executed_count", batch_size)
+            compact["requested_count"] = batch_size
+            if not compact["executed"]:
+                compact["executed_count"] = 0
+            else:
+                try:
+                    compact["executed_count"] = min(
+                        batch_size,
+                        max(0, int(payload.get("executed_count", batch_size))),
+                    )
+                except (TypeError, ValueError):
+                    compact["executed_count"] = 1
             compact["stopped_early"] = bool(payload.get("stopped_early"))
         if payload.get("stop_reason"):
             compact["stop_reason"] = payload.get("stop_reason")
@@ -1788,7 +1726,6 @@ class ToolAgent:
                     self._controller_config,
                 ),
                 "strategy": dict(self._strategy_memory),
-                "objectives": self._objective_reducer.snapshot(),
                 "last_action_result": (
                     dict(persisted_action_result)
                     if isinstance(persisted_action_result, dict)
@@ -1800,10 +1737,9 @@ class ToolAgent:
 
         def _handle_action(actions: list[dict[str, Any]]) -> dict[str, Any]:
             nonlocal terminal_action_result
+            if self._step_env_callback is None:
+                raise RuntimeError("action(actions) is not available in this session.")
             normalized_actions = self._normalize_python_actions(actions)
-            active_objective = self._objective_reducer.active_node
-            active_objective_id = active_objective.id if active_objective is not None else None
-            active_objective_path = self._objective_reducer.active_path_descriptions()
             if terminal_action_result is not None:
                 reason = _terminal_action_reason(terminal_action_result) or "terminal_state"
                 compact_payload = {
@@ -1824,9 +1760,6 @@ class ToolAgent:
                     "stopped_early": True,
                     "stop_reason": f"previous_{reason}",
                     "stop_detail": _terminal_action_stop_detail(reason),
-                    "objective_id": terminal_action_result.get("objective_id") or active_objective_id,
-                    "objective_path": terminal_action_result.get("objective_path") or active_objective_path,
-                    "objective_snapshot": self._objective_reducer.snapshot(),
                 }
                 self._last_action_result = dict(compact_payload)
                 return {
@@ -1836,41 +1769,6 @@ class ToolAgent:
                         last_action_result=compact_payload,
                     ),
                 }
-            if self._objective_reduction_enabled and active_objective_id is None:
-                objective_snapshot = self._objective_reducer.snapshot()
-                blocking_id = objective_snapshot.get("blocking_objective_id")
-                blocking_reason = objective_snapshot.get("blocking_reason")
-                blocking_status = objective_snapshot.get("blocking_status")
-                compact_payload = {
-                    "executed": False,
-                    "requested_count": len(normalized_actions),
-                    "executed_count": 0,
-                    "error": {
-                        "code": (
-                            "objective_failed"
-                            if blocking_status == "failed"
-                            else "objective_review_required"
-                            if blocking_id
-                            else "objective_required"
-                        ),
-                        "message": (
-                            f"Revise blocked objective {blocking_id}: {blocking_reason}"
-                            if blocking_id
-                            else "Initialize or repair the objective tree before acting."
-                        ),
-                    },
-                    "blocking_objective_id": blocking_id,
-                    "objective_id": None,
-                    "objective_path": [],
-                    "objective_snapshot": objective_snapshot,
-                }
-                self._last_action_result = dict(compact_payload)
-                return {
-                    "action_result": compact_payload,
-                    "state": _serialized_runtime_state(last_action_result=compact_payload),
-                }
-            if self._step_env_callback is None:
-                raise RuntimeError("action(actions) is not available in this session.")
             raw_payload = self._step_env_callback(
                 {
                     "actions": normalized_actions,
@@ -1879,15 +1777,11 @@ class ToolAgent:
                         for key in ("test_action", "expected_outcome")
                         if self._strategy_memory.get(key)
                     },
-                    "objective_id": active_objective_id,
-                    "objective_path": active_objective_path,
                 }
             )
             if not isinstance(raw_payload, dict):
                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
             compact_payload = self._compact_action_result(raw_payload)
-            compact_payload["objective_id"] = active_objective_id
-            compact_payload["objective_path"] = active_objective_path
             prediction_result = self._evaluate_strategy_prediction(compact_payload)
             if prediction_result is not None:
                 compact_payload["prediction_result"] = prediction_result
@@ -1896,18 +1790,6 @@ class ToolAgent:
                 self._current_valid_actions = _normalize_valid_actions(next_valid_actions)
             if compact_payload.get("executed") and _terminal_action_reason(compact_payload):
                 terminal_action_result = compact_payload
-            if active_objective_id is not None and normalized_actions:
-                self._objective_reducer.record_outcome(active_objective_id, compact_payload)
-            if compact_payload.get("level_completed") or compact_payload.get("run_complete"):
-                self.archive_objectives(
-                    (
-                        "run_complete"
-                        if compact_payload.get("run_complete")
-                        else "level_transition"
-                    ),
-                    successful=True,
-                )
-            compact_payload["objective_snapshot"] = self._objective_reducer.snapshot()
             self._last_action_result = dict(compact_payload)
             return {
                 "action_result": compact_payload,
@@ -1923,8 +1805,6 @@ class ToolAgent:
             initial_state=_serialized_runtime_state(),
             action_handler=_handle_action,
             strategy_handler=self._record_strategy,
-            objective_handler=self._objective_reducer.apply,
-            state_provider=_serialized_runtime_state,
         )
 
         action_results = [
@@ -1933,13 +1813,6 @@ class ToolAgent:
             if isinstance(item, dict)
         ]
         payload: dict[str, Any] = {"tool": "python"}
-        objective_updates = [
-            item
-            for item in sandbox_result.get("objective_updates") or []
-            if isinstance(item, dict)
-        ]
-        if objective_updates:
-            payload["objective_updates"] = objective_updates
         rendered_stdout = str(sandbox_result.get("stdout", "") or "")
         rendered_error = str(sandbox_result.get("error", "") or "")
         if rendered_error:

@@ -551,22 +551,6 @@
       display: none;
     }
 
-    .objective-wrap:empty {
-      display: none;
-    }
-
-    .objective-path {
-      color: var(--ink);
-      font-size: 0.88rem;
-      line-height: 1.45;
-    }
-
-    .objective-evidence {
-      color: var(--muted);
-      font-size: 0.8rem;
-      line-height: 1.4;
-    }
-
     canvas {
       display: block;
       max-width: 100%;
@@ -666,7 +650,6 @@
             <pre id="ascii-board" class="ascii-board" hidden></pre>
           </div>
           <div class="runtime-usage-wrap" id="runtime-usage"></div>
-          <div class="objective-wrap" id="objective-state"></div>
         </div>
       </aside>
     </div>
@@ -705,7 +688,6 @@
     const canvasEl = document.getElementById("board-canvas");
     const asciiBoardEl = document.getElementById("ascii-board");
     const runtimeUsageEl = document.getElementById("runtime-usage");
-    const objectiveStateEl = document.getElementById("objective-state");
 
     document.getElementById("reload-button").addEventListener("click", () => {
       loadPayload(currentRunName, { preserveSelection: true, silent: false });
@@ -842,11 +824,6 @@
         lastStepState: lastStep?.state || "",
         lastStepLevel: lastStep?.level ?? null,
         lastStepContext,
-        activeObjectiveId: game.objectiveState?.active_objective_id || "",
-        blockingObjectiveId: game.objectiveState?.blocking_objective_id || "",
-        objectiveArchiveCount: game.objectiveState?.archives?.length || 0,
-        objectiveDiscardedCount: game.objectiveState?.discarded_branches?.length || 0,
-        objectiveOperationSequence: game.objectiveState?.operation_events?.at(-1)?.sequence || 0,
       });
     }
 
@@ -905,7 +882,6 @@
         eventsListEl.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
         boardSummaryEl.innerHTML = "";
         runtimeUsageEl.innerHTML = "";
-        objectiveStateEl.innerHTML = "";
         clearBoard();
         asciiBoardEl.hidden = false;
         asciiBoardEl.textContent = "No run data available yet.\nRun `make run` first, then reload the viewer.";
@@ -981,7 +957,6 @@
           eventsListEl.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
           boardSummaryEl.innerHTML = "";
           runtimeUsageEl.innerHTML = "";
-          objectiveStateEl.innerHTML = "";
           clearBoard();
           asciiBoardEl.hidden = false;
           asciiBoardEl.textContent = "No game data available for this selection.";
@@ -1083,7 +1058,6 @@
         levelCountEl.textContent = "0 levels";
         boardSummaryEl.innerHTML = "";
         runtimeUsageEl.innerHTML = "";
-        objectiveStateEl.innerHTML = "";
         clearBoard();
         return;
       }
@@ -1099,7 +1073,6 @@
         levelCountEl.textContent = "0 levels";
         boardSummaryEl.innerHTML = "";
         runtimeUsageEl.innerHTML = "";
-        objectiveStateEl.innerHTML = "";
         clearBoard();
         return;
       }
@@ -1646,7 +1619,6 @@
         </div>
       `;
       runtimeUsageEl.innerHTML = renderToolUsageSummary(game);
-      objectiveStateEl.innerHTML = renderObjectiveState(game.objectiveState);
 
       renderBoard(event);
     }
@@ -1686,40 +1658,6 @@
               </div>
             `).join("")}
           </div>
-        </div>
-      `;
-    }
-
-    function renderObjectiveState(state) {
-      if (!state || !state.enabled) {
-        return "";
-      }
-      const graphNodes = Array.isArray(state.graph?.nodes) ? state.graph.nodes : [];
-      const nodeById = new Map(graphNodes.map((node) => [node.id, node]));
-      const isBlocked = Boolean(state.blocking_objective_id);
-      const pathIds = Array.isArray(isBlocked ? state.blocking_path : state.active_path)
-        ? (isBlocked ? state.blocking_path : state.active_path)
-        : [];
-      const path = pathIds.map((id) => nodeById.get(id)?.description || id);
-      const selected = nodeById.get(state.active_objective_id || state.blocking_objective_id);
-      const evidence = Array.isArray(selected?.evidence) ? selected.evidence.slice(-2) : [];
-      const archives = Array.isArray(state.archives) ? state.archives : [];
-      const discarded = Array.isArray(state.discarded_branches) ? state.discarded_branches : [];
-      const operations = Array.isArray(state.operation_events) ? state.operation_events : [];
-      const lastOperation = operations.length ? operations[operations.length - 1] : null;
-      return `
-        <div class="tool-usage-block">
-          <div class="tool-usage-header">
-            <div class="tool-usage-title">Objective Reduction</div>
-            <div class="tool-usage-total">${escapeHtml(selected ? (isBlocked ? "review" : selected.status) : "uninitialized")}</div>
-          </div>
-          <div class="objective-path">${escapeHtml(path.length ? path.join(" › ") : "No active objective")}</div>
-          <div class="objective-evidence">${escapeHtml(state.blocking_reason || selected?.success_criterion || "Initialize the objective tree before acting.")}</div>
-          ${selected ? `<div class="objective-evidence">Attempts: ${escapeHtml(String(selected.attempts_since_revision || 0))}/${escapeHtml(String(selected.attempt_budget || 0))} this revision · ${escapeHtml(String(selected.attempts || 0))} lifetime · ${escapeHtml(String(selected.revision_count || 0))}/${escapeHtml(String(selected.revision_limit || 5))} revisions · ${escapeHtml(String(selected.rejected_action_requests || 0))} rejected requests · ${escapeHtml(String(selected.prediction_contradictions || 0))} contradicted predictions</div>` : ""}
-          ${evidence.length ? `<div class="objective-evidence">Evidence: ${escapeHtml(evidence.join("; "))}</div>` : ""}
-          ${discarded.length ? `<div class="objective-evidence">Replanned branches: ${escapeHtml(String(discarded.length))}</div>` : ""}
-          ${lastOperation ? `<div class="objective-evidence">Last operation: #${escapeHtml(String(lastOperation.sequence))} ${escapeHtml(lastOperation.operation)} (${escapeHtml(lastOperation.ok ? "ok" : (lastOperation.error_code || "rejected"))})</div>` : ""}
-          ${archives.length ? `<div class="objective-evidence">Archived levels: ${escapeHtml(String(archives.length))}</div>` : ""}
         </div>
       `;
     }

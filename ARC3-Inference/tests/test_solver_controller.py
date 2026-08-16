@@ -8,17 +8,89 @@ from unittest import TestCase
 
 import arcengine
 
+from inference.agent.action_names import MAX_ACTION_BATCH
 from inference.agent.inference_controller import (
     OUTCOME_AWARE_POLICY,
     InferenceControllerConfig,
 )
+from inference.agent.runtime_state import Frame, HistoryEntry
 from inference.framework.solver import (
     _HarnessGameSession,
     _evaluate_strategy_prediction,
+    _summarize_animation,
 )
 
 
 class SolverControllerTests(TestCase):
+    def test_outcome_aware_orient_phase_rejects_multi_action_probe(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        frame = Frame(grid=((1,),), step=0, level=1)
+        action = SimpleNamespace(
+            id=SimpleNamespace(value=arcengine.GameAction.ACTION1.value, name="ACTION1"),
+            data={},
+        )
+        session.controller_config = InferenceControllerConfig(
+            enabled=True, policy=OUTCOME_AWARE_POLICY
+        )
+        session.history_entries = [HistoryEntry(action="", frame=frame)]
+        session.game = SimpleNamespace(
+            current_state=SimpleNamespace(
+                available_actions={arcengine.GameAction.ACTION1.value}
+            )
+        )
+        session._normalize_actions = lambda arguments: ([action, action], None)
+        session.current_frame = lambda: frame
+        session._error_payload = lambda message: {
+            "executed": False,
+            "error": {"message": message},
+        }
+
+        result = session.step_env({"actions": ["UP", "UP"]})
+
+        self.assertFalse(result["executed"])
+        self.assertEqual(result["controller_phase"], "orient")
+        self.assertEqual(result["phase_action_budget"], 1)
+        self.assertEqual(result["executed_count"], 0)
+
+    def test_animation_summary_preserves_transient_visual_evidence(self) -> None:
+        before = ((0, 0), (0, 0))
+        state = SimpleNamespace(
+            raw=SimpleNamespace(
+                frame=[
+                    [[0, 1], [0, 0]],
+                    [[0, 0], [0, 0]],
+                ]
+            ),
+            frame=SimpleNamespace(data=[[0, 0], [0, 0]]),
+        )
+
+        summary = _summarize_animation(before, state)
+
+        self.assertEqual(summary["frame_count"], 2)
+        self.assertEqual(summary["intermediate_frame_count"], 1)
+        self.assertEqual(summary["changed_frame_count"], 2)
+        self.assertEqual(summary["final_changed_cells"], 0)
+        self.assertEqual(summary["transient_changed_cells"], 1)
+        self.assertEqual(summary["motion_bbox"], [0, 1, 0, 1])
+        self.assertEqual(
+            summary["dominant_color_transitions"],
+            [
+                {"from": "W", "to": "w", "count": 1},
+                {"from": "w", "to": "W", "count": 1},
+            ],
+        )
+
+    def test_solver_rejects_oversized_batch_before_action_parsing(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        actions, error = session._normalize_actions(
+            {"actions": [{"action": "UP"}] * (MAX_ACTION_BATCH + 1)}
+        )
+
+        self.assertIsNone(actions)
+        self.assertEqual(
+            error, f"`actions` may contain at most {MAX_ACTION_BATCH} actions."
+        )
+
     def test_terminal_action_stops_remaining_batch_and_keeps_step_details(self) -> None:
         state = SimpleNamespace(
             available_actions={arcengine.GameAction.ACTION1.value},
@@ -46,7 +118,6 @@ class SolverControllerTests(TestCase):
             data={},
         )
         calls: list[int] = []
-        objective_calls: list[tuple[str | None, list[str]]] = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -67,7 +138,6 @@ class SolverControllerTests(TestCase):
 
             def execute(*args, **kwargs):
                 calls.append(1)
-                objective_calls.append((kwargs.get("objective_id"), kwargs.get("objective_path")))
                 return {
                     "executed": True,
                     "action_num": 1,
@@ -89,20 +159,13 @@ class SolverControllerTests(TestCase):
                 }
 
             session._execute_action = execute
-            result = session.step_env(
-                {
-                    "actions": ["UP", "UP"],
-                    "objective_id": "obj-2",
-                    "objective_path": ["Complete level", "Reach target"],
-                }
-            )
+            result = session.step_env({"actions": ["UP", "UP"]})
 
         self.assertEqual(len(calls), 1)
         self.assertTrue(result["stopped_early"])
         self.assertEqual(result["stop_reason"], "level_completed")
         self.assertEqual(result["steps"][0]["before_state_id"], "a")
         self.assertEqual(result["steps"][0]["after_state_id"], "b")
-        self.assertEqual(objective_calls, [("obj-2", ["Complete level", "Reach target"])])
 
     def test_prediction_result_is_structured(self) -> None:
         result = _evaluate_strategy_prediction(
@@ -155,7 +218,9 @@ class SolverControllerTests(TestCase):
                 stop_event=threading.Event(),
                 viewer_data_path=root / "viewer.json",
                 controller_config=InferenceControllerConfig(
-                    enabled=True, policy=OUTCOME_AWARE_POLICY
+                    enabled=True,
+                    policy=OUTCOME_AWARE_POLICY,
+                    orient_action_budget=2,
                 ),
             )
             session._normalize_actions = lambda arguments: ([action, action], None)

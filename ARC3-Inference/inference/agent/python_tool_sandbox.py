@@ -402,7 +402,6 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             runtime_globals["last_action_result"] = action_result
             runtime_globals["experience"] = dict(state_payload.get("experience") or {})
             runtime_globals["strategy"] = dict(state_payload.get("strategy") or {})
-            runtime_globals["objective_state"] = dict(state_payload.get("objectives") or {})
 
         def action(actions):
             normalized_actions = _normalize_actions(actions)
@@ -442,20 +441,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             runtime_globals["strategy"] = persisted
             return persisted
 
-        def objectives(update):
-            if not isinstance(update, dict):
-                raise TypeError("objectives(update) expects an objective operation dict.")
-            _send({"type": "objectives", "update": _json_safe(update)})
-            reply = _recv()
-            if reply.get("type") != "objectives_result":
-                raise RuntimeError("Invalid objectives response from sandbox host.")
-            persisted = dict(reply.get("result") or {})
-            _refresh_state(reply.get("state") or {})
-            return persisted
-
         runtime_globals["action"] = action
         runtime_globals["record_strategy"] = record_strategy
-        runtime_globals["objectives"] = objectives
         _refresh_state(initial.get("state") or {})
 
         try:
@@ -581,13 +568,10 @@ def run_sandboxed_python(
     initial_state: dict[str, Any],
     action_handler: Callable[[list[dict[str, Any]]], dict[str, Any]],
     strategy_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-    objective_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-    state_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="rgb_python_tool_") as sandbox_dir:
         host_action_results: list[dict[str, Any]] = []
         host_strategy_updates: list[dict[str, Any]] = []
-        host_objective_updates: list[dict[str, Any]] = []
         command, isolated_cwd = _sandbox_command()
         try:
             process = subprocess.Popen(
@@ -714,34 +698,6 @@ def run_sandboxed_python(
                 )
                 continue
 
-            if msg_type == "objectives":
-                if objective_handler is None:
-                    objective_result = {
-                        "ok": False,
-                        "operation": str((message.get("update") or {}).get("op") or ""),
-                        "error": {"code": "disabled", "message": "Objective reduction is not enabled."},
-                    }
-                else:
-                    try:
-                        objective_result = objective_handler(dict(message.get("update") or {}))
-                    except Exception:  # noqa: BLE001
-                        objective_result = {
-                            "ok": False,
-                            "operation": str((message.get("update") or {}).get("op") or ""),
-                            "error": {"code": "host_error", "message": "Objective update failed in sandbox host."},
-                        }
-                host_objective_updates.append(dict(objective_result))
-                refreshed_state = state_provider() if state_provider is not None else initial_state
-                _send_json_line(
-                    process.stdin,
-                    {
-                        "type": "objectives_result",
-                        "result": objective_result,
-                        "state": refreshed_state,
-                    },
-                )
-                continue
-
             if msg_type in {"final", "error"}:
                 _wait_for_process_exit(process)
                 return {
@@ -750,7 +706,6 @@ def run_sandboxed_python(
                     "error": str(message.get("error", "") or ""),
                     "action_results": list(message.get("action_results") or host_action_results),
                     "strategy_updates": list(host_strategy_updates),
-                    "objective_updates": list(host_objective_updates),
                 }
 
             _wait_for_process_exit(process)

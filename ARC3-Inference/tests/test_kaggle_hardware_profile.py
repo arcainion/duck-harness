@@ -42,12 +42,19 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("EXPECTED_GPU_TYPE = 't4'", command)
         self.assertIn("EXPECTED_GPU_COUNT = 2", command)
 
-    def test_other_accelerators_preserve_existing_defaults(self) -> None:
-        config = duck_kaggle_vllm_config_for_accelerator("NvidiaH100")
+    def test_rtx_pro_6000_profile_uses_single_gpu_defaults(self) -> None:
+        config = duck_kaggle_vllm_config_for_accelerator("NvidiaRtxPro6000")
 
         self.assertEqual(config.max_model_len, DEFAULT_VLLM_MAX_MODEL_LEN)
         self.assertEqual(config.tensor_parallel_size, 1)
+        self.assertEqual(config.expected_gpu_type, "rtx-pro-6000")
         self.assertEqual(config.expected_gpu_count, 1)
+
+        command = duck_kaggle_setup_command(config)
+        self.assertIn("VLLM_MAX_MODEL_LEN = 65536", command)
+        self.assertIn("VLLM_TENSOR_PARALLEL_SIZE = 1", command)
+        self.assertIn("EXPECTED_GPU_TYPE = 'rtx-pro-6000'", command)
+        self.assertIn("EXPECTED_GPU_COUNT = 1", command)
 
     def test_setup_detects_server_exit_and_emits_complete_log(self) -> None:
         command = duck_kaggle_setup_command(

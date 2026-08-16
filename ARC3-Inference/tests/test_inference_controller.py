@@ -95,6 +95,7 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(snapshot["phase"], "recover")
         self.assertEqual(snapshot["cycle_period"], 2)
         self.assertGreaterEqual(snapshot["stagnation_actions"], 2)
+        self.assertEqual(snapshot["action_budget"], 1)
 
     def test_memory_is_per_history_but_retains_cross_level_evidence(self) -> None:
         first_level = _frame(1, step=0)
@@ -169,6 +170,55 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(ranked[-1]["action"], "UP")
         self.assertEqual(ranked[-1]["no_ops"], 1)
 
+    def test_transition_model_verifies_repeated_state_action_effect(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            volatile_min_samples=10,
+        )
+        a = _frame(1, step=0)
+        b = _frame(2, step=1)
+        history = [
+            HistoryEntry(action="", frame=a),
+            HistoryEntry(action="RIGHT", frame=b),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=2)),
+        ]
+
+        snapshot = build_experience_snapshot(history, history[-1].frame, ["RIGHT"], config)
+        model = snapshot["transition_models_here"][0]
+
+        self.assertEqual(model["action"], "RIGHT")
+        self.assertEqual(model["trials"], 1)
+        self.assertEqual(model["confidence"], 1.0)
+        self.assertTrue(model["verified_deterministic"])
+        self.assertEqual(model["contradictions"], 0)
+        self.assertEqual(snapshot["model_conflicts_here"], 0)
+
+    def test_transition_model_conflict_forces_hypothesis_recovery(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            volatile_min_samples=10,
+        )
+        history = [
+            HistoryEntry(action="", frame=_frame(1, step=0)),
+            HistoryEntry(action="RIGHT", frame=_frame(2, step=1)),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=2)),
+            HistoryEntry(action="RIGHT", frame=_frame(3, step=3)),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=4)),
+        ]
+
+        snapshot = build_experience_snapshot(history, history[-1].frame, ["RIGHT"], config)
+        model = snapshot["transition_models_here"][0]
+
+        self.assertFalse(model["verified_deterministic"])
+        self.assertEqual(model["trials"], 2)
+        self.assertEqual(model["confidence"], 0.5)
+        self.assertEqual(model["contradictions"], 1)
+        self.assertEqual(snapshot["model_conflicts_here"], 1)
+        self.assertIn("transition_model_conflict", snapshot["recovery_reasons"])
+        self.assertEqual(snapshot["phase"], "recover")
+
     def test_mouse_family_keeps_coordinate_search_open(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
         state = _frame(1, step=0)
@@ -199,6 +249,24 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(metadata["controller_policy"], OUTCOME_AWARE_POLICY)
         self.assertEqual(metadata["action_rank"], 1)
 
+    def test_progress_phase_allows_only_a_short_confirmed_batch(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            progress_action_budget=3,
+        )
+        before = _frame(1, step=0)
+        after = _frame(2, step=1)
+        history = [
+            HistoryEntry(action="", frame=before),
+            HistoryEntry(action="RIGHT", frame=after),
+        ]
+
+        snapshot = build_experience_snapshot(history, after, ["RIGHT"], config)
+
+        self.assertEqual(snapshot["phase"], "progress")
+        self.assertEqual(snapshot["action_budget"], 3)
+
     def test_snapshot_payloads_remain_bounded(self) -> None:
         config = InferenceControllerConfig(
             enabled=True,
@@ -218,3 +286,4 @@ class InferenceControllerTests(TestCase):
 
         self.assertLessEqual(len(snapshot["recent_transitions"]), 3)
         self.assertLessEqual(len(snapshot["ranked_actions"]), 6)
+        self.assertLessEqual(len(snapshot["transition_models_here"]), 6)

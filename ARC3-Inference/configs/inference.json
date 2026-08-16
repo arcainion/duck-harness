@@ -64,7 +64,6 @@
     "tool_timeout": 30,
     "tool_output_tokens": 1024,
     "strategy_enabled": true,
-    "objective_reduction_enabled": false,
     "strategy_policy": "legacy",
     "same_state_noop_limit": 2,
     "stagnation_window": 12,

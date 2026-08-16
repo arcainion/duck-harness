@@ -49,6 +49,10 @@ class TraceMetricsTests(TestCase):
                 "outcome_class": "level_progress",
                 "prediction_result": {"status": "supported"},
                 "controller_phase": "progress",
+                "animation": {
+                    "intermediate_frame_count": 2,
+                    "transient_changed_cells": 3,
+                },
             },
         ]
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -66,6 +70,8 @@ class TraceMetricsTests(TestCase):
         self.assertEqual(summary["no_op_actions"], 2)
         self.assertEqual(summary["repeated_no_ops"], 1)
         self.assertEqual(summary["rewarding_actions"], 1)
+        self.assertEqual(summary["multi_frame_actions"], 1)
+        self.assertEqual(summary["transient_animation_actions"], 1)
         self.assertEqual(summary["unique_states_observed"], 3)
         self.assertEqual(summary["unique_behavioral_states_observed"], 2)
         self.assertEqual(summary["loop_interventions"], 1)

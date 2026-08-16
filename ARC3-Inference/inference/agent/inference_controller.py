@@ -59,6 +59,10 @@ class InferenceControllerConfig:
     volatile_window: int = 8
     volatile_min_samples: int = 4
     volatile_ratio: float = 0.75
+    orient_action_budget: int = 1
+    explore_action_budget: int = 1
+    recover_action_budget: int = 1
+    progress_action_budget: int = 4
 
     @property
     def outcome_aware(self) -> bool:
@@ -76,6 +80,10 @@ class InferenceControllerConfig:
             volatile_window=max(2, _env_int("LOCAL_ANALYZER_VOLATILE_WINDOW", 8)),
             volatile_min_samples=max(2, _env_int("LOCAL_ANALYZER_VOLATILE_MIN_SAMPLES", 4)),
             volatile_ratio=max(0.5, min(1.0, _env_float("LOCAL_ANALYZER_VOLATILE_RATIO", 0.75))),
+            orient_action_budget=max(1, min(12, _env_int("LOCAL_ANALYZER_ORIENT_ACTION_BUDGET", 1))),
+            explore_action_budget=max(1, min(12, _env_int("LOCAL_ANALYZER_EXPLORE_ACTION_BUDGET", 1))),
+            recover_action_budget=max(1, min(12, _env_int("LOCAL_ANALYZER_RECOVER_ACTION_BUDGET", 1))),
+            progress_action_budget=max(1, min(12, _env_int("LOCAL_ANALYZER_PROGRESS_ACTION_BUDGET", 4))),
         )
 
 
@@ -323,6 +331,56 @@ def _rank_actions(
     return [payload for _, payload in ranked[:6]]
 
 
+def _transition_models_here(
+    transitions: list[dict[str, Any]], current_behavioral_id: str
+) -> list[dict[str, Any]]:
+    """Return compact empirical action models verified at the current state."""
+    observations: dict[str, dict[str, Counter[str]]] = {}
+    for item in transitions:
+        if item["behavioral_before_state_id"] != current_behavioral_id:
+            continue
+        action = str(item["action"])
+        stats = observations.setdefault(
+            action, {"next_states": Counter(), "outcomes": Counter()}
+        )
+        stats["next_states"][str(item["behavioral_after_state_id"])] += 1
+        stats["outcomes"][str(item["outcome_class"])] += 1
+
+    models: list[dict[str, Any]] = []
+    for action, stats in observations.items():
+        next_states = stats["next_states"]
+        outcomes = stats["outcomes"]
+        trials = sum(next_states.values())
+        next_state, support = min(
+            next_states.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        outcome = min(
+            outcomes.items(), key=lambda item: (-item[1], item[0])
+        )[0]
+        deterministic = len(next_states) == 1
+        models.append(
+            {
+                "action": action,
+                "trials": trials,
+                "predicted_outcome": outcome,
+                "predicted_behavioral_state_id": next_state if deterministic else None,
+                "support": support,
+                "contradictions": trials - support,
+                "confidence": round(support / trials, 3) if trials else 0.0,
+                "verified_deterministic": deterministic,
+            }
+        )
+    models.sort(
+        key=lambda model: (
+            not bool(model["verified_deterministic"]),
+            -int(model["trials"]),
+            str(model["action"]),
+        )
+    )
+    return models[:6]
+
+
 def build_experience_snapshot(
     history: list[HistoryEntry], current_frame: Frame | None, valid_actions: Iterable[str], config: InferenceControllerConfig
 ) -> dict[str, Any]:
@@ -390,10 +448,28 @@ def build_experience_snapshot(
     else:
         phase = "explore"
     ranked_actions = _rank_actions(transitions, behavioral_id, normalized_valid, config) if config.outcome_aware else []
+    transition_models = (
+        _transition_models_here(transitions, behavioral_id)
+        if config.outcome_aware
+        else []
+    )
+    model_conflicts = sum(
+        int(model["contradictions"] > 0) for model in transition_models
+    )
+    if model_conflicts and "transition_model_conflict" not in recovery_reasons:
+        recovery_reasons.append("transition_model_conflict")
+        phase = "recover"
+    action_budget = {
+        "orient": config.orient_action_budget,
+        "explore": config.explore_action_budget,
+        "recover": config.recover_action_budget,
+        "progress": config.progress_action_budget,
+    }.get(phase, 1)
     return {
         "enabled": config.enabled,
         "policy": _normalize_policy(config.policy),
         "phase": phase,
+        "action_budget": action_budget,
         "state_id": current_id,
         "behavioral_state_id": behavioral_id,
         "state_visits": sum(state_id == active_current_id for state_id in active_ids),
@@ -412,6 +488,8 @@ def build_experience_snapshot(
         "suggested_actions": suggested,
         "discouraged_actions": discouraged,
         "ranked_actions": ranked_actions,
+        "transition_models_here": transition_models,
+        "model_conflicts_here": model_conflicts,
         "recent_transitions": transitions[-config.recent_transition_limit :],
     }
 
