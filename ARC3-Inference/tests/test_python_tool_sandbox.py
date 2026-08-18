@@ -57,7 +57,9 @@ class PythonToolSandboxTests(TestCase):
 
         response = run_sandboxed_python(
             code=(
-                "saved = record_strategy(goal='reach target', evidence=['moved'], confidence=0.75)\n"
+                "saved = record_strategy(goal='reach target', evidence=['moved'], confidence=0.75, "
+                "test_action='RIGHT', expected_outcome='new_state', "
+                "fallback='try LEFT', contradictions=['timer changed'])\n"
                 "result = [experience['phase'], saved['goal'], strategy['confidence']]"
             ),
             timeout_seconds=5,
@@ -76,3 +78,7 @@ class PythonToolSandboxTests(TestCase):
         self.assertEqual(response["error"], "")
         self.assertEqual(response["result"], ["orient", "reach target", 0.75])
         self.assertEqual(updates[0]["evidence"], ["moved"])
+        self.assertEqual(updates[0]["test_action"], "RIGHT")
+        self.assertEqual(updates[0]["expected_outcome"], "new_state")
+        self.assertEqual(updates[0]["fallback"], "try LEFT")
+        self.assertEqual(updates[0]["contradictions"], ["timer changed"])

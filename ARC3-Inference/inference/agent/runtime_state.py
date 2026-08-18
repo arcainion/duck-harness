@@ -108,7 +108,10 @@ def history_entry_to_payload(entry: HistoryEntry) -> dict[str, Any]:
 def load_runtime_state(path: Path) -> tuple[Frame | None, list[HistoryEntry]]:
     if not path.exists():
         return None, []
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, []
     current_frame = frame_from_payload(payload.get("current_frame"))
     history_entries = [
         entry

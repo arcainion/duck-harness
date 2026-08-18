@@ -36,6 +36,7 @@ from inference.agent.inference_controller import (
     action_guard_reason,
     action_guard_reason_code,
     build_experience_snapshot,
+    evaluate_outcome_match,
     frame_fingerprint,
     normalize_action_key,
     transition_metadata,
@@ -48,6 +49,8 @@ from inference.agent.runtime_state import (
 )
 from inference.agent.tool_agent import ToolAgent
 from inference.framework.kaggle import (
+    DEFAULT_EXPECTED_GPU_COUNT,
+    DEFAULT_EXPECTED_GPU_TYPE,
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
@@ -60,6 +63,7 @@ from inference.framework.kaggle import (
     duck_kaggle_setup_command,
     duck_kaggle_teardown_command,
 )
+from inference.utils import grid_utils
 from inference.utils.grid_utils import ARC_COLOR_CHARS
 from inference.utils.viewer_artifacts import (
     append_raw_events_sidecar,
@@ -184,7 +188,8 @@ def _summarize_animation(
     def color_name(value: int | None) -> str:
         if value is None:
             return "outside"
-        return ARC_COLOR_CHARS[max(0, min(15, int(value)))]
+        idx = max(0, min(15, int(value)))
+        return f"{grid_utils.ARC_COLOR_NAMES[idx]} ({ARC_COLOR_CHARS[idx]})"
 
     dominant_transitions = [
         {"from": color_name(pair[0]), "to": color_name(pair[1]), "count": count}
@@ -267,20 +272,7 @@ def _evaluate_strategy_prediction(
         or (test_action == "MOUSE" and action_family(actual_action) == "MOUSE")
     ):
         return None
-    if not payload.get("executed") or expected == "unknown":
-        status = "inconclusive"
-    else:
-        matched = {
-            "no_change": not bool(payload.get("board_changed")),
-            "state_change": bool(payload.get("board_changed")),
-            "new_state": bool(payload.get("novel_state")),
-            "level_progress": bool(
-                payload.get("level_completed")
-                or payload.get("run_complete")
-                or float(payload.get("reward") or 0.0) > 0.0
-            ),
-        }.get(expected)
-        status = "supported" if matched else "contradicted"
+    status = evaluate_outcome_match(expected, payload)
     return {
         "status": status,
         "action": actual_action,
@@ -707,12 +699,16 @@ class _HarnessGameSession:
             data: dict[str, Any] = {}
             if action_id == arcengine.GameAction.ACTION6:
                 try:
-                    row = max(0, min(63, int(raw_action["row"])))
-                    column = max(0, min(63, int(raw_action["col"])))
+                    raw_row = int(raw_action["row"])
+                    raw_col = int(raw_action["col"])
+                    clamped_row = max(0, min(63, raw_row))
+                    clamped_col = max(0, min(63, raw_col))
                     data = {
-                        "x": column,
-                        "y": row,
+                        "x": clamped_col,
+                        "y": clamped_row,
                     }
+                    if clamped_row != raw_row or clamped_col != raw_col:
+                        data["_clamped_from"] = {"row": raw_row, "col": raw_col}
                 except (KeyError, TypeError, ValueError):
                     return (
                         None,
@@ -1008,6 +1004,7 @@ class _HarnessGameSession:
         previous_grid = _grid_from_state(self.game.current_state)
         previous_frame = self.current_frame()
         prior_history = list(self.history_entries)
+        valid_actions_before = to_model_actions(_engine_action_names(self.game))
         previous_completed = int(self.game.current_state.levels_completed)
         if generated_tokens is None:
             current_tokens = _analyzer_reported_tokens(self.analyzer)
@@ -1071,6 +1068,7 @@ class _HarnessGameSession:
                     prior_history,
                     action_display,
                     self.controller_config,
+                    valid_actions_before,
                 )
             )
         prediction_result = _evaluate_strategy_prediction(strategy_prediction, payload)
@@ -1114,6 +1112,12 @@ class HarnessSolver(Solver):
     )
     kaggle_vllm_tensor_parallel_size: int = field(
         default=DEFAULT_VLLM_TENSOR_PARALLEL_SIZE, repr=False
+    )
+    kaggle_expected_gpu_type: str = field(
+        default=DEFAULT_EXPECTED_GPU_TYPE, repr=False
+    )
+    kaggle_expected_gpu_count: int = field(
+        default=DEFAULT_EXPECTED_GPU_COUNT, repr=False
     )
     kaggle_wheelhouse_stamp_text: str = field(
         default=DEFAULT_WHEELHOUSE_STAMP_TEXT, repr=False
@@ -1223,6 +1227,8 @@ class HarnessSolver(Solver):
             vllm_port=self.kaggle_vllm_port,
             max_model_len=self.kaggle_vllm_max_model_len,
             tensor_parallel_size=self.kaggle_vllm_tensor_parallel_size,
+            expected_gpu_type=self.kaggle_expected_gpu_type,
+            expected_gpu_count=self.kaggle_expected_gpu_count,
             wheelhouse_stamp_text=self.kaggle_wheelhouse_stamp_text,
         )
 
@@ -1235,11 +1241,11 @@ class HarnessSolver(Solver):
         )
 
     def _teardown(self) -> None:
+        if self._worker_pool is not None:
+            self._worker_pool.shutdown(wait=True)
+            self._worker_pool = None
         if self._local_server_started:
             self._stop_local_servers()
-        if self._worker_pool is not None:
-            self._worker_pool.shutdown(wait=False)
-            self._worker_pool = None
 
     async def _run_games(self, games: list[taaf.game.Game]) -> None:
         self._stop_event.clear()

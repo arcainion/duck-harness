@@ -19,6 +19,7 @@ from inference.agent.inference_controller import (
     InferenceControllerConfig,
     action_family,
     build_experience_snapshot,
+    evaluate_outcome_match,
     normalize_action_key,
 )
 from inference.agent.prompts import (
@@ -474,7 +475,18 @@ def _estimate_tokens(value: Any) -> int:
         rendered = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
     except TypeError:
         rendered = str(value)
-    return max(1, (len(rendered) + 2) // 3)
+    length = len(rendered)
+    if length == 0:
+        return 0
+    ascii_chars = sum(1 for c in rendered if ord(c) < 128)
+    ascii_ratio = ascii_chars / length
+    if ascii_ratio > 0.9:
+        chars_per_token = 4.0
+    elif ascii_ratio > 0.7:
+        chars_per_token = 3.5
+    else:
+        chars_per_token = 2.5
+    return max(1, int(length / chars_per_token))
 
 
 def _host_accessible_base_url(base_url: str) -> str:
@@ -531,10 +543,13 @@ def _append_transcript_section(log_path: Path, label: str, content: str) -> None
     rendered_content = content.strip()
     if not rendered_content:
         return
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"[{label}]\n")
-        f.write(rendered_content)
-        f.write("\n\n")
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{label}]\n")
+            f.write(rendered_content)
+            f.write("\n\n")
+    except OSError:
+        logging.warning("Failed to write transcript section %s to %s", label, log_path)
 
 
 def _render_transcript_section(label: str, content: str) -> str:
@@ -852,8 +867,9 @@ def _write_prompt_log_snapshot(
     transcript_text = transcript.strip()
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write("LATEST MODEL CALL SNAPSHOT\n")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("=" * 60 + "\n")
+        f.write("MODEL CALL SNAPSHOT\n")
         f.write(f"model: {model_id}\n")
         f.write(f"base_url: {base_url}\n")
         f.write(f"analysis_step: {analysis_label}\n")
@@ -1068,6 +1084,10 @@ class ToolAgent:
             )
         if persisted.get("next_test"):
             self._summarized_knowledge["current_plan"] = str(persisted["next_test"])
+        if persisted.get("contradictions"):
+            self._summarized_knowledge["contradictions"] = "; ".join(
+                str(item) for item in persisted["contradictions"]
+            )
         return dict(self._strategy_memory)
 
     def _evaluate_strategy_prediction(
@@ -1102,20 +1122,7 @@ class ToolAgent:
         if observed is None:
             return None
         actual = str(observed.get("outcome_class") or "unknown")
-        if not observed.get("executed", action_result.get("executed")) or expected == "unknown":
-            status = "inconclusive"
-        else:
-            matched = {
-                "no_change": not bool(observed.get("board_changed")),
-                "state_change": bool(observed.get("board_changed")),
-                "new_state": bool(observed.get("novel_state")),
-                "level_progress": bool(
-                    observed.get("level_completed")
-                    or observed.get("run_complete")
-                    or float(observed.get("reward") or 0.0) > 0.0
-                ),
-            }.get(expected)
-            status = "supported" if matched else "contradicted"
+        status = evaluate_outcome_match(expected, observed)
         result = {
             "status": status,
             "action": normalize_action_key(observed.get("action_display", test_action)),
@@ -1257,6 +1264,7 @@ class ToolAgent:
         if not summary:
             return
         if summary.get("level_transition") or summary.get("run_complete") or summary.get("game_over"):
+            existing_notes = self._summarized_knowledge.get("cross_level_notes", "")
             for key in (
                 "world_model",
                 "goal_model",
@@ -1266,6 +1274,13 @@ class ToolAgent:
                 "current_plan",
             ):
                 self._summarized_knowledge[key] = ""
+            if summary.get("level_transition") and existing_notes:
+                self._summarized_knowledge["cross_level_notes"] = existing_notes
+            else:
+                self._summarized_knowledge["cross_level_notes"] = ""
+            for stale_key in ("evidence", "contradictions", "test_action", "expected_outcome", "prediction_result"):
+                self._strategy_memory.pop(stale_key, None)
+            self._summarized_knowledge.pop("contradictions", None)
 
     def _summarized_knowledge_lines(self) -> list[str]:
         entries = [
@@ -1275,9 +1290,17 @@ class ToolAgent:
             ("Recent findings", self._summarized_knowledge.get("recent_findings", "")),
             ("Open questions", self._summarized_knowledge.get("open_questions", "")),
             ("Plan", self._summarized_knowledge.get("current_plan", "")),
+            ("Contradictions", self._summarized_knowledge.get("contradictions", "")),
             ("Cross-level notes", self._summarized_knowledge.get("cross_level_notes", "")),
         ]
-        lines = [f"- {label}: {value}" for label, value in entries if value]
+        max_value_chars = 200
+        lines = []
+        for label, value in entries:
+            if not value:
+                continue
+            if len(value) > max_value_chars:
+                value = value[:max_value_chars].rstrip() + "..."
+            lines.append(f"- {label}: {value}")
         if not lines:
             return []
         return [
@@ -1299,6 +1322,39 @@ class ToolAgent:
             ],
         }
 
+    def _compress_experience_snapshot(self, exp: dict[str, Any]) -> str:
+        if not exp or not exp.get("enabled"):
+            return ""
+        parts = []
+        phase = exp.get("phase", "unknown")
+        budget = exp.get("action_budget", "?")
+        parts.append(f"Phase: {phase} (budget: {budget} actions)")
+        visits = exp.get("state_visits", 0)
+        unique = exp.get("unique_states", 0)
+        parts.append(f"States: {unique} unique, {visits} visits")
+        no_op_streak = exp.get("behavioral_no_op_streak", 0)
+        if no_op_streak > 0:
+            parts.append(f"No-op streak: {no_op_streak}")
+        cycle = exp.get("cycle_period")
+        if cycle:
+            confidence = exp.get("cycle_confidence", 0)
+            parts.append(f"Cycle detected: period={cycle}, confidence={confidence:.0%}")
+        outcome = exp.get("latest_outcome")
+        if outcome:
+            parts.append(f"Last outcome: {outcome}")
+        suggested = exp.get("suggested_actions", [])
+        if suggested:
+            parts.append(f"Suggested: {', '.join(str(a) for a in suggested[:3])}")
+        discouraged = exp.get("discouraged_actions", [])
+        if discouraged:
+            parts.append(f"Discouraged: {', '.join(str(a) for a in discouraged[:3])}")
+        tried = exp.get("tried_here", [])
+        if tried:
+            parts.append(f"Tried: {', '.join(str(a) for a in tried[:5])}")
+        recovery = exp.get("recovery_reasons", [])
+        if recovery:
+            parts.append(f"Recovery: {', '.join(str(r) for r in recovery[:2])}")
+        return "; ".join(parts)
 
     def _build_user_prompt(
         self,
@@ -1359,9 +1415,18 @@ class ToolAgent:
         if observed_max_level > current_level:
             state_line += f" out of observed max level {observed_max_level} so far"
         state_line += "."
+        lines.append(state_line)
+        total_actions = len(history_entries)
+        if total_actions > 0 and experience_snapshot and experience_snapshot.get("enabled"):
+            exp = experience_snapshot
+            no_ops = int(exp.get("no_op_actions", 0))
+            changes = total_actions - no_ops
+            lines.append(
+                f"Cumulative: {total_actions} actions, {no_ops} no-ops, {changes} board changes, "
+                f"{exp.get('unique_behavioral_states', 0)} unique states visited."
+            )
         lines.extend(
             [
-                state_line,
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
                 "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, `record_strategy(...)`, and `action(actions)`.",
                 "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
@@ -1373,40 +1438,15 @@ class ToolAgent:
             ]
         )
         if experience_snapshot and experience_snapshot.get("enabled"):
-            compact_experience = {
-                key: experience_snapshot.get(key)
-                for key in (
-                    "policy",
-                    "phase",
-                    "action_budget",
-                    "state_id",
-                    "behavioral_state_id",
-                    "state_visits",
-                    "unique_states",
-                    "unique_behavioral_states",
-                    "volatile_cells",
-                    "actions_observed",
-                    "no_op_streak",
-                    "behavioral_no_op_streak",
-                    "stagnation_actions",
-                    "cycle_period",
-                    "latest_outcome",
-                    "recovery_reasons",
-                    "tried_here",
-                    "suggested_actions",
-                    "discouraged_actions",
-                    "ranked_actions",
-                    "transition_models_here",
-                    "model_conflicts_here",
+            compressed_exp = self._compress_experience_snapshot(experience_snapshot)
+            if compressed_exp:
+                lines.extend(
+                    [
+                        "Experience controller:",
+                        compressed_exp,
+                        "Follow the controller phase and action budget: orient with one compact inspection, explore with a controlled falsifiable probe, continue progress when evidence supports it, and abandon or revise the current hypothesis in recover. Never retry a discouraged action in the same visible state.",
+                    ]
                 )
-            }
-            lines.extend(
-                [
-                    "Deterministic experience controller snapshot:",
-                    json.dumps(compact_experience, separators=(",", ":"), sort_keys=True),
-                    "Follow the controller phase, `action_budget`, and ranked action evidence: orient with one compact inspection, explore with a controlled falsifiable probe, continue progress when evidence supports it, and abandon or revise the current hypothesis in recover. Treat `transition_models_here` as a tiny executable world model: verified deterministic entries may be used for short planning, while contradictions mean the state abstraction or hypothesis is incomplete. Never retry a discouraged exact action in the same visible state; semantic cycle warnings remain advisory when backtracking is necessary.",
-                ]
-            )
         lines.append(
             "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, "
             "but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`."
@@ -1423,6 +1463,7 @@ class ToolAgent:
             )
         lines.extend(
             [
+                "Before writing code, quickly state in one line: (a) what you think the board contains, (b) what the goal is, (c) what you will test. Then write minimal code to test it.",
                 "When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. Batch only a short sequence supported by observed action effects; use single probes while orienting, exploring, or recovering.",
                 "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.",
                 "If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.",
@@ -1485,7 +1526,21 @@ class ToolAgent:
                 timeout=request_timeout_seconds if request_timeout_seconds is not None else self._timeout,
             )
 
-        response = post_chat(payload)
+        _RETRYABLE_HTTP_CODES = {408, 429, 502, 503, 504}
+        _max_retries = 3
+        response = None
+        for _retry in range(_max_retries):
+            try:
+                response = post_chat(payload)
+            except requests.ConnectionError:
+                if _retry == _max_retries - 1:
+                    raise
+                time.sleep(min(2 ** _retry * 0.5, 4.0))
+                continue
+            if response.status_code not in _RETRYABLE_HTTP_CODES:
+                break
+            if _retry < _max_retries - 1:
+                time.sleep(min(2 ** _retry * 0.5, 4.0))
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
@@ -1546,12 +1601,23 @@ class ToolAgent:
             if isinstance(value, str):
                 result[field], field_truncated = self._trim_tool_text(value)
                 truncated = truncated or field_truncated
+        rendered = json.dumps(result, indent=2)
+        max_chars = self._tool_output_chars * 2
+        if len(rendered) > max_chars:
+            rendered = rendered[:max_chars] + f"\n... [truncated {len(rendered) - max_chars} chars to fit output budget]"
+            truncated = True
         if truncated:
-            result["truncated"] = True
-            result["truncation_note"] = (
+            truncation_note = (
                 f"Tool output was cut off to stay within the ~{self._tool_output_tokens}-token response budget."
             )
-        return json.dumps(result, indent=2)
+            try:
+                parsed = json.loads(rendered)
+                parsed["truncated"] = True
+                parsed["truncation_note"] = truncation_note
+                rendered = json.dumps(parsed, indent=2)
+            except json.JSONDecodeError:
+                rendered += f"\n{{\"truncated\": true, \"truncation_note\": \"{truncation_note}\"}}"
+        return rendered
 
     def _normalize_python_actions(self, value: Any) -> list[dict[str, Any]]:
         if isinstance(value, str):
@@ -1611,6 +1677,9 @@ class ToolAgent:
             "run_complete": bool(payload.get("run_complete")),
             "action_display": payload.get("action_display") or payload.get("action_name"),
         }
+        action_data = payload.get("action_data")
+        if isinstance(action_data, dict) and "_clamped_from" in action_data:
+            compact["action_data"] = action_data
         for controller_key in (
             "guarded",
             "guard_reason_code",
@@ -1686,6 +1755,17 @@ class ToolAgent:
             compact["error"] = payload.get("error")
         return compact
 
+    def _validate_code_common_mistakes(self, code: str) -> str | None:
+        if "current_frame._grid" in code or "frame._grid" in code:
+            return "Warning: Direct _grid access is discouraged. Use current_frame.segmentation instead."
+        if code.count("action(") > 3:
+            return "Warning: Many action() calls in one snippet. Consider batching actions."
+        if re.search(r"while\s+True\s*:", code):
+            return "Warning: Infinite loop detected. Ensure a break condition exists."
+        if "import os" in code or "import sys" in code or "import subprocess" in code:
+            return "Warning: System modules are not available in sandbox."
+        return None
+
     def _run_python_tool(self, state_path: Path, arguments: dict[str, Any]) -> _ToolDispatchResult:
         self._ensure_session(state_path)
         code = str(arguments.get("code", "")).rstrip()
@@ -1695,8 +1775,10 @@ class ToolAgent:
             compile(code, "<python_tool>", "exec")
         except SyntaxError as exc:
             return _ToolDispatchResult(json.dumps({"error": f"Python syntax error: {exc}"}, indent=2))
+        validation_warning = self._validate_code_common_mistakes(code)
+        if validation_warning:
+            log.info("Code validation warning: %s", validation_warning)
 
-        current_frame, history_entries = load_runtime_state(state_path)
         valid_actions = list(_normalize_valid_actions(self._current_valid_actions))
 
         def _serialized_runtime_state(
@@ -1724,6 +1806,7 @@ class ToolAgent:
                     refreshed_frame,
                     sanitized_actions,
                     self._controller_config,
+                    strategy_confidence=float(self._strategy_memory.get("confidence", 1.0)),
                 ),
                 "strategy": dict(self._strategy_memory),
                 "last_action_result": (
@@ -1815,8 +1898,27 @@ class ToolAgent:
         payload: dict[str, Any] = {"tool": "python"}
         rendered_stdout = str(sandbox_result.get("stdout", "") or "")
         rendered_error = str(sandbox_result.get("error", "") or "")
+        error_hint = str(sandbox_result.get("error_hint", "") or "")
+        error_category = str(sandbox_result.get("error_category", "") or "")
         if rendered_error:
             payload["error"] = rendered_error
+            if error_hint:
+                payload["error_hint"] = error_hint
+            if error_category:
+                recovery_map = {
+                    "UNDEFINED_VARIABLE": "Define the variable or check spelling.",
+                    "MISSING_RUNTIME_VARIABLE": "Do not redefine runtime variables.",
+                    "MISUSED_RUNTIME_FUNCTION": "Call the function, e.g. action(['LEFT']).",
+                    "BLOCKED_MODULE": "Use only allowed modules.",
+                    "TYPE_MISMATCH": "Ensure operands are compatible types.",
+                    "WRONG_ARGUMENTS": "Check function signature.",
+                    "MISSING_KEY": "Check available keys before accessing.",
+                    "INDEX_OUT_OF_RANGE": "Check bounds before indexing.",
+                    "PRIVATE_ACCESS": "Use public attributes only.",
+                    "TIMEOUT": "Optimize or reduce computation.",
+                }
+                recovery = recovery_map.get(error_category, "Simplify code and retry.")
+                payload["recovery_hint"] = f"{error_hint} {recovery}" if error_hint else recovery
             if rendered_stdout:
                 payload["stdout"] = rendered_stdout
         else:
@@ -1939,10 +2041,32 @@ class ToolAgent:
         history = list(messages[1:])
         preserve_recent = max(0, preserve_recent)
         budget_tokens = max(1, self._context_budget_tokens - max(0, extra_safety_tokens))
+        initial_len = len(history)
         while history and self._estimate_request_input_tokens([system_message, *history], tools=tools) > budget_tokens:
             if not self._drop_oldest_history_block(history, preserve_recent=preserve_recent):
                 break
         history = self._drop_until_first_user_message(history)
+        dropped_count = initial_len - len(history)
+        if dropped_count > 0:
+            summary_parts = []
+            actions_seen = set()
+            errors_seen = set()
+            for msg in messages[1:initial_len - len(history)]:
+                if msg.get("role") == "tool":
+                    content = str(msg.get("content", ""))
+                    if "executed" in content and "action" in content:
+                        actions_seen.add("actions")
+                    if "error" in content.lower():
+                        errors_seen.add("errors")
+            if actions_seen:
+                summary_parts.append(f"{dropped_count} earlier turns with actions were trimmed")
+            else:
+                summary_parts.append(f"{dropped_count} earlier turns were trimmed")
+            if errors_seen:
+                summary_parts.append("some earlier errors occurred")
+            summary_text = "; ".join(summary_parts) + "."
+            summary_msg = {"role": "user", "content": f"[Context summary: {summary_text} Re-ground from current_frame and experience.]"}
+            history = [summary_msg, *history]
         return [system_message, *history]
 
     def _force_reduce_messages(
@@ -1985,6 +2109,7 @@ class ToolAgent:
             current_frame,
             self._current_valid_actions,
             self._controller_config,
+            strategy_confidence=float(self._strategy_memory.get("confidence", 1.0)),
         )
         user_prompt = self._build_user_prompt(
             action_num,
@@ -2175,14 +2300,29 @@ class ToolAgent:
                             "Emit exactly one `python` tool call directly as your next response. "
                             "Do not place `<tool_call>` markup inside reasoning, explanation, or notes. "
                         )
+                    else:
+                        followup_prefix = "You have not acted yet. "
+                        if content:
+                            analysis_excerpt = content[:150].rstrip()
+                            if len(content) > 150:
+                                analysis_excerpt += "..."
+                            followup_prefix += f"Your analysis was: {analysis_excerpt}. "
+                        exp_snap = experience_snapshot if experience_snapshot else {}
+                        phase = exp_snap.get("phase", "unknown")
+                        last_outcome = exp_snap.get("latest_outcome")
+                        if last_outcome:
+                            followup_prefix += f"Last outcome was '{last_outcome}'. "
+                        if phase in ("orient", "explore"):
+                            followup_prefix += f"Phase is {phase}: inspect the board with segmentation, then make a controlled probe. "
+                        elif phase == "recover":
+                            no_op_streak = exp_snap.get("behavioral_no_op_streak", 0)
+                            followup_prefix += f"Phase is recover (no-op streak={no_op_streak}). Try a different action family than what was recently tried. "
+                        elif phase == "progress":
+                            followup_prefix += "Phase is progress: continue the action sequence that was working. "
                     followup_prompt = (
                         f"{followup_prefix}"
-                        "Then investigate and revise your working world model of what the level contains, what actions appear to do, what the current goal seems to be, and what plan looks best. "
-                        "If helpful, include short world-model update lines such as `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, or `Cross-level notes:`. "
-                        "Call the `python` tool with code that inspects `current_frame`, `previous_frame`, `last_transition`, `history`, or `valid_actions` -- use `current_frame.segmentation` as the primary view, and `.ascii` only for a small specific region -- "
-                        "compare `previous_frame` to `current_frame` for the most recent change, "
-                        "derives a compact board summary, programs a small search or scorer over candidate actions or short sequences, "
-                        "then call `action(actions)` inside Python with the best valid action or ordered batch that your code selected. "
+                        "Call the `python` tool with code that inspects `current_frame.segmentation` to understand the current board state, "
+                        "then call `action(actions)` from inside Python with the best valid action. "
                         f"{TOOL_CALL_FORMAT_GUIDANCE}"
                     )
                     append_transcript("USER PROMPT", followup_prompt)

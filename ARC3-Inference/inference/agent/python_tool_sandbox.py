@@ -27,6 +27,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     import io
     import json
     import os
+    import re
     import sys
     import traceback
     import types
@@ -52,9 +53,11 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "itertools",
         "json",
         "math",
+        "operator",
         "random",
         "re",
         "statistics",
+        "string",
     }
     SAFE_BUILTINS = {
         "abs",
@@ -159,6 +162,121 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         __repr__ = __str__
 
 
+    class GridUtils:
+        @staticmethod
+        def diff_frames(frame1, frame2):
+            if frame1 is None or frame2 is None:
+                return {"changed_cells": [], "appeared": [], "disappeared": []}
+            grid1 = frame1._grid if hasattr(frame1, '_grid') else []
+            grid2 = frame2._grid if hasattr(frame2, '_grid') else []
+            if not grid1 or not grid2 or len(grid1) != len(grid2):
+                return {"changed_cells": [], "appeared": [], "disappeared": []}
+            changed = []
+            appeared = []
+            disappeared = []
+            for r in range(len(grid1)):
+                if r >= len(grid2):
+                    break
+                row1 = grid1[r]
+                row2 = grid2[r]
+                for c in range(min(len(row1), len(row2))):
+                    if row1[c] != row2[c]:
+                        changed.append((r, c))
+                        if row1[c] == 0:
+                            appeared.append((r, c))
+                        elif row2[c] == 0:
+                            disappeared.append((r, c))
+            return {"changed_cells": changed, "appeared": appeared, "disappeared": disappeared}
+
+        @staticmethod
+        def get_cell(frame, row, col):
+            grid = frame._grid if hasattr(frame, '_grid') else []
+            if 0 <= row < len(grid) and 0 <= col < len(grid[row]):
+                return grid[row][col]
+            return None
+
+        @staticmethod
+        def set_cell(frame, row, col, value):
+            grid = frame._grid if hasattr(frame, '_grid') else None
+            if grid is not None and 0 <= row < len(grid) and 0 <= col < len(grid[row]):
+                grid[row][col] = value
+
+        @staticmethod
+        def neighbors(pos, shape, diagonals=False):
+            r, c = pos
+            rows, cols = shape
+            dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            if diagonals:
+                dirs += [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+            result = []
+            for dr, dc in dirs:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    result.append((nr, nc))
+            return result
+
+        @staticmethod
+        def find_color(frame, color_char):
+            grid = frame._grid if hasattr(frame, '_grid') else []
+            result = []
+            for r, row in enumerate(grid):
+                for c, cell in enumerate(row):
+                    if cell == color_char:
+                        result.append((r, c))
+            return result
+
+        @staticmethod
+        def flood_fill(frame, start, target_color=None):
+            grid = frame._grid if hasattr(frame, '_grid') else []
+            if not grid:
+                return set()
+            rows = len(grid)
+            cols = max((len(row) for row in grid), default=0)
+            if start[0] < 0 or start[0] >= rows or start[1] < 0 or start[1] >= cols:
+                return set()
+            if target_color is None:
+                target_color = grid[start[0]][start[1]]
+            visited = set()
+            stack = [start]
+            while stack:
+                r, c = stack.pop()
+                if (r, c) in visited:
+                    continue
+                if r < 0 or r >= rows or c < 0 or c >= cols:
+                    continue
+                if grid[r][c] != target_color:
+                    continue
+                visited.add((r, c))
+                stack.extend([(r-1, c), (r+1, c), (r, c-1), (r, c+1)])
+            return visited
+
+        @staticmethod
+        def bfs_path(frame, start, goal):
+            grid = frame._grid if hasattr(frame, '_grid') else []
+            if not grid or not start or not goal:
+                return []
+            rows = len(grid)
+            cols = max((len(row) for row in grid), default=0)
+            if start[0] < 0 or start[0] >= rows or goal[0] < 0 or goal[0] >= rows:
+                return []
+            from collections import deque
+            queue = deque([(start, [start])])
+            visited = {start}
+            while queue:
+                (r, c), path = queue.popleft()
+                if (r, c) == goal:
+                    return path
+                for nr, nc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    new_r, new_c = r + nr, c + nc
+                    if (0 <= new_r < rows and 0 <= new_c < cols and
+                            (new_r, new_c) not in visited):
+                        visited.add((new_r, new_c))
+                        queue.append(((new_r, new_c), path + [(new_r, new_c)]))
+            return []
+
+    grid_utils = GridUtils()
+
+
     class HistoryEntryView:
         def __init__(self, *, action, frame):
             self.action = action
@@ -244,6 +362,47 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             return [_json_safe(item) for item in value]
         return str(value)
 
+
+    def _classify_error(exc):
+        error_type = type(exc).__name__
+        error_msg = str(exc)
+        if error_type == "NameError":
+            match = re.search(r"name '(\w+)' is not defined", error_msg)
+            name = match.group(1) if match else "unknown"
+            if name in ("action", "record_strategy"):
+                return "MISUSED_RUNTIME_FUNCTION", f"'{name}()' must be called, not referenced. Use: action(['LEFT'])"
+            if name in ("current_frame", "history", "valid_actions", "last_action_result",
+                        "experience", "strategy", "transitions", "last_transition",
+                        "previous_frame", "last_action"):
+                return "MISSING_RUNTIME_VARIABLE", f"'{name}' is available. Do not redefine it."
+            return "UNDEFINED_VARIABLE", f"'{name}' is not defined. Check spelling or define it first."
+        if error_type == "TypeError":
+            if "argument" in error_msg and "positional" in error_msg:
+                return "WRONG_ARGUMENTS", f"Wrong arguments: {error_msg}. Check function signature."
+            if "unsupported operand" in error_msg or "cannot unpack" in error_msg:
+                return "TYPE_MISMATCH", f"Type mismatch: {error_msg}. Ensure operands are compatible types."
+            return "TYPE_ERROR", f"TypeError: {error_msg}"
+        if error_type == "AttributeError":
+            match = re.search(r"object has no attribute '(\w+)'", error_msg)
+            attr = match.group(1) if match else "unknown"
+            if attr.startswith("_"):
+                return "PRIVATE_ACCESS", f"Private attribute '{attr}' is not allowed. Use public attributes only."
+            return "MISSING_ATTRIBUTE", f"Attribute '{attr}' not found. Check available attributes."
+        if error_type == "ImportError" or error_type == "ModuleNotFoundError":
+            if "not allowed" in error_msg:
+                return "BLOCKED_MODULE", f"Module blocked: {error_msg}. Use only allowed modules."
+            return "IMPORT_ERROR", f"Import failed: {error_msg}"
+        if error_type == "KeyError":
+            return "MISSING_KEY", f"Key not found: {error_msg}. Check available keys."
+        if error_type == "IndexError":
+            return "INDEX_OUT_OF_RANGE", f"Index out of range: {error_msg}. Check bounds."
+        if error_type == "ValueError":
+            if "Private" in error_msg:
+                return "PRIVATE_ACCESS", f"Private access blocked: {error_msg}"
+            return "VALUE_ERROR", f"Value error: {error_msg}"
+        if error_type == "TimeoutError" or "timed out" in error_msg.lower():
+            return "TIMEOUT", f"Code timed out. Optimize or reduce computation."
+        return "RUNTIME_ERROR", f"{error_type}: {error_msg}"
 
     def _sanitize_exception(exc):
         extracted = traceback.extract_tb(exc.__traceback__)
@@ -366,7 +525,28 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         _set_limits(timeout_seconds)
 
         action_results = []
+        max_stdout_chars = 32768
         stdout = io.StringIO()
+        _stdout_len = [0]
+
+        class _BoundedStdout:
+            def write(self, s):
+                remaining = max_stdout_chars - _stdout_len[0]
+                if remaining <= 0:
+                    return len(s)
+                chunk = s[:remaining]
+                stdout.write(chunk)
+                _stdout_len[0] += len(chunk)
+                return len(s)
+            def flush(self):
+                stdout.flush()
+            def getvalue(self):
+                val = stdout.getvalue()
+                if _stdout_len[0] >= max_stdout_chars:
+                    val += "\n... [stdout capped at 32KB]"
+                return val
+
+        bounded_stdout = _BoundedStdout()
         runtime_globals = {
             "__builtins__": {
                 name: getattr(builtins, name)
@@ -424,6 +604,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             confidence=None,
             open_question=None,
             next_test=None,
+            test_action=None,
+            expected_outcome=None,
+            fallback=None,
+            contradictions=None,
         ):
             update = {
                 "goal": goal,
@@ -432,6 +616,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 "confidence": confidence,
                 "open_question": open_question,
                 "next_test": next_test,
+                "test_action": test_action,
+                "expected_outcome": expected_outcome,
+                "fallback": fallback,
+                "contradictions": contradictions,
             }
             _send({"type": "strategy", "update": _json_safe(update)})
             reply = _recv()
@@ -443,27 +631,31 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
         runtime_globals["action"] = action
         runtime_globals["record_strategy"] = record_strategy
+        runtime_globals["grid_utils"] = grid_utils
         _refresh_state(initial.get("state") or {})
 
         try:
             parsed = _validate_user_code(str(initial.get("code", "")))
             compiled = compile(parsed, "<python_tool>", "exec")
-            with contextlib.redirect_stdout(stdout):
+            with contextlib.redirect_stdout(bounded_stdout):
                 exec(compiled, runtime_globals, runtime_globals)
             _send(
                 {
                     "type": "final",
-                    "stdout": stdout.getvalue(),
+                    "stdout": bounded_stdout.getvalue(),
                     "result": _json_safe(runtime_globals.get("result")),
                     "action_results": _json_safe(action_results),
                 }
             )
         except Exception as exc:
+            error_category, error_hint = _classify_error(exc)
             _send(
                 {
                     "type": "error",
                     "error": _sanitize_exception(exc),
-                    "stdout": stdout.getvalue(),
+                    "error_category": error_category,
+                    "error_hint": error_hint,
+                    "stdout": bounded_stdout.getvalue(),
                     "action_results": _json_safe(action_results),
                 }
             )
@@ -476,9 +668,16 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
 
 def _sanitize_host_error_text(text: str) -> str:
-    if not str(text or "").strip():
+    raw = str(text or "").strip()
+    if not raw:
         return "Sandbox process exited unexpectedly."
-    return "Sandbox process exited unexpectedly."
+    cleaned = "".join(ch for ch in raw if ch.isprintable() or ch in "\n\r\t")
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return "Sandbox process exited unexpectedly."
+    if len(cleaned) > 512:
+        cleaned = cleaned[:512] + "..."
+    return cleaned
 
 
 def _sandbox_env() -> dict[str, str]:
@@ -533,7 +732,10 @@ def _sandbox_command() -> tuple[list[str], str | None]:
 
 def _kill_process_group(process: subprocess.Popen[str]) -> None:
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
     except OSError:
         try:
             process.kill()
@@ -616,14 +818,23 @@ def run_sandboxed_python(
         )
 
         deadline = time.monotonic() + max(1, int(timeout_seconds))
+        partial_stdout_lines: list[str] = []
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _kill_process_group(process)
                 _wait_for_process_exit(process)
+                partial_stdout = "".join(partial_stdout_lines)
+                if len(partial_stdout) > 4096:
+                    partial_stdout = partial_stdout[:4096] + "... [truncated]"
+                executed_count = len(host_action_results)
+                attribution = ""
+                if executed_count > 0:
+                    last = host_action_results[-1]
+                    attribution = f" {executed_count} action(s) completed before timeout."
                 return {
-                    "error": f"Tool timed out after {timeout_seconds}s",
-                    "stdout": "",
+                    "error": f"Tool timed out after {timeout_seconds}s.{attribution}",
+                    "stdout": partial_stdout,
                     "action_results": list(host_action_results),
                 }
 
@@ -631,12 +842,17 @@ def run_sandboxed_python(
                 line = stdout_queue.get(timeout=remaining)
             except queue.Empty:
                 continue
+            if line is not None:
+                partial_stdout_lines.append(line)
             if line is None:
                 stderr = process.stderr.read()
                 _wait_for_process_exit(process)
+                partial_stdout = "".join(partial_stdout_lines)
+                if len(partial_stdout) > 4096:
+                    partial_stdout = partial_stdout[:4096] + "... [truncated]"
                 return {
                     "error": _sanitize_host_error_text(stderr),
-                    "stdout": "",
+                    "stdout": partial_stdout,
                     "action_results": list(host_action_results),
                 }
 
@@ -646,9 +862,12 @@ def run_sandboxed_python(
                 stderr = process.stderr.read()
                 _kill_process_group(process)
                 _wait_for_process_exit(process)
+                partial_stdout = "".join(partial_stdout_lines)
+                if len(partial_stdout) > 4096:
+                    partial_stdout = partial_stdout[:4096] + "... [truncated]"
                 return {
                     "error": "Sandbox process returned an invalid response.",
-                    "stdout": "",
+                    "stdout": partial_stdout,
                     "action_results": list(host_action_results),
                 }
 
@@ -656,12 +875,12 @@ def run_sandboxed_python(
             if msg_type == "action":
                 try:
                     action_result_payload = action_handler(list(message.get("actions") or []))
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
                     _send_json_line(
                         process.stdin,
                         {
                             "type": "action_error",
-                            "error": "action failed in sandbox host.",
+                            "error": f"action failed: {type(exc).__name__}: {exc}",
                         },
                     )
                     continue
@@ -680,7 +899,10 @@ def run_sandboxed_python(
 
             if msg_type == "strategy":
                 if strategy_handler is None:
-                    persisted_strategy: dict[str, Any] = {}
+                    persisted_strategy: dict[str, Any] = {
+                        "_feedback": "no_strategy_handler",
+                        "_warning": "strategy updates are not supported in this sandbox",
+                    }
                 else:
                     try:
                         persisted_strategy = strategy_handler(
@@ -700,13 +922,17 @@ def run_sandboxed_python(
 
             if msg_type in {"final", "error"}:
                 _wait_for_process_exit(process)
-                return {
+                result = {
                     "stdout": str(message.get("stdout", "") or ""),
                     "result": message.get("result"),
                     "error": str(message.get("error", "") or ""),
                     "action_results": list(message.get("action_results") or host_action_results),
                     "strategy_updates": list(host_strategy_updates),
                 }
+                if msg_type == "error":
+                    result["error_category"] = str(message.get("error_category", "") or "")
+                    result["error_hint"] = str(message.get("error_hint", "") or "")
+                return result
 
             _wait_for_process_exit(process)
             return {

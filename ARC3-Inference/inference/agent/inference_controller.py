@@ -215,6 +215,27 @@ def _cycle_period(state_ids: list[str], max_period: int) -> int | None:
     return None
 
 
+def _deep_cycle_detection(state_ids: list[str], max_period: int) -> dict[str, Any]:
+    """Detect cycles via tail repetition AND subsequence occurrence patterns."""
+    tail_cycle = _cycle_period(state_ids, max_period)
+    if tail_cycle is not None:
+        return {"detected": True, "period": tail_cycle, "confidence": 1.0, "method": "tail"}
+    if len(state_ids) < 6:
+        return {"detected": False, "period": None, "confidence": 0.0, "method": "none"}
+    for period in range(2, min(max_period + 1, len(state_ids) // 3 + 1)):
+        candidate = state_ids[-period:]
+        occurrences = 0
+        last_seen_at = -1
+        for i in range(len(state_ids) - period, -1, -period):
+            if state_ids[i:i + period] == candidate:
+                occurrences += 1
+                last_seen_at = i
+        if occurrences >= 2:
+            confidence = min(1.0, 0.5 + 0.15 * occurrences)
+            return {"detected": True, "period": period, "confidence": confidence, "method": "subsequence"}
+    return {"detected": False, "period": None, "confidence": 0.0, "method": "none"}
+
+
 def _stagnation_count(transitions: list[dict[str, Any]], *, behavioral: bool = False) -> int:
     before_key = "behavioral_before_state_id" if behavioral else "before_state_id"
     after_key = "behavioral_after_state_id" if behavioral else "after_state_id"
@@ -276,12 +297,14 @@ def _rank_actions(
 ) -> list[dict[str, Any]]:
     local: dict[str, Counter[str]] = {}
     global_progress: Counter[str] = Counter()
+    global_trials: Counter[str] = Counter()
     recent_behavioral = {
         str(item["behavioral_after_state_id"]) for item in transitions[-config.cycle_window :]
     }
     cycle_returns: Counter[str] = Counter()
     for item in transitions:
         family = str(item["action_family"])
+        global_trials[family] += 1
         if item["outcome_class"] == "level_progress":
             global_progress[family] += 1
         if item["behavioral_before_state_id"] != current_behavioral_id:
@@ -292,7 +315,8 @@ def _rank_actions(
         if item["behavioral_after_state_id"] in recent_behavioral:
             cycle_returns[family] += 1
 
-    ranked: list[tuple[tuple[int, int, int, int, int], dict[str, Any]]] = []
+    families_seen = set()
+    ranked: list[tuple[tuple[int, int, int, int, int, float], dict[str, Any]]] = []
     for valid_index, action in enumerate(valid_actions):
         family = action_family(action)
         stats = local.get(family, Counter())
@@ -314,6 +338,10 @@ def _rank_actions(
             priority, reason = 3, "changes state but may revisit known territory"
         else:
             priority, reason = 4, "previous trials were no-op or cycle-prone"
+        gt = int(global_trials[family])
+        success_rate = round(int(global_progress[family]) / gt, 3) if gt else 0.0
+        diversity_bonus = 0.0 if family in families_seen else -0.1
+        families_seen.add(family)
         payload = {
             "action": family,
             "priority": priority,
@@ -324,9 +352,10 @@ def _rank_actions(
             "no_ops": noops,
             "cycle_risk": bool(cycle_risk),
             "parameterized": parameterized,
+            "global_success_rate": success_rate,
             "reason": reason,
         }
-        ranked.append(((priority, trials, -int(global_progress[family]), -novel, valid_index), payload))
+        ranked.append(((priority, trials, -int(global_progress[family]), -novel, valid_index, diversity_bonus), payload))
     ranked.sort(key=lambda item: item[0])
     return [payload for _, payload in ranked[:6]]
 
@@ -378,11 +407,43 @@ def _transition_models_here(
             str(model["action"]),
         )
     )
-    return models[:6]
+
+    chain_predictions: list[dict[str, Any]] = []
+    deterministic_models = [m for m in models if m["verified_deterministic"] and m["predicted_behavioral_state_id"]]
+    if deterministic_models:
+        second_step: dict[str, list[dict[str, Any]]] = {}
+        for item in transitions:
+            mid = item["behavioral_before_state_id"]
+            if mid == current_behavioral_id:
+                continue
+            for dm in deterministic_models:
+                if dm["predicted_behavioral_state_id"] == mid:
+                    second_step.setdefault(dm["action"], []).append(item)
+        for dm in deterministic_models:
+            follow_ups = second_step.get(dm["action"], [])
+            if not follow_ups:
+                continue
+            follow_counter: Counter[str] = Counter()
+            for fu in follow_ups:
+                follow_counter[str(fu["action_family"])] += 1
+            if follow_counter:
+                best_follow, follow_count = follow_counter.most_common(1)[0]
+                total = sum(follow_counter.values())
+                chain_predictions.append({
+                    "first_action": dm["action"],
+                    "second_action": best_follow,
+                    "chain_confidence": round(follow_count / total, 3),
+                    "chain_trials": total,
+                    "note": f"if '{dm['action']}' reaches {dm['predicted_behavioral_state_id'][:8]}, '{best_follow}' is the most likely next step",
+                })
+    chain_predictions.sort(key=lambda c: (-c["chain_trials"], c["first_action"]))
+
+    return models[:6], chain_predictions[:4]
 
 
 def build_experience_snapshot(
-    history: list[HistoryEntry], current_frame: Frame | None, valid_actions: Iterable[str], config: InferenceControllerConfig
+    history: list[HistoryEntry], current_frame: Frame | None, valid_actions: Iterable[str], config: InferenceControllerConfig,
+    strategy_confidence: float = 1.0,
 ) -> dict[str, Any]:
     masked_cells = _volatile_cells(history, current_frame, config)
     transitions = _transitions(history, masked_cells)
@@ -399,7 +460,8 @@ def build_experience_snapshot(
     no_op_streak = _no_op_streak(transitions)
     behavioral_no_op_streak = _no_op_streak(transitions, behavioral=True)
     stagnation = _stagnation_count(transitions, behavioral=config.outcome_aware)
-    cycle_period = _cycle_period(active_ids, config.cycle_window)
+    cycle_info = _deep_cycle_detection(active_ids, config.cycle_window)
+    cycle_period = cycle_info["period"]
 
     tried: dict[str, dict[str, int]] = {}
     for item in transitions:
@@ -448,23 +510,37 @@ def build_experience_snapshot(
     else:
         phase = "explore"
     ranked_actions = _rank_actions(transitions, behavioral_id, normalized_valid, config) if config.outcome_aware else []
-    transition_models = (
+    transition_models, chain_predictions = (
         _transition_models_here(transitions, behavioral_id)
         if config.outcome_aware
-        else []
+        else ([], [])
     )
     model_conflicts = sum(
-        int(model["contradictions"] > 0) for model in transition_models
+        int(model.get("contradictions", 0) > 0) for model in transition_models if isinstance(model, dict) and "contradictions" in model
     )
     if model_conflicts and "transition_model_conflict" not in recovery_reasons:
         recovery_reasons.append("transition_model_conflict")
         phase = "recover"
-    action_budget = {
+    base_budget = {
         "orient": config.orient_action_budget,
         "explore": config.explore_action_budget,
         "recover": config.recover_action_budget,
         "progress": config.progress_action_budget,
     }.get(phase, 1)
+    action_budget = base_budget
+    if phase in ("explore", "orient") and config.outcome_aware:
+        recent_novel = sum(
+            1 for item in transitions[-4:] if item["outcome_class"] in ("novel", "level_progress")
+        )
+        if recent_novel >= 2 and base_budget < 3:
+            action_budget = base_budget + 1
+    if phase in ("orient", "explore", "recover") and strategy_confidence < 0.3:
+        if action_budget < 3:
+            action_budget = action_budget + 1
+    if phase == "recover" and config.outcome_aware:
+        has_chains = bool(chain_predictions)
+        if has_chains and base_budget < 2:
+            action_budget = base_budget + 1
     return {
         "enabled": config.enabled,
         "policy": _normalize_policy(config.policy),
@@ -482,6 +558,8 @@ def build_experience_snapshot(
         "behavioral_no_op_streak": behavioral_no_op_streak,
         "stagnation_actions": stagnation,
         "cycle_period": cycle_period,
+        "cycle_confidence": cycle_info.get("confidence", 0.0),
+        "cycle_method": cycle_info.get("method", "none"),
         "latest_outcome": latest_outcome,
         "recovery_reasons": recovery_reasons,
         "tried_here": tried,
@@ -489,6 +567,7 @@ def build_experience_snapshot(
         "discouraged_actions": discouraged,
         "ranked_actions": ranked_actions,
         "transition_models_here": transition_models,
+        "chain_predictions": chain_predictions,
         "model_conflicts_here": model_conflicts,
         "recent_transitions": transitions[-config.recent_transition_limit :],
     }
@@ -500,17 +579,28 @@ def transition_metadata(
     prior_history: list[HistoryEntry],
     action: str,
     config: InferenceControllerConfig,
+    valid_actions: list[str] | None = None,
 ) -> dict[str, Any]:
     before_id = frame_fingerprint(before)
     after_id = frame_fingerprint(after)
     known_states = {frame_fingerprint(entry.frame) for entry in prior_history}
+    executed_family = action_family(action)
+    candidate_actions = valid_actions or [executed_family]
     before_snapshot = build_experience_snapshot(
-        prior_history, before, [action_family(action)], config
+        prior_history, before, candidate_actions, config
     )
     provisional_history = [*prior_history, HistoryEntry(action=action, frame=after)]
     snapshot = build_experience_snapshot(provisional_history, after, [action_family(action)], config)
     transition = snapshot["recent_transitions"][-1]
     ranking = before_snapshot["ranked_actions"]
+    ranked_action = next(
+        (
+            (rank, item)
+            for rank, item in enumerate(ranking, start=1)
+            if item["action"] == executed_family
+        ),
+        None,
+    )
     return {
         "before_state_id": before_id,
         "after_state_id": after_id,
@@ -521,12 +611,30 @@ def transition_metadata(
         "loop_detected": snapshot["cycle_period"] is not None,
         "cycle_risk": snapshot["cycle_period"] is not None,
         "cycle_period": snapshot["cycle_period"],
+        "cycle_confidence": snapshot.get("cycle_confidence", 0.0),
         "controller_policy": snapshot["policy"],
         "controller_phase": snapshot["phase"],
         "controller_reason_codes": list(snapshot["recovery_reasons"]),
-        "action_rank": 1 if ranking else None,
-        "action_rank_reason": ranking[0]["reason"] if ranking else None,
+        "action_rank": ranked_action[0] if ranked_action else None,
+        "action_rank_reason": ranked_action[1]["reason"] if ranked_action else None,
         "no_op_streak": snapshot["no_op_streak"],
         "behavioral_no_op_streak": snapshot["behavioral_no_op_streak"],
         "stagnation_actions": snapshot["stagnation_actions"],
     }
+
+
+def evaluate_outcome_match(expected: str, payload: dict[str, Any]) -> str:
+    """Evaluate whether a payload matches an expected outcome class."""
+    if not payload.get("executed") or expected == "unknown":
+        return "inconclusive"
+    matched = {
+        "no_change": not bool(payload.get("board_changed")),
+        "state_change": bool(payload.get("board_changed")),
+        "new_state": bool(payload.get("novel_state")),
+        "level_progress": bool(
+            payload.get("level_completed")
+            or payload.get("run_complete")
+            or float(payload.get("reward") or 0.0) > 0.0
+        ),
+    }.get(expected)
+    return "supported" if matched else "contradicted"

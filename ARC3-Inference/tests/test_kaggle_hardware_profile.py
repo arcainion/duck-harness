@@ -13,6 +13,7 @@ from inference.framework.kaggle import (
     duck_kaggle_setup_command,
     duck_kaggle_vllm_config_for_accelerator,
 )
+from inference.framework.solver import HarnessSolver
 
 
 class KaggleHardwareProfileTests(TestCase):
@@ -55,6 +56,21 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("VLLM_TENSOR_PARALLEL_SIZE = 1", command)
         self.assertIn("EXPECTED_GPU_TYPE = 'rtx-pro-6000'", command)
         self.assertIn("EXPECTED_GPU_COUNT = 1", command)
+
+    def test_solver_wires_resolved_accelerator_profile_into_setup_command(self) -> None:
+        config = duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
+        solver = HarnessSolver(
+            kaggle_vllm_max_model_len=config.max_model_len,
+            kaggle_vllm_tensor_parallel_size=config.tensor_parallel_size,
+            kaggle_expected_gpu_type=config.expected_gpu_type,
+            kaggle_expected_gpu_count=config.expected_gpu_count,
+        )
+
+        command = solver.kaggle_setup_commands[0]
+        self.assertIn("VLLM_MAX_MODEL_LEN = 8192", command)
+        self.assertIn("VLLM_TENSOR_PARALLEL_SIZE = 2", command)
+        self.assertIn("EXPECTED_GPU_TYPE = 't4'", command)
+        self.assertIn("EXPECTED_GPU_COUNT = 2", command)
 
     def test_setup_detects_server_exit_and_emits_complete_log(self) -> None:
         command = duck_kaggle_setup_command(

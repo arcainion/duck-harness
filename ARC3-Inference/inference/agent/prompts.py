@@ -22,7 +22,7 @@ GAME_OVERVIEW_ADDENDUM = (
 VISUAL_GAME_ADDENDUM = (
     "\n\nVisual-game guidance:\n"
     "- Treat each board as a scene with objects, blockers, targets, adjacency, containment, motion, and symmetry.\n"
-    "- Game entities are usually be rendered as connected multi-tile shapes such as 2×2, 2×3, 3×3, or longer patterned structures. Sometime they might also be 1x1 tokens."
+    "- Game entities are usually rendered as connected multi-tile shapes such as 2×2, 2×3, 3×3, or longer patterned structures. Sometimes they might also be 1x1 tokens.\n"
     "- Some games are logic or layout puzzles with no explicit player avatar or controllable sprite on the board. Do not assume a player exists; the relevant state may be an object, region, cursor, selector, or whole-board configuration.\n"
     "- Background colors are often white or gray/black-ish large regions, but not always. Verify background hypotheses by area, stability, and object boundaries rather than assuming them.\n"
     "- In many games, a long horizontal or vertical line near an edge is a timer or remaining-steps bar. It often shrinks or changes each step. If you identify such a bar, do not get distracted by it or treat it as core gameplay state unless there is concrete evidence that it interacts with the puzzle mechanics.\n"
@@ -46,7 +46,7 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- `current_frame.step` is the current environment step count.\n"
     "- `current_frame.level` is the current level number.\n"
     "- `current_frame.shape` is a `(rows, cols)` tuple.\n"
-    "- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.\n"
+    "- The raw numeric grid is available as `current_frame._grid` but is intentionally discouraged. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.\n"
 
     "- `history` is a chronological list of action/frame snapshots.\n"
     "- `history` is a Python list of objects, not a dict.\n"
@@ -103,6 +103,11 @@ PYTHON_ADDENDUM = (
     "- `action(...)` accepts an ordered list of 1-12 actions. Batch only a short sequence whose effects are supported by evidence; otherwise use a single probe so outcomes remain attributable.\n"
     "- You can also call `action(...)` multiple times in one Python snippet, including inside loops. Each call updates the preloaded variables before execution continues.\n"
     "- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.\n"
+    "- IMPORTANT: If your Python code raises an exception or produces an error, simplify it drastically. Do not retry the same failing code. Strip all non-essential logic, use the simplest possible approach, and call `action(...)` directly with the best guess. Do not spend another tool call debugging.\n"
+    "- IMPORTANT: Only access variables that are listed in the runtime variables section above (`current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, `last_action_result`, `experience`, `strategy`, `record_strategy`, `action`). Accessing any variable not listed will raise a NameError and waste a tool call.\n"
+    "- If you lose track of where you are or what the goal is, discard your current world model and start fresh from `current_frame` and `experience`. Do not accumulate stale beliefs.\n"
+    "- When you complete a level and move to the next, check `experience['recent_transitions']` and `experience['tried_here']` for evidence of what worked in previous levels. Successful strategies often transfer: if mouse coordinates, pathfinding heuristics, or object interactions solved the prior level, try them first on the new layout.\n"
+    "- `grid_utils` provides helper methods: `diff_frames(f1, f2)` returns changed/appeared/disappeared cells; `get_cell(frame, r, c)` returns cell color; `set_cell(frame, r, c, val)` sets a cell; `neighbors(pos, shape)` returns adjacent positions; `find_color(frame, char)` returns positions of a color; `flood_fill(frame, start)` returns connected region; `bfs_path(frame, start, goal)` returns shortest path.\n"
 )
 
 COMPACT_TOOL_SESSION_ADDENDUM = (
@@ -116,4 +121,6 @@ COMPACT_TOOL_SESSION_ADDENDUM = (
     "- Each `python` tool call has a hard time limit of 30 seconds.\n"
     "- Tool responses are capped to about {tool_output_tokens} tokens. If a response is cut off, the tool result will tell you that.\n"
     "- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.\n"
+    "- If `last_action_result` shows `run_complete=True`, `level_completed=True`, `game_over=True`, or `done=True`, do NOT call `action(...)` again. Instead, print a brief summary of what happened and return. The next turn will re-ground you on the updated state.\n"
+    "- If you have called `action(...)` and it succeeded, and your code has already determined the next best action, call `action(...)` again in the same snippet to save a turn. But stop the loop immediately if any result reports completion.\n"
 )

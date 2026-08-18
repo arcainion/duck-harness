@@ -9,6 +9,11 @@ ARC_COLOR_LEGEND = (
     "M=magenta, P=pink, R=red, b=blue, S=sky blue, Y=yellow, O=orange, "
     "r=dark red, N=light green, p=purple"
 )
+ARC_COLOR_NAMES = [
+    "white", "light gray", "gray", "dark gray", "charcoal", "black",
+    "magenta", "pink", "red", "blue", "sky blue", "yellow", "orange",
+    "dark red", "light green", "purple",
+]
 
 
 def format_grid_ascii(grid: Sequence[Sequence[int]]) -> str:

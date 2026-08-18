@@ -75,8 +75,8 @@ class SolverControllerTests(TestCase):
         self.assertEqual(
             summary["dominant_color_transitions"],
             [
-                {"from": "W", "to": "w", "count": 1},
-                {"from": "w", "to": "W", "count": 1},
+                {"from": "white (W)", "to": "light gray (w)", "count": 1},
+                {"from": "light gray (w)", "to": "white (W)", "count": 1},
             ],
         )
 

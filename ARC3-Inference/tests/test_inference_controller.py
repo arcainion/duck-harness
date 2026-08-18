@@ -249,6 +249,34 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(metadata["controller_policy"], OUTCOME_AWARE_POLICY)
         self.assertEqual(metadata["action_rank"], 1)
 
+    def test_outcome_metadata_reports_executed_action_rank(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            same_state_noop_limit=2,
+        )
+        state = _frame(1, step=0)
+        history = [
+            HistoryEntry(action="", frame=state),
+            HistoryEntry(action="RIGHT", frame=_frame(1, step=1)),
+            HistoryEntry(action="RIGHT", frame=_frame(1, step=2)),
+        ]
+
+        metadata = transition_metadata(
+            state,
+            _frame(1, step=3),
+            history,
+            "RIGHT",
+            config,
+            ["LEFT", "RIGHT"],
+        )
+
+        self.assertEqual(metadata["action_rank"], 2)
+        self.assertEqual(
+            metadata["action_rank_reason"],
+            "previous trials were no-op or cycle-prone",
+        )
+
     def test_progress_phase_allows_only_a_short_confirmed_batch(self) -> None:
         config = InferenceControllerConfig(
             enabled=True,

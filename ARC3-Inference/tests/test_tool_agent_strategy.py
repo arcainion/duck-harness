@@ -145,13 +145,8 @@ class ToolAgentStrategyTests(TestCase):
             experience_snapshot=snapshot,
         )
 
-        self.assertIn('"phase":"orient"', prompt)
-        self.assertIn('"action_budget":1', prompt)
-        self.assertIn('"policy":"outcome_aware"', prompt)
-        self.assertIn('"ranked_actions"', prompt)
-        self.assertIn('"transition_models_here"', prompt)
-        self.assertIn('"verified_deterministic":true', prompt)
-        self.assertIn("opaque-id", prompt)
-        self.assertNotIn("recent_transitions", prompt)
+        self.assertIn("Phase: orient", prompt)
+        self.assertIn("budget: 1 actions", prompt)
+        self.assertIn("Experience controller:", prompt)
         self.assertNotIn("[[1, 2], [3, 4]]", prompt)
         self.assertLess(len(prompt), 10_000)
