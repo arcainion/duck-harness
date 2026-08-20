@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import json
 from unittest import TestCase
+from unittest.mock import patch
 
+import inference.agent.python_tool_sandbox as sandbox_module
 from inference.agent.python_tool_sandbox import run_sandboxed_python
 
 
@@ -53,9 +54,61 @@ class PythonToolSandboxTests(TestCase):
         self.assertEqual(response["error"], "")
         self.assertEqual(response["result"], 10)
 
+    def test_runtime_error_reports_innermost_user_source_line(self) -> None:
+        response = _run("def fail():\n    missing_name()\nfail()")
+        self.assertEqual(response["error_category"], "UNDEFINED_VARIABLE")
+        self.assertEqual(response["error_line"], 2)
+
     def test_sandbox_rejects_object_graph_escape(self) -> None:
         response = _run("result = ().__class__.__base__.__subclasses__()")
         self.assertIn("Private attribute access is not allowed", response["error"])
+
+    def test_sandbox_rejects_runtime_binding_shadowing(self) -> None:
+        cases = (
+            "current_frame = None",
+            "def action():\n    pass",
+            "def helper(history):\n    pass",
+            "import math as bfs",
+        )
+        for code in cases:
+            with self.subTest(code=code):
+                response = _run(code)
+                self.assertEqual(
+                    response["error_category"],
+                    "PROTECTED_RUNTIME_BINDING",
+                )
+                self.assertIn("cannot be overwritten", response["error"])
+
+    def test_sandbox_rejects_operator_attrgetter_dunder_escape(self) -> None:
+        response = _run('import operator\nresult = operator.attrgetter("__class__")(1)')
+        self.assertEqual(response["error_category"], "PRIVATE_ACCESS")
+        self.assertIn("operator.attrgetter", response["error"])
+
+    def test_sandbox_rejects_operator_methodcaller_dunder_escape(self) -> None:
+        response = _run('import operator\nresult = operator.methodcaller("__reduce__")(1)')
+        self.assertEqual(response["error_category"], "PRIVATE_ACCESS")
+        self.assertIn("operator.methodcaller", response["error"])
+
+    def test_sandbox_rejects_from_import_of_dynamic_attribute_helper(self) -> None:
+        response = _run('from operator import attrgetter\nresult = attrgetter("__class__")(1)')
+        self.assertEqual(response["error_category"], "PRIVATE_ACCESS")
+
+    def test_safe_operator_functions_remain_available(self) -> None:
+        response = _run("import operator\nresult = operator.add(2, 3)")
+        self.assertEqual(response["error"], "")
+        self.assertEqual(response["result"], 5)
+
+    def test_sandbox_rejects_string_formatter_dunder_escape(self) -> None:
+        response = _run(
+            'import string\nresult = string.Formatter().get_field("0.__class__", [1], {})'
+        )
+        self.assertEqual(response["error_category"], "PRIVATE_ACCESS")
+        self.assertIn("string.Formatter", response["error"])
+
+    def test_sandbox_rejects_str_format_private_resolution(self) -> None:
+        response = _run('result = "{0.__class__}".format(1)')
+        self.assertEqual(response["error_category"], "PRIVATE_ACCESS")
+        self.assertIn("dynamic attribute resolution", response["error"])
 
     def test_sandbox_rejects_private_from_import(self) -> None:
         response = _run("from random import _os as host_os\nresult = host_os.getcwd()")
@@ -114,9 +167,7 @@ class SandboxPreInjectedHelpersTests(TestCase):
         self.assertEqual(len(response["result"][0]), 3)
 
     def test_diff_frames_detects_changes(self) -> None:
-        grid1 = [[1, 1], [1, 1]]
         grid2 = [[1, 2], [1, 1]]
-        frame1 = _make_frame_payload(grid1)
         frame2 = _make_frame_payload(grid2)
         state = {
             "current_frame": frame2,
@@ -282,10 +333,52 @@ class SandboxEdgeCaseTests(TestCase):
 
     def test_timeout_returns_error(self) -> None:
         response = _run(
-            "import time\ntime.sleep(10)",
+            "while True:\n    pass",
             timeout_seconds=1,
         )
-        self.assertIn("error", response["error"].lower())
+        self.assertIn("timed out", response["error"].lower())
+        self.assertEqual(response["error_category"], "TIMEOUT")
+
+    def test_process_start_failure_is_structured(self) -> None:
+        with patch("inference.agent.python_tool_sandbox.subprocess.Popen", side_effect=OSError("boom")):
+            response = _run("pass")
+        self.assertEqual(response["error_category"], "SANDBOX_START_FAILED")
+        self.assertIn("could not start", response["error"])
+
+    def test_initial_payload_failure_is_structured(self) -> None:
+        with patch("inference.agent.python_tool_sandbox._send_json_line", side_effect=BrokenPipeError):
+            response = _run("pass")
+        self.assertEqual(response["error_category"], "SANDBOX_PROTOCOL_ERROR")
+
+    def test_unserializable_initial_payload_is_structured(self) -> None:
+        response = _run("pass", initial_state={"bad": object()})
+        self.assertEqual(response["error_category"], "SANDBOX_PROTOCOL_ERROR")
+        self.assertIn("initial payload", response["error"])
+
+    def test_action_result_protocol_write_failure_is_structured(self) -> None:
+        original_send = sandbox_module._send_json_line
+        send_count = 0
+
+        def fail_second_send(handle, payload):
+            nonlocal send_count
+            send_count += 1
+            if send_count == 2:
+                raise BrokenPipeError
+            return original_send(handle, payload)
+
+        def handler(actions):
+            return {
+                "action_result": {"executed": True},
+                "state": {},
+            }
+        with patch(
+            "inference.agent.python_tool_sandbox._send_json_line",
+            side_effect=fail_second_send,
+        ):
+            response = _run("action(['LEFT'])", action_handler=handler)
+        self.assertEqual(response["error_category"], "SANDBOX_PROTOCOL_ERROR")
+        self.assertIn("action result", response["error"])
+        self.assertEqual(len(response["action_results"]), 1)
 
     def test_action_handler_is_called(self) -> None:
         calls = []
@@ -305,6 +398,21 @@ class SandboxEdgeCaseTests(TestCase):
         self.assertTrue(response["result"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0], [{"action": "LEFT"}])
+
+    def test_action_batch_limit_is_enforced_before_host_ipc(self) -> None:
+        calls = []
+
+        def handler(actions):
+            calls.append(actions)
+            return {"action_result": {}, "state": {}}
+
+        response = _run(
+            "action(['LEFT'] * 13)",
+            action_handler=handler,
+        )
+        self.assertEqual(response["error_category"], "ACTION_BATCH_LIMIT")
+        self.assertIn("at most 12", response["error_hint"])
+        self.assertEqual(calls, [])
 
     def test_action_with_dict_format(self) -> None:
         calls = []
@@ -332,7 +440,7 @@ class SandboxEdgeCaseTests(TestCase):
             call_count[0] += 1
             return {"action_result": {"executed": True}, "state": {}}
 
-        response = _run(
+        _run(
             "r1 = action(['LEFT'])\nr2 = action(['RIGHT'])\nresult = call_count",
             action_handler=handler,
         )
@@ -353,6 +461,17 @@ class SandboxEdgeCaseTests(TestCase):
         self.assertEqual(response["error"], "")
         self.assertIn("line1", response["stdout"])
         self.assertIn("line2", response["stdout"])
+
+    def test_exact_stdout_limit_is_not_reported_as_truncated(self) -> None:
+        response = _run("print('x' * 32767)")
+        self.assertEqual(response["error"], "")
+        self.assertEqual(len(response["stdout"]), 32768)
+        self.assertNotIn("stdout capped", response["stdout"])
+
+    def test_stdout_over_limit_is_capped(self) -> None:
+        response = _run("print('x' * 32768)")
+        self.assertEqual(response["error"], "")
+        self.assertIn("stdout capped at 32KB", response["stdout"])
 
     def test_builtins_are_available(self) -> None:
         response = _run("result = [len([1,2,3]), max([1,5,3]), min([1,5,3]), sorted([3,1,2])]")
@@ -555,11 +674,42 @@ class SandboxEdgeCaseTests(TestCase):
         def handler(actions):
             return "not a dict"
 
-        with self.assertRaises(AttributeError):
-            _run(
-                "action(['LEFT'])",
-                action_handler=handler,
-            )
+        response = _run(
+            "action(['LEFT'])",
+            action_handler=handler,
+        )
+        self.assertEqual(response["error_category"], "ACTION_FAILED")
+        self.assertIn("action failed", response["error"].lower())
+
+    def test_action_invalid_nested_payload_is_structured(self) -> None:
+        response = _run(
+            "action(['LEFT'])",
+            action_handler=lambda actions: {"action_result": "invalid", "state": {}},
+        )
+        self.assertEqual(response["error_category"], "ACTION_FAILED")
+
+    def test_action_falsy_non_dict_nested_payloads_are_rejected(self) -> None:
+        cases = (
+            {"action_result": [], "state": {}},
+            {"action_result": False, "state": {}},
+            {"action_result": {}, "state": []},
+            {"action_result": {}, "state": ""},
+        )
+        for handler_result in cases:
+            with self.subTest(handler_result=handler_result):
+                response = _run(
+                    "action(['LEFT'])",
+                    action_handler=lambda actions, value=handler_result: value,
+                )
+                self.assertEqual(response["error_category"], "ACTION_FAILED")
+
+    def test_non_dict_strategy_response_does_not_crash_host(self) -> None:
+        response = _run(
+            "record_strategy(goal='test')\nresult = strategy",
+            strategy_handler=lambda update: "invalid",
+        )
+        self.assertEqual(response["error"], "")
+        self.assertEqual(response["result"], {})
 
     def test_bfs_same_start_and_goal(self) -> None:
         grid = [[0, 0], [0, 0]]
@@ -593,6 +743,11 @@ class SandboxEdgeCaseTests(TestCase):
         self.assertEqual(response["error"], "")
         self.assertEqual(response["result"], "日本語: 🎮")
 
+    def test_unpaired_surrogate_result_does_not_break_protocol(self) -> None:
+        response = _run("result = chr(55296)")
+        self.assertEqual(response["error"], "")
+        self.assertEqual(response["result"], "\ud800")
+
     def test_unicode_in_frame_grid(self) -> None:
         grid = [[1, 2], [3, 4]]
         response = _run_with_frame(
@@ -607,6 +762,24 @@ class SandboxEdgeCaseTests(TestCase):
         response = _run(f"result = {large_dict}")
         self.assertEqual(response["error"], "")
         self.assertEqual(len(response["result"]), 1000)
+
+    def test_result_is_bounded_before_crossing_sandbox_ipc(self) -> None:
+        response = _run("result = ['x' * 1000 for item in range(1000)]")
+        self.assertEqual(response["error"], "")
+        self.assertTrue(response["result_truncated"])
+        self.assertLess(len(str(response["result"])), 50_000)
+
+    def test_cyclic_result_is_bounded_instead_of_failing(self) -> None:
+        response = _run("result = []\nresult.append(result)")
+        self.assertEqual(response["error"], "")
+        self.assertTrue(response["result_truncated"])
+        self.assertEqual(response["result"], ["... [cycle]"])
+
+    def test_non_finite_result_numbers_are_json_safe(self) -> None:
+        response = _run("import math\nresult = [math.nan, math.inf, -math.inf]")
+        self.assertEqual(response["error"], "")
+        self.assertTrue(response["result_truncated"])
+        self.assertEqual(response["result"], ["nan", "inf", "-inf"])
 
     def test_deeply_nested_result(self) -> None:
         nested = {"a": {"b": {"c": {"d": [1, 2, 3]}}}}

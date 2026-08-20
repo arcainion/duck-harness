@@ -225,11 +225,9 @@ def _deep_cycle_detection(state_ids: list[str], max_period: int) -> dict[str, An
     for period in range(2, min(max_period + 1, len(state_ids) // 3 + 1)):
         candidate = state_ids[-period:]
         occurrences = 0
-        last_seen_at = -1
         for i in range(len(state_ids) - period, -1, -period):
             if state_ids[i:i + period] == candidate:
                 occurrences += 1
-                last_seen_at = i
         if occurrences >= 2:
             confidence = min(1.0, 0.5 + 0.15 * occurrences)
             return {"detected": True, "period": period, "confidence": confidence, "method": "subsequence"}
@@ -637,4 +635,6 @@ def evaluate_outcome_match(expected: str, payload: dict[str, Any]) -> str:
             or float(payload.get("reward") or 0.0) > 0.0
         ),
     }.get(expected)
+    if matched is None:
+        return "inconclusive"
     return "supported" if matched else "contradicted"

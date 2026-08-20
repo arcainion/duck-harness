@@ -9,9 +9,13 @@ from unittest.mock import patch
 from inference.agent.program_ir import (
     COMPILER_VERSION,
     MAX_COMPILER_DIAGNOSTICS,
+    MAX_CONTAINER_ITEMS,
+    MAX_INTEGER_BITS,
     MAX_IR_DEPTH,
     MAX_IR_NODES,
     MAX_PROGRAM_CHARS,
+    MAX_RAW_PAYLOAD_DEPTH,
+    MAX_RAW_PAYLOAD_VALUES,
     ProgramCompileError,
     compile_program,
     program_tool_parameters_schema,
@@ -57,6 +61,21 @@ class ProgramIRCompilerTests(unittest.TestCase):
         self.assertEqual(len(compiled.metadata()["program_sha256"]), 64)
         self.assertEqual(len(compiled.metadata()["source_sha256"]), 64)
         self.assertRegex(compiled.metadata()["python_version"], r"^\d+\.\d+\.\d+")
+
+    def test_generated_lines_map_to_nested_ir_statement_paths(self) -> None:
+        compiled = compile_program(program({
+            "kind": "function_def",
+            "name": "fail",
+            "body": [
+                {"kind": "assign", "targets": [target("value")], "value": const(1)},
+                {"kind": "expr", "value": call("missing")},
+            ],
+        }))
+        self.assertEqual(compiled.path_for_line(1), "program.body.0")
+        self.assertEqual(compiled.path_for_line(2), "program.body.0.body.0")
+        self.assertEqual(compiled.path_for_line(3), "program.body.0.body.1")
+        self.assertIsNone(compiled.path_for_line(99))
+        self.assertEqual(compiled.metadata()["source_map_entries"], 3)
 
     def test_collections_subscripts_slice_and_operators(self) -> None:
         compiled = compile_program(program(
@@ -266,12 +285,18 @@ class ProgramIRCompilerTests(unittest.TestCase):
         self.assertEqual(captured.exception.diagnostics[0].code, "IR_INVALID_VALUE")
         self.assertEqual(captured.exception.diagnostics[0].path, "program.body.0.names.0.name")
 
-    def test_regular_import_still_allows_dotted_module(self) -> None:
-        compiled = compile_program(program({
-            "kind": "import",
-            "names": [{"name": "collections.abc", "asname": "abc"}],
-        }))
-        self.assertEqual(compiled.source, "import collections.abc as abc\n")
+    def test_unlisted_dotted_module_is_rejected_by_safety_policy(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({
+                "kind": "import",
+                "names": [{"name": "collections.abc", "asname": "abc"}],
+            }))
+        self.assertEqual(captured.exception.stage, "safety")
+        self.assertEqual(captured.exception.diagnostics[0].code, "IR_BLOCKED_MODULE")
+        self.assertEqual(
+            captured.exception.diagnostics[0].path,
+            "program.body.0.names.0.name",
+        )
 
     def test_invalid_identifier_and_compare_shape_have_paths(self) -> None:
         with self.assertRaises(ProgramCompileError) as captured:
@@ -344,6 +369,13 @@ class ProgramIRCompilerTests(unittest.TestCase):
                 compile_program(program({"kind": "expr", "value": const(value)}))
             self.assertEqual(captured.exception.diagnostics[0].code, "IR_INVALID_VALUE")
             self.assertEqual(captured.exception.diagnostics[0].path, "program.body.0.value.value")
+
+    def test_oversized_integer_is_rejected_before_canonical_serialization(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({"kind": "expr", "value": const(1 << MAX_INTEGER_BITS)}))
+        self.assertEqual(captured.exception.stage, "schema")
+        self.assertEqual(captured.exception.diagnostics[0].code, "IR_INVALID_VALUE")
+        self.assertEqual(captured.exception.diagnostics[0].path, "program.body.0.value.value")
 
     def test_keyword_lowering_is_canonical(self) -> None:
         first = program({
@@ -492,6 +524,20 @@ class ProgramIRCompilerTests(unittest.TestCase):
             compile_program(program(*body))
         self.assertEqual(captured.exception.error_category, "PROGRAM_TOO_LARGE")
 
+    def test_container_cardinality_is_rejected_during_schema_validation(self) -> None:
+        expression = {
+            "kind": "list",
+            "items": [const(None)] * (MAX_CONTAINER_ITEMS + 1),
+        }
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({"kind": "expr", "value": expression}))
+        self.assertEqual(captured.exception.stage, "schema")
+        self.assertEqual(captured.exception.diagnostics[0].code, "IR_TOO_LONG")
+        self.assertEqual(
+            captured.exception.diagnostics[0].path,
+            "program.body.0.value.items",
+        )
+
     def test_aggregate_program_size_limit(self) -> None:
         large_value = "x" * 8192
         body = [{"kind": "expr", "value": const(large_value)} for _ in range(10)]
@@ -506,7 +552,46 @@ class ProgramIRCompilerTests(unittest.TestCase):
             expression = {"kind": "unary", "op": "not", "operand": expression}
         with self.assertRaises(ProgramCompileError) as captured:
             compile_program(program({"kind": "expr", "value": expression}))
-        self.assertIn(captured.exception.error_category, {"PROGRAM_TOO_DEEP", "INVALID_PROGRAM_IR"})
+        self.assertEqual(captured.exception.error_category, "PROGRAM_TOO_DEEP")
+
+    def test_raw_payload_depth_is_bounded_before_model_validation(self) -> None:
+        payload: object = None
+        for _ in range(MAX_RAW_PAYLOAD_DEPTH + 2):
+            payload = {"nested": payload}
+        with patch("inference.agent.program_ir.ProgramIR.model_validate") as validate:
+            with self.assertRaises(ProgramCompileError) as captured:
+                compile_program(payload)
+        validate.assert_not_called()
+        self.assertEqual(captured.exception.stage, "limits")
+        self.assertEqual(captured.exception.error_category, "PROGRAM_TOO_DEEP")
+        self.assertEqual(captured.exception.diagnostics[0].code, "IR_RAW_DEPTH_LIMIT")
+
+    def test_raw_payload_value_count_is_bounded_before_model_validation(self) -> None:
+        payload = {"unused": [None] * MAX_RAW_PAYLOAD_VALUES}
+        with patch("inference.agent.program_ir.ProgramIR.model_validate") as validate:
+            with self.assertRaises(ProgramCompileError) as captured:
+                compile_program(payload)
+        validate.assert_not_called()
+        self.assertEqual(captured.exception.stage, "limits")
+        self.assertEqual(captured.exception.diagnostics[0].code, "IR_RAW_VALUE_LIMIT")
+
+    def test_raw_payload_size_is_bounded_before_model_validation(self) -> None:
+        payload = {"unused": "x" * (MAX_PROGRAM_CHARS + 1)}
+        with patch("inference.agent.program_ir.ProgramIR.model_validate") as validate:
+            with self.assertRaises(ProgramCompileError) as captured:
+                compile_program(payload)
+        validate.assert_not_called()
+        self.assertEqual(captured.exception.stage, "limits")
+        self.assertEqual(captured.exception.diagnostics[0].code, "IR_SIZE_LIMIT")
+
+    def test_cyclic_direct_payload_is_rejected_before_model_validation(self) -> None:
+        payload: dict = {"version": 1}
+        payload["body"] = [payload]
+        with patch("inference.agent.program_ir.ProgramIR.model_validate") as validate:
+            with self.assertRaises(ProgramCompileError) as captured:
+                compile_program(payload)
+        validate.assert_not_called()
+        self.assertEqual(captured.exception.diagnostics[0].code, "IR_CYCLIC_PAYLOAD")
 
     def test_tool_schema_has_hoisted_definitions(self) -> None:
         schema = program_tool_parameters_schema()
@@ -516,6 +601,11 @@ class ProgramIRCompilerTests(unittest.TestCase):
         self.assertIn("body", schema["properties"]["program"]["properties"])
         self.assertIn("raw Python source is not accepted", schema["properties"]["program"]["description"])
         self.assertIn("never coerced", schema["properties"]["program"]["description"])
+        self.assertIn(f"{MAX_INTEGER_BITS} bits", schema["properties"]["program"]["description"])
+        self.assertIn(
+            f"{MAX_RAW_PAYLOAD_VALUES} values before schema validation",
+            schema["properties"]["program"]["description"],
+        )
         self.assertIn("kind discriminator", schema["$defs"]["Stmt"]["description"])
         self.assertIn("unreachable statements", schema["$defs"]["Stmt"]["description"])
         self.assertIn("attribute, or subscript", schema["$defs"]["AugTarget"]["description"])
@@ -545,16 +635,97 @@ class ProgramIRSandboxTests(unittest.TestCase):
         )
         self.assertEqual(response.get("result"), {"W": 2})
 
-    def test_blocked_import_still_rejected_by_sandbox(self) -> None:
-        compiled = compile_program(program({"kind": "import", "names": [{"name": "os"}]}))
+    def test_blocked_import_is_rejected_by_compiler_and_sandbox(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({"kind": "import", "names": [{"name": "os"}]}))
+        self.assertEqual(captured.exception.stage, "safety")
+        self.assertEqual(captured.exception.error_category, "UNSAFE_PROGRAM_IR")
+        self.assertEqual(captured.exception.diagnostics[0].code, "IR_BLOCKED_MODULE")
+        self.assertEqual(captured.exception.diagnostics[0].path, "program.body.0.names.0.name")
+
         response = run_sandboxed_python(
-            code=compiled.source,
+            code="import os",
             timeout_seconds=5,
             initial_state={},
             action_handler=lambda actions: {},
             strategy_handler=lambda update: update,
         )
         self.assertEqual(response.get("error_category"), "BLOCKED_MODULE")
+
+    def test_from_import_dynamic_helper_has_path_addressed_safety_error(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({
+                "kind": "from_import",
+                "module": "operator",
+                "names": [{"name": "attrgetter", "asname": "getter"}],
+            }))
+        diagnostic = captured.exception.diagnostics[0]
+        self.assertEqual(diagnostic.code, "IR_BLOCKED_DYNAMIC_ATTRIBUTE")
+        self.assertEqual(diagnostic.path, "program.body.0.names.0.name")
+
+    def test_attribute_dynamic_helper_has_path_addressed_safety_error(self) -> None:
+        expression = {
+            "kind": "call",
+            "function": {
+                "kind": "attribute",
+                "value": const("{0.__class__}"),
+                "attr": "format",
+            },
+            "args": [const(1)],
+        }
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({"kind": "expr", "value": expression}))
+        diagnostic = captured.exception.diagnostics[0]
+        self.assertEqual(diagnostic.code, "IR_BLOCKED_DYNAMIC_ATTRIBUTE")
+        self.assertEqual(diagnostic.path, "program.body.0.value.function.attr")
+
+    def test_runtime_bindings_cannot_be_shadowed(self) -> None:
+        cases = (
+            (
+                {"kind": "assign", "targets": [target("current_frame")], "value": const(None)},
+                "program.body.0.targets.0.name",
+            ),
+            (
+                {"kind": "function_def", "name": "action", "parameters": [], "body": [{"kind": "pass"}]},
+                "program.body.0.name",
+            ),
+            (
+                {
+                    "kind": "function_def",
+                    "name": "helper",
+                    "parameters": [{"name": "history"}],
+                    "body": [{"kind": "pass"}],
+                },
+                "program.body.0.parameters.0.name",
+            ),
+            (
+                {"kind": "import", "names": [{"name": "math", "asname": "bfs"}]},
+                "program.body.0.names.0.asname",
+            ),
+            (
+                {
+                    "kind": "from_import",
+                    "module": "math",
+                    "names": [{"name": "sqrt", "asname": "valid_actions"}],
+                },
+                "program.body.0.names.0.asname",
+            ),
+        )
+        for statement, expected_path in cases:
+            with self.subTest(statement=statement), self.assertRaises(ProgramCompileError) as captured:
+                compile_program(program(statement))
+            diagnostic = captured.exception.diagnostics[0]
+            self.assertEqual(captured.exception.stage, "safety")
+            self.assertEqual(diagnostic.code, "IR_PROTECTED_RUNTIME_BINDING")
+            self.assertEqual(diagnostic.path, expected_path)
+
+    def test_result_remains_a_writable_output_binding(self) -> None:
+        compiled = compile_program(program({
+            "kind": "assign",
+            "targets": [target("result")],
+            "value": const(42),
+        }))
+        self.assertIn("result = 42", compiled.source)
 
 
 class ProgramIRToolAgentTests(unittest.TestCase):
@@ -567,12 +738,111 @@ class ProgramIRToolAgentTests(unittest.TestCase):
         self.assertEqual(schema["required"], ["program"])
         self.assertNotIn("code", schema["properties"])
 
+    def test_action_result_compaction_preserves_partial_batch_stop_detail(self) -> None:
+        compact = self.agent._compact_action_result({
+            "executed": True,
+            "requested_count": 2,
+            "executed_count": 1,
+            "stopped_early": True,
+            "stop_reason": "action_error",
+            "stop_detail": "RuntimeError: second action failed",
+        })
+        self.assertEqual(compact["stop_reason"], "action_error")
+        self.assertEqual(
+            compact["stop_detail"],
+            "RuntimeError: second action failed",
+        )
+
     def test_raw_code_is_rejected_before_sandbox(self) -> None:
         with TemporaryDirectory() as tmp:
             result = self.agent._dispatch_tool(Path(tmp) / "state.json", "python", {"code": "print(1)"})
         payload = json.loads(result.content)
         self.assertEqual(payload["error_category"], "RAW_SOURCE_NOT_ACCEPTED")
-        self.assertEqual(payload["diagnostics"][0]["path"], "program")
+        self.assertEqual(payload["diagnostics"][0]["path"], "code")
+
+    def test_raw_code_is_rejected_even_with_valid_program(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "python",
+                {
+                    "program": program({"kind": "assign", "targets": [target("result")], "value": const(42)}),
+                    "code": "result = 99",
+                },
+            )
+        payload = json.loads(result.content)
+        self.assertEqual(payload["error_category"], "RAW_SOURCE_NOT_ACCEPTED")
+        self.assertNotIn("result", payload)
+
+    def test_unsafe_program_is_rejected_before_sandbox_start(self) -> None:
+        unsafe_program = program({"kind": "import", "names": [{"name": "subprocess"}]})
+        with TemporaryDirectory() as tmp, patch(
+            "inference.agent.tool_agent.run_sandboxed_python"
+        ) as sandbox:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "python",
+                {"program": unsafe_program},
+            )
+        payload = json.loads(result.content)
+        self.assertEqual(payload["stage"], "safety")
+        self.assertEqual(payload["error_category"], "UNSAFE_PROGRAM_IR")
+        sandbox.assert_not_called()
+
+    def test_missing_and_unknown_tool_arguments_are_rejected(self) -> None:
+        cases = (
+            ({}, "IR_REQUIRED_FIELD", "program"),
+            ({"program": program({"kind": "pass"}), "extra": True}, "IR_UNKNOWN_TOOL_ARGUMENT", "extra"),
+        )
+        for arguments, code, path in cases:
+            with self.subTest(arguments=arguments), TemporaryDirectory() as tmp:
+                result = self.agent._dispatch_tool(Path(tmp) / "state.json", "python", arguments)
+                payload = json.loads(result.content)
+                self.assertEqual(payload["error_category"], "INVALID_TOOL_ARGUMENTS")
+                self.assertEqual(payload["diagnostics"][0]["code"], code)
+                self.assertEqual(payload["diagnostics"][0]["path"], path)
+
+    def test_non_object_tool_arguments_are_rejected_structurally(self) -> None:
+        for arguments in ([], [program({"kind": "pass"})], "program"):
+            with self.subTest(arguments=arguments), TemporaryDirectory() as tmp:
+                result = self.agent._dispatch_tool(
+                    Path(tmp) / "state.json",
+                    "python",
+                    arguments,
+                )
+                payload = json.loads(result.content)
+                self.assertEqual(payload["error_category"], "INVALID_TOOL_ARGUMENTS")
+                self.assertEqual(
+                    payload["diagnostics"][0]["code"],
+                    "IR_TOOL_ARGUMENTS_NOT_OBJECT",
+                )
+                self.assertEqual(payload["diagnostics"][0]["path"], "arguments")
+
+    def test_compiler_failure_metadata_is_complete(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "python",
+                {"program": {"version": 1, "body": []}},
+            )
+        payload = json.loads(result.content)
+        self.assertEqual(payload["compiler"]["version"], COMPILER_VERSION)
+        self.assertEqual(payload["compiler"]["policy_version"], "duck-python-tool-policy/2")
+        self.assertIn("python_version", payload["compiler"])
+        self.assertEqual(payload["compiler"]["supported_ir_version"], 1)
+        self.assertIn("max_ir_nodes", payload["compiler"]["limits"])
+        self.assertEqual(
+            payload["compiler"]["limits"]["max_raw_payload_depth"],
+            MAX_RAW_PAYLOAD_DEPTH,
+        )
+        self.assertEqual(
+            payload["compiler"]["limits"]["max_raw_payload_values"],
+            MAX_RAW_PAYLOAD_VALUES,
+        )
+        self.assertEqual(
+            payload["compiler"]["limits"]["max_container_items"],
+            MAX_CONTAINER_ITEMS,
+        )
 
     def test_compiler_metadata_in_successful_result(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -586,6 +856,109 @@ class ProgramIRToolAgentTests(unittest.TestCase):
         self.assertEqual(payload["compiler"]["version"], COMPILER_VERSION)
         self.assertEqual(len(payload["compiler"]["program_sha256"]), 64)
         self.assertEqual(len(payload["compiler"]["source_sha256"]), 64)
+
+    def test_runtime_failure_reports_program_ir_statement_path(self) -> None:
+        failing_program = program(
+            {
+                "kind": "function_def",
+                "name": "fail",
+                "body": [{"kind": "expr", "value": call("missing_name")}],
+            },
+            {"kind": "expr", "value": call("fail")},
+        )
+        with TemporaryDirectory() as tmp:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "python",
+                {"program": failing_program},
+            )
+        payload = json.loads(result.content)
+        self.assertEqual(payload["stage"], "runtime")
+        self.assertEqual(payload["error_category"], "UNDEFINED_VARIABLE")
+        self.assertEqual(payload["diagnostics"][0]["code"], "IR_RUNTIME_ERROR")
+        self.assertEqual(payload["diagnostics"][0]["path"], "program.body.0.body.0")
+
+    def test_already_terminal_action_result_suppresses_later_action_calls(self) -> None:
+        action_call = call(
+            "action",
+            {"kind": "list", "items": [const("LEFT")]},
+        )
+        action_program = program(
+            {
+                "kind": "assign",
+                "targets": [target("first")],
+                "value": action_call,
+            },
+            {
+                "kind": "assign",
+                "targets": [target("result")],
+                "value": action_call,
+            },
+        )
+        callback_count = 0
+
+        def step_env(arguments):
+            nonlocal callback_count
+            callback_count += 1
+            return {
+                "executed": False,
+                "action_num": 0,
+                "level": 1,
+                "score": 0,
+                "reward": 0.0,
+                "state": "GAME_OVER",
+                "valid_actions": [],
+                "board_changed": False,
+                "done": False,
+                "level_completed": False,
+                "game_over": True,
+                "run_complete": False,
+                "stopped_early": True,
+                "stop_reason": "game_over",
+            }
+
+        self.agent._step_env_callback = step_env
+        with TemporaryDirectory() as tmp:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "python",
+                {"program": action_program},
+            )
+        payload = json.loads(result.content)
+        self.assertEqual(callback_count, 1)
+        self.assertFalse(payload["result"]["executed"])
+        self.assertEqual(payload["result"]["stop_reason"], "previous_game_over")
+        self.assertEqual(payload["result"]["valid_actions"], [])
+
+    def test_stdout_and_result_are_both_preserved(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "python",
+                {"program": program(
+                    {"kind": "expr", "value": call("print", const("summary"))},
+                    {"kind": "assign", "targets": [target("result")], "value": const(42)},
+                )},
+            )
+        payload = json.loads(result.content)
+        self.assertIn("summary", payload["stdout"])
+        self.assertEqual(payload["result"], 42)
+
+    def test_truncated_result_metadata_reaches_tool_response(self) -> None:
+        large_result = {
+            "kind": "list_comprehension",
+            "element": {"kind": "binary", "op": "mul", "left": const("x"), "right": const(1000)},
+            "clauses": [{"target": target("item"), "iterable": call("range", const(1000))}],
+        }
+        with TemporaryDirectory() as tmp:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "python",
+                {"program": program({"kind": "assign", "targets": [target("result")], "value": large_result})},
+            )
+        payload = json.loads(result.content)
+        self.assertTrue(payload["result_truncated"])
+        self.assertIn("smaller summary", payload["result_warning"])
 
 
 if __name__ == "__main__":

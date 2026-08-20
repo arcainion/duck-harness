@@ -819,14 +819,6 @@ class CompactActionResultEdgeCasesTests(TestCase):
         compact = agent._compact_action_result({"executed": True, "steps": steps})
         self.assertLessEqual(len(compact["steps"]), 12)
 
-    def test_action_data_with_clamped_from(self) -> None:
-        agent = self._agent()
-        compact = agent._compact_action_result({
-            "executed": True,
-            "action_data": {"_clamped_from": "MOUSE(row=100, col=100)"},
-        })
-        self.assertIn("action_data", compact)
-
     def test_stop_reason_and_detail(self) -> None:
         agent = self._agent()
         compact = agent._compact_action_result({

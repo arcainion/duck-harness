@@ -24,7 +24,7 @@ PROGRAM = {
 class ProgramIRViewerTests(TestCase):
     def test_program_ir_renders_lowered_preview_and_metadata(self) -> None:
         rendered = _render_tool_arguments("python", {"program": PROGRAM})
-        self.assertIn("compiled by duck-program-ir/1.7", rendered)
+        self.assertIn("compiled by duck-program-ir/1.15", rendered)
         self.assertIn("sha256=", rendered)
         self.assertIn("src_sha256=", rendered)
         self.assertIn("print(current_frame)", rendered)
@@ -50,6 +50,17 @@ class ProgramIRViewerTests(TestCase):
         )
         self.assertEqual(_extract_python_code(legacy_json), "print(current_frame)")
         self.assertEqual(_extract_python_code(legacy_markup), "print(current_frame)")
+
+    def test_mixed_raw_code_and_program_trace_is_not_counted_as_executed(self) -> None:
+        mixed_json = json.dumps({"code": "print('never')", "program": PROGRAM})
+        mixed_markup = (
+            "<tool_call>\n<function=python>\n"
+            "<parameter=code>print('never')</parameter>\n"
+            f"<parameter=program>{json.dumps(PROGRAM)}</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.assertEqual(_extract_python_code(mixed_json), "")
+        self.assertEqual(_extract_python_code(mixed_markup), "")
 
     def test_invalid_program_falls_back_to_json(self) -> None:
         rendered = _render_tool_arguments("python", {"program": {"version": 1, "body": []}})

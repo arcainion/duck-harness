@@ -31,9 +31,10 @@ from inference.agent.prompts import (
     TOOL_CALL_FORMAT_GUIDANCE,
     VISUAL_GAME_ADDENDUM,
 )
+from inference.agent.python_tool_policy import allowed_modules_text
 from inference.agent.program_ir import (
-    COMPILER_VERSION,
     ProgramCompileError,
+    compiler_runtime_metadata,
     compile_program,
     program_tool_parameters_schema,
 )
@@ -1640,19 +1641,55 @@ class ToolAgent:
         rendered = json.dumps(result, indent=2)
         max_chars = self._tool_output_chars * 2
         if len(rendered) > max_chars:
-            rendered = rendered[:max_chars] + f"\n... [truncated {len(rendered) - max_chars} chars to fit output budget]"
-            truncated = True
+            # Preserve a valid JSON tool response. Slicing the serialized object
+            # makes it impossible for the model (and trace consumers) to parse.
+            for field in sorted(
+                truncate_fields,
+                key=lambda name: len(json.dumps(result.get(name), ensure_ascii=True)),
+                reverse=True,
+            ):
+                if field not in result:
+                    continue
+                value = result[field]
+                encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+                if len(encoded) <= 512:
+                    continue
+                result[field] = {
+                    "truncated": True,
+                    "type": type(value).__name__,
+                    "preview": encoded[:512],
+                    "omitted_chars": len(encoded) - 512,
+                }
+                truncated = True
+                rendered = json.dumps(result, indent=2)
+                if len(rendered) <= max_chars:
+                    break
         if truncated:
             truncation_note = (
                 f"Tool output was cut off to stay within the ~{self._tool_output_tokens}-token response budget."
             )
-            try:
-                parsed = json.loads(rendered)
-                parsed["truncated"] = True
-                parsed["truncation_note"] = truncation_note
-                rendered = json.dumps(parsed, indent=2)
-            except json.JSONDecodeError:
-                rendered += f"\n{{\"truncated\": true, \"truncation_note\": \"{truncation_note}\"}}"
+            result["truncated"] = True
+            result["truncation_note"] = truncation_note
+            rendered = json.dumps(result, indent=2)
+        if len(rendered) > max_chars:
+            # Defensive fallback for an unexpectedly large non-truncatable
+            # payload. Keep protocol-level fields and return valid JSON.
+            compact = {
+                key: value
+                for key, value in result.items()
+                if key in {"success", "stage", "error_category", "compiler_version", "result_truncated"}
+                and isinstance(value, (str, int, float, bool, type(None)))
+            }
+            compact.update(
+                {
+                    "truncated": True,
+                    "truncation_note": (
+                        f"Tool payload exceeded the ~{self._tool_output_tokens}-token response budget; "
+                        "large fields were omitted."
+                    ),
+                }
+            )
+            rendered = json.dumps(compact, indent=2)
         return rendered
 
     def _normalize_python_actions(self, value: Any) -> list[dict[str, Any]]:
@@ -1713,9 +1750,6 @@ class ToolAgent:
             "run_complete": bool(payload.get("run_complete")),
             "action_display": payload.get("action_display") or payload.get("action_name"),
         }
-        action_data = payload.get("action_data")
-        if isinstance(action_data, dict) and "_clamped_from" in action_data:
-            compact["action_data"] = action_data
         for controller_key in (
             "guarded",
             "guard_reason_code",
@@ -1816,18 +1850,54 @@ class ToolAgent:
 
     def _run_python_tool(self, state_path: Path, arguments: dict[str, Any]) -> _ToolDispatchResult:
         self._ensure_session(state_path)
-        try:
-            compiled_program = compile_program(arguments.get("program"))
-        except ProgramCompileError as exc:
-            payload = {"tool": "python", "compiler": {"version": COMPILER_VERSION}, **exc.payload()}
-            if "code" in arguments:
-                payload["error_category"] = "RAW_SOURCE_NOT_ACCEPTED"
-                payload["error"] = "python requires structured `program` version 1; raw `code` is not accepted."
-                payload["diagnostics"] = [{
-                    "code": "IR_RAW_SOURCE_REJECTED",
+        unexpected_arguments = [key for key in arguments if key != "program"]
+        if unexpected_arguments:
+            diagnostics = []
+            for key in unexpected_arguments:
+                is_raw_source = key == "code"
+                message = (
+                    "python requires structured `program` version 1; raw `code` is not accepted."
+                    if is_raw_source
+                    else f"unknown python tool argument: {key}"
+                )
+                diagnostics.append({
+                    "code": "IR_RAW_SOURCE_REJECTED" if is_raw_source else "IR_UNKNOWN_TOOL_ARGUMENT",
+                    "path": key,
+                    "message": message,
+                })
+            error_category = (
+                "RAW_SOURCE_NOT_ACCEPTED"
+                if "code" in unexpected_arguments
+                else "INVALID_TOOL_ARGUMENTS"
+            )
+            payload = {
+                "tool": "python",
+                "compiler": compiler_runtime_metadata(),
+                "stage": "schema",
+                "error_category": error_category,
+                "error": diagnostics[0]["message"],
+                "diagnostics": diagnostics,
+            }
+            return _ToolDispatchResult(self._render_tool_payload(payload))
+        if "program" not in arguments:
+            message = "python requires the `program` argument."
+            payload = {
+                "tool": "python",
+                "compiler": compiler_runtime_metadata(),
+                "stage": "schema",
+                "error_category": "INVALID_TOOL_ARGUMENTS",
+                "error": message,
+                "diagnostics": [{
+                    "code": "IR_REQUIRED_FIELD",
                     "path": "program",
-                    "message": payload["error"],
-                }]
+                    "message": message,
+                }],
+            }
+            return _ToolDispatchResult(self._render_tool_payload(payload))
+        try:
+            compiled_program = compile_program(arguments["program"])
+        except ProgramCompileError as exc:
+            payload = {"tool": "python", "compiler": compiler_runtime_metadata(), **exc.payload()}
             return _ToolDispatchResult(self._render_tool_payload(payload))
         code = compiled_program.source.rstrip()
         validation_warning = self._validate_code_common_mistakes(code)
@@ -1926,7 +1996,7 @@ class ToolAgent:
             next_valid_actions = raw_payload.get("valid_actions")
             if isinstance(next_valid_actions, list):
                 self._current_valid_actions = _normalize_valid_actions(next_valid_actions)
-            if compact_payload.get("executed") and _terminal_action_reason(compact_payload):
+            if _terminal_action_reason(compact_payload):
                 terminal_action_result = compact_payload
             self._last_action_result = dict(compact_payload)
             return {
@@ -1960,6 +2030,24 @@ class ToolAgent:
             if error_hint:
                 payload["error_hint"] = error_hint
             if error_category:
+                payload["error_category"] = error_category
+                payload["stage"] = (
+                    "sandbox"
+                    if error_category in {
+                        "SANDBOX_START_FAILED",
+                        "SANDBOX_PROCESS_ERROR",
+                        "SANDBOX_PROTOCOL_ERROR",
+                    }
+                    else "runtime"
+                )
+                error_line = sandbox_result.get("error_line")
+                runtime_path = compiled_program.path_for_line(error_line) or "program"
+                diagnostic_message = error_hint or rendered_error.splitlines()[-1]
+                payload["diagnostics"] = [{
+                    "code": "IR_RUNTIME_ERROR",
+                    "path": runtime_path,
+                    "message": diagnostic_message,
+                }]
                 recovery_map = {
                     "UNDEFINED_VARIABLE": "Define the variable or check spelling.",
                     "MISSING_RUNTIME_VARIABLE": "Do not redefine runtime variables.",
@@ -1971,6 +2059,12 @@ class ToolAgent:
                     "INDEX_OUT_OF_RANGE": "Check bounds before indexing.",
                     "PRIVATE_ACCESS": "Use public attributes only.",
                     "TIMEOUT": "Optimize or reduce computation.",
+                    "ACTION_FAILED": "Inspect the action payload and current valid_actions before retrying.",
+                    "ACTION_BATCH_LIMIT": f"Use at most {MAX_ACTION_BATCH} actions in one action() call.",
+                    "PROTECTED_RUNTIME_BINDING": "Use injected runtime variables and helpers without redefining them.",
+                    "SANDBOX_START_FAILED": "Retry with a smaller program; the isolated runtime could not start.",
+                    "SANDBOX_PROCESS_ERROR": "Simplify the program and retry in a fresh tool call.",
+                    "SANDBOX_PROTOCOL_ERROR": "Retry in a fresh tool call with a smaller result.",
                 }
                 recovery = recovery_map.get(error_category, "Simplify code and retry.")
                 if error_category == "UNDEFINED_VARIABLE":
@@ -1984,7 +2078,7 @@ class ToolAgent:
                     ]
                     recovery += f" Available: {', '.join(available_vars)}."
                 elif error_category == "BLOCKED_MODULE":
-                    recovery = "Allowed: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string."
+                    recovery = f"Allowed: {allowed_modules_text()}."
                 elif error_category == "MISSING_ATTRIBUTE":
                     recovery += " FrameView has: .ascii, .step, .level, .shape, .segmentation. HistoryEntry has: .action, .frame. TransitionView has: .action, .before_frame, .after_frame, .frame, .result."
                 elif error_category == "TYPE_ERROR":
@@ -2000,7 +2094,7 @@ class ToolAgent:
             payload["returncode"] = 0
             if rendered_stdout:
                 payload["stdout"] = rendered_stdout
-            elif sandbox_result.get("result") is not None:
+            if sandbox_result.get("result") is not None:
                 payload["result"] = sandbox_result.get("result")
             elif action_results:
                 if len(action_results) == 1:
@@ -2010,6 +2104,9 @@ class ToolAgent:
                         "action_calls": len(action_results),
                         "last_action_result": action_results[-1],
                     }
+            if sandbox_result.get("result_truncated"):
+                payload["result_truncated"] = True
+                payload["result_warning"] = "Result was truncated inside the sandbox; return a smaller summary."
 
         step_executed = any(bool(item.get("executed")) for item in action_results)
         if validation_warning:
@@ -2022,9 +2119,29 @@ class ToolAgent:
             step_executed=step_executed,
         )
 
-    def _dispatch_tool(self, state_path: Path, name: str, arguments: dict[str, Any]) -> _ToolDispatchResult:
+    def _dispatch_tool(self, state_path: Path, name: str, arguments: Any) -> _ToolDispatchResult:
         self._ensure_session(state_path)
         if name == "python":
+            if not isinstance(arguments, dict):
+                message = "python tool arguments must be a JSON object containing `program`."
+                return _ToolDispatchResult(
+                    self._render_tool_payload(
+                        {
+                            "tool": "python",
+                            "compiler": compiler_runtime_metadata(),
+                            "stage": "schema",
+                            "error_category": "INVALID_TOOL_ARGUMENTS",
+                            "error": message,
+                            "diagnostics": [
+                                {
+                                    "code": "IR_TOOL_ARGUMENTS_NOT_OBJECT",
+                                    "path": "arguments",
+                                    "message": message,
+                                }
+                            ],
+                        }
+                    )
+                )
             return self._run_python_tool(state_path, arguments)
         return _ToolDispatchResult(json.dumps({"error": f"Unknown tool: {name}"}, indent=2))
 

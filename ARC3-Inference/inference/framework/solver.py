@@ -138,6 +138,7 @@ def _summarize_animation(
         else []
     )
     frames = [frame for frame in frames if frame]
+    animation_frame_count = len(frames)
     if not frames:
         frames = [_grid_from_state(state)]
 
@@ -209,8 +210,8 @@ def _summarize_animation(
         ]
 
     return {
-        "frame_count": len(frames),
-        "intermediate_frame_count": max(0, len(frames) - 1),
+        "frame_count": animation_frame_count,
+        "intermediate_frame_count": max(0, animation_frame_count - 1),
         "changed_frame_count": changed_frame_count,
         "total_changed_cells": total_changed_cells,
         "peak_changed_cells": peak_changed_cells,
@@ -250,6 +251,27 @@ def _model_mouse_action_data(
     return {"row": int(data.get("y", 0)), "col": int(data.get("x", 0))}
 
 
+def _mouse_grid_size(game: taaf.game.Game) -> tuple[int, int]:
+    """Return the engine's click bounds as ``(width, height)``."""
+    raw_size = getattr(game, "grid_size", (64, 64))
+    try:
+        width, height = raw_size
+        width = int(width)
+        height = int(height)
+    except (TypeError, ValueError):
+        return 64, 64
+    if width <= 0 or height <= 0:
+        return 64, 64
+    return width, height
+
+
+def _mouse_coordinate(value: Any) -> int:
+    """Parse an integer coordinate without truncating floats or accepting booleans."""
+    if isinstance(value, (bool, float)):
+        raise ValueError("mouse coordinates must be integers")
+    return int(value)
+
+
 def _format_action_display(
     action_name: str, action_data: dict[str, Any] | None = None
 ) -> str:
@@ -267,26 +289,58 @@ def _evaluate_strategy_prediction(
     test_action = normalize_action_key(prediction.get("test_action", ""))
     expected = str(prediction.get("expected_outcome") or "").strip().lower()
     actual_action = normalize_action_key(payload.get("action_display", ""))
-    if not test_action or not expected or not (
-        actual_action == test_action
-        or (test_action == "MOUSE" and action_family(actual_action) == "MOUSE")
-    ):
+    if not test_action or not expected:
         return None
-    status = evaluate_outcome_match(expected, payload)
+    action_matches = actual_action == test_action or (
+        test_action == "MOUSE" and action_family(actual_action) == "MOUSE"
+    )
+    status = evaluate_outcome_match(expected, payload) if action_matches else "inconclusive"
     return {
         "status": status,
-        "action": actual_action,
+        "action": actual_action or test_action,
         "expected": expected,
         "actual": str(payload.get("outcome_class") or "unknown"),
     }
 
 
+def _state_name(state: taaf.game.GameState) -> str:
+    raw_state = getattr(getattr(state, "raw", None), "state", None)
+    return str(getattr(raw_state, "name", raw_state) or "UNKNOWN").strip().upper()
+
+
+def _state_is_game_over(state: taaf.game.GameState) -> bool:
+    state_name = _state_name(state)
+    if state_name == "FINISHED":
+        return not bool(getattr(state, "won", False))
+    return state_name == "GAME_OVER"
+
+
+def _state_is_run_complete(state: taaf.game.GameState) -> bool:
+    state_name = _state_name(state)
+    if state_name == "FINISHED":
+        return bool(getattr(state, "won", False))
+    return state_name in {"WIN", "WON", "COMPLETE", "COMPLETED"}
+
+
+def _engine_state_name(game: taaf.game.Game) -> str:
+    return _state_name(game.current_state)
+
+
 def _is_engine_game_over(game: taaf.game.Game) -> bool:
-    return game.current_state.raw.state == arcengine.GameState.GAME_OVER
+    return _state_is_game_over(game.current_state)
 
 
 def _is_run_complete(game: taaf.game.Game) -> bool:
-    return game.current_state.raw.state == arcengine.GameState.WIN
+    return _state_is_run_complete(game.current_state)
+
+
+def _snapshot_action_budget(snapshot: dict[str, Any]) -> int:
+    """Read a controller budget without turning an intentional zero into one."""
+    raw_budget = snapshot.get("action_budget", 1)
+    try:
+        return max(0, int(raw_budget))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _write_transcript_html(transcript_path: Path, html_path: Path, title: str) -> None:
@@ -354,8 +408,9 @@ class _HarnessGameSession:
 
     @property
     def action_count(self) -> int:
-        run = self.game.game_run
-        return len(run.history) if run is not None else 0
+        run = getattr(self.game, "game_run", None)
+        history = getattr(run, "history", None)
+        return len(history) if history is not None else 0
 
     def runtime_limit_reached(self) -> bool:
         if self.solver.max_runtime_s_per_game is None:
@@ -392,8 +447,8 @@ class _HarnessGameSession:
         return max(0.1, min(candidates))
 
     def should_stop(self) -> bool:
-        run = self.game.game_run
-        if run is None or run.state != "playing":
+        run = getattr(self.game, "game_run", None)
+        if run is None or str(getattr(run, "state", "")).strip().lower() != "playing":
             return True
         if self.stop_event.is_set():
             return True
@@ -523,13 +578,12 @@ class _HarnessGameSession:
 
     def _base_viewer_event(self, frame: Frame) -> dict[str, Any]:
         run = self.game.game_run
-        raw_state = self.game.current_state.raw.state
         return {
             "board": [list(row) for row in frame.grid],
             "board_ascii": frame.ascii,
             "state_id": frame_fingerprint(frame),
             "score": int(self.game.current_state.levels_completed),
-            "state": raw_state.name,
+            "state": _engine_state_name(self.game),
             "level": frame.level,
             "run_status": run.state if run is not None else "playing",
         }
@@ -658,7 +712,10 @@ class _HarnessGameSession:
     def _normalize_actions(
         self, arguments: dict[str, Any]
     ) -> tuple[list[arcengine.ActionInput] | None, str | None]:
-        has_single = bool(str(arguments.get("action", "")).strip())
+        raw_single_action = arguments.get("action")
+        has_single = raw_single_action is not None and bool(
+            str(raw_single_action).strip()
+        )
         has_batch = arguments.get("actions") is not None
         if has_single and has_batch:
             return None, "Use either `action` or `actions`, not both."
@@ -688,8 +745,16 @@ class _HarnessGameSession:
         actions: list[arcengine.ActionInput] = []
         for index, raw_action in enumerate(raw_actions, start=1):
             if not isinstance(raw_action, dict):
-                return None, f"Action {index} must be a JSON object."
-            action_name = to_engine_action(raw_action.get("action"))
+                return (
+                    None,
+                    f"Action {index} must be a JSON object with a non-empty `action` field.",
+                )
+            if "action" not in raw_action:
+                return None, f"Action {index} is missing the required `action` field."
+            raw_action_name = raw_action.get("action")
+            if not str(raw_action_name or "").strip():
+                return None, f"Action {index} must contain a non-empty `action` field."
+            action_name = to_engine_action(raw_action_name)
             if not action_name:
                 return (
                     None,
@@ -699,21 +764,23 @@ class _HarnessGameSession:
             data: dict[str, Any] = {}
             if action_id == arcengine.GameAction.ACTION6:
                 try:
-                    raw_row = int(raw_action["row"])
-                    raw_col = int(raw_action["col"])
-                    clamped_row = max(0, min(63, raw_row))
-                    clamped_col = max(0, min(63, raw_col))
-                    data = {
-                        "x": clamped_col,
-                        "y": clamped_row,
-                    }
-                    if clamped_row != raw_row or clamped_col != raw_col:
-                        data["_clamped_from"] = {"row": raw_row, "col": raw_col}
-                except (KeyError, TypeError, ValueError):
+                    raw_row = _mouse_coordinate(raw_action["row"])
+                    raw_col = _mouse_coordinate(raw_action["col"])
+                except (KeyError, OverflowError, TypeError, ValueError):
                     return (
                         None,
                         f"MOUSE action at index {index} requires integer row and col arguments.",
                     )
+                width, height = _mouse_grid_size(self.game)
+                if not (0 <= raw_row < height and 0 <= raw_col < width):
+                    return (
+                        None,
+                        f"MOUSE action at index {index} is outside the current "
+                        f"{height}x{width} board: row must be 0..{height - 1} and "
+                        f"col must be 0..{width - 1}; received row={raw_row}, "
+                        f"col={raw_col}.",
+                    )
+                data = {"x": raw_col, "y": raw_row}
             actions.append(arcengine.ActionInput(id=action_id, data=data))
         return actions, None
 
@@ -728,9 +795,9 @@ class _HarnessGameSession:
     def _terminal_payload(
         self, requested_actions: list[arcengine.ActionInput]
     ) -> dict[str, Any]:
-        raw_state = self.game.current_state.raw.state
-        is_game_over = raw_state == arcengine.GameState.GAME_OVER
-        is_win = raw_state == arcengine.GameState.WIN
+        state_name = _engine_state_name(self.game)
+        is_game_over = _is_engine_game_over(self.game)
+        is_win = _is_run_complete(self.game)
         requested = [
             _format_action_display(action.id.name, dict(action.data))
             for action in requested_actions
@@ -744,7 +811,7 @@ class _HarnessGameSession:
             "action_num": self.action_count,
             "level": _level_number(self.game),
             "score": int(self.game.current_state.levels_completed),
-            "state": raw_state.name,
+            "state": state_name,
             "valid_actions": [],
             "board_changed": False,
             "done": is_win,
@@ -772,7 +839,7 @@ class _HarnessGameSession:
                 _engine_action_names(self.game),
                 self.controller_config,
             )
-            action_budget = max(1, int(snapshot.get("action_budget") or 1))
+            action_budget = _snapshot_action_budget(snapshot)
             if len(requested_actions) > action_budget:
                 phase = str(snapshot.get("phase") or "explore")
                 payload = self._error_payload(
@@ -794,6 +861,7 @@ class _HarnessGameSession:
         executed_payloads: list[dict[str, Any]] = []
         total_reward = 0.0
         stop_reason: str | None = None
+        stop_detail: str | None = None
         batch_size = len(requested_actions)
         requested_displays = [
             _format_action_display(action.id.name, dict(action.data))
@@ -811,11 +879,13 @@ class _HarnessGameSession:
                     _engine_action_names(self.game),
                     self.controller_config,
                 )
-                current_budget = max(
-                    1, int(current_snapshot.get("action_budget") or 1)
-                )
+                current_budget = _snapshot_action_budget(current_snapshot)
                 if batch_index > current_budget:
                     stop_reason = "phase_action_budget"
+                    stop_detail = (
+                        "The controller phase changed and no longer supports the "
+                        "remaining queued actions."
+                    )
                     break
             if self.should_stop():
                 stop_reason = "stopped"
@@ -824,6 +894,7 @@ class _HarnessGameSession:
                 message = f"{_format_action_display(action.id.name, dict(action.data))} is not valid right now."
                 if executed_payloads:
                     stop_reason = "invalid_action"
+                    stop_detail = message
                     break
                 return self._error_payload(message)
 
@@ -842,7 +913,10 @@ class _HarnessGameSession:
                     self.controller_config,
                 )
                 stop_reason = "loop_guard"
+                stop_detail = guard_reason
                 current = self.current_frame()
+                is_game_over = _is_engine_game_over(self.game)
+                is_run_complete = _is_run_complete(self.game)
                 self.viewer_events.append(
                     {
                         **self._base_viewer_event(current),
@@ -870,13 +944,13 @@ class _HarnessGameSession:
                     "level": current.level,
                     "score": int(self.game.current_state.levels_completed),
                     "reward": 0.0,
-                    "state": self.game.current_state.raw.state.name,
+                    "state": _engine_state_name(self.game),
                     "valid_actions": to_model_actions(_engine_action_names(self.game)),
                     "board_changed": False,
-                    "done": False,
+                    "done": is_run_complete,
                     "level_completed": False,
-                    "game_over": False,
-                    "run_complete": False,
+                    "game_over": is_game_over,
+                    "run_complete": is_run_complete,
                     "guarded": True,
                     "guard_reason_code": guard_reason_code,
                     "loop_detected": True,
@@ -906,6 +980,7 @@ class _HarnessGameSession:
             except Exception as exc:
                 if executed_payloads:
                     stop_reason = "action_error"
+                    stop_detail = f"{type(exc).__name__}: {exc}"
                     break
                 return self._error_payload(f"{type(exc).__name__}: {exc}")
             executed_payloads.append(payload)
@@ -979,11 +1054,8 @@ class _HarnessGameSession:
         final_payload["stopped_early"] = len(executed_payloads) < batch_size
         if stop_reason is not None:
             final_payload["stop_reason"] = stop_reason
-            if stop_reason == "phase_action_budget":
-                final_payload["stop_detail"] = (
-                    "The controller phase changed and no longer supports the "
-                    "remaining queued actions."
-                )
+            if stop_detail is not None:
+                final_payload["stop_detail"] = stop_detail
         self.write_viewer_payload()
         return final_payload
 
@@ -1030,10 +1102,12 @@ class _HarnessGameSession:
         reward = float(completed - previous_completed) / max(
             1.0, float(self.game.number_of_levels)
         )
-        raw_state = new_state.raw.state
+        state_name = _state_name(new_state)
+        is_game_over = _state_is_game_over(new_state)
+        is_run_complete = _state_is_run_complete(new_state)
         board_changed = previous_grid != _grid_from_state(new_state)
         level_completed = bool(
-            new_state.just_won_level and raw_state != arcengine.GameState.WIN
+            new_state.just_won_level and not is_run_complete
         )
         payload = {
             "executed": True,
@@ -1041,13 +1115,13 @@ class _HarnessGameSession:
             "level": _level_number(self.game),
             "score": completed,
             "reward": reward,
-            "state": raw_state.name,
+            "state": state_name,
             "valid_actions": to_model_actions(_engine_action_names(self.game)),
             "board_changed": board_changed,
-            "done": raw_state == arcengine.GameState.WIN,
+            "done": is_run_complete,
             "level_completed": level_completed,
-            "game_over": raw_state == arcengine.GameState.GAME_OVER,
-            "run_complete": raw_state == arcengine.GameState.WIN,
+            "game_over": is_game_over,
+            "run_complete": is_run_complete,
             "action_name": action.id.name,
             "action_data": (
                 _model_mouse_action_data(action.data)

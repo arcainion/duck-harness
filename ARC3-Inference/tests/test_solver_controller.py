@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
+from unittest.mock import patch
 
 import arcengine
 
@@ -17,6 +18,8 @@ from inference.agent.runtime_state import Frame, HistoryEntry
 from inference.framework.solver import (
     _HarnessGameSession,
     _evaluate_strategy_prediction,
+    _is_engine_game_over,
+    _is_run_complete,
     _summarize_animation,
 )
 
@@ -167,6 +170,55 @@ class SolverControllerTests(TestCase):
         self.assertEqual(result["steps"][0]["before_state_id"], "a")
         self.assertEqual(result["steps"][0]["after_state_id"], "b")
 
+    def test_partial_batch_preserves_later_action_exception_detail(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        frame = Frame(grid=((0,),), step=0, level=1)
+        action = SimpleNamespace(
+            id=SimpleNamespace(value=arcengine.GameAction.ACTION1.value, name="ACTION1"),
+            data={},
+        )
+        session.controller_config = InferenceControllerConfig(enabled=False)
+        session.history_entries = [HistoryEntry(action="", frame=frame)]
+        session.game = SimpleNamespace(
+            current_state=SimpleNamespace(
+                available_actions={arcengine.GameAction.ACTION1.value}
+            )
+        )
+        session._normalize_actions = lambda arguments: ([action, action], None)
+        session.current_frame = lambda: frame
+        session.should_stop = lambda: False
+        session.write_viewer_payload = lambda: None
+        calls = 0
+
+        def execute(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("second action failed")
+            return {
+                "executed": True,
+                "action_num": 1,
+                "level": 1,
+                "score": 0,
+                "reward": 0.0,
+                "state": "NOT_FINISHED",
+                "valid_actions": ["UP"],
+                "board_changed": False,
+                "done": False,
+                "level_completed": False,
+                "game_over": False,
+                "run_complete": False,
+                "action_display": "UP",
+            }
+
+        session._execute_action = execute
+        result = session.step_env({"actions": ["UP", "UP"]})
+
+        self.assertEqual(result["executed_count"], 1)
+        self.assertTrue(result["stopped_early"])
+        self.assertEqual(result["stop_reason"], "action_error")
+        self.assertEqual(result["stop_detail"], "RuntimeError: second action failed")
+
     def test_prediction_result_is_structured(self) -> None:
         result = _evaluate_strategy_prediction(
             {"test_action": "SPACE", "expected_outcome": "new_state"},
@@ -253,6 +305,28 @@ class SolverControllerTests(TestCase):
         self.assertIsNone(actions)
         self.assertIn("at least one", error)
 
+    def test_null_single_action_does_not_conflict_with_valid_batch(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        actions, error = session._normalize_actions({
+            "action": None,
+            "actions": [{"action": "LEFT"}],
+        })
+        self.assertIsNone(error)
+        self.assertEqual(len(actions or []), 1)
+
+    def test_legacy_finished_state_distinguishes_win_from_game_over(self) -> None:
+        legacy_state = SimpleNamespace(name="FINISHED")
+        won_game = SimpleNamespace(
+            current_state=SimpleNamespace(raw=SimpleNamespace(state=legacy_state), won=True)
+        )
+        lost_game = SimpleNamespace(
+            current_state=SimpleNamespace(raw=SimpleNamespace(state=legacy_state), won=False)
+        )
+        self.assertTrue(_is_run_complete(won_game))
+        self.assertFalse(_is_engine_game_over(won_game))
+        self.assertFalse(_is_run_complete(lost_game))
+        self.assertTrue(_is_engine_game_over(lost_game))
+
     def test_invalid_action_format_returns_error(self) -> None:
         session = object.__new__(_HarnessGameSession)
         actions, error = session._normalize_actions({"actions": [{"invalid": "format"}]})
@@ -264,6 +338,53 @@ class SolverControllerTests(TestCase):
         actions, error = session._normalize_actions({"actions": ["LEFT", {"action": "RIGHT"}]})
         self.assertIsNone(actions)
         self.assertIn("empty", error)
+
+    def test_mouse_action_uses_row_col_and_clean_engine_payload(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.game = SimpleNamespace(grid_size=(12, 8))
+
+        actions, error = session._normalize_actions(
+            {"action": "MOUSE", "row": 7, "col": 11}
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(len(actions or []), 1)
+        self.assertEqual((actions or [])[0].data, {"x": 11, "y": 7})
+
+    def test_mouse_action_rejects_coordinates_outside_actual_grid(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.game = SimpleNamespace(grid_size=(12, 8))
+
+        actions, error = session._normalize_actions(
+            {"action": "MOUSE", "row": 8, "col": 11}
+        )
+
+        self.assertIsNone(actions)
+        self.assertIn("outside the current 8x12 board", error)
+        self.assertIn("row must be 0..7", error)
+
+    def test_mouse_action_rejects_non_integer_coordinates_without_coercion(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.game = SimpleNamespace(grid_size=(12, 8))
+
+        for row in (1.9, True):
+            with self.subTest(row=row):
+                actions, error = session._normalize_actions(
+                    {"action": "MOUSE", "row": row, "col": 2}
+                )
+                self.assertIsNone(actions)
+                self.assertIn("requires integer row and col", error)
+
+    def test_mouse_action_invalid_grid_size_uses_engine_default(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.game = SimpleNamespace(grid_size=(0, 0))
+
+        actions, error = session._normalize_actions(
+            {"action": "MOUSE", "row": 63, "col": 63}
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual((actions or [])[0].data, {"x": 63, "y": 63})
 
     def test_action_budget_exhausted_in_orient_phase(self) -> None:
         session = object.__new__(_HarnessGameSession)
@@ -288,10 +409,14 @@ class SolverControllerTests(TestCase):
             "error": {"message": message},
         }
 
-        result = session.step_env({"actions": ["UP"]})
+        with patch(
+            "inference.framework.solver.build_experience_snapshot",
+            return_value={"phase": "orient", "action_budget": 0},
+        ):
+            result = session.step_env({"actions": ["UP"]})
         self.assertFalse(result["executed"])
         self.assertEqual(result["controller_phase"], "orient")
-        self.assertEqual(result["phase_action_budget"], 1)
+        self.assertEqual(result["phase_action_budget"], 0)
 
     def test_animation_summary_empty_frames(self) -> None:
         before = ()
@@ -357,7 +482,7 @@ class SolverControllerTests(TestCase):
     def test_step_env_stops_on_game_over(self) -> None:
         state = SimpleNamespace(
             available_actions={arcengine.GameAction.ACTION1.value},
-            raw=SimpleNamespace(state=arcengine.GameState.FINISHED),
+            raw=SimpleNamespace(state=arcengine.GameState.GAME_OVER),
             levels_completed=1,
             won=True,
             frame=SimpleNamespace(data=[[0]]),

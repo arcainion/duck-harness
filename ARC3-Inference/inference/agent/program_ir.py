@@ -18,15 +18,27 @@ from typing import Annotated, Any, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from typing_extensions import TypeAliasType
 
+from inference.agent.python_tool_policy import (
+    BLOCKED_DYNAMIC_ATTRIBUTES,
+    BLOCKED_MODULE_ATTRIBUTES,
+    POLICY_VERSION,
+    PROTECTED_RUNTIME_BINDINGS,
+    SAFE_MODULES,
+)
 
-COMPILER_VERSION = "duck-program-ir/1.7"
+
+COMPILER_VERSION = "duck-program-ir/1.15"
 PROGRAM_IR_VERSION = 1
 MAX_IR_NODES = 512
 MAX_IR_DEPTH = 32
 MAX_PROGRAM_CHARS = 65_536
+MAX_RAW_PAYLOAD_DEPTH = MAX_IR_DEPTH * 2 + 8
+MAX_RAW_PAYLOAD_VALUES = MAX_IR_NODES * 32
 MAX_COMPILER_DIAGNOSTICS = 24
 MAX_IDENTIFIER_CHARS = 128
 MAX_STRING_CHARS = 8192
+MAX_INTEGER_BITS = 4096
+MAX_CONTAINER_ITEMS = 1024
 DISALLOWED_RUNTIME_NAMES = frozenset({
     "__import__", "breakpoint", "compile", "delattr", "eval", "exec",
     "getattr", "globals", "input", "locals", "open", "setattr", "vars",
@@ -68,6 +80,8 @@ class ConstantExpr(StrictModel):
     def bounded_string(cls, value: str | int | float | bool | None):
         if isinstance(value, str) and len(value) > MAX_STRING_CHARS:
             raise ValueError(f"string constant exceeds {MAX_STRING_CHARS} characters")
+        if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > MAX_INTEGER_BITS:
+            raise ValueError(f"integer constant exceeds {MAX_INTEGER_BITS} bits")
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError("floating-point constants must be finite")
         return value
@@ -99,17 +113,17 @@ class SubscriptExpr(StrictModel):
 
 class ListExpr(StrictModel):
     kind: Literal["list"]
-    items: list["Expr"] = Field(default_factory=list)
+    items: list["Expr"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
 
 
 class TupleExpr(StrictModel):
     kind: Literal["tuple"]
-    items: list["Expr"] = Field(default_factory=list)
+    items: list["Expr"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
 
 
 class SetExpr(StrictModel):
     kind: Literal["set"]
-    items: list["Expr"] = Field(min_length=1)
+    items: list["Expr"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
 
 class DictEntry(StrictModel):
@@ -119,7 +133,7 @@ class DictEntry(StrictModel):
 
 class DictExpr(StrictModel):
     kind: Literal["dict"]
-    entries: list[DictEntry] = Field(default_factory=list)
+    entries: list[DictEntry] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
 
 
 class UnaryExpr(StrictModel):
@@ -144,14 +158,14 @@ class BinaryExpr(StrictModel):
 class BoolExpr(StrictModel):
     kind: Literal["bool"]
     op: Literal["and", "or"]
-    values: list["Expr"] = Field(min_length=2)
+    values: list["Expr"] = Field(min_length=2, max_length=MAX_CONTAINER_ITEMS)
 
 
 class CompareExpr(StrictModel):
     kind: Literal["compare"]
     left: "Expr"
-    ops: list[Literal["eq", "ne", "lt", "lte", "gt", "gte", "in", "not_in", "is", "is_not"]] = Field(min_length=1)
-    comparators: list["Expr"] = Field(min_length=1)
+    ops: list[Literal["eq", "ne", "lt", "lte", "gt", "gte", "in", "not_in", "is", "is_not"]] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
+    comparators: list["Expr"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
     @model_validator(mode="after")
     def matching_operands(self):
@@ -163,8 +177,8 @@ class CompareExpr(StrictModel):
 class CallExpr(StrictModel):
     kind: Literal["call"]
     function: "Expr"
-    args: list["Expr"] = Field(default_factory=list)
-    keywords: dict[str, "Expr"] = Field(default_factory=dict)
+    args: list["Expr"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
+    keywords: dict[str, "Expr"] = Field(default_factory=dict, max_length=MAX_CONTAINER_ITEMS)
 
     @field_validator("keywords")
     @classmethod
@@ -224,7 +238,7 @@ class StarredTarget(StrictModel):
 
 class TupleTarget(StrictModel):
     kind: Literal["tuple_target"]
-    items: list["UnpackTarget"] = Field(min_length=1)
+    items: list["UnpackTarget"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
     @model_validator(mode="after")
     def single_star(self):
@@ -235,7 +249,7 @@ class TupleTarget(StrictModel):
 
 class ListTarget(StrictModel):
     kind: Literal["list_target"]
-    items: list["UnpackTarget"] = Field(min_length=1)
+    items: list["UnpackTarget"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
     @model_validator(mode="after")
     def single_star(self):
@@ -267,26 +281,26 @@ UnpackTarget = TypeAliasType(
 class ComprehensionClause(StrictModel):
     target: StoreTarget
     iterable: "Expr"
-    conditions: list["Expr"] = Field(default_factory=list)
+    conditions: list["Expr"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
 
 
 class ListComprehensionExpr(StrictModel):
     kind: Literal["list_comprehension"]
     element: "Expr"
-    clauses: list[ComprehensionClause] = Field(min_length=1)
+    clauses: list[ComprehensionClause] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
 
 class SetComprehensionExpr(StrictModel):
     kind: Literal["set_comprehension"]
     element: "Expr"
-    clauses: list[ComprehensionClause] = Field(min_length=1)
+    clauses: list[ComprehensionClause] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
 
 class DictComprehensionExpr(StrictModel):
     kind: Literal["dict_comprehension"]
     key: "Expr"
     value: "Expr"
-    clauses: list[ComprehensionClause] = Field(min_length=1)
+    clauses: list[ComprehensionClause] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
 
 Expr = TypeAliasType(
@@ -305,7 +319,7 @@ Expr = TypeAliasType(
 
 class AssignStmt(StrictModel):
     kind: Literal["assign"]
-    targets: list[StoreTarget] = Field(min_length=1)
+    targets: list[StoreTarget] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
     value: Expr
 
 
@@ -324,23 +338,23 @@ class ExprStmt(StrictModel):
 class IfStmt(StrictModel):
     kind: Literal["if"]
     condition: Expr
-    body: list["Stmt"] = Field(min_length=1)
-    orelse: list["Stmt"] = Field(default_factory=list)
+    body: list["Stmt"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
+    orelse: list["Stmt"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
 
 
 class ForStmt(StrictModel):
     kind: Literal["for"]
     target: StoreTarget
     iterable: Expr
-    body: list["Stmt"] = Field(min_length=1)
-    orelse: list["Stmt"] = Field(default_factory=list)
+    body: list["Stmt"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
+    orelse: list["Stmt"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
 
 
 class WhileStmt(StrictModel):
     kind: Literal["while"]
     condition: Expr
-    body: list["Stmt"] = Field(min_length=1)
-    orelse: list["Stmt"] = Field(default_factory=list)
+    body: list["Stmt"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
+    orelse: list["Stmt"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
 
 
 class ParameterIR(StrictModel):
@@ -356,8 +370,8 @@ class ParameterIR(StrictModel):
 class FunctionDefStmt(StrictModel):
     kind: Literal["function_def"]
     name: str
-    parameters: list[ParameterIR] = Field(default_factory=list)
-    body: list["Stmt"] = Field(min_length=1)
+    parameters: list[ParameterIR] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
+    body: list["Stmt"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
     @field_validator("name")
     @classmethod
@@ -404,7 +418,7 @@ class ImportAlias(StrictModel):
 
 class ImportStmt(StrictModel):
     kind: Literal["import"]
-    names: list[ImportAlias] = Field(min_length=1)
+    names: list[ImportAlias] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
 
 class FromImportAlias(StrictModel):
@@ -425,7 +439,7 @@ class FromImportAlias(StrictModel):
 class FromImportStmt(StrictModel):
     kind: Literal["from_import"]
     module: str
-    names: list[FromImportAlias] = Field(min_length=1)
+    names: list[FromImportAlias] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
     @field_validator("module")
     @classmethod
@@ -463,7 +477,7 @@ Stmt = TypeAliasType(
 
 class ProgramIR(StrictModel):
     version: Literal[1] = PROGRAM_IR_VERSION
-    body: list[Stmt] = Field(min_length=1)
+    body: list[Stmt] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
     @field_validator("version", mode="before")
     @classmethod
@@ -500,24 +514,59 @@ class ProgramCompileError(ValueError):
 
 
 @dataclass(frozen=True)
+class SourceMapEntry:
+    path: str
+    line: int
+    end_line: int
+
+
+@dataclass(frozen=True)
 class CompiledProgram:
     program: ProgramIR
     source: str
     node_count: int
     program_sha256: str
     source_sha256: str
-    compiler_version: str = COMPILER_VERSION
+    source_map: tuple[SourceMapEntry, ...]
+
+    def path_for_line(self, line: Any) -> str | None:
+        """Resolve a generated Python line to its most specific IR statement."""
+        if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+            return None
+        for entry in reversed(self.source_map):
+            if entry.line <= line <= entry.end_line:
+                return entry.path
+        return None
 
     def metadata(self) -> dict[str, Any]:
         return {
-            "version": self.compiler_version,
+            **compiler_runtime_metadata(),
             "ir_version": self.program.version,
             "node_count": self.node_count,
             "generated_chars": len(self.source),
             "program_sha256": self.program_sha256,
             "source_sha256": self.source_sha256,
-            "python_version": platform.python_version(),
+            "source_map_entries": len(self.source_map),
         }
+
+
+def compiler_runtime_metadata() -> dict[str, Any]:
+    """Return compiler identity and limits for success and failure traces."""
+    return {
+        "version": COMPILER_VERSION,
+        "python_version": platform.python_version(),
+        "policy_version": POLICY_VERSION,
+        "supported_ir_version": PROGRAM_IR_VERSION,
+        "limits": {
+            "max_ir_nodes": MAX_IR_NODES,
+            "max_ir_depth": MAX_IR_DEPTH,
+            "max_program_chars": MAX_PROGRAM_CHARS,
+            "max_raw_payload_depth": MAX_RAW_PAYLOAD_DEPTH,
+            "max_raw_payload_values": MAX_RAW_PAYLOAD_VALUES,
+            "max_integer_bits": MAX_INTEGER_BITS,
+            "max_container_items": MAX_CONTAINER_ITEMS,
+        },
+    }
 
 
 def _path(location: tuple[Any, ...]) -> str:
@@ -529,7 +578,7 @@ def _path(location: tuple[Any, ...]) -> str:
         "tuple", "set", "dict", "unary", "binary", "bool", "compare",
         "call", "if_expr", "list_comprehension", "set_comprehension",
         "dict_comprehension", "name_target", "attribute_target",
-        "subscript_target", "tuple_target", "list_target", "assign",
+        "subscript_target", "tuple_target", "list_target", "starred_target", "assign",
         "aug_assign", "expr", "if", "for", "while", "function_def",
         "return", "import", "from_import", "break", "continue", "pass",
     }
@@ -589,6 +638,119 @@ def _schema_diagnostics(exc: ValidationError) -> list[CompilerDiagnostic]:
             f"{omitted} additional validation diagnostic(s) omitted",
         ))
     return diagnostics
+
+
+def _preflight_payload(payload: Any) -> None:
+    """Bound untrusted JSON-like input before recursive model validation.
+
+    Validated IR complexity remains the public semantic limit. These wider
+    raw-tree limits prevent malformed payloads, including unknown fields, from
+    making Pydantic traverse an effectively unbounded object graph first.
+    """
+    value_count = 0
+    canonical_chars = 0
+    active_containers: set[int] = set()
+    stack: list[tuple[Any, tuple[Any, ...], int, bool]] = [
+        (payload, (), 0, False)
+    ]
+
+    def fail(*, category: str, code: str, path: tuple[Any, ...], message: str) -> None:
+        raise ProgramCompileError(
+            stage="limits",
+            error_category=category,
+            diagnostics=[CompilerDiagnostic(code, _path(path), message)],
+        )
+
+    while stack:
+        value, path, depth, exiting = stack.pop()
+        if exiting:
+            active_containers.remove(id(value))
+            continue
+
+        value_count += 1
+        if value_count > MAX_RAW_PAYLOAD_VALUES:
+            fail(
+                category="PROGRAM_TOO_LARGE",
+                code="IR_RAW_VALUE_LIMIT",
+                path=path,
+                message=(
+                    f"raw program payload contains more than "
+                    f"{MAX_RAW_PAYLOAD_VALUES} values"
+                ),
+            )
+        if depth > MAX_RAW_PAYLOAD_DEPTH:
+            fail(
+                category="PROGRAM_TOO_DEEP",
+                code="IR_RAW_DEPTH_LIMIT",
+                path=path,
+                message=(
+                    f"raw program payload depth exceeds "
+                    f"{MAX_RAW_PAYLOAD_DEPTH} before schema validation"
+                ),
+            )
+
+        if isinstance(value, (dict, list)):
+            identity = id(value)
+            if identity in active_containers:
+                fail(
+                    category="INVALID_PROGRAM_IR",
+                    code="IR_CYCLIC_PAYLOAD",
+                    path=path,
+                    message="program payload must be an acyclic JSON value",
+                )
+            active_containers.add(identity)
+            stack.append((value, path, depth, True))
+
+        if isinstance(value, dict):
+            if len(value) > MAX_RAW_PAYLOAD_VALUES - value_count:
+                fail(
+                    category="PROGRAM_TOO_LARGE",
+                    code="IR_RAW_VALUE_LIMIT",
+                    path=path,
+                    message=(
+                        f"raw program payload contains more than "
+                        f"{MAX_RAW_PAYLOAD_VALUES} values"
+                    ),
+                )
+            canonical_chars += 2 + max(0, len(value) - 1) + len(value)
+            for key, item in value.items():
+                if isinstance(key, str):
+                    canonical_chars += len(json.dumps(key, ensure_ascii=True))
+                stack.append((item, (*path, key), depth + 1, False))
+        elif isinstance(value, list):
+            if len(value) > MAX_RAW_PAYLOAD_VALUES - value_count:
+                fail(
+                    category="PROGRAM_TOO_LARGE",
+                    code="IR_RAW_VALUE_LIMIT",
+                    path=path,
+                    message=(
+                        f"raw program payload contains more than "
+                        f"{MAX_RAW_PAYLOAD_VALUES} values"
+                    ),
+                )
+            canonical_chars += 2 + max(0, len(value) - 1)
+            for index in range(len(value) - 1, -1, -1):
+                stack.append((value[index], (*path, index), depth + 1, False))
+        elif value is None or isinstance(value, (str, int, float, bool)):
+            if isinstance(value, str) and len(value) > MAX_PROGRAM_CHARS:
+                canonical_chars = MAX_PROGRAM_CHARS + 1
+            else:
+                try:
+                    canonical_chars += len(json.dumps(value, ensure_ascii=True))
+                except (TypeError, ValueError):
+                    # Schema validation supplies the more useful type/value error.
+                    pass
+
+        if canonical_chars > MAX_PROGRAM_CHARS:
+            fail(
+                category="PROGRAM_TOO_LARGE",
+                code="IR_SIZE_LIMIT",
+                path=path,
+                message=(
+                    f"raw canonical program exceeds {MAX_PROGRAM_CHARS} "
+                    "characters before schema validation"
+                ),
+            )
 
 
 def _validate_statement_context(program: ProgramIR) -> None:
@@ -689,6 +851,99 @@ def _validate_statement_context(program: ProgramIR) -> None:
         raise ProgramCompileError(
             stage="structure",
             error_category="INVALID_CONTROL_FLOW",
+            diagnostics=diagnostics,
+        )
+
+
+def _validate_ir_safety(program: ProgramIR) -> None:
+    """Reject known unsafe capabilities before AST lowering or subprocess startup."""
+    diagnostics: list[CompilerDiagnostic] = []
+    omitted = 0
+
+    def add(code: str, path: tuple[Any, ...], message: str) -> None:
+        nonlocal omitted
+        if len(diagnostics) < MAX_COMPILER_DIAGNOSTICS:
+            diagnostics.append(CompilerDiagnostic(code, _path(path), message))
+        else:
+            omitted += 1
+
+    def protect(name: str, path: tuple[Any, ...]) -> None:
+        if name in PROTECTED_RUNTIME_BINDINGS:
+            add(
+                "IR_PROTECTED_RUNTIME_BINDING",
+                path,
+                f"runtime binding {name!r} is injected and cannot be overwritten",
+            )
+
+    def visit(value: Any, path: tuple[Any, ...]) -> None:
+        if isinstance(value, ImportStmt):
+            for index, alias in enumerate(value.names):
+                if alias.name not in SAFE_MODULES:
+                    add(
+                        "IR_BLOCKED_MODULE",
+                        (*path, "names", index, "name"),
+                        f"module {alias.name!r} is not available in the sandbox",
+                    )
+                bound_name = alias.asname or alias.name.split(".", 1)[0]
+                protect(
+                    bound_name,
+                    (*path, "names", index, "asname" if alias.asname else "name"),
+                )
+        elif isinstance(value, FromImportStmt):
+            if value.module not in SAFE_MODULES:
+                add(
+                    "IR_BLOCKED_MODULE",
+                    (*path, "module"),
+                    f"module {value.module!r} is not available in the sandbox",
+                )
+            blocked_names = BLOCKED_MODULE_ATTRIBUTES.get(value.module, frozenset())
+            for index, alias in enumerate(value.names):
+                if alias.name in blocked_names:
+                    add(
+                        "IR_BLOCKED_DYNAMIC_ATTRIBUTE",
+                        (*path, "names", index, "name"),
+                        f"dynamic attribute helper {value.module}.{alias.name} is not allowed",
+                    )
+                protect(
+                    alias.asname or alias.name,
+                    (*path, "names", index, "asname" if alias.asname else "name"),
+                )
+        elif isinstance(value, (AttributeExpr, AttributeTarget)):
+            if value.attr in BLOCKED_DYNAMIC_ATTRIBUTES:
+                add(
+                    "IR_BLOCKED_DYNAMIC_ATTRIBUTE",
+                    (*path, "attr"),
+                    f"dynamic attribute helper {value.attr!r} is not allowed",
+                )
+
+        if isinstance(value, NameTarget):
+            protect(value.name, (*path, "name"))
+        elif isinstance(value, FunctionDefStmt):
+            protect(value.name, (*path, "name"))
+        elif isinstance(value, ParameterIR):
+            protect(value.name, (*path, "name"))
+
+        if isinstance(value, BaseModel):
+            for field_name in type(value).model_fields:
+                visit(getattr(value, field_name), (*path, field_name))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                visit(item, (*path, index))
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                visit(item, (*path, key))
+
+    visit(program, ())
+    if diagnostics:
+        if omitted:
+            diagnostics.append(CompilerDiagnostic(
+                "IR_DIAGNOSTICS_TRUNCATED",
+                "program",
+                f"{omitted} additional safety diagnostic(s) omitted",
+            ))
+        raise ProgramCompileError(
+            stage="safety",
+            error_category="UNSAFE_PROGRAM_IR",
             diagnostics=diagnostics,
         )
 
@@ -873,9 +1128,58 @@ def _lower_stmt(node: Stmt) -> ast.stmt:
     raise TypeError(f"unsupported statement: {type(node).__name__}")
 
 
+def _build_source_map(program: ProgramIR, module: ast.Module) -> tuple[SourceMapEntry, ...]:
+    """Map verified generated-source ranges back to ProgramIR statement paths."""
+    entries: list[SourceMapEntry] = []
+
+    def visit_block(
+        ir_statements: list[Stmt],
+        python_statements: list[ast.stmt],
+        path: tuple[Any, ...],
+    ) -> None:
+        for index, (ir_statement, python_statement) in enumerate(
+            zip(ir_statements, python_statements, strict=False)
+        ):
+            statement_path = (*path, index)
+            line = getattr(python_statement, "lineno", None)
+            end_line = getattr(python_statement, "end_lineno", line)
+            if isinstance(line, int):
+                entries.append(SourceMapEntry(
+                    path=_path(statement_path),
+                    line=line,
+                    end_line=end_line if isinstance(end_line, int) else line,
+                ))
+
+            if isinstance(ir_statement, IfStmt) and isinstance(python_statement, ast.If):
+                visit_block(ir_statement.body, python_statement.body, (*statement_path, "body"))
+                visit_block(ir_statement.orelse, python_statement.orelse, (*statement_path, "orelse"))
+            elif isinstance(ir_statement, ForStmt) and isinstance(python_statement, ast.For):
+                visit_block(ir_statement.body, python_statement.body, (*statement_path, "body"))
+                visit_block(ir_statement.orelse, python_statement.orelse, (*statement_path, "orelse"))
+            elif isinstance(ir_statement, WhileStmt) and isinstance(python_statement, ast.While):
+                visit_block(ir_statement.body, python_statement.body, (*statement_path, "body"))
+                visit_block(ir_statement.orelse, python_statement.orelse, (*statement_path, "orelse"))
+            elif isinstance(ir_statement, FunctionDefStmt) and isinstance(python_statement, ast.FunctionDef):
+                visit_block(ir_statement.body, python_statement.body, (*statement_path, "body"))
+
+    visit_block(program.body, module.body, ("body",))
+    return tuple(entries)
+
+
 def compile_program(payload: Any) -> CompiledProgram:
+    _preflight_payload(payload)
     try:
         program = ProgramIR.model_validate(payload)
+    except RecursionError as exc:
+        raise ProgramCompileError(
+            stage="limits",
+            error_category="PROGRAM_TOO_DEEP",
+            diagnostics=[CompilerDiagnostic(
+                "IR_RAW_DEPTH_LIMIT",
+                "program",
+                "program payload exceeded the validator recursion limit",
+            )],
+        ) from exc
     except ValidationError as exc:
         raise ProgramCompileError(
             stage="schema",
@@ -908,6 +1212,7 @@ def compile_program(payload: Any) -> CompiledProgram:
             diagnostics=[CompilerDiagnostic("IR_DEPTH_LIMIT", "program", f"program depth is {depth}; maximum is {MAX_IR_DEPTH}")],
         )
 
+    _validate_ir_safety(program)
     _validate_statement_context(program)
 
     try:
@@ -940,6 +1245,7 @@ def compile_program(payload: Any) -> CompiledProgram:
         node_count=node_count,
         program_sha256=_program_sha256(canonical_json),
         source_sha256=_source_sha256(compiled_source),
+        source_map=_build_source_map(program, verified),
     )
 
 
@@ -952,7 +1258,11 @@ def program_tool_parameters_schema() -> dict[str, Any]:
         "Stmt and expressions through Expr; raw Python source is not accepted. "
         "JSON types are strict and are never coerced. "
         f"Limits: {MAX_IR_NODES} IR nodes, depth {MAX_IR_DEPTH}, and "
-        f"{MAX_PROGRAM_CHARS} canonical characters."
+        f"{MAX_PROGRAM_CHARS} canonical characters; integers are limited to "
+        f"{MAX_INTEGER_BITS} bits and individual containers to "
+        f"{MAX_CONTAINER_ITEMS} items. Malformed raw payloads are preflighted "
+        f"at {MAX_RAW_PAYLOAD_DEPTH} container levels and "
+        f"{MAX_RAW_PAYLOAD_VALUES} values before schema validation."
     )
     guidance = {
         "AugTarget": "Augmented-assignment target: name, attribute, or subscript only.",

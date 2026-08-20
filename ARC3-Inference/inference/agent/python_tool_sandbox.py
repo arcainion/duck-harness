@@ -15,6 +15,13 @@ import textwrap
 import time
 from typing import Any, Callable
 
+from inference.agent.action_names import MAX_ACTION_BATCH
+from inference.agent.python_tool_policy import (
+    BLOCKED_DYNAMIC_ATTRIBUTES,
+    BLOCKED_MODULE_ATTRIBUTES,
+    PROTECTED_RUNTIME_BINDINGS,
+    SAFE_MODULES,
+)
 from inference.utils import segmentation as _segmentation
 from inference.utils.grid_utils import ARC_COLOR_CHARS
 
@@ -26,6 +33,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     import contextlib
     import io
     import json
+    import math
     import os
     import re
     import sys
@@ -38,27 +46,13 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         resource = None
 
     COLOR_CHARS = ""
+    MAX_ACTION_BATCH = __MAX_ACTION_BATCH__
 
     __SEGMENTATION_SOURCE__
 
     HOST_STDOUT = sys.stdout
 
-    SAFE_MODULES = {
-        "bisect",
-        "collections",
-        "copy",
-        "fractions",
-        "functools",
-        "heapq",
-        "itertools",
-        "json",
-        "math",
-        "operator",
-        "random",
-        "re",
-        "statistics",
-        "string",
-    }
+    SAFE_MODULES = set(__SAFE_MODULES__)
     SAFE_BUILTINS = {
         "abs",
         "all",
@@ -110,6 +104,9 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "zip",
     }
     SAFE_MODULE_CACHE = {}
+    BLOCKED_MODULE_ATTRIBUTES = __BLOCKED_MODULE_ATTRIBUTES__
+    BLOCKED_DYNAMIC_ATTRIBUTES = set(__BLOCKED_DYNAMIC_ATTRIBUTES__)
+    PROTECTED_RUNTIME_BINDINGS = set(__PROTECTED_RUNTIME_BINDINGS__)
 
 
     class SafeModule:
@@ -122,6 +119,11 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             if str(name).startswith("_"):
                 raise AttributeError("Private module attributes are not allowed.")
             module = object.__getattribute__(self, "_module")
+            module_name = str(getattr(module, "__name__", "")).split(".", 1)[0]
+            if str(name) in BLOCKED_MODULE_ATTRIBUTES.get(module_name, set()):
+                raise ValueError(
+                    f"Private dynamic attribute access is not allowed: {module_name}.{name}"
+                )
             value = getattr(module, name)
             if isinstance(value, types.ModuleType):
                 raise AttributeError(f"Module-valued attribute '{name}' is not allowed.")
@@ -129,7 +131,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
 
     def _send(payload):
-        HOST_STDOUT.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        HOST_STDOUT.write(json.dumps(payload, ensure_ascii=True) + "\n")
         HOST_STDOUT.flush()
 
 
@@ -393,6 +395,74 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         return str(value)
 
 
+    def _bounded_json_result(value, max_chars=32768, max_items=2048, max_depth=24):
+        # Convert a result without allowing one IPC message to grow unbounded.
+        remaining_chars = [max_chars]
+        remaining_items = [max_items]
+        truncated = [False]
+        active_containers = set()
+
+        def marker(text):
+            truncated[0] = True
+            return text
+
+        def convert(item, depth=0):
+            if remaining_items[0] <= 0:
+                return marker("... [item limit reached]")
+            remaining_items[0] -= 1
+
+            if isinstance(item, float) and not math.isfinite(item):
+                return marker(str(item))
+            if item is None or isinstance(item, (bool, int, float)):
+                remaining_chars[0] -= min(remaining_chars[0], len(str(item)))
+                return item
+            if isinstance(item, str):
+                allowance = max(0, remaining_chars[0])
+                if len(item) <= allowance:
+                    remaining_chars[0] -= len(item)
+                    return item
+                remaining_chars[0] = 0
+                return marker(item[:allowance] + "... [truncated]")
+            if depth >= max_depth:
+                return marker("... [depth limit reached]")
+
+            if isinstance(item, (dict, list, tuple, set)):
+                identity = id(item)
+                if identity in active_containers:
+                    return marker("... [cycle]")
+                active_containers.add(identity)
+                try:
+                    if isinstance(item, dict):
+                        converted = {}
+                        for key, child in item.items():
+                            if remaining_items[0] <= 0 or remaining_chars[0] <= 0:
+                                converted["... [truncated]"] = True
+                                truncated[0] = True
+                                break
+                            rendered_key = str(key)
+                            if len(rendered_key) > 256:
+                                rendered_key = rendered_key[:256] + "..."
+                                truncated[0] = True
+                            remaining_chars[0] -= min(remaining_chars[0], len(rendered_key))
+                            converted[rendered_key] = convert(child, depth + 1)
+                        return converted
+
+                    converted = []
+                    for child in item:
+                        if remaining_items[0] <= 0 or remaining_chars[0] <= 0:
+                            converted.append("... [truncated]")
+                            truncated[0] = True
+                            break
+                        converted.append(convert(child, depth + 1))
+                    return converted
+                finally:
+                    active_containers.remove(identity)
+
+            return convert(str(item), depth)
+
+        return convert(value), truncated[0]
+
+
     def _classify_error(exc):
         error_type = type(exc).__name__
         error_msg = str(exc)
@@ -427,11 +497,17 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         if error_type == "IndexError":
             return "INDEX_OUT_OF_RANGE", f"Index out of range: {error_msg}. Check bounds."
         if error_type == "ValueError":
+            if "action(actions) accepts at most" in error_msg:
+                return "ACTION_BATCH_LIMIT", error_msg
+            if "Protected runtime binding" in error_msg:
+                return "PROTECTED_RUNTIME_BINDING", error_msg
             if "Private" in error_msg:
                 return "PRIVATE_ACCESS", f"Private access blocked: {error_msg}"
             return "VALUE_ERROR", f"Value error: {error_msg}"
         if error_type == "TimeoutError" or "timed out" in error_msg.lower():
             return "TIMEOUT", f"Code timed out. Optimize or reduce computation."
+        if error_type == "RuntimeError" and error_msg.startswith("action failed:"):
+            return "ACTION_FAILED", "Action execution failed. Check the action payload and current valid_actions."
         if error_type == "RecursionError":
             return "RECURSION_ERROR", "Recursion depth exceeded. Use iterative loops with bounded ranges instead of recursive calls."
         if error_type == "MemoryError":
@@ -446,6 +522,12 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             lines.append(f'  File "<python_tool>", line {frame.lineno}, in {frame.name}')
         lines.append(f"{exc.__class__.__name__}: {exc}")
         return "\n".join(lines)
+
+
+    def _exception_user_line(exc):
+        extracted = traceback.extract_tb(exc.__traceback__)
+        user_frames = [frame for frame in extracted if frame.filename == "<python_tool>"]
+        return user_frames[-1].lineno if user_frames else None
 
 
     def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -472,20 +554,49 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         # Reject Python object-graph escape primitives before execution.
         tree = ast.parse(code, filename="<python_tool>", mode="exec")
         for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and node.id in PROTECTED_RUNTIME_BINDINGS
+            ):
+                raise ValueError(
+                    f"Protected runtime binding cannot be overwritten: {node.id}"
+                )
             if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
                 raise ValueError(f"Private attribute access is not allowed: {node.attr}")
             if isinstance(node, ast.Name) and node.id.startswith("_"):
                 raise ValueError(f"Private names are not allowed: {node.id}")
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name.startswith("_"):
                 raise ValueError(f"Private definitions are not allowed: {node.name}")
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and node.name in PROTECTED_RUNTIME_BINDINGS
+            ):
+                raise ValueError(
+                    f"Protected runtime binding cannot be overwritten: {node.name}"
+                )
             if isinstance(node, ast.arg) and node.arg.startswith("_"):
                 raise ValueError(f"Private argument names are not allowed: {node.arg}")
+            if isinstance(node, ast.arg) and node.arg in PROTECTED_RUNTIME_BINDINGS:
+                raise ValueError(
+                    f"Protected runtime binding cannot be overwritten: {node.arg}"
+                )
             if isinstance(node, ast.keyword) and node.arg is not None and node.arg.startswith("_"):
                 raise ValueError(f"Private keyword arguments are not allowed: {node.arg}")
+            if isinstance(node, ast.Attribute) and node.attr in BLOCKED_DYNAMIC_ATTRIBUTES:
+                owner = node.value.id if isinstance(node.value, ast.Name) else ""
+                qualified_name = f"{owner}.{node.attr}" if owner else node.attr
+                raise ValueError(
+                    f"Private dynamic attribute resolution is not allowed: {qualified_name}"
+                )
             if isinstance(node, ast.alias):
                 bound_name = node.asname or node.name.split(".", 1)[0]
                 if node.name.startswith("_") or bound_name.startswith("_"):
                     raise ValueError(f"Private imports are not allowed: {node.name}")
+                if bound_name in PROTECTED_RUNTIME_BINDINGS:
+                    raise ValueError(
+                        f"Protected runtime binding cannot be overwritten: {bound_name}"
+                    )
         return tree
 
 
@@ -513,6 +624,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         elif isinstance(actions, dict):
             items = [actions]
         elif isinstance(actions, (list, tuple)):
+            if len(actions) > MAX_ACTION_BATCH:
+                raise ValueError(
+                    f"action(actions) accepts at most {MAX_ACTION_BATCH} actions per batch."
+                )
             items = list(actions)
         else:
             raise TypeError(
@@ -562,21 +677,26 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         max_stdout_chars = 32768
         stdout = io.StringIO()
         _stdout_len = [0]
+        _stdout_truncated = [False]
 
         class _BoundedStdout:
             def write(self, s):
                 remaining = max_stdout_chars - _stdout_len[0]
                 if remaining <= 0:
+                    if s:
+                        _stdout_truncated[0] = True
                     return len(s)
                 chunk = s[:remaining]
                 stdout.write(chunk)
                 _stdout_len[0] += len(chunk)
+                if len(s) > remaining:
+                    _stdout_truncated[0] = True
                 return len(s)
             def flush(self):
                 stdout.flush()
             def getvalue(self):
                 val = stdout.getvalue()
-                if _stdout_len[0] >= max_stdout_chars:
+                if _stdout_truncated[0]:
                     val += "\n... [stdout capped at 32KB]"
                 return val
 
@@ -683,11 +803,13 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             compiled = compile(parsed, "<python_tool>", "exec")
             with contextlib.redirect_stdout(bounded_stdout):
                 exec(compiled, runtime_globals, runtime_globals)
+            safe_result, result_truncated = _bounded_json_result(runtime_globals.get("result"))
             _send(
                 {
                     "type": "final",
                     "stdout": bounded_stdout.getvalue(),
-                    "result": _json_safe(runtime_globals.get("result")),
+                    "result": safe_result,
+                    "result_truncated": result_truncated,
                     "action_results": _json_safe(action_results),
                 }
             )
@@ -697,6 +819,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 {
                     "type": "error",
                     "error": _sanitize_exception(exc),
+                    "error_line": _exception_user_line(exc),
                     "error_category": error_category,
                     "error_hint": error_hint,
                     "stdout": bounded_stdout.getvalue(),
@@ -708,7 +831,18 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     if __name__ == "__main__":
         main()
     """
-).replace("__SEGMENTATION_SOURCE__\n", inspect.getsource(_segmentation))
+).replace("__SEGMENTATION_SOURCE__\n", inspect.getsource(_segmentation)).replace(
+    "__MAX_ACTION_BATCH__", str(MAX_ACTION_BATCH)
+).replace(
+    "__SAFE_MODULES__", repr(sorted(SAFE_MODULES))
+).replace(
+    "__BLOCKED_MODULE_ATTRIBUTES__",
+    repr({name: sorted(values) for name, values in BLOCKED_MODULE_ATTRIBUTES.items()}),
+).replace(
+    "__BLOCKED_DYNAMIC_ATTRIBUTES__", repr(sorted(BLOCKED_DYNAMIC_ATTRIBUTES))
+).replace(
+    "__PROTECTED_RUNTIME_BINDINGS__", repr(sorted(PROTECTED_RUNTIME_BINDINGS))
+)
 
 
 def _sanitize_host_error_text(text: str) -> str:
@@ -736,7 +870,7 @@ def _sandbox_env() -> dict[str, str]:
 
 
 def _send_json_line(handle: Any, payload: dict[str, Any]) -> None:
-    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
     handle.flush()
 
 
@@ -804,7 +938,10 @@ def _wait_for_process_exit(process: subprocess.Popen[str], *, timeout: float = 1
     finally:
         for handle in (process.stdin, process.stdout, process.stderr):
             if handle is not None:
-                handle.close()
+                try:
+                    handle.close()
+                except (OSError, ValueError):
+                    pass
 
 
 def run_sandboxed_python(
@@ -834,6 +971,8 @@ def run_sandboxed_python(
         except OSError:
             return {
                 "error": "Sandbox process could not start.",
+                "error_category": "SANDBOX_START_FAILED",
+                "error_hint": "The isolated Python runtime could not start. Retry with a smaller program.",
                 "stdout": "",
                 "action_results": [],
             }
@@ -850,8 +989,27 @@ def run_sandboxed_python(
 
         threading.Thread(target=_stdout_reader, daemon=True).start()
 
-        _send_json_line(
-            process.stdin,
+        def _send_to_runtime(
+            payload: dict[str, Any],
+            *,
+            error: str,
+            error_hint: str,
+        ) -> dict[str, Any] | None:
+            try:
+                _send_json_line(process.stdin, payload)
+                return None
+            except Exception:  # noqa: BLE001 - contain IPC and serialization failures
+                _kill_process_group(process)
+                _wait_for_process_exit(process)
+                return {
+                    "error": error,
+                    "error_category": "SANDBOX_PROTOCOL_ERROR",
+                    "error_hint": error_hint,
+                    "stdout": "",
+                    "action_results": list(host_action_results),
+                }
+
+        send_failure = _send_to_runtime(
             {
                 "code": code,
                 "timeout_seconds": timeout_seconds,
@@ -859,26 +1017,27 @@ def run_sandboxed_python(
                 "state": initial_state,
                 "color_chars": ARC_COLOR_CHARS,
             },
+            error="Sandbox process rejected its initial payload.",
+            error_hint="The isolated runtime could not receive the program payload.",
         )
+        if send_failure is not None:
+            return send_failure
 
         deadline = time.monotonic() + max(1, int(timeout_seconds))
-        partial_stdout_lines: list[str] = []
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _kill_process_group(process)
                 _wait_for_process_exit(process)
-                partial_stdout = "".join(partial_stdout_lines)
-                if len(partial_stdout) > 4096:
-                    partial_stdout = partial_stdout[:4096] + "... [truncated]"
                 executed_count = len(host_action_results)
                 attribution = ""
                 if executed_count > 0:
-                    last = host_action_results[-1]
                     attribution = f" {executed_count} action(s) completed before timeout."
                 return {
                     "error": f"Tool timed out after {timeout_seconds}s.{attribution}",
-                    "stdout": partial_stdout,
+                    "error_category": "TIMEOUT",
+                    "error_hint": "Code timed out. Optimize or reduce computation.",
+                    "stdout": "",
                     "action_results": list(host_action_results),
                 }
 
@@ -886,32 +1045,37 @@ def run_sandboxed_python(
                 line = stdout_queue.get(timeout=remaining)
             except queue.Empty:
                 continue
-            if line is not None:
-                partial_stdout_lines.append(line)
             if line is None:
                 stderr = process.stderr.read()
                 _wait_for_process_exit(process)
-                partial_stdout = "".join(partial_stdout_lines)
-                if len(partial_stdout) > 4096:
-                    partial_stdout = partial_stdout[:4096] + "... [truncated]"
                 return {
                     "error": _sanitize_host_error_text(stderr),
-                    "stdout": partial_stdout,
+                    "error_category": "SANDBOX_PROCESS_ERROR",
+                    "error_hint": "The isolated Python process exited unexpectedly.",
+                    "stdout": "",
                     "action_results": list(host_action_results),
                 }
 
             try:
                 message = json.loads(line)
             except json.JSONDecodeError:
-                stderr = process.stderr.read()
                 _kill_process_group(process)
                 _wait_for_process_exit(process)
-                partial_stdout = "".join(partial_stdout_lines)
-                if len(partial_stdout) > 4096:
-                    partial_stdout = partial_stdout[:4096] + "... [truncated]"
                 return {
                     "error": "Sandbox process returned an invalid response.",
-                    "stdout": partial_stdout,
+                    "error_category": "SANDBOX_PROTOCOL_ERROR",
+                    "error_hint": "The isolated runtime returned malformed protocol data.",
+                    "stdout": "",
+                    "action_results": list(host_action_results),
+                }
+            if not isinstance(message, dict):
+                _kill_process_group(process)
+                _wait_for_process_exit(process)
+                return {
+                    "error": "Sandbox process returned a non-object response.",
+                    "error_category": "SANDBOX_PROTOCOL_ERROR",
+                    "error_hint": "The isolated runtime returned invalid protocol data.",
+                    "stdout": "",
                     "action_results": list(host_action_results),
                 }
 
@@ -919,26 +1083,42 @@ def run_sandboxed_python(
             if msg_type == "action":
                 try:
                     action_result_payload = action_handler(list(message.get("actions") or []))
+                    if not isinstance(action_result_payload, dict):
+                        raise TypeError("action handler must return a dictionary")
+                    raw_action_result = action_result_payload.get("action_result")
+                    refreshed_state = action_result_payload.get("state")
+                    if raw_action_result is None:
+                        raw_action_result = {}
+                    if refreshed_state is None:
+                        refreshed_state = {}
+                    if not isinstance(raw_action_result, dict):
+                        raise TypeError("action_result must be a dictionary")
+                    if not isinstance(refreshed_state, dict):
+                        raise TypeError("action state must be a dictionary")
                 except Exception as exc:  # noqa: BLE001
-                    _send_json_line(
-                        process.stdin,
+                    send_failure = _send_to_runtime(
                         {
                             "type": "action_error",
                             "error": f"action failed: {type(exc).__name__}: {exc}",
                         },
+                        error="Sandbox process could not receive an action failure.",
+                        error_hint="The isolated runtime protocol closed during action handling.",
                     )
+                    if send_failure is not None:
+                        return send_failure
                     continue
-                raw_action_result = action_result_payload.get("action_result") or {}
-                if isinstance(raw_action_result, dict):
-                    host_action_results.append(dict(raw_action_result))
-                _send_json_line(
-                    process.stdin,
+                host_action_results.append(dict(raw_action_result))
+                send_failure = _send_to_runtime(
                     {
                         "type": "action_result",
                         "action_result": raw_action_result,
-                        "state": action_result_payload.get("state") or {},
+                        "state": refreshed_state,
                     },
+                    error="Sandbox process could not receive an action result.",
+                    error_hint="The isolated runtime protocol closed after an action executed.",
                 )
+                if send_failure is not None:
+                    return send_failure
                 continue
 
             if msg_type == "strategy":
@@ -952,16 +1132,21 @@ def run_sandboxed_python(
                         persisted_strategy = strategy_handler(
                             dict(message.get("update") or {})
                         )
+                        if not isinstance(persisted_strategy, dict):
+                            raise TypeError("strategy handler must return a dictionary")
                     except Exception:  # noqa: BLE001
                         persisted_strategy = {}
                 host_strategy_updates.append(dict(persisted_strategy))
-                _send_json_line(
-                    process.stdin,
+                send_failure = _send_to_runtime(
                     {
                         "type": "strategy_result",
                         "strategy": persisted_strategy,
                     },
+                    error="Sandbox process could not receive a strategy result.",
+                    error_hint="The isolated runtime protocol closed during strategy handling.",
                 )
+                if send_failure is not None:
+                    return send_failure
                 continue
 
             if msg_type in {"final", "error"}:
@@ -969,6 +1154,7 @@ def run_sandboxed_python(
                 result = {
                     "stdout": str(message.get("stdout", "") or ""),
                     "result": message.get("result"),
+                    "result_truncated": bool(message.get("result_truncated")),
                     "error": str(message.get("error", "") or ""),
                     "action_results": list(message.get("action_results") or host_action_results),
                     "strategy_updates": list(host_strategy_updates),
@@ -976,11 +1162,16 @@ def run_sandboxed_python(
                 if msg_type == "error":
                     result["error_category"] = str(message.get("error_category", "") or "")
                     result["error_hint"] = str(message.get("error_hint", "") or "")
+                    error_line = message.get("error_line")
+                    if isinstance(error_line, int) and not isinstance(error_line, bool):
+                        result["error_line"] = error_line
                 return result
 
             _wait_for_process_exit(process)
             return {
                 "error": "Sandbox process returned an unknown message type.",
+                "error_category": "SANDBOX_PROTOCOL_ERROR",
+                "error_hint": "The isolated runtime returned an unknown protocol message.",
                 "stdout": "",
                 "action_results": list(host_action_results),
             }

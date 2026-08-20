@@ -1,5 +1,6 @@
 """Prompt templates for the analyzer agent."""
 
+from inference.agent.python_tool_policy import allowed_modules_text
 from inference.utils.grid_utils import ARC_COLOR_LEGEND
 
 TOOL_CALL_FORMAT_GUIDANCE = (
@@ -46,7 +47,7 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- `current_frame.step` is the current environment step count.\n"
     "- `current_frame.level` is the current level number.\n"
     "- `current_frame.shape` is a `(rows, cols)` tuple.\n"
-    "- The raw numeric grid is available as `current_frame._grid` but is intentionally discouraged. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.\n"
+    "- The private raw grid (`current_frame._grid`) is not accessible. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.\n"
 
     "- `history` is a chronological list of action/frame snapshots.\n"
     "- `history` is a Python list of objects, not a dict.\n"
@@ -81,7 +82,7 @@ PYTHON_ADDENDUM = (
     "- Use `current_frame.segmentation` as your primary view of the board -- objects, colors, containment, adjacency, and cross-frame object hashes.\n"
     "- Use `current_frame.ascii` only to read a small, specific region of the board when `segmentation` is not enough; never use it to scan or summarize the whole board.\n"
     "- Every `python` tool call starts fresh. Submit structured `program` version 1; raw Python source is not accepted. Re-import modules or re-define custom utility logic in each program.\n"
-    "- The only importable standard-library modules are: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string.\n"
+    f"- The only importable standard-library modules are: {allowed_modules_text()}. Dynamic attribute helpers (operator.attrgetter/operator.methodcaller, string.Formatter, and str.format/format_map) are blocked.\n"
     "- The only tool is `python`; its JSON schema is authoritative. Build expressions and statements from the discriminated `kind` variants in that schema.\n"
     "- Common ProgramIR forms: names use `{'kind':'name','name':'x'}`; constants use `{'kind':'constant','value':...}`; calls use `{'kind':'call','function':..., 'args':[...]}`; assignments use `targets` containing `name_target`; field/key access uses `attribute`/`subscript`; starred unpacking uses `starred_target` only inside a `tuple_target` or `list_target`.\n"
     "- Always inspect `current_frame`, `history`, and `valid_actions` from Python instead of reasoning from the raw board by eye.\n"
@@ -106,6 +107,7 @@ PYTHON_ADDENDUM = (
     "- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.\n"
     "- IMPORTANT: If ProgramIR validation, compilation, or execution fails, use the diagnostic path to fix or drastically simplify it. Do not retry the same failing program. Prefer a direct `action(...)` call when recovery is needed.\n"
     "- IMPORTANT: Only access variables that are listed in the runtime variables section above (`current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, `last_action_result`, `experience`, `strategy`, `record_strategy`, `action`). Accessing any variable not listed will raise a NameError and waste a tool call.\n"
+    "- Runtime variables and pre-injected helpers are protected bindings. Read or call them, but never assign to them or reuse their names for functions, parameters, or import aliases.\n"
     "- If you lose track of where you are or what the goal is, discard your current world model and start fresh from `current_frame` and `experience`. Do not accumulate stale beliefs.\n"
     "- When you complete a level and move to the next, check `experience['recent_transitions']` and `experience['tried_here']` for evidence of what worked in previous levels. Successful strategies often transfer: if mouse coordinates, pathfinding heuristics, or object interactions solved the prior level, try them first on the new layout.\n"
     "- Pre-injected helpers (no import needed): `color_grid(frame)` returns 2D list of color chars; `diff_frames(f1, f2)` returns changed/appeared/disappeared; `find_positions(frame, char)` returns [(r,c),...]; `neighbors4(r,c,rows,cols)` and `neighbors8(...)`; `bfs(frame,start,goal,blocked=None)` returns path; `flood(frame,start,color=None)` returns set; `cell_at(frame,r,c)` returns color char; `count_colors(frame)` returns dict; `object_positions(frame,color)` returns objects of that color.\n"

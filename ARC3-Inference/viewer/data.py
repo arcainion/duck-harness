@@ -777,9 +777,11 @@ def _extract_python_code(tool_call_content: str) -> str:
     if not text:
         return ""
     match = _TOOL_CODE_PARAMETER_RE.search(text)
+    program_match = _TOOL_PROGRAM_PARAMETER_RE.search(text)
+    if match and program_match:
+        return ""
     if match:
         return str(match.group(1) or "").strip("\n")
-    program_match = _TOOL_PROGRAM_PARAMETER_RE.search(text)
     if program_match:
         try:
             return compile_program(json.loads(str(program_match.group(1) or ""))).source.strip("\n")
@@ -791,6 +793,8 @@ def _extract_python_code(tool_call_content: str) -> str:
         return ""
     if isinstance(parsed, dict):
         code = parsed.get("code")
+        if isinstance(code, str) and "program" in parsed:
+            return ""
         if isinstance(code, str):
             return code.strip("\n")
         if "program" in parsed:
