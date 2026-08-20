@@ -121,3 +121,36 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("exited with code 17 before becoming ready", message)
         self.assertIn("earliest worker failure", message)
         self.assertIn("latest engine failure", message)
+
+    def test_unknown_accelerator_uses_defaults(self) -> None:
+        config = duck_kaggle_vllm_config_for_accelerator("NvidiaUnknownGPU")
+        self.assertEqual(config.tensor_parallel_size, 1)
+        self.assertGreater(config.max_model_len, 0)
+
+    def test_rtx_pro_6000_setup_command_structure(self) -> None:
+        config = duck_kaggle_vllm_config_for_accelerator("NvidiaRtxPro6000")
+        command = duck_kaggle_setup_command(config)
+        self.assertIn("def wait_for_vllm_server(", command)
+        self.assertIn("VLLM_BASE_URL", command)
+
+    def test_t4_single_gpu_config(self) -> None:
+        config = duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
+        self.assertGreater(config.tensor_parallel_size, 0)
+
+    def test_config_has_expected_attributes(self) -> None:
+        for acc in ("NvidiaTeslaT4", "NvidiaRtxPro6000"):
+            config = duck_kaggle_vllm_config_for_accelerator(acc)
+            self.assertTrue(hasattr(config, "max_model_len"))
+            self.assertTrue(hasattr(config, "tensor_parallel_size"))
+            self.assertTrue(hasattr(config, "expected_gpu_type"))
+            self.assertTrue(hasattr(config, "expected_gpu_count"))
+
+    def test_solver_default_kaggle_commands(self) -> None:
+        solver = HarnessSolver()
+        self.assertIsInstance(solver.kaggle_setup_commands, list)
+
+    def test_setup_command_mentions_vllm_server(self) -> None:
+        for acc in ("NvidiaTeslaT4", "NvidiaRtxPro6000"):
+            config = duck_kaggle_vllm_config_for_accelerator(acc)
+            command = duck_kaggle_setup_command(config)
+            self.assertIn("vllm", command.lower())

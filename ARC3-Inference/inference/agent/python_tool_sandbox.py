@@ -164,42 +164,52 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
     class GridUtils:
         @staticmethod
+        def _to_char_grid(frame):
+            if frame is None:
+                return []
+            grid = frame._grid if hasattr(frame, '_grid') else None
+            if grid is None:
+                return []
+            cc = COLOR_CHARS
+            return [[cc[max(0, min(15, int(v)))] if isinstance(v, int) else str(v) for v in row] for row in grid]
+
+        @staticmethod
         def diff_frames(frame1, frame2):
-            if frame1 is None or frame2 is None:
-                return {"changed_cells": [], "appeared": [], "disappeared": []}
-            grid1 = frame1._grid if hasattr(frame1, '_grid') else []
-            grid2 = frame2._grid if hasattr(frame2, '_grid') else []
-            if not grid1 or not grid2 or len(grid1) != len(grid2):
-                return {"changed_cells": [], "appeared": [], "disappeared": []}
-            changed = []
-            appeared = []
-            disappeared = []
-            for r in range(len(grid1)):
-                if r >= len(grid2):
+            g1 = GridUtils._to_char_grid(frame1)
+            g2 = GridUtils._to_char_grid(frame2)
+            if not g1 or not g2 or len(g1) != len(g2):
+                return {"changed": [], "appeared": [], "disappeared": []}
+            changed, appeared, disappeared = [], [], []
+            for r in range(len(g1)):
+                if r >= len(g2):
                     break
-                row1 = grid1[r]
-                row2 = grid2[r]
-                for c in range(min(len(row1), len(row2))):
-                    if row1[c] != row2[c]:
-                        changed.append((r, c))
-                        if row1[c] == 0:
-                            appeared.append((r, c))
-                        elif row2[c] == 0:
+                for c in range(min(len(g1[r]), len(g2[r]))):
+                    if g1[r][c] != g2[r][c]:
+                        changed.append({"pos": (r, c), "from": g1[r][c], "to": g2[r][c]})
+                        if g2[r][c] == '.':
                             disappeared.append((r, c))
-            return {"changed_cells": changed, "appeared": appeared, "disappeared": disappeared}
+                        if g1[r][c] == '.':
+                            appeared.append((r, c))
+            return {"changed": changed, "appeared": appeared, "disappeared": disappeared}
 
         @staticmethod
         def get_cell(frame, row, col):
-            grid = frame._grid if hasattr(frame, '_grid') else []
-            if 0 <= row < len(grid) and 0 <= col < len(grid[row]):
-                return grid[row][col]
+            g = GridUtils._to_char_grid(frame)
+            if 0 <= row < len(g) and 0 <= col < len(g[row]):
+                return g[row][col]
             return None
 
         @staticmethod
         def set_cell(frame, row, col, value):
             grid = frame._grid if hasattr(frame, '_grid') else None
             if grid is not None and 0 <= row < len(grid) and 0 <= col < len(grid[row]):
-                grid[row][col] = value
+                cc = COLOR_CHARS
+                if isinstance(value, str) and len(value) == 1:
+                    idx = cc.find(value)
+                    if idx >= 0:
+                        grid[row][col] = idx
+                else:
+                    grid[row][col] = int(value)
 
         @staticmethod
         def neighbors(pos, shape, diagonals=False):
@@ -208,73 +218,93 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
             if diagonals:
                 dirs += [(-1, -1), (-1, 1), (1, -1), (1, 1)]
-            result = []
-            for dr, dc in dirs:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols:
-                    result.append((nr, nc))
-            return result
+            return [(r + dr, c + dc) for dr, dc in dirs if 0 <= r + dr < rows and 0 <= c + dc < cols]
 
         @staticmethod
         def find_color(frame, color_char):
-            grid = frame._grid if hasattr(frame, '_grid') else []
-            result = []
-            for r, row in enumerate(grid):
-                for c, cell in enumerate(row):
-                    if cell == color_char:
-                        result.append((r, c))
-            return result
+            return [(r, c) for r, row in enumerate(GridUtils._to_char_grid(frame)) for c, cell in enumerate(row) if cell == color_char]
 
         @staticmethod
         def flood_fill(frame, start, target_color=None):
-            grid = frame._grid if hasattr(frame, '_grid') else []
-            if not grid:
+            g = GridUtils._to_char_grid(frame)
+            if not g:
                 return set()
-            rows = len(grid)
-            cols = max((len(row) for row in grid), default=0)
-            if start[0] < 0 or start[0] >= rows or start[1] < 0 or start[1] >= cols:
+            rows, cols = len(g), max((len(row) for row in g), default=0)
+            if not (0 <= start[0] < rows and 0 <= start[1] < cols):
                 return set()
             if target_color is None:
-                target_color = grid[start[0]][start[1]]
+                target_color = g[start[0]][start[1]]
             visited = set()
             stack = [start]
             while stack:
                 r, c = stack.pop()
-                if (r, c) in visited:
-                    continue
-                if r < 0 or r >= rows or c < 0 or c >= cols:
-                    continue
-                if grid[r][c] != target_color:
+                if (r, c) in visited or not (0 <= r < rows and 0 <= c < cols) or g[r][c] != target_color:
                     continue
                 visited.add((r, c))
                 stack.extend([(r-1, c), (r+1, c), (r, c-1), (r, c+1)])
             return visited
 
         @staticmethod
-        def bfs_path(frame, start, goal):
-            grid = frame._grid if hasattr(frame, '_grid') else []
-            if not grid or not start or not goal:
+        def bfs_path(frame, start, goal, blocked_colors=None):
+            g = GridUtils._to_char_grid(frame)
+            if not g or not start or not goal:
                 return []
-            rows = len(grid)
-            cols = max((len(row) for row in grid), default=0)
-            if start[0] < 0 or start[0] >= rows or goal[0] < 0 or goal[0] >= rows:
+            rows, cols = len(g), max((len(row) for row in g), default=0)
+            if not (0 <= start[0] < rows and 0 <= start[1] < cols and 0 <= goal[0] < rows and 0 <= goal[1] < cols):
                 return []
+            blocked = set(blocked_colors) if blocked_colors else set()
             from collections import deque
-            queue = deque([(start, [start])])
+            q = deque([(start, [start])])
             visited = {start}
-            while queue:
-                (r, c), path = queue.popleft()
+            while q:
+                (r, c), path = q.popleft()
                 if (r, c) == goal:
                     return path
                 for nr, nc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     new_r, new_c = r + nr, c + nc
-                    if (0 <= new_r < rows and 0 <= new_c < cols and
-                            (new_r, new_c) not in visited):
+                    if (0 <= new_r < rows and 0 <= new_c < cols and (new_r, new_c) not in visited and g[new_r][new_c] not in blocked):
                         visited.add((new_r, new_c))
-                        queue.append(((new_r, new_c), path + [(new_r, new_c)]))
+                        q.append(((new_r, new_c), path + [(new_r, new_c)]))
             return []
 
     grid_utils = GridUtils()
+
+    def color_grid(frame):
+        return GridUtils._to_char_grid(frame)
+
+    def diff_frames(f1, f2):
+        return GridUtils.diff_frames(f1, f2)
+
+    def find_positions(frame, color_char):
+        return GridUtils.find_color(frame, color_char)
+
+    def neighbors4(r, c, rows, cols):
+        return [(r+dr, c+dc) for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)] if 0 <= r+dr < rows and 0 <= c+dc < cols]
+
+    def neighbors8(r, c, rows, cols):
+        return [(r+dr, c+dc) for dr, dc in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)] if 0 <= r+dr < rows and 0 <= c+dc < cols]
+
+    def bfs(frame, start, goal, blocked=None):
+        return GridUtils.bfs_path(frame, start, goal, blocked_colors=blocked)
+
+    def flood(frame, start, color=None):
+        return GridUtils.flood_fill(frame, start, target_color=color)
+
+    def cell_at(frame, r, c):
+        return GridUtils.get_cell(frame, r, c)
+
+    def count_colors(frame):
+        cc = color_grid(frame)
+        counts = {}
+        for row in cc:
+            for cell in row:
+                counts[cell] = counts.get(cell, 0) + 1
+        return counts
+
+    def object_positions(frame, color_char):
+        seg = frame.segmentation
+        nodes = seg.get('nodes', []) if isinstance(seg, dict) else []
+        return [{'id': n.get('id'), 'pixels': n.get('pixels'), 'boundary': n.get('boundary', [])} for n in nodes if n.get('color') == color_char]
 
 
     class HistoryEntryView:
@@ -402,6 +432,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             return "VALUE_ERROR", f"Value error: {error_msg}"
         if error_type == "TimeoutError" or "timed out" in error_msg.lower():
             return "TIMEOUT", f"Code timed out. Optimize or reduce computation."
+        if error_type == "RecursionError":
+            return "RECURSION_ERROR", "Recursion depth exceeded. Use iterative loops with bounded ranges instead of recursive calls."
+        if error_type == "MemoryError":
+            return "MEMORY_ERROR", "Memory exceeded. Use smaller data structures, avoid copying large grids, and process cells lazily."
         return "RUNTIME_ERROR", f"{error_type}: {error_msg}"
 
     def _sanitize_exception(exc):
@@ -632,6 +666,16 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         runtime_globals["action"] = action
         runtime_globals["record_strategy"] = record_strategy
         runtime_globals["grid_utils"] = grid_utils
+        runtime_globals["color_grid"] = color_grid
+        runtime_globals["diff_frames"] = diff_frames
+        runtime_globals["find_positions"] = find_positions
+        runtime_globals["neighbors4"] = neighbors4
+        runtime_globals["neighbors8"] = neighbors8
+        runtime_globals["bfs"] = bfs
+        runtime_globals["flood"] = flood
+        runtime_globals["cell_at"] = cell_at
+        runtime_globals["count_colors"] = count_colors
+        runtime_globals["object_positions"] = object_positions
         _refresh_state(initial.get("state") or {})
 
         try:

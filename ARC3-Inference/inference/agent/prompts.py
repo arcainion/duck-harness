@@ -107,7 +107,7 @@ PYTHON_ADDENDUM = (
     "- IMPORTANT: Only access variables that are listed in the runtime variables section above (`current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, `last_action_result`, `experience`, `strategy`, `record_strategy`, `action`). Accessing any variable not listed will raise a NameError and waste a tool call.\n"
     "- If you lose track of where you are or what the goal is, discard your current world model and start fresh from `current_frame` and `experience`. Do not accumulate stale beliefs.\n"
     "- When you complete a level and move to the next, check `experience['recent_transitions']` and `experience['tried_here']` for evidence of what worked in previous levels. Successful strategies often transfer: if mouse coordinates, pathfinding heuristics, or object interactions solved the prior level, try them first on the new layout.\n"
-    "- `grid_utils` provides helper methods: `diff_frames(f1, f2)` returns changed/appeared/disappeared cells; `get_cell(frame, r, c)` returns cell color; `set_cell(frame, r, c, val)` sets a cell; `neighbors(pos, shape)` returns adjacent positions; `find_color(frame, char)` returns positions of a color; `flood_fill(frame, start)` returns connected region; `bfs_path(frame, start, goal)` returns shortest path.\n"
+    "- Pre-injected helpers (no import needed): `color_grid(frame)` returns 2D list of color chars; `diff_frames(f1, f2)` returns changed/appeared/disappeared; `find_positions(frame, char)` returns [(r,c),...]; `neighbors4(r,c,rows,cols)` and `neighbors8(...)`; `bfs(frame,start,goal,blocked=None)` returns path; `flood(frame,start,color=None)` returns set; `cell_at(frame,r,c)` returns color char; `count_colors(frame)` returns dict; `object_positions(frame,color)` returns objects of that color.\n"
 )
 
 COMPACT_TOOL_SESSION_ADDENDUM = (
@@ -123,4 +123,11 @@ COMPACT_TOOL_SESSION_ADDENDUM = (
     "- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.\n"
     "- If `last_action_result` shows `run_complete=True`, `level_completed=True`, `game_over=True`, or `done=True`, do NOT call `action(...)` again. Instead, print a brief summary of what happened and return. The next turn will re-ground you on the updated state.\n"
     "- If you have called `action(...)` and it succeeded, and your code has already determined the next best action, call `action(...)` again in the same snippet to save a turn. But stop the loop immediately if any result reports completion.\n"
+    "\nCode templates (copy and adapt):\n"
+    "- Inspect: seg = current_frame.segmentation; nodes = seg['nodes']; print([(n['id'], n['color'], n['pixels']) for n in nodes])\n"
+    "- Diff: d = diff_frames(previous_frame, current_frame); print(d['changed'][:10])\n"
+    "- BFS: path = bfs(current_frame, (start_r, start_c), (goal_r, goal_c)); action([{{'action':'MOUSE','row':path[1][0],'col':path[1][1]}}])\n"
+    "- Flood: region = flood(current_frame, (r, c)); print(len(region))\n"
+    "- Count: print(count_colors(current_frame))\n"
+    "- Track object: objs = object_positions(current_frame, 'r'); print([(o['id'], o['pixels']) for o in objs])\n"
 )

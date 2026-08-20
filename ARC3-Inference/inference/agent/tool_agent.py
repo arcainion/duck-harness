@@ -167,12 +167,9 @@ _PYTHON_TOOL_DESCRIPTION = (
     "`current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, "
     "`valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, "
     "`record_strategy(...)`, and `action(actions)` for executing one or more real environment actions. "
-    "`current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, and `.level`; "
-    "`history[-1].frame` is the current post-action frame, not the previous frame. "
-    "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
-    "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
-    "The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. "
-    "Use `print(...)` for compact output or assign final data to `result`."
+    "Pre-injected helpers: `color_grid(frame)`, `diff_frames(f1,f2)`, `find_positions(frame,char)`, "
+    "`neighbors4(r,c,rows,cols)`, `neighbors8(...)`, `bfs(frame,start,goal,blocked=None)`, "
+    "`flood(frame,start,color=None)`, `cell_at(frame,r,c)`, `count_colors(frame)`, `object_positions(frame,color)`."
 )
 
 def _normalize_valid_actions(valid_actions: list[str] | None) -> list[str]:
@@ -1263,6 +1260,12 @@ class ToolAgent:
         summary = self._last_step_summary
         if not summary:
             return
+        if summary.get("board_changed"):
+            self._summarized_knowledge["recent_findings"] = _normalize_summary_text(
+                f"Board changed. Level={summary.get('level')}. "
+                + (self._summarized_knowledge.get("recent_findings") or ""),
+                max_chars=200,
+            )
         if summary.get("level_transition") or summary.get("run_complete") or summary.get("game_over"):
             existing_notes = self._summarized_knowledge.get("cross_level_notes", "")
             for key in (
@@ -1348,12 +1351,47 @@ class ToolAgent:
         discouraged = exp.get("discouraged_actions", [])
         if discouraged:
             parts.append(f"Discouraged: {', '.join(str(a) for a in discouraged[:3])}")
-        tried = exp.get("tried_here", [])
+        tried = exp.get("tried_here", {})
         if tried:
-            parts.append(f"Tried: {', '.join(str(a) for a in tried[:5])}")
+            summaries = []
+            for action_name, stats in tried.items():
+                trials = stats.get("trials", 0) if isinstance(stats, dict) else 0
+                changes = stats.get("changes", 0) if isinstance(stats, dict) else 0
+                no_ops = stats.get("no_ops", 0) if isinstance(stats, dict) else 0
+                if changes > 0:
+                    summaries.append(f"{action_name}({trials}x,{changes}change)")
+                elif no_ops > 0:
+                    summaries.append(f"{action_name}({trials}x,{no_ops}noop)")
+                else:
+                    summaries.append(f"{action_name}({trials}x)")
+            if summaries:
+                parts.append(f"Tried here: {', '.join(summaries[:6])}")
         recovery = exp.get("recovery_reasons", [])
         if recovery:
             parts.append(f"Recovery: {', '.join(str(r) for r in recovery[:2])}")
+        ranked = exp.get("ranked_actions", [])
+        if ranked:
+            top3 = ranked[:3]
+            rank_parts = []
+            for item in top3:
+                act = item.get("action", "?")
+                reason = item.get("reason", "")
+                rank_parts.append(f"{act}({reason})" if reason else act)
+            parts.append(f"Ranked: {', '.join(rank_parts)}")
+        models = exp.get("transition_models_here", [])
+        if models:
+            model_lines = []
+            for m in models[:3]:
+                action = m.get("action", "?")
+                outcome = m.get("predicted_outcome", "?")
+                conf = m.get("confidence", 0)
+                det = "det" if m.get("verified_deterministic") else f"conf={conf:.0%}"
+                model_lines.append(f"{action}→{outcome}({det})")
+            parts.append(f"Models: {'; '.join(model_lines)}")
+        chains = exp.get("chain_predictions", [])
+        if chains:
+            chain_lines = [f"{c['first_action']}→{c['second_action']}(conf={c['chain_confidence']:.0%})" for c in chains[:2]]
+            parts.append(f"Chains: {'; '.join(chain_lines)}")
         return "; ".join(parts)
 
     def _build_user_prompt(
@@ -1428,13 +1466,7 @@ class ToolAgent:
         lines.extend(
             [
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, `record_strategy(...)`, and `action(actions)`.",
-                "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
-                "Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.",
-                "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one. Inspect `last_action_result['animation']` for bounded temporal evidence that may have disappeared from the final frame.",
-                "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
-                "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
-                "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test; optionally include test_action, expected_outcome, fallback, and contradictions so the next result can falsify the plan. This survives fresh Python snippets within this run.",
+                "See system prompt for runtime variable reference. Use Python to inspect the evidence and call `action(actions)` with the best valid action.",
             ]
         )
         if experience_snapshot and experience_snapshot.get("enabled"):
@@ -1757,13 +1789,25 @@ class ToolAgent:
 
     def _validate_code_common_mistakes(self, code: str) -> str | None:
         if "current_frame._grid" in code or "frame._grid" in code:
-            return "Warning: Direct _grid access is discouraged. Use current_frame.segmentation instead."
+            return "Warning: Direct _grid access is discouraged. Use current_frame.segmentation or pre-injected helpers instead."
         if code.count("action(") > 3:
             return "Warning: Many action() calls in one snippet. Consider batching actions."
         if re.search(r"while\s+True\s*:", code):
             return "Warning: Infinite loop detected. Ensure a break condition exists."
         if "import os" in code or "import sys" in code or "import subprocess" in code:
-            return "Warning: System modules are not available in sandbox."
+            return "Warning: System modules are not available in sandbox. Use allowed modules only."
+        if "import numpy" in code or "import np" in code:
+            return "Warning: numpy is not available. Use built-in list operations."
+        if re.search(r"while\s+\d+\s*[<>=!]", code):
+            return "Warning: Numeric while loop may timeout. Use for-loop with range() instead."
+        if code.count("for ") > 3 and "def " in code:
+            return "Warning: Complex nested code may timeout. Simplify and use pre-injected helpers."
+        if re.search(r"history\[\d+\]\[['\"]", code):
+            return "Warning: history entries use .action and .frame attributes, not dict keys. Use history[i].action."
+        if re.search(r"action\(\s*['\"]", code):
+            return "Warning: action() expects a list. Use action(['LEFT']) not action('LEFT')."
+        if re.search(r"print\s*\(\s*\w+\.ascii\s*\)", code):
+            return "Warning: Printing full board ascii wastes output tokens. Print compact derived data instead."
         return None
 
     def _run_python_tool(self, state_path: Path, arguments: dict[str, Any]) -> _ToolDispatchResult:
@@ -1918,6 +1962,26 @@ class ToolAgent:
                     "TIMEOUT": "Optimize or reduce computation.",
                 }
                 recovery = recovery_map.get(error_category, "Simplify code and retry.")
+                if error_category == "UNDEFINED_VARIABLE":
+                    available_vars = [
+                        "current_frame", "previous_frame", "history", "transitions",
+                        "last_transition", "valid_actions", "last_action_result",
+                        "experience", "strategy", "record_strategy(...)", "action(...)",
+                        "grid_utils", "color_grid", "diff_frames", "find_positions",
+                        "neighbors4", "neighbors8", "bfs", "flood", "cell_at",
+                        "count_colors", "object_positions",
+                    ]
+                    recovery += f" Available: {', '.join(available_vars)}."
+                elif error_category == "BLOCKED_MODULE":
+                    recovery = "Allowed: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string."
+                elif error_category == "MISSING_ATTRIBUTE":
+                    recovery += " FrameView has: .ascii, .step, .level, .shape, .segmentation. HistoryEntry has: .action, .frame. TransitionView has: .action, .before_frame, .after_frame, .frame, .result."
+                elif error_category == "TYPE_ERROR":
+                    recovery = f"Type error: {error_hint}. Use isinstance() to check types, or convert with int()/str()/list()."
+                elif "recursion" in rendered_error.lower():
+                    recovery = "Recursion depth exceeded. Use iterative loops with bounded ranges instead of recursive calls."
+                elif "memory" in rendered_error.lower():
+                    recovery = "Memory exceeded. Use smaller data structures and avoid copying large grids."
                 payload["recovery_hint"] = f"{error_hint} {recovery}" if error_hint else recovery
             if rendered_stdout:
                 payload["stdout"] = rendered_stdout
@@ -1937,6 +2001,8 @@ class ToolAgent:
                     }
 
         step_executed = any(bool(item.get("executed")) for item in action_results)
+        if validation_warning:
+            payload["validation_warning"] = validation_warning
         if step_executed:
             self._last_step_summary = self._summarize_step_sequence(action_results)
             self._update_summarized_knowledge_from_step_summary()
@@ -2154,6 +2220,7 @@ class ToolAgent:
         latest_request_index = 0
         turn_started_at = time.monotonic()
         yielded_control_reason: str | None = None
+        last_tool_error: str = ""
 
         def control_yield_reason() -> str | None:
             if should_stop is not None:
@@ -2175,6 +2242,8 @@ class ToolAgent:
                 turn_count += 1
                 tools = self._tools(state_path)
                 tool_choice = _request_tool_choice(tools)
+                if turn_count > 1 and not step_executed:
+                    tool_choice = "required"
                 messages = self._trim_messages_for_context(messages, tools=tools)
                 latest_request_messages = json.loads(json.dumps(messages))
                 latest_request_tools = json.loads(json.dumps(tools))
@@ -2307,24 +2376,33 @@ class ToolAgent:
                             if len(content) > 150:
                                 analysis_excerpt += "..."
                             followup_prefix += f"Your analysis was: {analysis_excerpt}. "
+                            followup_prefix += "You already described the board and plan. Now emit exactly one `python` tool call implementing that plan. Do not repeat your analysis. "
                         exp_snap = experience_snapshot if experience_snapshot else {}
                         phase = exp_snap.get("phase", "unknown")
                         last_outcome = exp_snap.get("latest_outcome")
                         if last_outcome:
                             followup_prefix += f"Last outcome was '{last_outcome}'. "
                         if phase in ("orient", "explore"):
-                            followup_prefix += f"Phase is {phase}: inspect the board with segmentation, then make a controlled probe. "
+                            followup_prefix += (
+                                f"Phase is {phase}: write code that diffs previous_frame vs current_frame using diff_frames(), "
+                                "identifies key objects with segmentation, then calls action() with your best probe. "
+                            )
                         elif phase == "recover":
                             no_op_streak = exp_snap.get("behavioral_no_op_streak", 0)
-                            followup_prefix += f"Phase is recover (no-op streak={no_op_streak}). Try a different action family than what was recently tried. "
+                            suggested = exp_snap.get("suggested_actions", [])
+                            suggest_text = f"Try one of {suggested[:3]}" if suggested else "Try a different action family"
+                            followup_prefix += (
+                                f"Phase is recover (no-op streak={no_op_streak}). {suggest_text} "
+                                "and call action() with it. Do not retry discouraged actions. "
+                            )
                         elif phase == "progress":
-                            followup_prefix += "Phase is progress: continue the action sequence that was working. "
+                            followup_prefix += "Phase is progress: call action() with the next step in the sequence that was producing board changes. "
                     followup_prompt = (
                         f"{followup_prefix}"
-                        "Call the `python` tool with code that inspects `current_frame.segmentation` to understand the current board state, "
-                        "then call `action(actions)` from inside Python with the best valid action. "
                         f"{TOOL_CALL_FORMAT_GUIDANCE}"
                     )
+                    if last_tool_error:
+                        followup_prompt += f"\nPrevious tool error: {last_tool_error}. Write simpler code and try a different approach."
                     append_transcript("USER PROMPT", followup_prompt)
                     messages.append({"role": "user", "content": followup_prompt})
                     continue
@@ -2357,6 +2435,14 @@ class ToolAgent:
                     dispatch = self._dispatch_tool(state_path, tool_name, arguments)
                     if dispatch.step_executed:
                         step_executed = True
+                        last_tool_error = ""
+                    elif dispatch.content:
+                        try:
+                            parsed_content = json.loads(dispatch.content)
+                            if isinstance(parsed_content, dict) and parsed_content.get("error"):
+                                last_tool_error = str(parsed_content.get("recovery_hint") or parsed_content["error"])[:200]
+                        except (json.JSONDecodeError, TypeError):
+                            pass
                     append_transcript(f"TOOL RESULT: {tool_name}", _render_tool_result_display(dispatch.content))
                     messages.append(
                         {

@@ -9,7 +9,9 @@ from inference.agent.inference_controller import (
     action_family,
     action_guard_reason,
     build_experience_snapshot,
+    evaluate_outcome_match,
     frame_fingerprint,
+    normalize_action_key,
     transition_metadata,
 )
 from inference.agent.runtime_state import Frame, HistoryEntry
@@ -315,3 +317,354 @@ class InferenceControllerTests(TestCase):
         self.assertLessEqual(len(snapshot["recent_transitions"]), 3)
         self.assertLessEqual(len(snapshot["ranked_actions"]), 6)
         self.assertLessEqual(len(snapshot["transition_models_here"]), 6)
+
+
+class EvaluateOutcomeMatchTests(TestCase):
+    def test_supported_no_change(self) -> None:
+        result = evaluate_outcome_match("no_change", {"executed": True, "board_changed": False})
+        self.assertEqual(result, "supported")
+
+    def test_contradicted_no_change(self) -> None:
+        result = evaluate_outcome_match("no_change", {"executed": True, "board_changed": True})
+        self.assertEqual(result, "contradicted")
+
+    def test_supported_state_change(self) -> None:
+        result = evaluate_outcome_match("state_change", {"executed": True, "board_changed": True})
+        self.assertEqual(result, "supported")
+
+    def test_contradicted_state_change(self) -> None:
+        result = evaluate_outcome_match("state_change", {"executed": True, "board_changed": False})
+        self.assertEqual(result, "contradicted")
+
+    def test_supported_new_state(self) -> None:
+        result = evaluate_outcome_match("new_state", {"executed": True, "novel_state": True})
+        self.assertEqual(result, "supported")
+
+    def test_contradicted_new_state(self) -> None:
+        result = evaluate_outcome_match("new_state", {"executed": True, "novel_state": False})
+        self.assertEqual(result, "contradicted")
+
+    def test_supported_level_progress_via_level_completed(self) -> None:
+        result = evaluate_outcome_match("level_progress", {"executed": True, "level_completed": True})
+        self.assertEqual(result, "supported")
+
+    def test_supported_level_progress_via_run_complete(self) -> None:
+        result = evaluate_outcome_match("level_progress", {"executed": True, "run_complete": True})
+        self.assertEqual(result, "supported")
+
+    def test_supported_level_progress_via_reward(self) -> None:
+        result = evaluate_outcome_match("level_progress", {"executed": True, "reward": 0.5})
+        self.assertEqual(result, "supported")
+
+    def test_contradicted_level_progress(self) -> None:
+        result = evaluate_outcome_match("level_progress", {"executed": True, "board_changed": False})
+        self.assertEqual(result, "contradicted")
+
+    def test_inconclusive_when_not_executed(self) -> None:
+        result = evaluate_outcome_match("no_change", {"executed": False})
+        self.assertEqual(result, "inconclusive")
+
+    def test_inconclusive_when_expected_unknown(self) -> None:
+        result = evaluate_outcome_match("unknown", {"executed": True, "board_changed": True})
+        self.assertEqual(result, "inconclusive")
+
+
+class NormalizeActionKeyTests(TestCase):
+    def test_normalizes_uppercase(self) -> None:
+        self.assertEqual(normalize_action_key("LEFT"), "LEFT")
+
+    def test_strips_whitespace(self) -> None:
+        self.assertEqual(normalize_action_key("  LEFT  "), "LEFT")
+
+    def test_mouse_with_coords(self) -> None:
+        result = normalize_action_key("MOUSE(row=3, col=4)")
+        self.assertEqual(result, "MOUSE(ROW=3, COL=4)")
+
+    def test_empty_string(self) -> None:
+        self.assertEqual(normalize_action_key(""), "")
+
+
+class ActionFamilyTests(TestCase):
+    def test_directional_actions(self) -> None:
+        self.assertEqual(action_family("LEFT"), "LEFT")
+        self.assertEqual(action_family("RIGHT"), "RIGHT")
+        self.assertEqual(action_family("UP"), "UP")
+        self.assertEqual(action_family("DOWN"), "DOWN")
+
+    def test_space_action(self) -> None:
+        self.assertEqual(action_family("SPACE"), "SPACE")
+
+    def test_mouse_family(self) -> None:
+        self.assertEqual(action_family("MOUSE(row=3, col=4)"), "MOUSE")
+        self.assertEqual(action_family("MOUSE"), "MOUSE")
+
+    def test_unknown_action(self) -> None:
+        self.assertEqual(action_family("RESET"), "RESET")
+
+
+class EmptyHistoryTests(TestCase):
+    def setUp(self) -> None:
+        self.config = InferenceControllerConfig()
+
+    def test_empty_history_orient_phase(self) -> None:
+        frame = _frame(1, step=0)
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=frame)], frame, ["LEFT", "RIGHT"], self.config
+        )
+        self.assertEqual(snapshot["phase"], "orient")
+        self.assertEqual(snapshot["actions_observed"], 0)
+
+    def test_empty_history_suggested_actions(self) -> None:
+        frame = _frame(1, step=0)
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=frame)], frame, ["LEFT", "RIGHT"], self.config
+        )
+        self.assertIn("LEFT", snapshot["suggested_actions"])
+        self.assertIn("RIGHT", snapshot["suggested_actions"])
+
+
+class SingleFrameHistoryTests(TestCase):
+    def setUp(self) -> None:
+        self.config = InferenceControllerConfig()
+
+    def test_single_frame_no_transitions(self) -> None:
+        frame = _frame(1, step=0)
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=frame)], frame, ["LEFT"], self.config
+        )
+        self.assertEqual(snapshot["actions_observed"], 0)
+        self.assertEqual(snapshot["cycle_period"], None)
+
+    def test_single_action_creates_transition(self) -> None:
+        before = _frame(1, step=0)
+        after = _frame(2, step=1)
+        history = [
+            HistoryEntry(action="", frame=before),
+            HistoryEntry(action="LEFT", frame=after),
+        ]
+        snapshot = build_experience_snapshot(history, after, ["LEFT"], self.config)
+        self.assertEqual(snapshot["actions_observed"], 1)
+        self.assertIsNotNone(snapshot["latest_outcome"])
+
+
+class FrameFingerprintTests(TestCase):
+    def test_none_frame(self) -> None:
+        result = frame_fingerprint(None)
+        self.assertEqual(result, "none")
+
+    def test_same_grid_same_level(self) -> None:
+        f1 = _frame(5, step=0)
+        f2 = _frame(5, step=99)
+        self.assertEqual(frame_fingerprint(f1), frame_fingerprint(f2))
+
+    def test_different_grids(self) -> None:
+        f1 = _frame(1, step=0)
+        f2 = _frame(2, step=0)
+        self.assertNotEqual(frame_fingerprint(f1), frame_fingerprint(f2))
+
+    def test_different_levels(self) -> None:
+        f1 = _frame(1, step=0, level=1)
+        f2 = _frame(1, step=0, level=2)
+        self.assertNotEqual(frame_fingerprint(f1), frame_fingerprint(f2))
+
+    def test_empty_grid(self) -> None:
+        f1 = Frame(grid=(), step=0, level=1)
+        f2 = Frame(grid=(), step=5, level=1)
+        self.assertEqual(frame_fingerprint(f1), frame_fingerprint(f2))
+
+    def test_single_cell_grid(self) -> None:
+        f1 = Frame(grid=((5,),), step=0, level=1)
+        f2 = Frame(grid=((5,),), step=10, level=1)
+        self.assertEqual(frame_fingerprint(f1), frame_fingerprint(f2))
+
+    def test_large_grid_fingerprint(self) -> None:
+        grid = tuple(tuple(i % 16 for i in range(64)) for _ in range(64))
+        f1 = Frame(grid=grid, step=0, level=1)
+        f2 = Frame(grid=grid, step=100, level=1)
+        self.assertEqual(frame_fingerprint(f1), frame_fingerprint(f2))
+
+
+class InferenceControllerEdgeCaseTests(TestCase):
+    def setUp(self) -> None:
+        self.config = InferenceControllerConfig(
+            enabled=True,
+            same_state_noop_limit=2,
+            stagnation_window=3,
+            cycle_window=4,
+        )
+
+    def test_noop_guard_with_different_action(self) -> None:
+        state = _frame(1, step=0)
+        history = [
+            HistoryEntry(action="", frame=state),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=1)),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=2)),
+        ]
+        reason = action_guard_reason(history, state, "RIGHT", self.config)
+        self.assertIsNone(reason)
+
+    def test_noop_guard_triggers_after_limit(self) -> None:
+        state = _frame(1, step=0)
+        history = [
+            HistoryEntry(action="", frame=state),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=1)),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=2)),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=3)),
+        ]
+        reason = action_guard_reason(history, state, "LEFT", self.config)
+        self.assertIsNotNone(reason)
+
+    def test_cycle_detection_minimum_window(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            cycle_window=2,
+        )
+        a = _frame(1, step=0)
+        b = _frame(2, step=1)
+        history = [
+            HistoryEntry(action="", frame=a),
+            HistoryEntry(action="RIGHT", frame=b),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=2)),
+            HistoryEntry(action="RIGHT", frame=_frame(2, step=3)),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=4)),
+        ]
+        snapshot = build_experience_snapshot(history, history[-1].frame, ["LEFT", "RIGHT"], config)
+        self.assertIn(snapshot["phase"], ("recover", "explore"))
+
+    def test_stagnation_window_edge_case(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            stagnation_window=1,
+        )
+        state = _frame(1, step=0)
+        history = [
+            HistoryEntry(action="", frame=state),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=1)),
+        ]
+        snapshot = build_experience_snapshot(history, state, ["LEFT", "RIGHT"], config)
+        self.assertEqual(snapshot["phase"], "recover")
+
+    def test_transition_metadata_no_history(self) -> None:
+        before = _frame(1, step=0)
+        after = _frame(2, step=1)
+        history = [HistoryEntry(action="", frame=before)]
+        metadata = transition_metadata(before, after, history, "RIGHT", self.config)
+        self.assertTrue(metadata["novel_state"])
+        self.assertEqual(metadata["controller_phase"], "progress")
+
+    def test_transition_metadata_same_state(self) -> None:
+        state = _frame(1, step=0)
+        history = [HistoryEntry(action="", frame=state)]
+        metadata = transition_metadata(state, state, history, "LEFT", self.config)
+        self.assertFalse(metadata["novel_state"])
+        self.assertEqual(metadata["before_state_id"], metadata["after_state_id"])
+
+    def test_transition_metadata_invalid_action(self) -> None:
+        before = _frame(1, step=0)
+        after = _frame(2, step=1)
+        history = [HistoryEntry(action="", frame=before)]
+        metadata = transition_metadata(before, after, history, "INVALID", self.config)
+        self.assertEqual(metadata["controller_phase"], "progress")
+
+    def test_build_snapshot_with_many_actions(self) -> None:
+        actions = [f"ACTION_{i}" for i in range(20)]
+        frame = _frame(1, step=0)
+        history = [HistoryEntry(action="", frame=frame)]
+        snapshot = build_experience_snapshot(history, frame, actions, self.config)
+        self.assertLessEqual(len(snapshot["ranked_actions"]), 6)
+
+    def test_volatile_cells_calculation(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            volatile_window=4,
+            volatile_min_samples=2,
+            volatile_ratio=0.5,
+        )
+        frames = [
+            Frame(grid=((value, 9),), step=index, level=1)
+            for index, value in enumerate((1, 2, 1, 2))
+        ]
+        history = [HistoryEntry(action="", frame=frames[0])] + [
+            HistoryEntry(action="SPACE", frame=frame) for frame in frames[1:]
+        ]
+        snapshot = build_experience_snapshot(history, frames[-1], ["SPACE"], config)
+        self.assertGreaterEqual(snapshot["volatile_cells"], 0)
+
+    def test_outcome_classification_level_progress_reward_zero(self) -> None:
+        result = evaluate_outcome_match("level_progress", {"executed": True, "reward": 0})
+        self.assertEqual(result, "contradicted")
+
+    def test_outcome_classification_level_progress_negative_reward(self) -> None:
+        result = evaluate_outcome_match("level_progress", {"executed": True, "reward": -0.5})
+        self.assertEqual(result, "contradicted")
+
+    def test_outcome_classification_new_state_false(self) -> None:
+        result = evaluate_outcome_match("new_state", {"executed": True, "novel_state": False})
+        self.assertEqual(result, "contradicted")
+
+    def test_normalize_action_key_mouse_variations(self) -> None:
+        result = normalize_action_key("MOUSE(row=1, col=2)")
+        self.assertIn("MOUSE", result)
+
+    def test_action_family_edge_cases(self) -> None:
+        self.assertEqual(action_family(""), "")
+        self.assertEqual(action_family("MOUSE"), "MOUSE")
+        self.assertEqual(action_family("RESET"), "RESET")
+
+    def test_config_from_env_invalid_values(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOCAL_ANALYZER_STRATEGY_ENABLED": "true",
+                "LOCAL_ANALYZER_VOLATILE_WINDOW": "invalid",
+                "LOCAL_ANALYZER_VOLATILE_RATIO": "not_a_float",
+            },
+            clear=True,
+        ):
+            config = InferenceControllerConfig.from_env()
+            self.assertTrue(config.enabled)
+            self.assertEqual(config.volatile_window, 8)
+            self.assertEqual(config.volatile_ratio, 0.75)
+
+    def test_config_bounds_volatile_params(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOCAL_ANALYZER_STRATEGY_ENABLED": "true",
+                "LOCAL_ANALYZER_VOLATILE_WINDOW": "0",
+                "LOCAL_ANALYZER_VOLATILE_MIN_SAMPLES": "100",
+                "LOCAL_ANALYZER_VOLATILE_RATIO": "2.0",
+            },
+            clear=True,
+        ):
+            config = InferenceControllerConfig.from_env()
+            self.assertGreaterEqual(config.volatile_window, 2)
+            self.assertGreaterEqual(config.volatile_min_samples, 2)
+            self.assertLessEqual(config.volatile_ratio, 1.0)
+
+    def test_history_with_none_frames_skipped(self) -> None:
+        history = [
+            HistoryEntry(action="", frame=_frame(1, step=0)),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=1)),
+        ]
+        snapshot = build_experience_snapshot(history, _frame(1, step=1), ["LEFT"], self.config)
+        self.assertEqual(snapshot["actions_observed"], 1)
+
+    def test_transition_model_many_trials(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            volatile_min_samples=10,
+        )
+        a = _frame(1, step=0)
+        b = _frame(2, step=1)
+        history = [HistoryEntry(action="", frame=a)]
+        for i in range(10):
+            history.append(HistoryEntry(action="RIGHT", frame=b if i % 2 == 0 else a))
+        snapshot = build_experience_snapshot(history, history[-1].frame, ["RIGHT"], config)
+        model = snapshot["transition_models_here"][0]
+        self.assertGreaterEqual(model["trials"], 1)
+        self.assertLessEqual(model["confidence"], 1.0)
+        self.assertGreaterEqual(model["confidence"], 0.0)

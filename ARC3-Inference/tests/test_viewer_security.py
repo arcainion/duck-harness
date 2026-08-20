@@ -62,3 +62,59 @@ class ViewerSecurityTests(TestCase):
 
         with data._RUN_PAYLOAD_CACHE_LOCK:
             self.assertEqual(len(data._RUN_PAYLOAD_CACHE), 1)
+
+    def test_requested_run_with_empty_name(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runs_dir = root / "runs"
+            runs_dir.mkdir()
+            result = _requested_run_dir(
+                runs_dir=runs_dir,
+                default_run_dir=root / "default-run",
+                requested_run="",
+            )
+            self.assertEqual(result, root / "default-run")
+
+    def test_requested_run_parent_traversal(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runs_dir = root / "runs"
+            runs_dir.mkdir()
+            with self.assertRaises(FileNotFoundError):
+                _requested_run_dir(
+                    runs_dir=runs_dir,
+                    default_run_dir=None,
+                    requested_run="../etc/passwd",
+                )
+
+    def test_requested_run_with_dots(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runs_dir = root / "runs"
+            runs_dir.mkdir()
+            with self.assertRaises(FileNotFoundError):
+                _requested_run_dir(
+                    runs_dir=runs_dir,
+                    default_run_dir=None,
+                    requested_run=".",
+                )
+            with self.assertRaises(FileNotFoundError):
+                _requested_run_dir(
+                    runs_dir=runs_dir,
+                    default_run_dir=None,
+                    requested_run="..",
+                )
+
+    def test_payload_cache_concurrent_writes(self) -> None:
+        with data._RUN_PAYLOAD_CACHE_LOCK:
+            data._RUN_PAYLOAD_CACHE.clear()
+
+        def store(version: int) -> dict:
+            key = ("run", "summary", (version,))
+            return data._store_cached_payload(key, {"version": version}, scope_length=2)
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(store, range(200)))
+
+        for r in results:
+            self.assertIn("version", r)
