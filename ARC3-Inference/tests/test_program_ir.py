@@ -247,6 +247,115 @@ class ProgramIRCompilerTests(unittest.TestCase):
         self.assertEqual(diagnostic.code, "IR_INVALID_VALUE")
         self.assertIn("duplicate parameter: items", diagnostic.message)
 
+    def test_keyword_only_parameters_lower_and_execute(self) -> None:
+        payload = program(
+            {
+                "kind": "function_def",
+                "name": "score",
+                "parameters": [{"name": "values"}],
+                "keyword_only_parameters": [
+                    {"name": "scale", "default": const(2)},
+                    {"name": "offset"},
+                ],
+                "body": [{
+                    "kind": "return",
+                    "value": {
+                        "kind": "binary",
+                        "op": "add",
+                        "left": {
+                            "kind": "binary",
+                            "op": "mul",
+                            "left": call("sum", name("values")),
+                            "right": name("scale"),
+                        },
+                        "right": name("offset"),
+                    },
+                }],
+            },
+            {
+                "kind": "assign",
+                "targets": [target("result")],
+                "value": call(
+                    "score",
+                    {"kind": "list", "items": [const(1), const(2)]},
+                    offset=const(4),
+                ),
+            },
+        )
+
+        compiled = compile_program(payload)
+        self.assertIn("def score(values, *, scale=2, offset):", compiled.source)
+        response = run_sandboxed_python(
+            code=compiled.source,
+            timeout_seconds=5,
+            initial_state={},
+            action_handler=lambda actions: {},
+            strategy_handler=lambda update: update,
+        )
+        self.assertEqual(response["result"], 10)
+
+    def test_keyword_only_parameter_names_share_function_namespace(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({
+                "kind": "function_def",
+                "name": "invalid",
+                "parameters": [{"name": "scale"}],
+                "keyword_only_parameters": [{"name": "scale"}],
+                "body": [{"kind": "pass"}],
+            }))
+
+        diagnostic = captured.exception.diagnostics[0]
+        self.assertEqual(captured.exception.stage, "schema")
+        self.assertIn("duplicate parameter: scale", diagnostic.message)
+
+    def test_generator_function_yield_and_delegation_execute_lazily(self) -> None:
+        payload = program(
+            {
+                "kind": "function_def",
+                "name": "numbers",
+                "body": [
+                    {"kind": "yield", "value": const(0)},
+                    {
+                        "kind": "yield",
+                        "value": {
+                            "kind": "list",
+                            "items": [const(1), const(2)],
+                        },
+                        "delegate": True,
+                    },
+                    {"kind": "yield", "value": const(3)},
+                ],
+            },
+            {
+                "kind": "assign",
+                "targets": [target("result")],
+                "value": call("list", call("numbers")),
+            },
+        )
+
+        compiled = compile_program(payload)
+        self.assertIn("yield 0", compiled.source)
+        self.assertIn("yield from [1, 2]", compiled.source)
+        self.assertEqual(compiled.path_for_line(2), "program.body.0.body.0")
+        self.assertEqual(compiled.path_for_line(3), "program.body.0.body.1")
+        response = run_sandboxed_python(
+            code=compiled.source,
+            timeout_seconds=5,
+            initial_state={},
+            action_handler=lambda actions: {},
+            strategy_handler=lambda update: update,
+        )
+        self.assertEqual(response["result"], [0, 1, 2, 3])
+
+    def test_yield_outside_function_has_precise_structural_diagnostic(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({"kind": "yield", "value": const(1)}))
+
+        diagnostic = captured.exception.diagnostics[0]
+        self.assertEqual(captured.exception.stage, "structure")
+        self.assertEqual(diagnostic.code, "IR_YIELD_OUTSIDE_FUNCTION")
+        self.assertEqual(diagnostic.path, "program.body.0")
+
     def test_comprehensions_and_conditional_expression(self) -> None:
         clause = {
             "target": target("x"),
@@ -984,6 +1093,7 @@ class ProgramIRCompilerTests(unittest.TestCase):
         function_schema = schema["$defs"]["FunctionDefStmt"]["properties"]
         self.assertIn("vararg", function_schema)
         self.assertIn("kwarg", function_schema)
+        self.assertIn("keyword_only_parameters", function_schema)
 
     def test_tool_schema_omits_nonsemantic_generated_titles(self) -> None:
         schema = program_tool_parameters_schema()
@@ -1124,6 +1234,15 @@ class ProgramIRSandboxTests(unittest.TestCase):
                     "body": [{"kind": "pass"}],
                 },
                 "program.body.0.kwarg",
+            ),
+            (
+                {
+                    "kind": "function_def",
+                    "name": "helper",
+                    "keyword_only_parameters": [{"name": "valid_actions"}],
+                    "body": [{"kind": "pass"}],
+                },
+                "program.body.0.keyword_only_parameters.0.name",
             ),
         )
         for statement, expected_path in cases:

@@ -28,7 +28,7 @@ from inference.agent.python_tool_policy import (
 )
 
 
-COMPILER_VERSION = "duck-program-ir/1.22"
+COMPILER_VERSION = "duck-program-ir/1.24"
 PROGRAM_IR_VERSION = 1
 MAX_IR_NODES = 512
 MAX_IR_DEPTH = 32
@@ -381,6 +381,10 @@ class FunctionDefStmt(StrictModel):
     kind: Literal["function_def"]
     name: str
     parameters: list[ParameterIR] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
+    keyword_only_parameters: list[ParameterIR] = Field(
+        default_factory=list,
+        max_length=MAX_CONTAINER_ITEMS,
+    )
     vararg: str | None = None
     kwarg: str | None = None
     body: list["Stmt"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
@@ -407,6 +411,10 @@ class FunctionDefStmt(StrictModel):
                 seen_default = True
             elif seen_default:
                 raise ValueError("non-default parameter follows default parameter")
+        for parameter in self.keyword_only_parameters:
+            if parameter.name in seen_names:
+                raise ValueError(f"duplicate parameter: {parameter.name}")
+            seen_names.add(parameter.name)
         for parameter_name in (self.vararg, self.kwarg):
             if parameter_name is None:
                 continue
@@ -419,6 +427,12 @@ class FunctionDefStmt(StrictModel):
 class ReturnStmt(StrictModel):
     kind: Literal["return"]
     value: Expr | None = None
+
+
+class YieldStmt(StrictModel):
+    kind: Literal["yield"]
+    value: Expr
+    delegate: bool = False
 
 
 class ImportAlias(StrictModel):
@@ -533,7 +547,7 @@ Stmt = TypeAliasType(
         Union[
             AssignStmt, AugAssignStmt, ExprStmt, IfStmt, ForStmt, WhileStmt,
             FunctionDefStmt, ReturnStmt, ImportStmt, FromImportStmt, BreakStmt,
-            ContinueStmt, PassStmt, TryStmt, RaiseStmt,
+            ContinueStmt, PassStmt, TryStmt, RaiseStmt, YieldStmt,
         ],
         Field(discriminator="kind"),
     ],
@@ -924,6 +938,12 @@ def _validate_statement_context(program: ProgramIR) -> None:
                     rendered_path,
                     "return is only valid inside a function body",
                 ))
+            elif isinstance(statement, YieldStmt) and function_depth == 0:
+                diagnostics.append(CompilerDiagnostic(
+                    "IR_YIELD_OUTSIDE_FUNCTION",
+                    rendered_path,
+                    "yield is only valid inside a function body",
+                ))
             elif isinstance(statement, BreakStmt) and loop_depth == 0:
                 diagnostics.append(CompilerDiagnostic(
                     "IR_BREAK_OUTSIDE_LOOP",
@@ -1253,8 +1273,14 @@ def _lower_parameters(function: FunctionDefStmt) -> ast.arguments:
         posonlyargs=[],
         args=[ast.arg(arg=item.name) for item in function.parameters],
         vararg=None if function.vararg is None else ast.arg(arg=function.vararg),
-        kwonlyargs=[],
-        kw_defaults=[],
+        kwonlyargs=[
+            ast.arg(arg=item.name)
+            for item in function.keyword_only_parameters
+        ],
+        kw_defaults=[
+            None if item.default is None else _lower_expr(item.default)
+            for item in function.keyword_only_parameters
+        ],
         kwarg=None if function.kwarg is None else ast.arg(arg=function.kwarg),
         defaults=[
             _lower_expr(item.default)
@@ -1286,6 +1312,10 @@ def _lower_stmt(node: Stmt) -> ast.stmt:
         )
     if isinstance(node, ReturnStmt):
         return ast.Return(value=None if node.value is None else _lower_expr(node.value))
+    if isinstance(node, YieldStmt):
+        value = _lower_expr(node.value)
+        yielded: ast.expr = ast.YieldFrom(value=value) if node.delegate else ast.Yield(value=value)
+        return ast.Expr(value=yielded)
     if isinstance(node, ImportStmt):
         return ast.Import(names=[ast.alias(name=item.name, asname=item.asname) for item in node.names])
     if isinstance(node, FromImportStmt):
