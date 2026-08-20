@@ -152,6 +152,7 @@ source = { editable = "." }
 dependencies = [
     { name = "arcengine" },
     { name = "matplotlib" },
+    { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "requests" },
     { name = "tufa-arc-agi-framework" },
@@ -172,6 +173,7 @@ requires-dist = [
     { name = "arcengine", specifier = "==0.9.3" },
     { name = "matplotlib", specifier = "==3.10.6" },
     { name = "ninja", marker = "extra == 'server'", specifier = "==1.13.0" },
+    { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==9.0.2" },
     { name = "python-dotenv", specifier = "==1.2.2" },
     { name = "requests", specifier = "==2.32.5" },

@@ -94,9 +94,13 @@ The model-facing actions are:
 
 `MOUSE` uses `row` and `col`. Legacy `x` / `y` mouse fields are rejected.
 
-Every Python tool call starts fresh. It can import a small allowlist of standard
-library modules, print compact summaries, assign a final value to `result`, and
-call `action(...)` once or many times. The tool call timeout defaults to 30
+Every Python tool call starts fresh. The model submits a strict, versioned
+`ProgramIR` object rather than raw source; Duck validates it, lowers it to a
+Python AST, recompiles it, and then passes it to the isolated sandbox. Programs
+can import a small allowlist of standard library modules, print compact
+summaries, assign a final value to `result`, and call `action(...)` once or many
+times. Validation is capped at 512 IR nodes and depth 32. Compiler failures
+return path-addressed diagnostics, while the tool call timeout defaults to 30
 seconds. Batched action results include a bounded `steps` list so each action can
 be attributed to its individual before/after state and outcome.
 Each batch is capped at 12 entries at both the sandbox and solver boundaries;
@@ -435,6 +439,7 @@ transitions linked back to message indices.
 - `inference/framework/solver.py`: TAAF solver adapter, action execution,
   viewer events, transcripts, and local-server orchestration.
 - `inference/agent/tool_agent.py`: OpenAI-compatible tool-calling duck.
+- `inference/agent/program_ir.py`: strict ProgramIR schema and deterministic AST compiler.
 - `inference/agent/python_tool_sandbox.py`: isolated Python tool runtime.
 - `inference/utils/segmentation.py`: connected-component board segmentation.
 - `inference/tools/eval.py`: TAAF score export.

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from inference.agent.program_ir import ProgramCompileError, compile_program
 from inference.utils.run_artifacts import is_selectable_run_dir_name, run_dir_sort_key
 from inference.utils.viewer_artifacts import load_raw_events
 
@@ -57,6 +58,10 @@ _RUN_PAYLOAD_CACHE_LOCK = threading.RLock()
 _PASS_INDEX_RE = re.compile(r"_p(?P<pass_index>\d+)_viewer_data\.json$")
 _TOOL_CODE_PARAMETER_RE = re.compile(
     r"<parameter=code>\s*(.*?)\s*</parameter>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_TOOL_PROGRAM_PARAMETER_RE = re.compile(
+    r"<parameter=program>\s*(.*?)\s*</parameter>",
     flags=re.DOTALL | re.IGNORECASE,
 )
 _RUNTIME_VALUE_SYMBOLS = {
@@ -774,6 +779,12 @@ def _extract_python_code(tool_call_content: str) -> str:
     match = _TOOL_CODE_PARAMETER_RE.search(text)
     if match:
         return str(match.group(1) or "").strip("\n")
+    program_match = _TOOL_PROGRAM_PARAMETER_RE.search(text)
+    if program_match:
+        try:
+            return compile_program(json.loads(str(program_match.group(1) or ""))).source.strip("\n")
+        except (TypeError, ValueError, json.JSONDecodeError, ProgramCompileError):
+            return ""
     try:
         parsed = json.loads(text)
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -782,6 +793,11 @@ def _extract_python_code(tool_call_content: str) -> str:
         code = parsed.get("code")
         if isinstance(code, str):
             return code.strip("\n")
+        if "program" in parsed:
+            try:
+                return compile_program(parsed["program"]).source.strip("\n")
+            except ProgramCompileError:
+                return ""
     return ""
 
 
@@ -1178,7 +1194,20 @@ def _render_tool_arguments(tool_name: str, arguments: Any) -> str:
     lines = ["<tool_call>", f"<function={tool_name}>"]
     for parameter_name, parameter_value in parsed.items():
         lines.append(f"<parameter={parameter_name}>")
-        if isinstance(parameter_value, str):
+        if tool_name == "python" and parameter_name == "program":
+            try:
+                compiled = compile_program(parameter_value)
+                metadata = compiled.metadata()
+                rendered_value = (
+                    f"# compiled by {metadata['version']}; "
+                    f"ir_nodes={metadata['node_count']}; generated_chars={metadata['generated_chars']}; "
+                    f"sha256={metadata['program_sha256'][:12]}; "
+                    f"src_sha256={metadata['source_sha256'][:12]}\n"
+                    f"{compiled.source.rstrip()}"
+                )
+            except ProgramCompileError:
+                rendered_value = json.dumps(parameter_value, indent=2, ensure_ascii=True)
+        elif isinstance(parameter_value, str):
             rendered_value = parameter_value.rstrip("\n")
         elif isinstance(parameter_value, bool):
             rendered_value = "true" if parameter_value else "false"

@@ -31,6 +31,12 @@ from inference.agent.prompts import (
     TOOL_CALL_FORMAT_GUIDANCE,
     VISUAL_GAME_ADDENDUM,
 )
+from inference.agent.program_ir import (
+    COMPILER_VERSION,
+    ProgramCompileError,
+    compile_program,
+    program_tool_parameters_schema,
+)
 from inference.agent.python_tool_sandbox import run_sandboxed_python
 from inference.agent.runtime_state import (
     RUNTIME_STATE_FILENAME,
@@ -110,11 +116,18 @@ def _recover_tool_calls_from_markup(*chunks: str) -> list[dict[str, Any]]:
             if not tool_name:
                 continue
             raw_body = str(match.group(2) or "")
-            arguments = {
-                str(parameter_name).strip(): value
-                for parameter_name, value in _TOOL_CALL_PARAMETER_RE.findall(raw_body)
-                if str(parameter_name).strip()
-            }
+            arguments: dict[str, Any] = {}
+            for parameter_name, value in _TOOL_CALL_PARAMETER_RE.findall(raw_body):
+                normalized_name = str(parameter_name).strip()
+                if not normalized_name:
+                    continue
+                normalized_value: Any = value
+                if normalized_name == "program":
+                    try:
+                        normalized_value = json.loads(str(value).strip())
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                arguments[normalized_name] = normalized_value
             cache_key = (
                 tool_name,
                 json.dumps(arguments, ensure_ascii=True, sort_keys=True),
@@ -163,7 +176,9 @@ _PERSISTENT_HISTORY_ASSISTANT_TURNS = 30
 _RESPONSE_META_MAX_CHARS = 4000
 
 _PYTHON_TOOL_DESCRIPTION = (
-    "Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: "
+    "Compile and run one ephemeral structured ProgramIR against preloaded ASCII game state. "
+    "Submit `program` with version 1 and a non-empty statement body; raw Python source is not accepted. "
+    "Available globals: "
     "`current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, "
     "`valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, "
     "`record_strategy(...)`, and `action(actions)` for executing one or more real environment actions. "
@@ -1514,18 +1529,7 @@ class ToolAgent:
                 "function": {
                     "name": "python",
                     "description": _PYTHON_TOOL_DESCRIPTION,
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "code": {
-                                "type": "string",
-                                "description": (
-                                    "Python code to run. The snippet is ephemeral and is not saved across tool calls."
-                                ),
-                            },
-                        },
-                        "required": ["code"],
-                    },
+                    "parameters": program_tool_parameters_schema(),
                 },
             }
         ]
@@ -1812,13 +1816,20 @@ class ToolAgent:
 
     def _run_python_tool(self, state_path: Path, arguments: dict[str, Any]) -> _ToolDispatchResult:
         self._ensure_session(state_path)
-        code = str(arguments.get("code", "")).rstrip()
-        if not code:
-            return _ToolDispatchResult(json.dumps({"error": "python requires a non-empty `code` string."}, indent=2))
         try:
-            compile(code, "<python_tool>", "exec")
-        except SyntaxError as exc:
-            return _ToolDispatchResult(json.dumps({"error": f"Python syntax error: {exc}"}, indent=2))
+            compiled_program = compile_program(arguments.get("program"))
+        except ProgramCompileError as exc:
+            payload = {"tool": "python", "compiler": {"version": COMPILER_VERSION}, **exc.payload()}
+            if "code" in arguments:
+                payload["error_category"] = "RAW_SOURCE_NOT_ACCEPTED"
+                payload["error"] = "python requires structured `program` version 1; raw `code` is not accepted."
+                payload["diagnostics"] = [{
+                    "code": "IR_RAW_SOURCE_REJECTED",
+                    "path": "program",
+                    "message": payload["error"],
+                }]
+            return _ToolDispatchResult(self._render_tool_payload(payload))
+        code = compiled_program.source.rstrip()
         validation_warning = self._validate_code_common_mistakes(code)
         if validation_warning:
             log.info("Code validation warning: %s", validation_warning)
@@ -1939,7 +1950,7 @@ class ToolAgent:
             for item in sandbox_result.get("action_results") or []
             if isinstance(item, dict)
         ]
-        payload: dict[str, Any] = {"tool": "python"}
+        payload: dict[str, Any] = {"tool": "python", "compiler": compiled_program.metadata()}
         rendered_stdout = str(sandbox_result.get("stdout", "") or "")
         rendered_error = str(sandbox_result.get("error", "") or "")
         error_hint = str(sandbox_result.get("error_hint", "") or "")

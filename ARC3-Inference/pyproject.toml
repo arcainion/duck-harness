@@ -15,6 +15,7 @@ keywords = ["arc-agi", "agent", "puzzle-solving"]
 dependencies = [
     "arcengine==0.9.3",
     "matplotlib==3.10.6",
+    "pydantic>=2.12,<3",
     "python-dotenv==1.2.2",
     "requests==2.32.5",
     # TEMP: editable override in [tool.uv.sources] below. Restore: @ git+https://github.com/Tufalabs/tufa-arc-agi-framework.git@main
