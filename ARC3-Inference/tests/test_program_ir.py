@@ -115,6 +115,138 @@ class ProgramIRCompilerTests(unittest.TestCase):
         self.assertIn("items[0:2]", compiled.source)
         self.assertIn("1 < 2 <= 2 and (not False)", compiled.source)
 
+    def test_dictionary_and_call_unpacking_lower_and_execute(self) -> None:
+        def dict_expr(*entries: dict) -> dict:
+            return {"kind": "dict", "entries": list(entries)}
+
+        def entry(key, value) -> dict:
+            return {"key": const(key), "value": const(value)}
+
+        payload = program(
+            {
+                "kind": "assign",
+                "targets": [target("base")],
+                "value": dict_expr(entry("base", 1)),
+            },
+            {
+                "kind": "assign",
+                "targets": [target("more")],
+                "value": dict_expr(entry("extra", 2)),
+            },
+            {
+                "kind": "assign",
+                "targets": [target("combined")],
+                "value": {
+                    "kind": "call",
+                    "function": name("dict"),
+                    "star_args": [{"kind": "list", "items": [name("base")]}],
+                    "star_keywords": [name("more")],
+                },
+            },
+            {
+                "kind": "assign",
+                "targets": [target("result")],
+                "value": dict_expr(
+                    {"key": None, "value": name("combined")},
+                    entry("extra", 5),
+                    entry("last", 3),
+                ),
+            },
+        )
+
+        compiled = compile_program(payload)
+        self.assertIn("dict(*[base], **more)", compiled.source)
+        self.assertIn("{**combined, 'extra': 5, 'last': 3}", compiled.source)
+        response = run_sandboxed_python(
+            code=compiled.source,
+            timeout_seconds=5,
+            initial_state={},
+            action_handler=lambda actions: {},
+            strategy_handler=lambda update: update,
+        )
+        self.assertEqual(response["result"], {"base": 1, "extra": 5, "last": 3})
+
+    def test_dictionary_entry_requires_explicit_key_or_null_unpack_marker(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({
+                "kind": "assign",
+                "targets": [target("result")],
+                "value": {
+                    "kind": "dict",
+                    "entries": [{"value": const(1)}],
+                },
+            }))
+
+        diagnostic = captured.exception.diagnostics[0]
+        self.assertEqual(captured.exception.stage, "schema")
+        self.assertEqual(diagnostic.code, "IR_REQUIRED_FIELD")
+        self.assertEqual(
+            diagnostic.path,
+            "program.body.0.value.entries.0.key",
+        )
+
+    def test_variadic_function_receives_unpacked_call_inputs(self) -> None:
+        payload = program(
+            {
+                "kind": "function_def",
+                "name": "collect",
+                "parameters": [{"name": "head"}],
+                "vararg": "items",
+                "kwarg": "options",
+                "body": [{
+                    "kind": "return",
+                    "value": {
+                        "kind": "list",
+                        "items": [
+                            name("head"),
+                            call("list", name("items")),
+                            name("options"),
+                        ],
+                    },
+                }],
+            },
+            {
+                "kind": "assign",
+                "targets": [target("result")],
+                "value": {
+                    "kind": "call",
+                    "function": name("collect"),
+                    "args": [const(0)],
+                    "star_args": [{"kind": "list", "items": [const(1), const(2)]}],
+                    "star_keywords": [{
+                        "kind": "dict",
+                        "entries": [{"key": const("flag"), "value": const(True)}],
+                    }],
+                },
+            },
+        )
+
+        compiled = compile_program(payload)
+        self.assertIn("def collect(head, *items, **options):", compiled.source)
+        response = run_sandboxed_python(
+            code=compiled.source,
+            timeout_seconds=5,
+            initial_state={},
+            action_handler=lambda actions: {},
+            strategy_handler=lambda update: update,
+        )
+        self.assertEqual(response["result"], [0, [1, 2], {"flag": True}])
+
+    def test_variadic_function_parameter_names_must_be_unique(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({
+                "kind": "function_def",
+                "name": "invalid",
+                "parameters": [{"name": "items"}],
+                "vararg": "items",
+                "body": [{"kind": "pass"}],
+            }))
+
+        diagnostic = captured.exception.diagnostics[0]
+        self.assertEqual(captured.exception.stage, "schema")
+        self.assertEqual(diagnostic.code, "IR_INVALID_VALUE")
+        self.assertIn("duplicate parameter: items", diagnostic.message)
+
     def test_comprehensions_and_conditional_expression(self) -> None:
         clause = {
             "target": target("x"),
@@ -149,6 +281,172 @@ class ProgramIRCompilerTests(unittest.TestCase):
         ))
         self.assertIn("[x * 2 for x in range(5) if x > 1]", compiled.source)
         self.assertIn("'yes' if values else 'no'", compiled.source)
+
+    def test_generator_comprehension_lowers_and_executes_lazily(self) -> None:
+        clause = {
+            "target": target("x"),
+            "iterable": call("range", const(5)),
+            "conditions": [{
+                "kind": "compare",
+                "left": name("x"),
+                "ops": ["gt"],
+                "comparators": [const(1)],
+            }],
+        }
+        payload = program({
+            "kind": "assign",
+            "targets": [target("result")],
+            "value": call(
+                "sum",
+                {
+                    "kind": "generator_comprehension",
+                    "element": {
+                        "kind": "binary",
+                        "op": "mul",
+                        "left": name("x"),
+                        "right": const(2),
+                    },
+                    "clauses": [clause],
+                },
+            ),
+        })
+
+        compiled = compile_program(payload)
+        self.assertIn("sum((x * 2 for x in range(5) if x > 1))", compiled.source)
+        response = run_sandboxed_python(
+            code=compiled.source,
+            timeout_seconds=5,
+            initial_state={},
+            action_handler=lambda actions: {},
+            strategy_handler=lambda update: update,
+        )
+        self.assertEqual(response["result"], 18)
+
+    def test_constrained_try_recovers_from_expected_data_error(self) -> None:
+        payload = program({
+            "kind": "try",
+            "body": [{
+                "kind": "assign",
+                "targets": [target("result")],
+                "value": {
+                    "kind": "subscript",
+                    "value": {"kind": "dict", "entries": []},
+                    "index": const("missing"),
+                },
+            }],
+            "handlers": [{
+                "exceptions": ["KeyError", "IndexError"],
+                "body": [{
+                    "kind": "assign",
+                    "targets": [target("result")],
+                    "value": const("fallback"),
+                }],
+            }],
+            "finalbody": [{"kind": "pass"}],
+        })
+
+        compiled = compile_program(payload)
+        self.assertIn("except (KeyError, IndexError):", compiled.source)
+        response = run_sandboxed_python(
+            code=compiled.source,
+            timeout_seconds=5,
+            initial_state={},
+            action_handler=lambda actions: {},
+            strategy_handler=lambda update: update,
+        )
+        self.assertEqual(response["result"], "fallback")
+        self.assertEqual(
+            compiled.path_for_line(4),
+            "program.body.0.handlers.0.body.0",
+        )
+
+    def test_try_rejects_broad_exception_handler_with_precise_path(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({
+                "kind": "try",
+                "body": [{"kind": "pass"}],
+                "handlers": [{
+                    "exceptions": ["Exception"],
+                    "body": [{"kind": "pass"}],
+                }],
+            }))
+
+        diagnostic = captured.exception.diagnostics[0]
+        self.assertEqual(captured.exception.stage, "schema")
+        self.assertEqual(diagnostic.code, "IR_INVALID_VALUE")
+        self.assertEqual(
+            diagnostic.path,
+            "program.body.0.handlers.0.exceptions.0",
+        )
+
+    def test_try_rejects_duplicate_exception_handlers(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({
+                "kind": "try",
+                "body": [{"kind": "pass"}],
+                "handlers": [
+                    {
+                        "exceptions": ["KeyError"],
+                        "body": [{"kind": "pass"}],
+                    },
+                    {
+                        "exceptions": ["KeyError"],
+                        "body": [{"kind": "pass"}],
+                    },
+                ],
+            }))
+
+        diagnostic = captured.exception.diagnostics[0]
+        self.assertEqual(captured.exception.stage, "structure")
+        self.assertEqual(diagnostic.code, "IR_DUPLICATE_EXCEPTION_HANDLER")
+        self.assertEqual(
+            diagnostic.path,
+            "program.body.0.handlers.1.exceptions.0",
+        )
+
+    def test_typed_raise_and_bound_handler_execute_in_sandbox(self) -> None:
+        payload = program({
+            "kind": "try",
+            "body": [{
+                "kind": "raise",
+                "exception": "ValueError",
+                "message": const("bad shape"),
+            }],
+            "handlers": [{
+                "exceptions": ["ValueError"],
+                "name": "error",
+                "body": [{
+                    "kind": "assign",
+                    "targets": [target("result")],
+                    "value": call("str", name("error")),
+                }],
+            }],
+        })
+
+        compiled = compile_program(payload)
+        self.assertIn("raise ValueError('bad shape')", compiled.source)
+        self.assertIn("except ValueError as error:", compiled.source)
+        response = run_sandboxed_python(
+            code=compiled.source,
+            timeout_seconds=5,
+            initial_state={},
+            action_handler=lambda actions: {},
+            strategy_handler=lambda update: update,
+        )
+        self.assertEqual(response["result"], "bad shape")
+
+    def test_raise_rejects_runtime_exception_type(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({
+                "kind": "raise",
+                "exception": "RuntimeError",
+                "message": const("do not suppress action failures"),
+            }))
+
+        diagnostic = captured.exception.diagnostics[0]
+        self.assertEqual(captured.exception.stage, "schema")
+        self.assertEqual(diagnostic.code, "IR_INVALID_VALUE")
+        self.assertEqual(diagnostic.path, "program.body.0.exception")
 
     def test_function_for_while_imports_and_control_flow(self) -> None:
         compiled = compile_program(program(
@@ -323,6 +621,46 @@ class ProgramIRCompilerTests(unittest.TestCase):
         self.assertEqual(captured.exception.diagnostics[0].code, "IR_INVALID_KIND")
         self.assertEqual(captured.exception.diagnostics[0].path, "program.body.0")
 
+    def test_missing_kind_reports_direct_structured_repair_hint(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program({
+                "version": 1,
+                "body": [{"type": "expr", "value": {"kind": "constant", "value": 1}}],
+            })
+
+        payload = captured.exception.payload()
+        diagnostic = payload["diagnostics"][0]
+        self.assertEqual(diagnostic["code"], "IR_INVALID_KIND")
+        self.assertEqual(diagnostic["path"], "program.body.0")
+        self.assertEqual(diagnostic["message"], "Node requires the `kind` discriminator.")
+        self.assertIn("rename `type` to `kind`", diagnostic["hint"])
+        self.assertEqual(payload["recovery_hint"], diagnostic["hint"])
+
+    def test_near_miss_kind_suggests_closest_valid_kind(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({
+                "kind": "expression",
+                "value": const(1),
+            }))
+
+        diagnostic = captured.exception.payload()["diagnostics"][0]
+        self.assertEqual(diagnostic["message"], "Unknown node kind 'expression'.")
+        self.assertIn("replace `kind`: 'expression' with 'expr'", diagnostic["hint"])
+
+    def test_missing_and_extra_fields_include_actionable_hints(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program({"kind": "expr", "unexpected": True}))
+
+        diagnostics = {item.path: item for item in captured.exception.diagnostics}
+        self.assertEqual(
+            diagnostics["program.body.0.value"].hint,
+            "Add required field `value` at program.body.0.value.",
+        )
+        self.assertEqual(
+            diagnostics["program.body.0.unexpected"].hint,
+            "Remove unsupported field `unexpected` at program.body.0.unexpected.",
+        )
+
     def test_type_coercion_is_rejected(self) -> None:
         coercive_payloads = (
             ({"version": "1", "body": [{"kind": "pass"}]}, "program.version"),
@@ -335,6 +673,19 @@ class ProgramIRCompilerTests(unittest.TestCase):
                     compile_program(payload)
                 self.assertEqual(captured.exception.stage, "schema")
                 self.assertEqual(captured.exception.diagnostics[0].path, expected_path)
+
+    def test_protocol_version_is_explicitly_required(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program({"body": [{"kind": "pass"}]})
+
+        payload = captured.exception.payload()
+        diagnostic = payload["diagnostics"][0]
+        self.assertEqual(diagnostic["code"], "IR_REQUIRED_FIELD")
+        self.assertEqual(diagnostic["path"], "program.version")
+        self.assertEqual(
+            diagnostic["hint"],
+            "Add required field `version` at program.version.",
+        )
 
     def test_strict_validation_preserves_integer_and_float_identity(self) -> None:
         integer = compile_program(program({"kind": "expr", "value": const(1)}))
@@ -470,6 +821,19 @@ class ProgramIRCompilerTests(unittest.TestCase):
         self.assertEqual(captured.exception.diagnostics[0].code, "IR_UNREACHABLE_STATEMENT")
         self.assertEqual(captured.exception.diagnostics[0].path, "program.body.0.body.1")
 
+    def test_statement_after_raise_is_rejected_as_unreachable(self) -> None:
+        with self.assertRaises(ProgramCompileError) as captured:
+            compile_program(program(
+                {"kind": "raise", "exception": "ValueError"},
+                {"kind": "pass"},
+            ))
+        self.assertEqual(captured.exception.stage, "structure")
+        self.assertEqual(
+            captured.exception.diagnostics[0].code,
+            "IR_UNREACHABLE_STATEMENT",
+        )
+        self.assertEqual(captured.exception.diagnostics[0].path, "program.body.1")
+
     def test_both_terminating_if_branches_make_following_statement_unreachable(self) -> None:
         with self.assertRaises(ProgramCompileError) as captured:
             compile_program(program({
@@ -598,7 +962,10 @@ class ProgramIRCompilerTests(unittest.TestCase):
         self.assertEqual(schema["required"], ["program"])
         self.assertFalse(schema["additionalProperties"])
         self.assertIn("$defs", schema)
-        self.assertIn("body", schema["properties"]["program"]["properties"])
+        program_schema = schema["properties"]["program"]
+        self.assertIn("body", program_schema["properties"])
+        self.assertIn("version", program_schema["required"])
+        self.assertNotIn("default", program_schema["properties"]["version"])
         self.assertIn("raw Python source is not accepted", schema["properties"]["program"]["description"])
         self.assertIn("never coerced", schema["properties"]["program"]["description"])
         self.assertIn(f"{MAX_INTEGER_BITS} bits", schema["properties"]["program"]["description"])
@@ -610,6 +977,24 @@ class ProgramIRCompilerTests(unittest.TestCase):
         self.assertIn("unreachable statements", schema["$defs"]["Stmt"]["description"])
         self.assertIn("attribute, or subscript", schema["$defs"]["AugTarget"]["description"])
         self.assertIn("starred_target", schema["$defs"]["UnpackTarget"]["description"])
+        self.assertIn("GeneratorComprehensionExpr", schema["$defs"])
+        self.assertIn("ExceptHandlerIR", schema["$defs"])
+        self.assertIn("TryStmt", schema["$defs"])
+        self.assertIn("RaiseStmt", schema["$defs"])
+        function_schema = schema["$defs"]["FunctionDefStmt"]["properties"]
+        self.assertIn("vararg", function_schema)
+        self.assertIn("kwarg", function_schema)
+
+    def test_tool_schema_omits_nonsemantic_generated_titles(self) -> None:
+        schema = program_tool_parameters_schema()
+        pending = [schema]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                self.assertNotIn("title", value)
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
         self.assertLess(len(json.dumps(schema)), 20_000)
 
 
@@ -710,6 +1095,36 @@ class ProgramIRSandboxTests(unittest.TestCase):
                 },
                 "program.body.0.names.0.asname",
             ),
+            (
+                {
+                    "kind": "try",
+                    "body": [{"kind": "pass"}],
+                    "handlers": [{
+                        "exceptions": ["ValueError"],
+                        "name": "action",
+                        "body": [{"kind": "pass"}],
+                    }],
+                },
+                "program.body.0.handlers.0.name",
+            ),
+            (
+                {
+                    "kind": "function_def",
+                    "name": "helper",
+                    "vararg": "action",
+                    "body": [{"kind": "pass"}],
+                },
+                "program.body.0.vararg",
+            ),
+            (
+                {
+                    "kind": "function_def",
+                    "name": "helper",
+                    "kwarg": "current_frame",
+                    "body": [{"kind": "pass"}],
+                },
+                "program.body.0.kwarg",
+            ),
         )
         for statement, expected_path in cases:
             with self.subTest(statement=statement), self.assertRaises(ProgramCompileError) as captured:
@@ -737,6 +1152,61 @@ class ProgramIRToolAgentTests(unittest.TestCase):
             schema = self.agent._tools(Path(tmp) / "state.json")[0]["function"]["parameters"]
         self.assertEqual(schema["required"], ["program"])
         self.assertNotIn("code", schema["properties"])
+
+    def test_malformed_provider_arguments_preserve_json_diagnostic(self) -> None:
+        arguments, dispatch = self.agent._decode_tool_arguments(
+            "python",
+            '{"program":{"version":1,"body":',
+        )
+
+        self.assertIsNone(arguments)
+        self.assertIsNotNone(dispatch)
+        payload = json.loads(dispatch.content)
+        self.assertEqual(payload["stage"], "schema")
+        self.assertEqual(payload["error_category"], "MALFORMED_TOOL_ARGUMENTS")
+        self.assertEqual(
+            payload["diagnostics"][0]["code"],
+            "IR_TOOL_ARGUMENTS_INVALID_JSON",
+        )
+        self.assertEqual(payload["diagnostics"][0]["path"], "arguments")
+        self.assertIn("line 1, column", payload["error"])
+        self.assertEqual(payload["compiler"]["version"], COMPILER_VERSION)
+
+    def test_valid_provider_arguments_decode_without_dispatch_error(self) -> None:
+        raw = json.dumps({"program": program({"kind": "pass"})})
+        arguments, dispatch = self.agent._decode_tool_arguments("python", raw)
+
+        self.assertIsNone(dispatch)
+        self.assertEqual(arguments, {"program": program({"kind": "pass"})})
+
+    def test_unknown_tool_returns_structured_repair_diagnostic(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "python_source",
+                {},
+            )
+
+        payload = json.loads(result.content)
+        self.assertEqual(payload["stage"], "schema")
+        self.assertEqual(payload["error_category"], "INVALID_TOOL_NAME")
+        self.assertEqual(payload["diagnostics"][0]["code"], "IR_UNKNOWN_TOOL")
+        self.assertEqual(payload["diagnostics"][0]["path"], "tool.name")
+        self.assertIn("only available tool is `python`", payload["error"])
+
+    def test_unknown_tool_name_is_sanitized_and_bounded(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "bad\nname\t" + ("x" * 500),
+                {},
+            )
+
+        payload = json.loads(result.content)
+        self.assertLessEqual(len(payload["tool"]), 80)
+        self.assertNotIn("\n", payload["tool"])
+        self.assertNotIn("\t", payload["tool"])
+        self.assertTrue(payload["tool"].endswith("..."))
 
     def test_action_result_compaction_preserves_partial_batch_stop_detail(self) -> None:
         compact = self.agent._compact_action_result({
@@ -844,6 +1314,27 @@ class ProgramIRToolAgentTests(unittest.TestCase):
             MAX_CONTAINER_ITEMS,
         )
 
+    def test_tiny_tool_budget_preserves_compiler_repair_context(self) -> None:
+        self.agent._tool_output_chars = 256
+        malformed = {
+            "version": 1,
+            "body": [{"type": "expr", "value": {"kind": "constant", "value": 1}}],
+        }
+
+        with TemporaryDirectory() as tmp:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "python",
+                {"program": malformed},
+            )
+
+        payload = json.loads(result.content)
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["stage"], "schema")
+        self.assertEqual(payload["error_category"], "INVALID_PROGRAM_IR")
+        self.assertIn("rename `type` to `kind`", payload["recovery_hint"])
+        self.assertLessEqual(len(result.content), self.agent._tool_output_chars * 2)
+
     def test_compiler_metadata_in_successful_result(self) -> None:
         with TemporaryDirectory() as tmp:
             result = self.agent._dispatch_tool(
@@ -877,6 +1368,8 @@ class ProgramIRToolAgentTests(unittest.TestCase):
         self.assertEqual(payload["error_category"], "UNDEFINED_VARIABLE")
         self.assertEqual(payload["diagnostics"][0]["code"], "IR_RUNTIME_ERROR")
         self.assertEqual(payload["diagnostics"][0]["path"], "program.body.0.body.0")
+        self.assertIn("last_action_frame", payload["recovery_hint"])
+        self.assertIn("bfs(frame, start, goal, blocked=None)", payload["recovery_hint"])
 
     def test_already_terminal_action_result_suppresses_later_action_calls(self) -> None:
         action_call = call(
@@ -929,6 +1422,59 @@ class ProgramIRToolAgentTests(unittest.TestCase):
         self.assertFalse(payload["result"]["executed"])
         self.assertEqual(payload["result"]["stop_reason"], "previous_game_over")
         self.assertEqual(payload["result"]["valid_actions"], [])
+
+    def test_solver_stop_result_suppresses_later_action_calls(self) -> None:
+        action_call = call(
+            "action",
+            {"kind": "list", "items": [const("LEFT")]},
+        )
+        action_program = program(
+            {
+                "kind": "assign",
+                "targets": [target("first")],
+                "value": action_call,
+            },
+            {
+                "kind": "assign",
+                "targets": [target("result")],
+                "value": action_call,
+            },
+        )
+        callback_count = 0
+
+        def step_env(arguments):
+            nonlocal callback_count
+            callback_count += 1
+            return {
+                "executed": False,
+                "action_num": 12,
+                "level": 1,
+                "score": 0,
+                "reward": 0.0,
+                "state": "PLAYING",
+                "valid_actions": [],
+                "board_changed": False,
+                "done": False,
+                "level_completed": False,
+                "game_over": False,
+                "run_complete": False,
+                "stopped_early": True,
+                "stop_reason": "stopped",
+                "error": "The solver action budget is exhausted.",
+            }
+
+        self.agent._step_env_callback = step_env
+        with TemporaryDirectory() as tmp:
+            result = self.agent._dispatch_tool(
+                Path(tmp) / "state.json",
+                "python",
+                {"program": action_program},
+            )
+        payload = json.loads(result.content)
+        self.assertEqual(callback_count, 1)
+        self.assertFalse(payload["result"]["executed"])
+        self.assertEqual(payload["result"]["stop_reason"], "previous_stopped")
+        self.assertIn("budget is exhausted", payload["result"]["stop_detail"])
 
     def test_stdout_and_result_are_both_preserved(self) -> None:
         with TemporaryDirectory() as tmp:

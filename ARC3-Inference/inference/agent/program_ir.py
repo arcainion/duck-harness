@@ -7,6 +7,7 @@ self-modification features are intentionally excluded from the runtime.
 from __future__ import annotations
 
 import ast
+from difflib import get_close_matches
 import hashlib
 import json
 import keyword
@@ -27,7 +28,7 @@ from inference.agent.python_tool_policy import (
 )
 
 
-COMPILER_VERSION = "duck-program-ir/1.15"
+COMPILER_VERSION = "duck-program-ir/1.22"
 PROGRAM_IR_VERSION = 1
 MAX_IR_NODES = 512
 MAX_IR_DEPTH = 32
@@ -127,7 +128,7 @@ class SetExpr(StrictModel):
 
 
 class DictEntry(StrictModel):
-    key: "Expr"
+    key: "Expr | None"
     value: "Expr"
 
 
@@ -178,7 +179,9 @@ class CallExpr(StrictModel):
     kind: Literal["call"]
     function: "Expr"
     args: list["Expr"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
+    star_args: list["Expr"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
     keywords: dict[str, "Expr"] = Field(default_factory=dict, max_length=MAX_CONTAINER_ITEMS)
+    star_keywords: list["Expr"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
 
     @field_validator("keywords")
     @classmethod
@@ -296,6 +299,12 @@ class SetComprehensionExpr(StrictModel):
     clauses: list[ComprehensionClause] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
 
+class GeneratorComprehensionExpr(StrictModel):
+    kind: Literal["generator_comprehension"]
+    element: "Expr"
+    clauses: list[ComprehensionClause] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
+
+
 class DictComprehensionExpr(StrictModel):
     kind: Literal["dict_comprehension"]
     key: "Expr"
@@ -310,7 +319,8 @@ Expr = TypeAliasType(
             NameExpr, ConstantExpr, AttributeExpr, SubscriptExpr, ListExpr,
             TupleExpr, SetExpr, DictExpr, UnaryExpr, BinaryExpr, BoolExpr,
             CompareExpr, CallExpr, IfExpr, ListComprehensionExpr,
-            SetComprehensionExpr, DictComprehensionExpr,
+            SetComprehensionExpr, GeneratorComprehensionExpr,
+            DictComprehensionExpr,
         ],
         Field(discriminator="kind"),
     ],
@@ -371,12 +381,19 @@ class FunctionDefStmt(StrictModel):
     kind: Literal["function_def"]
     name: str
     parameters: list[ParameterIR] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
+    vararg: str | None = None
+    kwarg: str | None = None
     body: list["Stmt"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
     @field_validator("name")
     @classmethod
     def valid_name(cls, value: str) -> str:
         return _identifier(value, label="function name")
+
+    @field_validator("vararg", "kwarg")
+    @classmethod
+    def valid_variadic_name(cls, value: str | None) -> str | None:
+        return None if value is None else _identifier(value, label="variadic parameter")
 
     @model_validator(mode="after")
     def valid_parameter_order(self):
@@ -390,6 +407,12 @@ class FunctionDefStmt(StrictModel):
                 seen_default = True
             elif seen_default:
                 raise ValueError("non-default parameter follows default parameter")
+        for parameter_name in (self.vararg, self.kwarg):
+            if parameter_name is None:
+                continue
+            if parameter_name in seen_names:
+                raise ValueError(f"duplicate parameter: {parameter_name}")
+            seen_names.add(parameter_name)
         return self
 
 
@@ -462,13 +485,55 @@ class PassStmt(StrictModel):
     kind: Literal["pass"]
 
 
+HandledException = Literal[
+    "AttributeError",
+    "IndexError",
+    "KeyError",
+    "OverflowError",
+    "TypeError",
+    "ValueError",
+    "ZeroDivisionError",
+]
+
+
+class ExceptHandlerIR(StrictModel):
+    exceptions: list[HandledException] = Field(
+        min_length=1,
+        max_length=MAX_CONTAINER_ITEMS,
+    )
+    name: str | None = None
+    body: list["Stmt"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, value: str | None) -> str | None:
+        return None if value is None else _identifier(value, label="exception name")
+
+
+class TryStmt(StrictModel):
+    kind: Literal["try"]
+    body: list["Stmt"] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
+    handlers: list[ExceptHandlerIR] = Field(
+        min_length=1,
+        max_length=MAX_CONTAINER_ITEMS,
+    )
+    orelse: list["Stmt"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
+    finalbody: list["Stmt"] = Field(default_factory=list, max_length=MAX_CONTAINER_ITEMS)
+
+
+class RaiseStmt(StrictModel):
+    kind: Literal["raise"]
+    exception: HandledException
+    message: Expr | None = None
+
+
 Stmt = TypeAliasType(
     "Stmt",
     Annotated[
         Union[
             AssignStmt, AugAssignStmt, ExprStmt, IfStmt, ForStmt, WhileStmt,
             FunctionDefStmt, ReturnStmt, ImportStmt, FromImportStmt, BreakStmt,
-            ContinueStmt, PassStmt,
+            ContinueStmt, PassStmt, TryStmt, RaiseStmt,
         ],
         Field(discriminator="kind"),
     ],
@@ -476,7 +541,7 @@ Stmt = TypeAliasType(
 
 
 class ProgramIR(StrictModel):
-    version: Literal[1] = PROGRAM_IR_VERSION
+    version: Literal[1]
     body: list[Stmt] = Field(min_length=1, max_length=MAX_CONTAINER_ITEMS)
 
     @field_validator("version", mode="before")
@@ -492,9 +557,13 @@ class CompilerDiagnostic:
     code: str
     path: str
     message: str
+    hint: str | None = None
 
     def to_dict(self) -> dict[str, str]:
-        return {"code": self.code, "path": self.path, "message": self.message}
+        result = {"code": self.code, "path": self.path, "message": self.message}
+        if self.hint:
+            result["hint"] = self.hint
+        return result
 
 
 class ProgramCompileError(ValueError):
@@ -505,12 +574,16 @@ class ProgramCompileError(ValueError):
         super().__init__(diagnostics[0].message if diagnostics else error_category)
 
     def payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "stage": self.stage,
             "error_category": self.error_category,
             "error": str(self),
             "diagnostics": [item.to_dict() for item in self.diagnostics],
         }
+        hints = list(dict.fromkeys(item.hint for item in self.diagnostics if item.hint))
+        if hints:
+            payload["recovery_hint"] = " ".join(hints[:3])
+        return payload
 
 
 @dataclass(frozen=True)
@@ -577,16 +650,17 @@ def _path(location: tuple[Any, ...]) -> str:
         "name", "constant", "attribute", "slice", "subscript", "list",
         "tuple", "set", "dict", "unary", "binary", "bool", "compare",
         "call", "if_expr", "list_comprehension", "set_comprehension",
-        "dict_comprehension", "name_target", "attribute_target",
+        "dict_comprehension", "generator_comprehension", "name_target", "attribute_target",
         "subscript_target", "tuple_target", "list_target", "starred_target", "assign",
         "aug_assign", "expr", "if", "for", "while", "function_def",
-        "return", "import", "from_import", "break", "continue", "pass",
+        "return", "import", "from_import", "break", "continue", "pass", "try",
+        "raise",
     }
     union_parent_fields = {
         "args", "body", "clauses", "comparators", "condition", "conditions",
         "element", "function", "index", "items", "iterable", "key", "left",
-        "lower", "operand", "orelse", "otherwise", "right", "step", "target",
-        "targets", "then", "upper", "value", "values",
+        "lower", "message", "operand", "orelse", "otherwise", "right", "step", "target",
+        "star_args", "star_keywords", "targets", "then", "upper", "value", "values",
     }
     clean_location: list[Any] = []
     for index, item in enumerate(location):
@@ -620,14 +694,54 @@ def _schema_diagnostic_code(error_type: str) -> str:
     return "IR_SCHEMA_INVALID"
 
 
+def _schema_diagnostic(error: dict[str, Any]) -> CompilerDiagnostic:
+    error_type = str(error["type"])
+    path = _path(tuple(error["loc"]))
+    message = str(error["msg"])
+    hint: str | None = None
+    context = error.get("ctx") if isinstance(error.get("ctx"), dict) else {}
+
+    if error_type == "union_tag_not_found":
+        message = "Node requires the `kind` discriminator."
+        input_value = error.get("input")
+        if isinstance(input_value, dict) and "type" in input_value:
+            hint = f"At {path}, rename `type` to `kind`."
+        else:
+            hint = f"At {path}, add a string `kind` field for the intended node."
+    elif error_type == "union_tag_invalid":
+        tag = str(context.get("tag", "")).strip()
+        expected = [
+            item.strip().strip("'")
+            for item in str(context.get("expected_tags", "")).split(",")
+            if item.strip().strip("'")
+        ]
+        message = f"Unknown node kind {tag!r}."
+        closest = get_close_matches(tag, expected, n=1, cutoff=0.35)
+        if closest:
+            hint = f"At {path}, replace `kind`: {tag!r} with {closest[0]!r}."
+        elif expected:
+            hint = f"At {path}, set `kind` to one of: {', '.join(expected)}."
+    elif error_type == "missing":
+        field = str(tuple(error["loc"])[-1])
+        message = "Required field is missing."
+        hint = f"Add required field `{field}` at {path}."
+    elif error_type == "extra_forbidden":
+        field = str(tuple(error["loc"])[-1])
+        message = "Field is not allowed for this node."
+        hint = f"Remove unsupported field `{field}` at {path}."
+
+    return CompilerDiagnostic(
+        code=_schema_diagnostic_code(error_type),
+        path=path,
+        message=message,
+        hint=hint,
+    )
+
+
 def _schema_diagnostics(exc: ValidationError) -> list[CompilerDiagnostic]:
     errors = exc.errors(include_url=False)
     diagnostics = [
-        CompilerDiagnostic(
-            code=_schema_diagnostic_code(str(error["type"])),
-            path=_path(tuple(error["loc"])),
-            message=str(error["msg"]),
-        )
+        _schema_diagnostic(error)
         for error in errors[:MAX_COMPILER_DIAGNOSTICS]
     ]
     omitted = len(errors) - len(diagnostics)
@@ -760,6 +874,8 @@ def _validate_statement_context(program: ProgramIR) -> None:
     def statement_terminates(statement: Stmt, *, function_depth: int, loop_depth: int) -> bool:
         if isinstance(statement, ReturnStmt):
             return function_depth > 0
+        if isinstance(statement, RaiseStmt):
+            return True
         if isinstance(statement, (BreakStmt, ContinueStmt)):
             return loop_depth > 0
         if isinstance(statement, IfStmt) and statement.orelse:
@@ -832,6 +948,26 @@ def _validate_statement_context(program: ProgramIR) -> None:
             elif isinstance(statement, FunctionDefStmt):
                 # A nested function cannot target loops in its enclosing scope.
                 visit_statements(statement.body, (*statement_path, "body"), function_depth=function_depth + 1, loop_depth=0)
+            elif isinstance(statement, TryStmt):
+                seen_exceptions: set[str] = set()
+                visit_statements(statement.body, (*statement_path, "body"), function_depth=function_depth, loop_depth=loop_depth)
+                for handler_index, handler in enumerate(statement.handlers):
+                    for exception_index, exception_name in enumerate(handler.exceptions):
+                        if exception_name in seen_exceptions:
+                            diagnostics.append(CompilerDiagnostic(
+                                "IR_DUPLICATE_EXCEPTION_HANDLER",
+                                _path((*statement_path, "handlers", handler_index, "exceptions", exception_index)),
+                                f"{exception_name} is already handled by an earlier handler",
+                            ))
+                        seen_exceptions.add(exception_name)
+                    visit_statements(
+                        handler.body,
+                        (*statement_path, "handlers", handler_index, "body"),
+                        function_depth=function_depth,
+                        loop_depth=loop_depth,
+                    )
+                visit_statements(statement.orelse, (*statement_path, "orelse"), function_depth=function_depth, loop_depth=loop_depth)
+                visit_statements(statement.finalbody, (*statement_path, "finalbody"), function_depth=function_depth, loop_depth=loop_depth)
             terminated = statement_terminates(
                 statement,
                 function_depth=function_depth,
@@ -920,7 +1056,13 @@ def _validate_ir_safety(program: ProgramIR) -> None:
             protect(value.name, (*path, "name"))
         elif isinstance(value, FunctionDefStmt):
             protect(value.name, (*path, "name"))
+            if value.vararg is not None:
+                protect(value.vararg, (*path, "vararg"))
+            if value.kwarg is not None:
+                protect(value.kwarg, (*path, "kwarg"))
         elif isinstance(value, ParameterIR):
+            protect(value.name, (*path, "name"))
+        elif isinstance(value, ExceptHandlerIR) and value.name is not None:
             protect(value.name, (*path, "name"))
 
         if isinstance(value, BaseModel):
@@ -1055,7 +1197,10 @@ def _lower_expr(node: Expr) -> ast.expr:
     if isinstance(node, SetExpr):
         return ast.Set(elts=[_lower_expr(item) for item in node.items])
     if isinstance(node, DictExpr):
-        return ast.Dict(keys=[_lower_expr(item.key) for item in node.entries], values=[_lower_expr(item.value) for item in node.entries])
+        return ast.Dict(
+            keys=[None if item.key is None else _lower_expr(item.key) for item in node.entries],
+            values=[_lower_expr(item.value) for item in node.entries],
+        )
     if isinstance(node, UnaryExpr):
         return ast.UnaryOp(op=_UNARYOPS[node.op](), operand=_lower_expr(node.operand))
     if isinstance(node, BinaryExpr):
@@ -1069,10 +1214,22 @@ def _lower_expr(node: Expr) -> ast.expr:
         # ProgramIR payloads also evaluate keyword values in the same order.
         return ast.Call(
             func=_lower_expr(node.function),
-            args=[_lower_expr(item) for item in node.args],
+            args=[
+                *[_lower_expr(item) for item in node.args],
+                *[
+                    ast.Starred(value=_lower_expr(item), ctx=ast.Load())
+                    for item in node.star_args
+                ],
+            ],
             keywords=[
-                ast.keyword(arg=name, value=_lower_expr(node.keywords[name]))
-                for name in sorted(node.keywords)
+                *[
+                    ast.keyword(arg=name, value=_lower_expr(node.keywords[name]))
+                    for name in sorted(node.keywords)
+                ],
+                *[
+                    ast.keyword(arg=None, value=_lower_expr(item))
+                    for item in node.star_keywords
+                ],
             ],
         )
     if isinstance(node, IfExpr):
@@ -1081,20 +1238,29 @@ def _lower_expr(node: Expr) -> ast.expr:
         return ast.ListComp(elt=_lower_expr(node.element), generators=_lower_comprehensions(node.clauses))
     if isinstance(node, SetComprehensionExpr):
         return ast.SetComp(elt=_lower_expr(node.element), generators=_lower_comprehensions(node.clauses))
+    if isinstance(node, GeneratorComprehensionExpr):
+        return ast.GeneratorExp(
+            elt=_lower_expr(node.element),
+            generators=_lower_comprehensions(node.clauses),
+        )
     if isinstance(node, DictComprehensionExpr):
         return ast.DictComp(key=_lower_expr(node.key), value=_lower_expr(node.value), generators=_lower_comprehensions(node.clauses))
     raise TypeError(f"unsupported expression: {type(node).__name__}")
 
 
-def _lower_parameters(parameters: list[ParameterIR]) -> ast.arguments:
+def _lower_parameters(function: FunctionDefStmt) -> ast.arguments:
     return ast.arguments(
         posonlyargs=[],
-        args=[ast.arg(arg=item.name) for item in parameters],
-        vararg=None,
+        args=[ast.arg(arg=item.name) for item in function.parameters],
+        vararg=None if function.vararg is None else ast.arg(arg=function.vararg),
         kwonlyargs=[],
         kw_defaults=[],
-        kwarg=None,
-        defaults=[_lower_expr(item.default) for item in parameters if item.default is not None],
+        kwarg=None if function.kwarg is None else ast.arg(arg=function.kwarg),
+        defaults=[
+            _lower_expr(item.default)
+            for item in function.parameters
+            if item.default is not None
+        ],
     )
 
 
@@ -1112,7 +1278,12 @@ def _lower_stmt(node: Stmt) -> ast.stmt:
     if isinstance(node, WhileStmt):
         return ast.While(test=_lower_expr(node.condition), body=[_lower_stmt(item) for item in node.body], orelse=[_lower_stmt(item) for item in node.orelse])
     if isinstance(node, FunctionDefStmt):
-        return ast.FunctionDef(name=node.name, args=_lower_parameters(node.parameters), body=[_lower_stmt(item) for item in node.body], decorator_list=[])
+        return ast.FunctionDef(
+            name=node.name,
+            args=_lower_parameters(node),
+            body=[_lower_stmt(item) for item in node.body],
+            decorator_list=[],
+        )
     if isinstance(node, ReturnStmt):
         return ast.Return(value=None if node.value is None else _lower_expr(node.value))
     if isinstance(node, ImportStmt):
@@ -1125,6 +1296,35 @@ def _lower_stmt(node: Stmt) -> ast.stmt:
         return ast.Continue()
     if isinstance(node, PassStmt):
         return ast.Pass()
+    if isinstance(node, RaiseStmt):
+        exception = ast.Name(id=node.exception, ctx=ast.Load())
+        if node.message is not None:
+            exception = ast.Call(
+                func=exception,
+                args=[_lower_expr(node.message)],
+                keywords=[],
+            )
+        return ast.Raise(exc=exception, cause=None)
+    if isinstance(node, TryStmt):
+        handlers = []
+        for handler in node.handlers:
+            exception_nodes = [ast.Name(id=name, ctx=ast.Load()) for name in handler.exceptions]
+            exception_type: ast.expr = (
+                exception_nodes[0]
+                if len(exception_nodes) == 1
+                else ast.Tuple(elts=exception_nodes, ctx=ast.Load())
+            )
+            handlers.append(ast.ExceptHandler(
+                type=exception_type,
+                name=handler.name,
+                body=[_lower_stmt(item) for item in handler.body],
+            ))
+        return ast.Try(
+            body=[_lower_stmt(item) for item in node.body],
+            handlers=handlers,
+            orelse=[_lower_stmt(item) for item in node.orelse],
+            finalbody=[_lower_stmt(item) for item in node.finalbody],
+        )
     raise TypeError(f"unsupported statement: {type(node).__name__}")
 
 
@@ -1161,6 +1361,18 @@ def _build_source_map(program: ProgramIR, module: ast.Module) -> tuple[SourceMap
                 visit_block(ir_statement.orelse, python_statement.orelse, (*statement_path, "orelse"))
             elif isinstance(ir_statement, FunctionDefStmt) and isinstance(python_statement, ast.FunctionDef):
                 visit_block(ir_statement.body, python_statement.body, (*statement_path, "body"))
+            elif isinstance(ir_statement, TryStmt) and isinstance(python_statement, ast.Try):
+                visit_block(ir_statement.body, python_statement.body, (*statement_path, "body"))
+                for handler_index, (ir_handler, python_handler) in enumerate(
+                    zip(ir_statement.handlers, python_statement.handlers, strict=False)
+                ):
+                    visit_block(
+                        ir_handler.body,
+                        python_handler.body,
+                        (*statement_path, "handlers", handler_index, "body"),
+                    )
+                visit_block(ir_statement.orelse, python_statement.orelse, (*statement_path, "orelse"))
+                visit_block(ir_statement.finalbody, python_statement.finalbody, (*statement_path, "finalbody"))
 
     visit_block(program.body, module.body, ("body",))
     return tuple(entries)
@@ -1274,7 +1486,7 @@ def program_tool_parameters_schema() -> dict[str, Any]:
     for definition_name, description in guidance.items():
         if definition_name in definitions:
             definitions[definition_name]["description"] = description
-    return {
+    schema = {
         "type": "object",
         "description": "Compile and execute one ephemeral ProgramIR program in The Duck sandbox.",
         "additionalProperties": False,
@@ -1282,6 +1494,17 @@ def program_tool_parameters_schema() -> dict[str, Any]:
         "required": ["program"],
         "$defs": definitions,
     }
+    # Pydantic-generated titles repeat class/field names but add no validation
+    # semantics. Removing them saves substantial context on small model profiles.
+    stack: list[Any] = [schema]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            current.pop("title", None)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return schema
 
 
 def program_to_source(payload: Any) -> str:

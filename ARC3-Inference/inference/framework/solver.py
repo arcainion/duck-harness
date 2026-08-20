@@ -266,10 +266,10 @@ def _mouse_grid_size(game: taaf.game.Game) -> tuple[int, int]:
 
 
 def _mouse_coordinate(value: Any) -> int:
-    """Parse an integer coordinate without truncating floats or accepting booleans."""
-    if isinstance(value, (bool, float)):
+    """Accept only JSON integer coordinates without coercion."""
+    if type(value) is not int:
         raise ValueError("mouse coordinates must be integers")
-    return int(value)
+    return value
 
 
 def _format_action_display(

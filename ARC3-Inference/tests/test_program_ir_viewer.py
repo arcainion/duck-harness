@@ -24,7 +24,7 @@ PROGRAM = {
 class ProgramIRViewerTests(TestCase):
     def test_program_ir_renders_lowered_preview_and_metadata(self) -> None:
         rendered = _render_tool_arguments("python", {"program": PROGRAM})
-        self.assertIn("compiled by duck-program-ir/1.15", rendered)
+        self.assertIn("compiled by duck-program-ir/1.22", rendered)
         self.assertIn("sha256=", rendered)
         self.assertIn("src_sha256=", rendered)
         self.assertIn("print(current_frame)", rendered)

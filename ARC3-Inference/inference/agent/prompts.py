@@ -1,6 +1,11 @@
 """Prompt templates for the analyzer agent."""
 
-from inference.agent.python_tool_policy import allowed_modules_text
+from inference.agent.python_tool_policy import (
+    allowed_modules_text,
+    runtime_bindings_text,
+    runtime_helper_signatures_text,
+)
+from inference.agent.vision_context import current_grid_image_enabled
 from inference.utils.grid_utils import ARC_COLOR_LEGEND
 
 TOOL_CALL_FORMAT_GUIDANCE = (
@@ -63,6 +68,9 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- `valid_actions` is the current list of valid action names.\n"
     "- `experience` is a read-only compact controller snapshot with the current phase, opaque state id, visits, tried/no-op actions, recent transitions, cycle/stagnation signals, and suggested probes. It never contains the raw numeric grid.\n"
     "- `strategy` is the latest structured strategy memory recorded during this run.\n"
+    "- `latest_frame` is a compatibility alias for `current_frame`; prefer `current_frame` in new programs.\n"
+    f"- Available protected runtime bindings are: {runtime_bindings_text()}. Read or call them, but never overwrite them.\n"
+    f"- Grid helper signatures are: {runtime_helper_signatures_text()}. `grid_utils` exposes the same helper operations as methods.\n"
     "- Call `record_strategy(goal=..., hypothesis=..., evidence=[...], confidence=0.0_to_1.0, open_question=..., next_test=...)` whenever evidence materially changes the plan. Omitted fields preserve their previous values.\n"
     "- Call `action(actions)` to execute one or more real environment actions from Python.\n"
     "- Pass `action(actions)` a list like `['LEFT']` or `[{'action': 'MOUSE', 'row': 4, 'col': 7}]`.\n"
@@ -85,6 +93,10 @@ PYTHON_ADDENDUM = (
     f"- The only importable standard-library modules are: {allowed_modules_text()}. Dynamic attribute helpers (operator.attrgetter/operator.methodcaller, string.Formatter, and str.format/format_map) are blocked.\n"
     "- The only tool is `python`; its JSON schema is authoritative. Build expressions and statements from the discriminated `kind` variants in that schema.\n"
     "- Common ProgramIR forms: names use `{'kind':'name','name':'x'}`; constants use `{'kind':'constant','value':...}`; calls use `{'kind':'call','function':..., 'args':[...]}`; assignments use `targets` containing `name_target`; field/key access uses `attribute`/`subscript`; starred unpacking uses `starred_target` only inside a `tuple_target` or `list_target`.\n"
+    "- Compose data-driven calls with `star_args` for `*sequences` and `star_keywords` for `**mappings`. In a dict expression, an entry whose `key` is null lowers to `**entry.value`; later entries override earlier unpacked keys.\n"
+    "- Reusable `function_def` helpers may declare optional `vararg` and `kwarg` names to receive dynamic positional and keyword inputs; those names must be unique and cannot shadow runtime bindings.\n"
+    "- Use `generator_comprehension` for lazy inputs to `sum`, `any`, `all`, `min`, or `max`; use list/set/dict comprehensions only when the collection itself is needed.\n"
+    "- Use `try` for a small local fallback when uncertain data may raise AttributeError, IndexError, KeyError, OverflowError, TypeError, ValueError, or ZeroDivisionError. A handler may bind `name` for compact diagnostics. Use constrained `raise` to signal one of those same errors from a helper; broad/runtime failures remain unavailable.\n"
     "- Always inspect `current_frame`, `history`, and `valid_actions` from Python instead of reasoning from the raw board by eye.\n"
     "- For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`. `history[-1].frame` is the current frame, so comparing it to `current_frame` only compares the board to itself.\n"
     "- Maintain a compact working world model: what entities or regions exist, what actions seem to do, what the goal likely is, what remains uncertain, and what plan best fits the evidence so far.\n"
@@ -106,7 +118,7 @@ PYTHON_ADDENDUM = (
     "- You can call `action(...)` multiple times in one compiled program, including inside loops. Each call updates the preloaded variables before execution continues.\n"
     "- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.\n"
     "- IMPORTANT: If ProgramIR validation, compilation, or execution fails, use the diagnostic path to fix or drastically simplify it. Do not retry the same failing program. Prefer a direct `action(...)` call when recovery is needed.\n"
-    "- IMPORTANT: Only access variables that are listed in the runtime variables section above (`current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, `last_action_result`, `experience`, `strategy`, `record_strategy`, `action`). Accessing any variable not listed will raise a NameError and waste a tool call.\n"
+    "- IMPORTANT: Names must be documented runtime bindings, safe builtins, allowed imports, or names defined earlier in the same program. Do not invent runtime variable names; undefined names raise NameError and waste a tool call.\n"
     "- Runtime variables and pre-injected helpers are protected bindings. Read or call them, but never assign to them or reuse their names for functions, parameters, or import aliases.\n"
     "- If you lose track of where you are or what the goal is, discard your current world model and start fresh from `current_frame` and `experience`. Do not accumulate stale beliefs.\n"
     "- When you complete a level and move to the next, check `experience['recent_transitions']` and `experience['tried_here']` for evidence of what worked in previous levels. Successful strategies often transfer: if mouse coordinates, pathfinding heuristics, or object interactions solved the prior level, try them first on the new layout.\n"
@@ -130,6 +142,47 @@ COMPACT_TOOL_SESSION_ADDENDUM = (
     "- Inspect by assigning `current_frame.segmentation`, subscripting `nodes`, deriving a compact collection, and calling `print`.\n"
     "- Diff by calling `diff_frames(previous_frame, current_frame)` and printing a short slice of `changed`.\n"
     "- Search by calling pre-injected `bfs` or using structured `for`/`while` statements, then call `action` with a list expression.\n"
+    "- Recover from an expected data-shape error with `try`: give each handler a non-empty `exceptions` list and `body`, plus optional `name`. A constrained `raise` supplies an allowed `exception` and optional `message`; broad and runtime-failure errors are unavailable.\n"
     "- Unpack variable-length rows with one `starred_target` per tuple/list target level, for example first, *middle, last.\n"
+    "- Expand reusable sequences/mappings in calls with `star_args`/`star_keywords`; merge a mapping into a dict with an entry whose `key` is null.\n"
+    "- Receive expanded inputs in a `function_def` with optional `vararg` and `kwarg` parameter names.\n"
     "- Minimal action example: program body contains an `expr` statement whose value calls the name `action` with one argument: a list containing the constant `LEFT`.\n"
 )
+
+
+def build_small_context_prompt(*, tool_output_tokens: int) -> str:
+    """Return the complete, non-redundant contract for <=16K contexts."""
+    image_guidance = (
+        " The attached image and current_frame describe the same current board."
+        if current_grid_image_enabled()
+        else ""
+    )
+    return (
+        "You are a coding agent solving every level of a grid puzzle with few reliable actions."
+        f"{image_guidance}\n\n"
+        f"ARC colors: {ARC_COLOR_LEGEND}. Inspect current_frame.segmentation first; use "
+        "current_frame.ascii only for small local regions and never print a full board. "
+        "current_frame has .ascii, .step, .level, .shape, and .segmentation. "
+        "history[-1].frame is the current frame; use previous_frame or last_transition for "
+        "before/after comparisons. Re-ground after every action and level change.\n\n"
+        f"Runtime bindings: {runtime_bindings_text()}. Grid helpers: "
+        f"{runtime_helper_signatures_text()}. Protected bindings may be read or called but "
+        "not overwritten. Names may also be safe builtins, allowed imports, or names defined "
+        f"earlier in the same program. Allowed modules: {allowed_modules_text()}.\n\n"
+        "The only tool is python. Submit an ephemeral ProgramIR object with explicit integer "
+        "version 1 and a non-empty body; raw source is rejected. The tool JSON schema is "
+        "authoritative: every node uses its kind discriminator. Programs start fresh each call. "
+        "Use generator_comprehension for lazy aggregate and predicate inputs. "
+        "Use star_args/star_keywords and null-key dict entries for validated unpacking. "
+        "Functions may declare vararg and kwarg names for reusable adapters. "
+        "Use constrained try/raise only for expected data-shape or conversion errors. "
+        f"{TOOL_CALL_FORMAT_GUIDANCE}\n\n"
+        "Use compact inspection or search, assign a compact final value to result, or print a "
+        "short summary. Execute real moves with action([...]); MOUSE entries require integer row "
+        "and col. action accepts 1-12 ordered actions and refreshes all runtime state before the "
+        "next statement. Batch only evidence-backed moves. Stop immediately on done, game_over, "
+        "level_completed, or run_complete. Repair compiler/runtime errors from their diagnostic "
+        "path and recovery_hint; never repeat an unchanged failing program. Record materially "
+        "changed hypotheses with record_strategy(...).\n\n"
+        f"Tool responses are capped near {tool_output_tokens} tokens; keep output decision-oriented."
+    )

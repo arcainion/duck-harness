@@ -64,6 +64,27 @@ PROTECTED_RUNTIME_BINDINGS = frozenset({
     "valid_actions",
 })
 
+RUNTIME_HELPER_SIGNATURES = (
+    "color_grid(frame)",
+    "diff_frames(before, after)",
+    "find_positions(frame, color)",
+    "neighbors4(row, col, rows, cols)",
+    "neighbors8(row, col, rows, cols)",
+    "bfs(frame, start, goal, blocked=None)",
+    "flood(frame, start, color=None)",
+    "cell_at(frame, row, col)",
+    "count_colors(frame)",
+    "object_positions(frame, color)",
+)
+
 
 def allowed_modules_text() -> str:
     return ", ".join(sorted(SAFE_MODULES))
+
+
+def runtime_bindings_text() -> str:
+    return ", ".join(sorted(PROTECTED_RUNTIME_BINDINGS))
+
+
+def runtime_helper_signatures_text() -> str:
+    return ", ".join(RUNTIME_HELPER_SIGNATURES)

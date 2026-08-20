@@ -367,7 +367,7 @@ class SolverControllerTests(TestCase):
         session = object.__new__(_HarnessGameSession)
         session.game = SimpleNamespace(grid_size=(12, 8))
 
-        for row in (1.9, True):
+        for row in (1.9, True, "3"):
             with self.subTest(row=row):
                 actions, error = session._normalize_actions(
                     {"action": "MOUSE", "row": row, "col": 2}

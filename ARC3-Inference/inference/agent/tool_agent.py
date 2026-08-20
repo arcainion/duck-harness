@@ -30,8 +30,13 @@ from inference.agent.prompts import (
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
     VISUAL_GAME_ADDENDUM,
+    build_small_context_prompt,
 )
-from inference.agent.python_tool_policy import allowed_modules_text
+from inference.agent.python_tool_policy import (
+    allowed_modules_text,
+    runtime_bindings_text,
+    runtime_helper_signatures_text,
+)
 from inference.agent.program_ir import (
     ProgramCompileError,
     compiler_runtime_metadata,
@@ -175,6 +180,7 @@ _REQUEST_SAFETY_MARGIN_TOKENS = 512
 _CONTEXT_OVERFLOW_RETRY_TRIM_TOKENS = 512
 _PERSISTENT_HISTORY_ASSISTANT_TURNS = 30
 _RESPONSE_META_MAX_CHARS = 4000
+_TOOL_NAME_MAX_CHARS = 80
 
 _PYTHON_TOOL_DESCRIPTION = (
     "Compile and run one ephemeral structured ProgramIR against preloaded ASCII game state. "
@@ -214,6 +220,8 @@ def _terminal_action_reason(result: dict[str, Any]) -> str | None:
         return "level_completed"
     if result.get("done"):
         return "done"
+    if result.get("stopped_early") and result.get("stop_reason") == "stopped":
+        return "stopped"
     return None
 
 
@@ -232,6 +240,11 @@ def _terminal_action_stop_detail(reason: str | None) -> str:
         )
     if reason == "done":
         return "No further actions were executed because the environment reported done."
+    if reason == "stopped":
+        return (
+            "No further actions were executed because the solver is stopping or its "
+            "runtime/action budget is exhausted."
+        )
     return "No further actions were executed because the previous action reached a terminal state."
 
 
@@ -336,6 +349,20 @@ def _request_tool_choice(tools: list[dict[str, Any]] | None) -> str | None:
     return "auto" if tools else None
 
 
+def _normalize_tool_name(value: Any) -> str:
+    raw = str(value or "").strip()
+    cleaned = "".join(
+        character
+        for character in raw
+        if character.isprintable() and character not in "\r\n\t"
+    )
+    if not cleaned:
+        return "unknown"
+    if len(cleaned) <= _TOOL_NAME_MAX_CHARS:
+        return cleaned
+    return cleaned[: _TOOL_NAME_MAX_CHARS - 3].rstrip() + "..."
+
+
 def _trim_log_text(text: str, *, max_chars: int = _RESPONSE_META_MAX_CHARS) -> str:
     stripped = text.strip()
     if len(stripped) <= max_chars:
@@ -371,7 +398,13 @@ def _format_model_response_meta(
     return "\n".join(lines)
 
 
-def _build_system_prompt(*, tool_output_tokens: int) -> str:
+def _build_system_prompt(
+    *,
+    tool_output_tokens: int,
+    context_window_tokens: int | None = None,
+) -> str:
+    if context_window_tokens is not None and context_window_tokens <= 16_384:
+        return build_small_context_prompt(tool_output_tokens=tool_output_tokens)
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
@@ -979,6 +1012,7 @@ class ToolAgent:
         self._save_request_logs = bool(save_request_logs)
         self._system_prompt = _build_system_prompt(
             tool_output_tokens=self._tool_output_tokens,
+            context_window_tokens=_LOCAL_ANALYZER_CONTEXT_WINDOW,
         )
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
@@ -1156,14 +1190,20 @@ class ToolAgent:
     def _accumulate_usage_tokens(self, usage: dict[str, Any] | None) -> None:
         if not isinstance(usage, dict):
             return
-        generated_token_count = 0
-        for key in ("completion_tokens", "output_tokens", "generated_tokens"):
-            raw_value = usage.get(key)
-            try:
-                generated_token_count = max(0, int(raw_value))
-                break
-            except (TypeError, ValueError):
-                continue
+
+        def first_token_count(keys: tuple[str, ...]) -> int:
+            for key in keys:
+                raw_value = usage.get(key)
+                try:
+                    if raw_value is not None:
+                        return max(0, int(raw_value))
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        generated_token_count = first_token_count(
+            ("completion_tokens", "output_tokens", "generated_tokens")
+        )
         self._session_generated_tokens += generated_token_count
 
         total_tokens = usage.get("total_tokens")
@@ -1174,14 +1214,8 @@ class ToolAgent:
         except (TypeError, ValueError):
             pass
 
-        token_count = 0
-        for key in ("prompt_tokens", "completion_tokens", "input_tokens", "output_tokens"):
-            raw_value = usage.get(key)
-            try:
-                token_count += max(0, int(raw_value))
-            except (TypeError, ValueError):
-                continue
-        self._session_total_tokens += token_count
+        input_token_count = first_token_count(("prompt_tokens", "input_tokens"))
+        self._session_total_tokens += input_token_count + generated_token_count
 
     def _summarize_step_sequence(self, action_results: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not action_results:
@@ -1673,22 +1707,44 @@ class ToolAgent:
             rendered = json.dumps(result, indent=2)
         if len(rendered) > max_chars:
             # Defensive fallback for an unexpectedly large non-truncatable
-            # payload. Keep protocol-level fields and return valid JSON.
+            # payload. Keep protocol-level fields and enough structured error
+            # context for the model to repair its next call.
             compact = {
                 key: value
                 for key, value in result.items()
-                if key in {"success", "stage", "error_category", "compiler_version", "result_truncated"}
+                if key in {
+                    "success",
+                    "tool",
+                    "stage",
+                    "error_category",
+                    "compiler_version",
+                    "result_truncated",
+                }
                 and isinstance(value, (str, int, float, bool, type(None)))
             }
+            compiler = result.get("compiler")
+            if isinstance(compiler, dict) and isinstance(compiler.get("version"), str):
+                compact["compiler_version"] = compiler["version"]
+            recovery_hint = result.get("recovery_hint") or result.get("error")
+            if isinstance(recovery_hint, str) and recovery_hint:
+                compact["recovery_hint"] = recovery_hint[: max(80, max_chars // 3)]
             compact.update(
                 {
                     "truncated": True,
-                    "truncation_note": (
-                        f"Tool payload exceeded the ~{self._tool_output_tokens}-token response budget; "
-                        "large fields were omitted."
-                    ),
+                    "truncation_note": "Large tool fields were omitted; repair context was preserved.",
                 }
             )
+            diagnostics = result.get("diagnostics")
+            if isinstance(diagnostics, list) and diagnostics and isinstance(diagnostics[0], dict):
+                first = diagnostics[0]
+                compact_diagnostic = {
+                    key: str(first[key])[:160]
+                    for key in ("code", "path", "message", "hint")
+                    if first.get(key) is not None
+                }
+                candidate = {**compact, "diagnostics": [compact_diagnostic]}
+                if len(json.dumps(candidate, indent=2)) <= max_chars:
+                    compact = candidate
             rendered = json.dumps(compact, indent=2)
         return rendered
 
@@ -1722,13 +1778,26 @@ class ToolAgent:
                 action_name = str(item.get("action", "")).strip()
                 if not action_name:
                     raise ValueError(f"Action {index} is missing an `action` field.")
-                entry = {"action": action_name}
                 if action_name.upper() == "MOUSE" and ("x" in item or "y" in item):
                     raise ValueError(f"Action {index} uses legacy MOUSE x/y fields; use row and col.")
-                if "row" in item:
-                    entry["row"] = item.get("row")
-                if "col" in item:
-                    entry["col"] = item.get("col")
+                unexpected_fields = sorted(set(item) - {"action", "row", "col"})
+                if unexpected_fields:
+                    raise ValueError(
+                        f"Action {index} has unsupported field(s): "
+                        f"{', '.join(str(field) for field in unexpected_fields)}."
+                    )
+                entry = {"action": action_name}
+                if action_name.upper() == "MOUSE":
+                    if type(item.get("row")) is not int or type(item.get("col")) is not int:
+                        raise ValueError(
+                            f"Action {index} MOUSE requires integer row and col fields."
+                        )
+                    entry["row"] = item["row"]
+                    entry["col"] = item["col"]
+                elif "row" in item or "col" in item:
+                    raise ValueError(
+                        f"Action {index} row and col fields are only valid for MOUSE."
+                    )
                 normalized.append(entry)
                 continue
             raise TypeError(f"Action {index} must be a string or a dict.")
@@ -1778,8 +1847,17 @@ class ToolAgent:
         steps = payload.get("steps")
         if isinstance(steps, list):
             compact["steps"] = [dict(item) for item in steps[:12] if isinstance(item, dict)]
+        requested_actions = payload.get("requested_actions")
+        if isinstance(requested_actions, list) and requested_actions:
+            compact["requested_actions"] = [
+                str(action).strip()
+                for action in requested_actions[:MAX_ACTION_BATCH]
+                if str(action).strip()
+            ]
         executed_actions = payload.get("executed_actions")
-        if isinstance(executed_actions, list) and executed_actions:
+        if not compact["executed"]:
+            compact["executed_actions"] = []
+        elif isinstance(executed_actions, list) and executed_actions:
             compact["executed_actions"] = [
                 str(action).strip()
                 for action in executed_actions[:MAX_ACTION_BATCH]
@@ -2068,15 +2146,10 @@ class ToolAgent:
                 }
                 recovery = recovery_map.get(error_category, "Simplify code and retry.")
                 if error_category == "UNDEFINED_VARIABLE":
-                    available_vars = [
-                        "current_frame", "previous_frame", "history", "transitions",
-                        "last_transition", "valid_actions", "last_action_result",
-                        "experience", "strategy", "record_strategy(...)", "action(...)",
-                        "grid_utils", "color_grid", "diff_frames", "find_positions",
-                        "neighbors4", "neighbors8", "bfs", "flood", "cell_at",
-                        "count_colors", "object_positions",
-                    ]
-                    recovery += f" Available: {', '.join(available_vars)}."
+                    recovery += (
+                        f" Available runtime bindings: {runtime_bindings_text()}."
+                        f" Helper signatures: {runtime_helper_signatures_text()}."
+                    )
                 elif error_category == "BLOCKED_MODULE":
                     recovery = f"Allowed: {allowed_modules_text()}."
                 elif error_category == "MISSING_ATTRIBUTE":
@@ -2143,7 +2216,65 @@ class ToolAgent:
                     )
                 )
             return self._run_python_tool(state_path, arguments)
-        return _ToolDispatchResult(json.dumps({"error": f"Unknown tool: {name}"}, indent=2))
+        rendered_name = _normalize_tool_name(name)
+        message = f"Unknown tool: {rendered_name}. The only available tool is `python`."
+        return _ToolDispatchResult(
+            self._render_tool_payload(
+                {
+                    "tool": rendered_name,
+                    "stage": "schema",
+                    "error_category": "INVALID_TOOL_NAME",
+                    "error": message,
+                    "diagnostics": [
+                        {
+                            "code": "IR_UNKNOWN_TOOL",
+                            "path": "tool.name",
+                            "message": message,
+                        }
+                    ],
+                    "recovery_hint": "Call `python` with one JSON object containing `program`.",
+                }
+            )
+        )
+
+    def _decode_tool_arguments(
+        self,
+        tool_name: str,
+        raw_arguments: Any,
+    ) -> tuple[Any, _ToolDispatchResult | None]:
+        """Decode provider arguments without disguising malformed JSON as `{}`."""
+        if not isinstance(raw_arguments, str):
+            if isinstance(raw_arguments, dict):
+                return json.loads(json.dumps(raw_arguments)), None
+            return raw_arguments, None
+        try:
+            return json.loads(raw_arguments), None
+        except json.JSONDecodeError as exc:
+            rendered_name = _normalize_tool_name(tool_name)
+            message = (
+                f"{rendered_name} tool arguments are invalid JSON at "
+                f"line {exc.lineno}, column {exc.colno}: {exc.msg}."
+            )
+            payload: dict[str, Any] = {
+                "tool": rendered_name,
+                "stage": "schema",
+                "error_category": "MALFORMED_TOOL_ARGUMENTS",
+                "error": message,
+                "diagnostics": [
+                    {
+                        "code": "IR_TOOL_ARGUMENTS_INVALID_JSON",
+                        "path": "arguments",
+                        "message": message,
+                    }
+                ],
+                "recovery_hint": (
+                    "Emit one valid JSON object. For `python`, the object must contain "
+                    "a structured `program`; do not emit raw source or tool-call markup."
+                ),
+            }
+            if rendered_name == "python":
+                payload["compiler"] = compiler_runtime_metadata()
+            return None, _ToolDispatchResult(self._render_tool_payload(payload))
 
     def _estimate_request_input_tokens(
         self,
@@ -2241,6 +2372,7 @@ class ToolAgent:
                 break
         history = self._drop_until_first_user_message(history)
         dropped_count = initial_len - len(history)
+        summary_msg: dict[str, Any] | None = None
         if dropped_count > 0:
             summary_parts = []
             actions_seen = set()
@@ -2261,7 +2393,33 @@ class ToolAgent:
             summary_text = "; ".join(summary_parts) + "."
             summary_msg = {"role": "user", "content": f"[Context summary: {summary_text} Re-ground from current_frame and experience.]"}
             history = [summary_msg, *history]
-        return [system_message, *history]
+        candidate = [system_message, *history]
+        if self._estimate_request_input_tokens(candidate, tools=tools) <= budget_tokens:
+            return candidate
+
+        if summary_msg is not None and history and history[0] is summary_msg:
+            history = history[1:]
+            candidate = [system_message, *history]
+            if self._estimate_request_input_tokens(candidate, tools=tools) <= budget_tokens:
+                return candidate
+
+        reground_message = {
+            "role": "user",
+            "content": (
+                "[Current turn content exceeded the input budget. Call python with a small "
+                "ProgramIR inspection and re-ground from current_frame, experience, and "
+                "valid_actions.]"
+            ),
+        }
+        candidate = [system_message, reground_message]
+        estimated_tokens = self._estimate_request_input_tokens(candidate, tools=tools)
+        if estimated_tokens > budget_tokens:
+            raise ValueError(
+                "System prompt and tool schema exceed the configured analyzer input "
+                f"budget ({estimated_tokens} estimated tokens > {budget_tokens}). "
+                "Increase LOCAL_ANALYZER_CONTEXT_WINDOW or reduce reserved output tokens."
+            )
+        return candidate
 
     def _force_reduce_messages(
         self,
@@ -2449,7 +2607,7 @@ class ToolAgent:
                 malformed_argument_errors: list[str] = []
                 for tool_call in tool_calls:
                     function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
-                    tool_name = str(function.get("name", "")).strip() or "unknown"
+                    tool_name = _normalize_tool_name(function.get("name", ""))
                     raw_arguments = function.get("arguments", "{}")
                     if isinstance(raw_arguments, str):
                         try:
@@ -2544,23 +2702,22 @@ class ToolAgent:
 
                 for tool_index, tool_call in enumerate(tool_calls):
                     function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
-                    tool_name = str(function.get("name", "")).strip()
+                    tool_name = _normalize_tool_name(function.get("name", ""))
                     raw_args = function.get("arguments", "{}")
-                    try:
-                        if isinstance(raw_args, str):
-                            arguments = json.loads(raw_args)
-                        elif isinstance(raw_args, dict):
-                            arguments = json.loads(json.dumps(raw_args))
-                        else:
-                            arguments = {}
-                    except json.JSONDecodeError:
-                        arguments = {}
+                    arguments, argument_error = self._decode_tool_arguments(
+                        tool_name,
+                        raw_args,
+                    )
                     rendered_tool_call = _render_tool_call_markup(tool_name, raw_args)
                     append_transcript(
                         f"TOOL CALL: {tool_name}",
                         rendered_tool_call or (json.dumps(arguments, indent=2) if arguments else "{}"),
                     )
-                    dispatch = self._dispatch_tool(state_path, tool_name, arguments)
+                    dispatch = argument_error or self._dispatch_tool(
+                        state_path,
+                        tool_name,
+                        arguments,
+                    )
                     if dispatch.step_executed:
                         step_executed = True
                         last_tool_error = ""

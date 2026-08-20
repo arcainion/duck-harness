@@ -4,6 +4,11 @@ from unittest import TestCase
 
 from inference.agent.action_names import MAX_ACTION_BATCH
 from inference.agent.inference_controller import InferenceControllerConfig
+from inference.agent.python_tool_policy import (
+    PROTECTED_RUNTIME_BINDINGS,
+    RUNTIME_HELPER_SIGNATURES,
+)
+from inference.agent.program_ir import program_tool_parameters_schema
 from inference.agent.runtime_state import Frame, HistoryEntry
 from inference.agent.tool_agent import (
     ToolAgent,
@@ -29,6 +34,26 @@ class ToolAgentStrategyTests(TestCase):
         )
         agent._controller_config = InferenceControllerConfig(enabled=True)
         return agent
+
+    def test_usage_aliases_are_not_double_counted(self) -> None:
+        agent = self._agent()
+        agent._accumulate_usage_tokens({
+            "prompt_tokens": 100,
+            "input_tokens": 100,
+            "completion_tokens": 20,
+            "output_tokens": 20,
+        })
+        self.assertEqual(agent.total_tokens, 120)
+        self.assertEqual(agent.generated_tokens, 20)
+
+    def test_generated_tokens_alias_contributes_to_total(self) -> None:
+        agent = self._agent()
+        agent._accumulate_usage_tokens({
+            "input_tokens": 5,
+            "generated_tokens": 3,
+        })
+        self.assertEqual(agent.total_tokens, 8)
+        self.assertEqual(agent.generated_tokens, 3)
 
     def test_python_action_batch_is_bounded_before_host_dispatch(self) -> None:
         agent = self._agent()
@@ -152,6 +177,65 @@ class ToolAgentStrategyTests(TestCase):
         self.assertIn("Experience controller:", prompt)
         self.assertNotIn("[[1, 2], [3, 4]]", prompt)
         self.assertLess(len(prompt), 10_000)
+
+    def test_context_trim_drops_summary_if_summary_would_exceed_budget(self) -> None:
+        agent = self._agent()
+        system = {"role": "system", "content": "system"}
+        current = {"role": "user", "content": "current"}
+        messages = [
+            system,
+            {"role": "user", "content": "old" * 1000},
+            {"role": "assistant", "content": "response"},
+            current,
+        ]
+        agent._context_budget_tokens = agent._estimate_request_input_tokens(
+            [system, current]
+        )
+
+        trimmed = agent._trim_messages_for_context(messages)
+
+        self.assertEqual(trimmed, [system, current])
+        self.assertLessEqual(
+            agent._estimate_request_input_tokens(trimmed),
+            agent._context_budget_tokens,
+        )
+
+    def test_context_trim_replaces_oversized_current_turn_with_regrounding(self) -> None:
+        agent = self._agent()
+        system = {"role": "system", "content": "system"}
+        oversized = {"role": "user", "content": "state" * 5000}
+        fallback = {
+            "role": "user",
+            "content": (
+                "[Current turn content exceeded the input budget. Call python with a small "
+                "ProgramIR inspection and re-ground from current_frame, experience, and "
+                "valid_actions.]"
+            ),
+        }
+        agent._context_budget_tokens = agent._estimate_request_input_tokens(
+            [system, fallback]
+        )
+
+        trimmed = agent._trim_messages_for_context(
+            [system, oversized],
+            preserve_recent=1,
+        )
+
+        self.assertEqual(trimmed, [system, fallback])
+        self.assertLessEqual(
+            agent._estimate_request_input_tokens(trimmed),
+            agent._context_budget_tokens,
+        )
+
+    def test_context_trim_fails_locally_when_base_request_cannot_fit(self) -> None:
+        agent = self._agent()
+        agent._context_budget_tokens = 1
+
+        with self.assertRaisesRegex(ValueError, "System prompt and tool schema exceed"):
+            agent._trim_messages_for_context([
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "current"},
+            ])
 
 
 class StripToolCallMarkupTests(TestCase):
@@ -286,6 +370,74 @@ class BuildSystemPromptTests(TestCase):
     def test_prompt_contains_color_legend(self) -> None:
         prompt = _build_system_prompt(tool_output_tokens=1024)
         self.assertIn("Color legend", prompt)
+
+    def test_prompt_documents_every_protected_runtime_binding(self) -> None:
+        prompt = _build_system_prompt(tool_output_tokens=1024)
+        binding_line = next(
+            line for line in prompt.splitlines()
+            if "Available protected runtime bindings are:" in line
+        )
+        for binding in PROTECTED_RUNTIME_BINDINGS:
+            with self.subTest(binding=binding):
+                self.assertIn(binding, binding_line)
+
+    def test_prompt_documents_every_grid_helper_signature(self) -> None:
+        prompt = _build_system_prompt(tool_output_tokens=1024)
+        for signature in RUNTIME_HELPER_SIGNATURES:
+            with self.subTest(signature=signature):
+                self.assertIn(signature, prompt)
+
+    def test_prompt_allows_locally_defined_program_names(self) -> None:
+        prompt = _build_system_prompt(tool_output_tokens=1024)
+        self.assertIn("names defined earlier in the same program", prompt)
+        self.assertNotIn("Only access variables that are listed", prompt)
+
+    def test_small_context_prompt_preserves_core_codegen_contract(self) -> None:
+        compact = _build_system_prompt(
+            tool_output_tokens=512,
+            context_window_tokens=8192,
+        )
+        full = _build_system_prompt(tool_output_tokens=512)
+
+        self.assertLess(len(compact), len(full) // 2)
+        for required in (
+            "ProgramIR",
+            "version 1",
+            "kind discriminator",
+            "current_frame.segmentation",
+            "previous_frame",
+            "action([",
+            "MOUSE",
+            "recovery_hint",
+            "run_complete",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, compact)
+
+    def test_program_ir_request_has_usable_headroom_in_8k_context(self) -> None:
+        compact = _build_system_prompt(
+            tool_output_tokens=512,
+            context_window_tokens=8192,
+        )
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "python",
+                "description": "Compile and execute structured ProgramIR.",
+                "parameters": program_tool_parameters_schema(),
+            },
+        }]
+        base_request = {
+            "messages": [
+                {"role": "system", "content": compact},
+                {"role": "user", "content": ""},
+            ],
+            "tools": tools,
+            "tool_choice": "auto",
+        }
+
+        input_budget = 8192 - 512 - 512
+        self.assertLess(_estimate_tokens(base_request), input_budget - 1500)
 
 
 class EstimateTokensTests(TestCase):
@@ -799,6 +951,17 @@ class CompactActionResultEdgeCasesTests(TestCase):
         })
         self.assertEqual(compact["executed_actions"], ["LEFT", "RIGHT", "UP"])
 
+    def test_requested_actions_preserved_separately_and_bounded(self) -> None:
+        agent = self._agent()
+        requested = [f"ACTION_{index}" for index in range(MAX_ACTION_BATCH + 5)]
+        compact = agent._compact_action_result({
+            "executed": True,
+            "requested_actions": requested,
+            "executed_actions": ["ACTION_0"],
+        })
+        self.assertEqual(compact["requested_actions"], requested[:MAX_ACTION_BATCH])
+        self.assertEqual(compact["executed_actions"], ["ACTION_0"])
+
     def test_controller_keys_preserved(self) -> None:
         agent = self._agent()
         compact = agent._compact_action_result({
@@ -860,8 +1023,10 @@ class CompactActionResultEdgeCasesTests(TestCase):
         compact = agent._compact_action_result({
             "executed": False,
             "action_display": "LEFT",
+            "requested_actions": ["LEFT"],
         })
-        self.assertEqual(compact["executed_actions"], ["LEFT"])
+        self.assertEqual(compact["requested_actions"], ["LEFT"])
+        self.assertEqual(compact["executed_actions"], [])
 
 
 class NormalizePythonActionsEdgeTests(TestCase):
@@ -905,6 +1070,30 @@ class NormalizePythonActionsEdgeTests(TestCase):
         agent = self._agent()
         with self.assertRaisesRegex(ValueError, "legacy"):
             agent._normalize_python_actions({"action": "MOUSE", "x": 3, "y": 7})
+
+    def test_mouse_requires_both_strict_integer_coordinates(self) -> None:
+        agent = self._agent()
+        invalid_actions = (
+            {"action": "MOUSE", "row": 3},
+            {"action": "MOUSE", "row": "3", "col": 7},
+            {"action": "MOUSE", "row": True, "col": 7},
+        )
+        for action in invalid_actions:
+            with self.subTest(action=action), self.assertRaisesRegex(
+                ValueError,
+                "requires integer row and col",
+            ):
+                agent._normalize_python_actions(action)
+
+    def test_non_mouse_coordinates_are_rejected_instead_of_ignored(self) -> None:
+        agent = self._agent()
+        with self.assertRaisesRegex(ValueError, "only valid for MOUSE"):
+            agent._normalize_python_actions({"action": "LEFT", "row": 1, "col": 2})
+
+    def test_unknown_action_fields_are_rejected_instead_of_ignored(self) -> None:
+        agent = self._agent()
+        with self.assertRaisesRegex(ValueError, "unsupported field.*note"):
+            agent._normalize_python_actions({"action": "LEFT", "note": "probe"})
 
     def test_non_action_dict_rejected(self) -> None:
         agent = self._agent()

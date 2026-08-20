@@ -69,6 +69,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "divmod",
         "enumerate",
         "Exception",
+        "AttributeError",
         "filter",
         "float",
         "format",
@@ -78,6 +79,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "int",
         "isinstance",
         "iter",
+        "IndexError",
+        "KeyError",
         "len",
         "list",
         "map",
@@ -86,6 +89,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "next",
         "oct",
         "ord",
+        "OverflowError",
         "pow",
         "print",
         "range",
@@ -101,6 +105,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "TypeError",
         "ValueError",
         "RuntimeError",
+        "ZeroDivisionError",
         "zip",
     }
     SAFE_MODULE_CACHE = {}
