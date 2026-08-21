@@ -55,7 +55,7 @@
   "analyzer": {
     "app_name": "ARC3 Agent Harness",
     "max_output": 0,
-    "thinking": true,
+    "thinking": false,
     "temperature": 0.6,
     "top_p": 0.95,
     "top_k": 20,
@@ -81,7 +81,7 @@
     "port": 8021
   },
   "multimodal" : {
-    "context" : "current_grid",
-    "upscale" : 4
+    "context" : "level_start",
+    "upscale" : 2
   }
 }

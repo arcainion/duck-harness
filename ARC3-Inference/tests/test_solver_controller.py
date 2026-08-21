@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import TestCase
-from unittest.mock import patch
+from unittest import IsolatedAsyncioTestCase, TestCase
+from unittest.mock import MagicMock, patch
 
 import arcengine
 
@@ -16,6 +17,7 @@ from inference.agent.inference_controller import (
 )
 from inference.agent.runtime_state import Frame, HistoryEntry
 from inference.framework.solver import (
+    HarnessSolver,
     _HarnessGameSession,
     _evaluate_strategy_prediction,
     _is_engine_game_over,
@@ -25,6 +27,85 @@ from inference.framework.solver import (
 
 
 class SolverControllerTests(TestCase):
+    @staticmethod
+    def _deadline_session(soft_remaining: float | None) -> _HarnessGameSession:
+        session = object.__new__(_HarnessGameSession)
+        session.started_at = 0.0
+        session.stop_event = threading.Event()
+        session.game = SimpleNamespace(
+            current_state=SimpleNamespace(
+                raw=SimpleNamespace(state=arcengine.GameState.NOT_FINISHED),
+                levels_completed=0,
+                won=False,
+            ),
+            game_run=SimpleNamespace(state="playing", history=[]),
+        )
+        session.solver = SimpleNamespace(
+            max_runtime_s_per_game=None,
+            max_actions_per_game=None,
+            soft_time_remaining_seconds=lambda: soft_remaining,
+        )
+        session.analyzer = SimpleNamespace(_timeout=120.0)
+        return session
+
+    def test_soft_experiment_deadline_stops_game_session(self) -> None:
+        session = self._deadline_session(0.0)
+
+        self.assertTrue(session.should_stop())
+
+    def test_retry_backoff_is_bounded_by_remaining_budget(self) -> None:
+        session = self._deadline_session(0.25)
+
+        self.assertEqual(session.retry_backoff_seconds(), 0.25)
+        self.assertEqual(session.request_timeout_seconds(), 0.25)
+
+    def test_play_one_closes_analyzer_if_session_initialization_fails(self) -> None:
+        analyzer_close = MagicMock()
+        analyzer = SimpleNamespace(close=analyzer_close)
+        solver = object.__new__(HarnessSolver)
+        solver._stop_event = threading.Event()
+        solver._make_analyzer = lambda *args: analyzer
+        solver._finish_after_error = MagicMock()
+        solver._run_stem = lambda game_id, pass_index: "game-0"
+        run = SimpleNamespace(game_id="game")
+        game = SimpleNamespace(game_run=run)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            solver._artifacts_dir = lambda: root / "artifacts"
+            solver._transcripts_dir = lambda: root / "transcripts"
+            with patch.object(
+                _HarnessGameSession,
+                "play",
+                side_effect=RuntimeError("initialization failed"),
+            ):
+                solver._play_one(game, 0, 0)
+
+        analyzer_close.assert_called_once_with()
+        solver._finish_after_error.assert_called_once()
+
+    def test_transcript_delta_reads_only_bytes_after_saved_offset(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session.transcript_path = Path(temp_dir) / "analysis.txt"
+            session.transcript_path.write_text("old transcript\n", encoding="utf-8")
+            offset = session._transcript_size()
+            with session.transcript_path.open("a", encoding="utf-8") as transcript:
+                transcript.write("new delta\n")
+
+            delta = session._transcript_delta_since(offset)
+
+        self.assertEqual(delta, "new delta")
+
+    def test_transcript_delta_recovers_if_file_was_truncated(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session.transcript_path = Path(temp_dir) / "analysis.txt"
+            session.transcript_path.write_text("replacement", encoding="utf-8")
+
+            delta = session._transcript_delta_since(10_000)
+
+        self.assertEqual(delta, "replacement")
+
     def test_outcome_aware_orient_phase_rejects_multi_action_probe(self) -> None:
         session = object.__new__(_HarnessGameSession)
         frame = Frame(grid=((1,),), step=0, level=1)
@@ -582,3 +663,69 @@ class SolverControllerTests(TestCase):
 
         self.assertFalse(result["executed"])
         self.assertIn("error", result)
+
+
+class SolverConcurrencyTests(IsolatedAsyncioTestCase):
+    @staticmethod
+    def _game(game_id: str) -> SimpleNamespace:
+        return SimpleNamespace(game_run=SimpleNamespace(game_id=game_id))
+
+    @staticmethod
+    def _solver() -> HarnessSolver:
+        solver = object.__new__(HarnessSolver)
+        solver.concurrency = 1
+        solver.cancel_drain_timeout_s = 1.0
+        solver._stop_event = threading.Event()
+        solver._worker_pool = None
+        solver._local_server_for_game_index = lambda index: None
+        solver._finish_remaining = MagicMock()
+        solver._finish_after_error = MagicMock()
+        return solver
+
+    async def test_cancelled_run_does_not_start_queued_games(self) -> None:
+        solver = self._solver()
+        first_started = threading.Event()
+        calls: list[int] = []
+
+        def play_one(game, index, pass_index, local_server) -> None:
+            calls.append(index)
+            first_started.set()
+            solver._stop_event.wait(timeout=2.0)
+
+        solver._play_one = play_one
+        task = asyncio.create_task(
+            solver._run_games([self._game("first"), self._game("queued")])
+        )
+        self.assertTrue(await asyncio.to_thread(first_started.wait, 1.0))
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(calls, [0])
+        solver._finish_remaining.assert_called_once()
+
+    async def test_zero_timeout_drain_cancels_pending_tasks(self) -> None:
+        solver = self._solver()
+        solver.cancel_drain_timeout_s = 0.0
+        pending = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+
+        await solver._drain_game_tasks([pending])
+
+        self.assertTrue(pending.cancelled())
+
+    async def test_orchestration_failure_is_recorded_on_game(self) -> None:
+        solver = self._solver()
+        game = self._game("broken")
+
+        def fail_server_assignment(index: int):
+            raise RuntimeError("server assignment failed")
+
+        solver._local_server_for_game_index = fail_server_assignment
+        await solver._run_games([game])
+
+        solver._finish_after_error.assert_called_once()
+        recorded_game, recorded_error = solver._finish_after_error.call_args.args
+        self.assertIs(recorded_game, game)
+        self.assertIn("server assignment failed", str(recorded_error))

@@ -390,16 +390,6 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         return transitions
 
 
-    def _json_safe(value):
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        if isinstance(value, dict):
-            return {str(key): _json_safe(item) for key, item in value.items()}
-        if isinstance(value, (list, tuple, set)):
-            return [_json_safe(item) for item in value]
-        return str(value)
-
-
     def _bounded_json_result(value, max_chars=32768, max_items=2048, max_depth=24):
         # Convert a result without allowing one IPC message to grow unbounded.
         remaining_chars = [max_chars]
@@ -780,7 +770,13 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 "fallback": fallback,
                 "contradictions": contradictions,
             }
-            _send({"type": "strategy", "update": _json_safe(update)})
+            safe_update, _ = _bounded_json_result(
+                update,
+                max_chars=8192,
+                max_items=256,
+                max_depth=8,
+            )
+            _send({"type": "strategy", "update": safe_update})
             reply = _recv()
             if reply.get("type") != "strategy_result":
                 raise RuntimeError("Invalid strategy response from sandbox host.")
@@ -809,17 +805,19 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             with contextlib.redirect_stdout(bounded_stdout):
                 exec(compiled, runtime_globals, runtime_globals)
             safe_result, result_truncated = _bounded_json_result(runtime_globals.get("result"))
+            safe_action_results, _ = _bounded_json_result(action_results)
             _send(
                 {
                     "type": "final",
                     "stdout": bounded_stdout.getvalue(),
                     "result": safe_result,
                     "result_truncated": result_truncated,
-                    "action_results": _json_safe(action_results),
+                    "action_results": safe_action_results,
                 }
             )
         except Exception as exc:
             error_category, error_hint = _classify_error(exc)
+            safe_action_results, _ = _bounded_json_result(action_results)
             _send(
                 {
                     "type": "error",
@@ -828,7 +826,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     "error_category": error_category,
                     "error_hint": error_hint,
                     "stdout": bounded_stdout.getvalue(),
-                    "action_results": _json_safe(action_results),
+                    "action_results": safe_action_results,
                 }
             )
 
@@ -1161,7 +1159,9 @@ def run_sandboxed_python(
                     "result": message.get("result"),
                     "result_truncated": bool(message.get("result_truncated")),
                     "error": str(message.get("error", "") or ""),
-                    "action_results": list(message.get("action_results") or host_action_results),
+                    # Action callbacks execute in the host. Never let the child
+                    # process replace that authoritative execution record.
+                    "action_results": list(host_action_results),
                     "strategy_updates": list(host_strategy_updates),
                 }
                 if msg_type == "error":

@@ -53,7 +53,10 @@ from inference.framework.kaggle import (
     DEFAULT_EXPECTED_GPU_TYPE,
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
+    DEFAULT_VLLM_GPU_MEMORY_UTILIZATION,
     DEFAULT_VLLM_MAX_MODEL_LEN,
+    DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS,
+    DEFAULT_VLLM_MAX_NUM_SEQS,
     DEFAULT_VLLM_PORT,
     DEFAULT_VLLM_TENSOR_PARALLEL_SIZE,
     DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE,
@@ -419,6 +422,20 @@ class _HarnessGameSession:
             time.monotonic() - self.started_at
         ) >= self.solver.max_runtime_s_per_game
 
+    def remaining_budget_seconds(self) -> float | None:
+        """Return the tighter per-game or experiment-wide time budget."""
+        candidates: list[float] = []
+        if self.solver.max_runtime_s_per_game is not None:
+            remaining = self.timing_payload()["time_remaining_seconds"]
+            if remaining is not None:
+                candidates.append(float(remaining))
+        soft_remaining = self.solver.soft_time_remaining_seconds()
+        if soft_remaining is not None:
+            candidates.append(float(soft_remaining))
+        if not candidates:
+            return None
+        return max(0.0, min(candidates))
+
     def timing_payload(self) -> dict[str, float | None]:
         elapsed = max(0.0, time.monotonic() - self.started_at)
         if self.solver.max_runtime_s_per_game is None:
@@ -435,16 +452,18 @@ class _HarnessGameSession:
                 candidates.append(float(configured))
         except (TypeError, ValueError):
             pass
-        if self.solver.max_runtime_s_per_game is not None:
-            remaining = self.timing_payload()["time_remaining_seconds"]
-            if remaining is not None:
-                candidates.append(float(remaining))
-        soft_remaining = self.solver.soft_time_remaining_seconds()
-        if soft_remaining is not None:
-            candidates.append(soft_remaining)
+        remaining_budget = self.remaining_budget_seconds()
+        if remaining_budget is not None:
+            candidates.append(remaining_budget)
         if not candidates:
             return None
         return max(0.1, min(candidates))
+
+    def retry_backoff_seconds(self) -> float:
+        remaining_budget = self.remaining_budget_seconds()
+        if remaining_budget is None:
+            return ANALYZER_RETRY_BACKOFF_SECONDS
+        return max(0.0, min(ANALYZER_RETRY_BACKOFF_SECONDS, remaining_budget))
 
     def should_stop(self) -> bool:
         run = getattr(self.game, "game_run", None)
@@ -455,6 +474,9 @@ class _HarnessGameSession:
         if _is_run_complete(self.game):
             return True
         if self.runtime_limit_reached():
+            return True
+        remaining_budget = self.remaining_budget_seconds()
+        if remaining_budget is not None and remaining_budget <= 0.0:
             return True
         if (
             self.solver.max_actions_per_game is not None
@@ -490,8 +512,12 @@ class _HarnessGameSession:
                 else:
                     analysis_step = retry_analysis_step
 
-                self.write_runtime_state()
-                transcript_before = self._read_transcript_bytes()
+                # Every engine mutation writes refreshed state in
+                # _execute_action. Avoid rewriting identical full history on
+                # the next analyzer iteration unless the file was removed.
+                if not self.state_path.exists():
+                    self.write_runtime_state()
+                transcript_before = self._transcript_size()
                 try:
                     result = self.analyzer.analyze(
                         self.state_path,
@@ -516,7 +542,9 @@ class _HarnessGameSession:
                     retry_analysis_step = analysis_step
                     if self.should_stop():
                         break
-                    time.sleep(ANALYZER_RETRY_BACKOFF_SECONDS)
+                    retry_delay = self.retry_backoff_seconds()
+                    if retry_delay <= 0.0 or self.stop_event.wait(retry_delay):
+                        break
                     continue
 
                 retry_analysis_step = None
@@ -556,22 +584,18 @@ class _HarnessGameSession:
             f"{self.game.game_run.game_id if self.game.game_run else self.game_index} analysis",
         )
 
-    def _read_transcript_bytes(self) -> bytes:
+    def _transcript_size(self) -> int:
         try:
-            return self.transcript_path.read_bytes()
+            return self.transcript_path.stat().st_size
         except OSError:
-            return b""
+            return 0
 
-    def _transcript_delta_since(self, previous_transcript: bytes) -> str:
+    def _transcript_delta_since(self, previous_size: int) -> str:
         try:
             current_size = self.transcript_path.stat().st_size
-            previous_size = len(previous_transcript)
             with self.transcript_path.open("rb") as file:
                 if current_size >= previous_size:
-                    current_prefix = file.read(previous_size)
-                    if current_prefix == previous_transcript:
-                        return file.read().decode("utf-8", errors="replace").strip()
-                    file.seek(0)
+                    file.seek(previous_size)
                 return file.read().decode("utf-8", errors="replace").strip()
         except OSError:
             return ""
@@ -1187,6 +1211,15 @@ class HarnessSolver(Solver):
     kaggle_vllm_tensor_parallel_size: int = field(
         default=DEFAULT_VLLM_TENSOR_PARALLEL_SIZE, repr=False
     )
+    kaggle_vllm_gpu_memory_utilization: float = field(
+        default=DEFAULT_VLLM_GPU_MEMORY_UTILIZATION, repr=False
+    )
+    kaggle_vllm_max_num_batched_tokens: int = field(
+        default=DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS, repr=False
+    )
+    kaggle_vllm_max_num_seqs: int = field(
+        default=DEFAULT_VLLM_MAX_NUM_SEQS, repr=False
+    )
     kaggle_expected_gpu_type: str = field(
         default=DEFAULT_EXPECTED_GPU_TYPE, repr=False
     )
@@ -1301,6 +1334,9 @@ class HarnessSolver(Solver):
             vllm_port=self.kaggle_vllm_port,
             max_model_len=self.kaggle_vllm_max_model_len,
             tensor_parallel_size=self.kaggle_vllm_tensor_parallel_size,
+            gpu_memory_utilization=self.kaggle_vllm_gpu_memory_utilization,
+            max_num_batched_tokens=self.kaggle_vllm_max_num_batched_tokens,
+            max_num_seqs=self.kaggle_vllm_max_num_seqs,
             expected_gpu_type=self.kaggle_expected_gpu_type,
             expected_gpu_count=self.kaggle_expected_gpu_count,
             wheelhouse_stamp_text=self.kaggle_wheelhouse_stamp_text,
@@ -1330,6 +1366,11 @@ class HarnessSolver(Solver):
 
         async def run_one(index: int, pass_index: int, game: taaf.game.Game) -> None:
             async with semaphore:
+                # Tasks are created eagerly. A queued game may acquire the
+                # semaphore after cancellation, but it must not create a new
+                # analyzer/session once shutdown has begun.
+                if self._stop_event.is_set():
+                    return
                 args = (game, index, pass_index, self._local_server_for_game_index(index))
                 if pool is not None:
                     await loop.run_in_executor(pool, functools.partial(self._play_one, *args))
@@ -1344,9 +1385,17 @@ class HarnessSolver(Solver):
             pass_indices_by_game_id[game_id] = pass_index + 1
             tasks.append(asyncio.create_task(run_one(index, pass_index, game)))
         try:
-            await asyncio.gather(
+            results = await asyncio.gather(
                 *(asyncio.shield(task) for task in tasks), return_exceptions=True
             )
+            for game, result in zip(games, results):
+                if isinstance(result, BaseException):
+                    error = (
+                        result
+                        if isinstance(result, Exception)
+                        else RuntimeError(f"game task failed: {type(result).__name__}")
+                    )
+                    self._finish_after_error(game, error)
         except asyncio.CancelledError:
             self._stop_event.set()
             await self._drain_game_tasks(tasks)
@@ -1357,11 +1406,16 @@ class HarnessSolver(Solver):
         if not tasks:
             return
         timeout = max(0.0, float(self.cancel_drain_timeout_s))
-        if timeout == 0.0:
-            return
-        done, _pending = await asyncio.wait(tasks, timeout=timeout)
+        done: set[asyncio.Task[None]] = set()
+        pending: set[asyncio.Task[None]] = set(tasks)
+        if timeout > 0.0:
+            done, pending = await asyncio.wait(tasks, timeout=timeout)
         if done:
             await asyncio.gather(*done, return_exceptions=True)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _start_local_servers(self) -> None:
         server_count = self._resolved_local_server_count()
@@ -1640,6 +1694,7 @@ class HarnessSolver(Solver):
         pass_index: int,
         local_server: _LocalServerRuntime | None = None,
     ) -> None:
+        analyzer: Any | None = None
         try:
             assert game.game_run is not None
             run = game.game_run
@@ -1664,6 +1719,14 @@ class HarnessSolver(Solver):
             session.play()
         except Exception as exc:
             self._finish_after_error(game, exc)
+        finally:
+            close_analyzer = getattr(analyzer, "close", None)
+            if callable(close_analyzer):
+                try:
+                    close_analyzer()
+                except Exception:
+                    # Resource cleanup must not change the recorded game result.
+                    pass
 
     def _artifacts_dir(self) -> Path:
         root = self.job_dir or Path.cwd() / "taaf_harness_artifacts"

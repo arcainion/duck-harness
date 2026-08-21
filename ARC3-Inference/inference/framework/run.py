@@ -448,6 +448,9 @@ def _make_solver(
         local_server_count=local_server_count,
         kaggle_vllm_max_model_len=kaggle_vllm_config.max_model_len,
         kaggle_vllm_tensor_parallel_size=kaggle_vllm_config.tensor_parallel_size,
+        kaggle_vllm_gpu_memory_utilization=kaggle_vllm_config.gpu_memory_utilization,
+        kaggle_vllm_max_num_batched_tokens=kaggle_vllm_config.max_num_batched_tokens,
+        kaggle_vllm_max_num_seqs=kaggle_vllm_config.max_num_seqs,
         kaggle_expected_gpu_type=kaggle_vllm_config.expected_gpu_type,
         kaggle_expected_gpu_count=kaggle_vllm_config.expected_gpu_count,
     )

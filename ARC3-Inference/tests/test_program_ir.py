@@ -6,6 +6,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+import requests
+
 from inference.agent.program_ir import (
     COMPILER_VERSION,
     MAX_COMPILER_DIAGNOSTICS,
@@ -18,10 +20,15 @@ from inference.agent.program_ir import (
     MAX_RAW_PAYLOAD_VALUES,
     ProgramCompileError,
     compile_program,
+    fast_program_tool_parameters_schema,
     program_tool_parameters_schema,
 )
 from inference.agent.python_tool_sandbox import run_sandboxed_python
-from inference.agent.tool_agent import ToolAgent, _turn_tool_choice
+from inference.agent.tool_agent import (
+    ToolAgent,
+    _tool_result_requires_strict_retry,
+    _turn_tool_choice,
+)
 
 
 def name(value: str) -> dict:
@@ -1107,8 +1114,52 @@ class ProgramIRCompilerTests(unittest.TestCase):
                 pending.extend(value)
         self.assertLess(len(json.dumps(schema)), 20_000)
 
+    def test_cached_tool_schema_returns_isolated_copies(self) -> None:
+        first = program_tool_parameters_schema()
+        first["properties"]["program"]["description"] = "mutated"
+
+        second = program_tool_parameters_schema()
+
+        self.assertIsNot(first, second)
+        self.assertIn(
+            "raw Python source is not accepted",
+            second["properties"]["program"]["description"],
+        )
+
+    def test_fast_tool_schema_keeps_structure_with_less_prompt_bulk(self) -> None:
+        full = program_tool_parameters_schema()
+        fast = fast_program_tool_parameters_schema()
+
+        self.assertEqual(fast["required"], ["program"])
+        self.assertFalse(fast["additionalProperties"])
+        self.assertFalse(fast["properties"]["program"]["additionalProperties"])
+        self.assertEqual(fast["$defs"].keys(), full["$defs"].keys())
+        self.assertIn("required", fast["$defs"]["AssignStmt"])
+        self.assertIn("enum", fast["$defs"]["BinaryExpr"]["properties"]["op"])
+        self.assertLess(len(json.dumps(fast)), len(json.dumps(full)) * 0.75)
+
 
 class ProgramIRSandboxTests(unittest.TestCase):
+    def test_cyclic_strategy_evidence_is_bounded_instead_of_recursing(self) -> None:
+        result = run_sandboxed_python(
+            code=(
+                "evidence = []\n"
+                "evidence.append(evidence)\n"
+                "record_strategy(evidence=evidence)\n"
+                "result = 'ok'\n"
+            ),
+            timeout_seconds=2,
+            initial_state={},
+            action_handler=lambda actions: {},
+            strategy_handler=lambda update: update,
+        )
+
+        self.assertEqual(result.get("error"), "")
+        self.assertEqual(result.get("result"), "ok")
+        strategy_updates = result.get("strategy_updates") or []
+        self.assertEqual(len(strategy_updates), 1)
+        self.assertIn("cycle", json.dumps(strategy_updates[0]).lower())
+
     def test_lowered_program_executes_in_existing_sandbox(self) -> None:
         compiled = compile_program(program(
             {"kind": "assign", "targets": [target("counts")], "value": call("count_colors", name("current_frame"))},
@@ -1284,6 +1335,37 @@ class ProgramIRToolAgentTests(unittest.TestCase):
             function = agent._tools(Path(tmp) / "state.json")[0]["function"]
         self.assertNotIn("strict", function)
 
+    def test_vllm_fast_path_omits_guided_decoding(self) -> None:
+        with TemporaryDirectory() as tmp:
+            function = self.agent._tools(
+                Path(tmp) / "state.json",
+                strict=False,
+            )[0]["function"]
+
+        self.assertNotIn("strict", function)
+        self.assertLess(
+            len(json.dumps(function["parameters"])),
+            len(json.dumps(program_tool_parameters_schema())) * 0.75,
+        )
+
+    def test_schema_failure_enables_strict_retry(self) -> None:
+        self.assertTrue(
+            _tool_result_requires_strict_retry(
+                json.dumps(
+                    {
+                        "stage": "schema",
+                        "error_category": "MALFORMED_TOOL_ARGUMENTS",
+                        "error": "invalid JSON",
+                    }
+                )
+            )
+        )
+        self.assertFalse(
+            _tool_result_requires_strict_retry(
+                json.dumps({"stage": "runtime", "error": "division by zero"})
+            )
+        )
+
     def test_vllm_requires_constrained_tool_until_action_executes(self) -> None:
         tools = [{"type": "function", "function": {"name": "python"}}]
         self.assertEqual(
@@ -1321,8 +1403,9 @@ class ProgramIRToolAgentTests(unittest.TestCase):
         response.json.return_value = {
             "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
         }
-        with patch(
-            "inference.agent.tool_agent.requests.post",
+        with patch.object(
+            self.agent._http_session,
+            "post",
             return_value=response,
         ) as post:
             self.agent._chat_completion(
@@ -1334,6 +1417,147 @@ class ProgramIRToolAgentTests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["tool_choice"], "required")
         self.assertIs(payload["tools"][0]["function"]["strict"], True)
+
+    def test_chat_completion_reuses_session_and_close_releases_it(self) -> None:
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+        }
+        with (
+            patch.object(
+                self.agent._http_session,
+                "post",
+                return_value=response,
+            ) as post,
+            patch.object(self.agent._http_session, "close") as close,
+        ):
+            for _ in range(2):
+                self.agent._chat_completion(
+                    [{"role": "user", "content": "inspect"}],
+                    tools=None,
+                )
+            self.agent.close()
+
+        self.assertEqual(post.call_count, 2)
+        close.assert_called_once_with()
+
+    def test_chat_completion_closes_retryable_and_success_responses(self) -> None:
+        retryable = MagicMock(status_code=503)
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+        }
+        with (
+            patch.object(
+                self.agent._http_session,
+                "post",
+                side_effect=[retryable, response],
+            ) as post,
+            patch("inference.agent.tool_agent.time.sleep"),
+        ):
+            self.agent._chat_completion(
+                [{"role": "user", "content": "inspect"}],
+                tools=None,
+            )
+
+        self.assertEqual(post.call_count, 2)
+        retryable.close.assert_called_once_with()
+        response.close.assert_called_once_with()
+
+    def test_chat_completion_retries_share_one_request_deadline(self) -> None:
+        retryable = MagicMock(status_code=503)
+        clock = [100.0]
+
+        def advance(delay: float) -> None:
+            clock[0] += delay
+
+        with (
+            patch.object(
+                self.agent._http_session,
+                "post",
+                return_value=retryable,
+            ) as post,
+            patch(
+                "inference.agent.tool_agent.time.monotonic",
+                side_effect=lambda: clock[0],
+            ),
+            patch(
+                "inference.agent.tool_agent.time.sleep",
+                side_effect=advance,
+            ) as sleep,
+        ):
+            with self.assertRaisesRegex(requests.Timeout, "deadline exceeded"):
+                self.agent._chat_completion(
+                    [{"role": "user", "content": "inspect"}],
+                    tools=None,
+                    request_timeout_seconds=0.25,
+                )
+
+        post.assert_called_once()
+        self.assertEqual(post.call_args.kwargs["timeout"], 0.25)
+        sleep.assert_called_once_with(0.25)
+        retryable.close.assert_called_once_with()
+
+    def test_chat_completion_rejects_malformed_provider_payload(self) -> None:
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "choices": [{"message": {"tool_calls": [None]}}],
+        }
+        with patch.object(
+            self.agent._http_session,
+            "post",
+            return_value=response,
+        ):
+            with self.assertRaisesRegex(requests.RequestException, "invalid tool call"):
+                self.agent._chat_completion(
+                    [{"role": "user", "content": "inspect"}],
+                    tools=None,
+                )
+
+        response.close.assert_called_once_with()
+
+    def test_chat_completion_repairs_missing_and_duplicate_tool_call_ids(self) -> None:
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "duplicate" + ("x" * 500) + "\x00",
+                                "function": {"name": "python", "arguments": "{}"},
+                            },
+                            {
+                                "id": "duplicate" + ("x" * 500) + "\x00",
+                                "function": {"name": "python", "arguments": "{}"},
+                            },
+                            {
+                                "function": {"name": "python", "arguments": "{}"},
+                            },
+                        ]
+                    }
+                }
+            ]
+        }
+        with patch.object(
+            self.agent._http_session,
+            "post",
+            return_value=response,
+        ):
+            result = self.agent._chat_completion(
+                [{"role": "user", "content": "inspect"}],
+                tools=None,
+            )
+
+        tool_calls = result.message["tool_calls"]
+        tool_call_ids = [tool_call["id"] for tool_call in tool_calls]
+        self.assertEqual(len(tool_call_ids[0]), 128)
+        self.assertNotIn("\x00", tool_call_ids[0])
+        self.assertEqual(len(tool_call_ids), len(set(tool_call_ids)))
+        self.assertTrue(all(tool_call_ids))
+        self.assertTrue(
+            all(tool_call["type"] == "function" for tool_call in tool_calls)
+        )
 
     def test_malformed_provider_arguments_preserve_json_diagnostic(self) -> None:
         arguments, dispatch = self.agent._decode_tool_arguments(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -13,9 +14,14 @@ DEFAULT_SERVED_MODEL_NAME = "vrfai/Qwen3.6-27B-FP8"
 DEFAULT_VLLM_PORT = 1234
 DEFAULT_VLLM_MAX_MODEL_LEN = 65536
 DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 1
+DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.92
+DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS = 16384
+DEFAULT_VLLM_MAX_NUM_SEQS = 32
 DEFAULT_EXPECTED_GPU_TYPE = "rtx-pro-6000"
 DEFAULT_EXPECTED_GPU_COUNT = 1
 T4_VLLM_MAX_MODEL_LEN = 8192
+T4_VLLM_MAX_NUM_BATCHED_TOKENS = 4096
+T4_VLLM_MAX_NUM_SEQS = 16
 DEFAULT_WHEELHOUSE_STAMP_TEXT = "vllm==0.19.0 torch==2.10.0 flashinfer==0.6.6\n"
 
 # The 25 official ARC-AGI-3 games. The first 16 are the original Kaggle duck
@@ -59,9 +65,32 @@ class DuckKaggleVllmConfig:
     vllm_port: int = DEFAULT_VLLM_PORT
     max_model_len: int = DEFAULT_VLLM_MAX_MODEL_LEN
     tensor_parallel_size: int = DEFAULT_VLLM_TENSOR_PARALLEL_SIZE
+    gpu_memory_utilization: float = DEFAULT_VLLM_GPU_MEMORY_UTILIZATION
+    max_num_batched_tokens: int = DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS
+    max_num_seqs: int = DEFAULT_VLLM_MAX_NUM_SEQS
     expected_gpu_type: str = DEFAULT_EXPECTED_GPU_TYPE
     expected_gpu_count: int = DEFAULT_EXPECTED_GPU_COUNT
     wheelhouse_stamp_text: str = DEFAULT_WHEELHOUSE_STAMP_TEXT
+
+
+def _validate_vllm_config(config: DuckKaggleVllmConfig) -> None:
+    positive_integer_fields = (
+        "max_model_len",
+        "tensor_parallel_size",
+        "max_num_batched_tokens",
+        "max_num_seqs",
+        "expected_gpu_count",
+    )
+    for field_name in positive_integer_fields:
+        if int(getattr(config, field_name)) <= 0:
+            raise ValueError(f"{field_name} must be a positive integer.")
+    if not 1 <= int(config.vllm_port) <= 65535:
+        raise ValueError("vllm_port must be between 1 and 65535.")
+    utilization = float(config.gpu_memory_utilization)
+    if not math.isfinite(utilization) or not 0.0 < utilization <= 1.0:
+        raise ValueError("gpu_memory_utilization must be finite and in (0, 1].")
+    if not str(config.served_model_name).strip():
+        raise ValueError("served_model_name must not be empty.")
 
 
 def duck_kaggle_vllm_config_for_accelerator(
@@ -76,6 +105,8 @@ def duck_kaggle_vllm_config_for_accelerator(
         return DuckKaggleVllmConfig(
             max_model_len=T4_VLLM_MAX_MODEL_LEN,
             tensor_parallel_size=2,
+            max_num_batched_tokens=T4_VLLM_MAX_NUM_BATCHED_TOKENS,
+            max_num_seqs=T4_VLLM_MAX_NUM_SEQS,
             expected_gpu_type="t4",
             expected_gpu_count=2,
         )
@@ -91,6 +122,7 @@ def duck_kaggle_dataset_sources(
 
 def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str:
     cfg = config or DuckKaggleVllmConfig()
+    _validate_vllm_config(cfg)
     wheelhouse_owner, wheelhouse_slug = _split_dataset_source(
         cfg.wheelhouse_dataset_source,
         option_name="wheelhouse_dataset_source",
@@ -116,6 +148,9 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
         "__VLLM_MAX_MODEL_LEN__": repr(int(cfg.max_model_len)),
+        "__VLLM_GPU_MEMORY_UTILIZATION__": repr(float(cfg.gpu_memory_utilization)),
+        "__VLLM_MAX_NUM_BATCHED_TOKENS__": repr(int(cfg.max_num_batched_tokens)),
+        "__VLLM_MAX_NUM_SEQS__": repr(int(cfg.max_num_seqs)),
         # The launcher's Makefile exports LOCAL_ANALYZER_CONTEXT_WINDOW from
         # JSON shared.context_window (or analyzer.context_window). Embed it
         # here so the agent's prompt budget on Kaggle is the JSON value, not
@@ -150,8 +185,8 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__LOCAL_ANALYZER_TOP_P__": repr(os.environ.get("LOCAL_ANALYZER_TOP_P", "0.95")),
         "__LOCAL_ANALYZER_TOP_K__": repr(os.environ.get("LOCAL_ANALYZER_TOP_K", "20")),
         "__LOCAL_ANALYZER_ENABLE_THINKING__": repr(os.environ.get("LOCAL_ANALYZER_ENABLE_THINKING", "1")),
-        "__MULTIMODAL_CONTEXT__": repr(os.environ.get("MULTIMODAL_CONTEXT", "current_grid")),
-        "__MULTIMODAL_UPSCALE__": repr(os.environ.get("MULTIMODAL_UPSCALE", "4")),
+        "__MULTIMODAL_CONTEXT__": repr(os.environ.get("MULTIMODAL_CONTEXT", "level_start")),
+        "__MULTIMODAL_UPSCALE__": repr(os.environ.get("MULTIMODAL_UPSCALE", "2")),
         "__VLLM_TENSOR_PARALLEL_SIZE__": repr(int(cfg.tensor_parallel_size)),
         "__EXPECTED_GPU_TYPE__": repr(str(cfg.expected_gpu_type)),
         "__EXPECTED_GPU_COUNT__": repr(int(cfg.expected_gpu_count)),
@@ -194,6 +229,9 @@ VLLM_HOST = '127.0.0.1'
 VLLM_PORT = __VLLM_PORT__
 VLLM_BASE_URL = f'http://{VLLM_HOST}:{VLLM_PORT}/v1'
 VLLM_MAX_MODEL_LEN = __VLLM_MAX_MODEL_LEN__
+VLLM_GPU_MEMORY_UTILIZATION = __VLLM_GPU_MEMORY_UTILIZATION__
+VLLM_MAX_NUM_BATCHED_TOKENS = __VLLM_MAX_NUM_BATCHED_TOKENS__
+VLLM_MAX_NUM_SEQS = __VLLM_MAX_NUM_SEQS__
 ANALYZER_CONTEXT_WINDOW = __ANALYZER_CONTEXT_WINDOW__
 VLLM_TENSOR_PARALLEL_SIZE = __VLLM_TENSOR_PARALLEL_SIZE__
 EXPECTED_GPU_TYPE = __EXPECTED_GPU_TYPE__
@@ -350,7 +388,22 @@ def wait_for_vllm_server(process: subprocess.Popen[str], timeout_seconds: int = 
     )
 
 
-def start_vllm_server() -> None:
+def stop_started_vllm_server(process: subprocess.Popen[str]) -> None:
+    try:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+    except Exception as exc:
+        print(f'Could not stop failed vLLM child cleanly: {exc!r}', flush=True)
+    finally:
+        VLLM_SERVER_PID.unlink(missing_ok=True)
+
+
+def start_vllm_server() -> subprocess.Popen[str]:
     install_vllm_wheelhouse()
     VLLM_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
     VLLM_SERVER_PID.unlink(missing_ok=True)
@@ -367,6 +420,9 @@ def start_vllm_server() -> None:
         VLLM_HOST,
         '--port',
         str(VLLM_PORT),
+        '--uvicorn-log-level',
+        'warning',
+        '--disable-uvicorn-access-log',
         '--tensor-parallel-size',
         str(VLLM_TENSOR_PARALLEL_SIZE),
         '--enable-auto-tool-choice',
@@ -381,14 +437,25 @@ def start_vllm_server() -> None:
         'qwen3',
         '--max-model-len',
         str(VLLM_MAX_MODEL_LEN),
+        '--gpu-memory-utilization',
+        str(VLLM_GPU_MEMORY_UTILIZATION),
+        '--max-num-batched-tokens',
+        str(VLLM_MAX_NUM_BATCHED_TOKENS),
+        '--max-num-seqs',
+        str(VLLM_MAX_NUM_SEQS),
+        '--enable-chunked-prefill',
     ]
     print('Starting vLLM OpenAI server:', ' '.join(cmd), flush=True)
     process = subprocess.Popen(cmd, env=vllm_env(), stdout=log_handle, stderr=subprocess.STDOUT, text=True)
     VLLM_SERVER_PID.write_text(str(process.pid), encoding='utf-8')
     try:
         wait_for_vllm_server(process)
+    except BaseException:
+        stop_started_vllm_server(process)
+        raise
     finally:
         log_handle.close()
+    return process
 
 
 def run_vllm_api_smoke_test() -> None:
@@ -525,9 +592,13 @@ assert_expected_cuda_gpu()
 missing = [str(path) for path in (WHEELHOUSE, MODEL_PATH) if not path.exists()]
 if missing:
     raise FileNotFoundError('Missing attached dataset path(s): ' + ', '.join(missing))
-start_vllm_server()
-run_vllm_api_smoke_test()
-run_programir_codegen_smoke_test()
+vllm_process = start_vllm_server()
+try:
+    run_vllm_api_smoke_test()
+    run_programir_codegen_smoke_test()
+except BaseException:
+    stop_started_vllm_server(vllm_process)
+    raise
 setup_env = {
     'USE_TF': '0',
     'TRANSFORMERS_NO_TF': '1',
@@ -584,17 +655,25 @@ site_packages = WORKING_DIR / 'vllm-site-packages'
 if pid_path.exists():
     try:
         pid = int(pid_path.read_text(encoding='utf-8').strip())
-        print('Stopping vLLM server', flush=True)
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                break
-            time.sleep(1)
-        else:
-            os.kill(pid, signal.SIGKILL)
+        cmdline_path = Path('/proc') / str(pid) / 'cmdline'
+        if cmdline_path.exists():
+            cmdline = cmdline_path.read_bytes().replace(b'\x00', b' ')
+            expected = b'vllm.entrypoints.openai.api_server'
+            if expected not in cmdline:
+                raise RuntimeError(
+                    f'Refusing to signal PID {pid}: it is not the Duck vLLM server.'
+                )
+            print('Stopping vLLM server', flush=True)
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(1)
+            else:
+                os.kill(pid, signal.SIGKILL)
     except Exception as exc:
         print(f'Could not stop vLLM server cleanly: {exc!r}', flush=True)
     pid_path.unlink(missing_ok=True)

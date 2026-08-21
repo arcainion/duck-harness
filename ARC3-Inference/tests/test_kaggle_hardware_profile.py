@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import subprocess
 import tempfile
@@ -10,13 +11,106 @@ from unittest import TestCase, mock
 
 from inference.framework.kaggle import (
     DEFAULT_VLLM_MAX_MODEL_LEN,
+    DuckKaggleVllmConfig,
     duck_kaggle_setup_command,
+    duck_kaggle_teardown_command,
     duck_kaggle_vllm_config_for_accelerator,
 )
 from inference.framework.solver import HarnessSolver
 
 
 class KaggleHardwareProfileTests(TestCase):
+    def test_invalid_vllm_profiles_fail_before_deployment(self) -> None:
+        invalid_configs = (
+            DuckKaggleVllmConfig(vllm_port=0),
+            DuckKaggleVllmConfig(max_model_len=0),
+            DuckKaggleVllmConfig(gpu_memory_utilization=float("nan")),
+            DuckKaggleVllmConfig(gpu_memory_utilization=1.01),
+            DuckKaggleVllmConfig(served_model_name=" "),
+        )
+        for config in invalid_configs:
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                duck_kaggle_setup_command(config)
+
+    def test_setup_cleans_started_server_after_boot_or_smoke_failure(self) -> None:
+        command = duck_kaggle_setup_command()
+
+        self.assertIn("def stop_started_vllm_server(", command)
+        self.assertIn("except BaseException:\n        stop_started_vllm_server(process)", command)
+        self.assertIn("except BaseException:\n    stop_started_vllm_server(vllm_process)", command)
+
+        script = command.split("\n", 1)[1].rsplit("\nPYSETUP", 1)[0]
+        parsed = ast.parse(script)
+        cleanup_function = ast.Module(
+            body=[
+                node
+                for node in parsed.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "stop_started_vllm_server"
+            ],
+            type_ignores=[],
+        )
+
+        class StuckProcess:
+            def __init__(self) -> None:
+                self.terminated = False
+                self.killed = False
+                self.wait_calls = 0
+
+            def poll(self):
+                return None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def wait(self, timeout: int) -> None:
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired("vllm", timeout)
+
+            def kill(self) -> None:
+                self.killed = True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pid_path = Path(temp_dir) / "vllm.pid"
+            pid_path.write_text("123", encoding="utf-8")
+            namespace = {
+                "subprocess": subprocess,
+                "VLLM_SERVER_PID": pid_path,
+            }
+            exec(compile(cleanup_function, "<kaggle-cleanup-test>", "exec"), namespace)
+            process = StuckProcess()
+            namespace["stop_started_vllm_server"](process)
+
+            self.assertTrue(process.terminated)
+            self.assertTrue(process.killed)
+            self.assertEqual(process.wait_calls, 2)
+            self.assertFalse(pid_path.exists())
+
+    def test_teardown_refuses_to_signal_unrelated_stale_pid(self) -> None:
+        command = duck_kaggle_teardown_command()
+
+        self.assertIn("Path('/proc') / str(pid) / 'cmdline'", command)
+        self.assertIn("vllm.entrypoints.openai.api_server", command)
+        self.assertIn("Refusing to signal PID", command)
+
+    def test_default_analyzer_profile_disables_hidden_thinking(self) -> None:
+        config_path = Path(__file__).parents[1] / "configs" / "inference.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertIs(config["analyzer"]["thinking"], False)
+
+    def test_default_multimodal_profile_sends_one_small_image_per_level(self) -> None:
+        config_path = Path(__file__).parents[1] / "configs" / "inference.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(config["multimodal"]["context"], "level_start")
+        self.assertEqual(config["multimodal"]["upscale"], 2)
+
+        command = duck_kaggle_setup_command()
+        self.assertIn("'MULTIMODAL_CONTEXT': 'level_start'", command)
+        self.assertIn("'MULTIMODAL_UPSCALE': '2'", command)
+
     def test_t4_profile_matches_kaggle_dual_gpu_shape(self) -> None:
         config = duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
 
@@ -24,6 +118,8 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertEqual(config.expected_gpu_count, 2)
         self.assertEqual(config.tensor_parallel_size, 2)
         self.assertEqual(config.max_model_len, 8192)
+        self.assertEqual(config.max_num_batched_tokens, 4096)
+        self.assertEqual(config.max_num_seqs, 16)
 
     def test_t4_setup_clamps_analyzer_context_to_server_limit(self) -> None:
         config = duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
@@ -40,6 +136,8 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("VLLM_MAX_MODEL_LEN = 8192", command)
         self.assertIn("ANALYZER_CONTEXT_WINDOW = 8192", command)
         self.assertIn("VLLM_TENSOR_PARALLEL_SIZE = 2", command)
+        self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 4096", command)
+        self.assertIn("VLLM_MAX_NUM_SEQS = 16", command)
         self.assertIn("EXPECTED_GPU_TYPE = 't4'", command)
         self.assertIn("EXPECTED_GPU_COUNT = 2", command)
 
@@ -50,10 +148,20 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertEqual(config.tensor_parallel_size, 1)
         self.assertEqual(config.expected_gpu_type, "rtx-pro-6000")
         self.assertEqual(config.expected_gpu_count, 1)
+        self.assertEqual(config.gpu_memory_utilization, 0.92)
+        self.assertEqual(config.max_num_batched_tokens, 16384)
+        self.assertEqual(config.max_num_seqs, 32)
 
         command = duck_kaggle_setup_command(config)
         self.assertIn("VLLM_MAX_MODEL_LEN = 65536", command)
         self.assertIn("VLLM_TENSOR_PARALLEL_SIZE = 1", command)
+        self.assertIn("VLLM_GPU_MEMORY_UTILIZATION = 0.92", command)
+        self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 16384", command)
+        self.assertIn("VLLM_MAX_NUM_SEQS = 32", command)
+        self.assertIn("'--enable-chunked-prefill'", command)
+        self.assertIn("'--uvicorn-log-level'", command)
+        self.assertIn("'warning'", command)
+        self.assertIn("'--disable-uvicorn-access-log'", command)
         self.assertIn("EXPECTED_GPU_TYPE = 'rtx-pro-6000'", command)
         self.assertIn("EXPECTED_GPU_COUNT = 1", command)
 
@@ -141,7 +249,7 @@ class KaggleHardwareProfileTests(TestCase):
                 self.assertIn(required, command)
 
         self.assertLess(
-            command.index("run_programir_codegen_smoke_test()\nsetup_env"),
+            command.index("run_programir_codegen_smoke_test()\nexcept BaseException:"),
             command.index("setup_env_path ="),
         )
 

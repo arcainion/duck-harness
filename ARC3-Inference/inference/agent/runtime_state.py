@@ -55,7 +55,7 @@ def normalize_grid(raw: Any) -> tuple[tuple[int, ...], ...]:
         for cell in row:
             try:
                 cells.append(int(cell))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 cells.append(0)
         rows.append(tuple(cells))
     return tuple(rows)
@@ -66,11 +66,11 @@ def frame_from_payload(payload: Any) -> Frame | None:
         return None
     try:
         step = max(0, int(payload.get("step", 0) or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         step = 0
     try:
         level = max(1, int(payload.get("level", 1) or 1))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         level = 1
     return Frame(
         grid=normalize_grid(payload.get("grid")),
@@ -110,12 +110,17 @@ def load_runtime_state(path: Path) -> tuple[Frame | None, list[HistoryEntry]]:
         return None, []
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None, []
+    if not isinstance(payload, dict):
         return None, []
     current_frame = frame_from_payload(payload.get("current_frame"))
+    raw_history = payload.get("history", [])
+    if not isinstance(raw_history, list):
+        raw_history = []
     history_entries = [
         entry
-        for raw_entry in payload.get("history", [])
+        for raw_entry in raw_history
         for entry in [history_entry_from_payload(raw_entry)]
         if entry is not None
     ]
@@ -134,5 +139,8 @@ def write_runtime_state(
         "history": [history_entry_to_payload(entry) for entry in history],
     }
     tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.write_text(
+        json.dumps(payload, separators=(",", ":")),
+        encoding="utf-8",
+    )
     tmp_path.replace(path)

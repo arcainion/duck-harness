@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from unittest import TestCase
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import TestCase, mock
 
 from inference.agent.action_names import MAX_ACTION_BATCH
 from inference.agent.inference_controller import InferenceControllerConfig
@@ -9,9 +12,10 @@ from inference.agent.python_tool_policy import (
     RUNTIME_HELPER_SIGNATURES,
 )
 from inference.agent.program_ir import program_tool_parameters_schema
-from inference.agent.runtime_state import Frame, HistoryEntry
+from inference.agent.runtime_state import Frame, HistoryEntry, write_runtime_state
 from inference.agent.tool_agent import (
     ToolAgent,
+    _ChatCompletionResult,
     _build_system_prompt,
     _contains_tool_call_markup,
     _estimate_tokens,
@@ -54,6 +58,94 @@ class ToolAgentStrategyTests(TestCase):
         })
         self.assertEqual(agent.total_tokens, 8)
         self.assertEqual(agent.generated_tokens, 3)
+
+    def test_level_start_multimodal_mode_attaches_one_image_per_level(self) -> None:
+        with mock.patch.dict(os.environ, {"MULTIMODAL_CONTEXT": "level_start"}):
+            agent = self._agent()
+            level_one = Frame(grid=((1, 2),), step=0, level=1)
+            later_level_one = Frame(grid=((2, 1),), step=1, level=1)
+            level_two = Frame(grid=((3, 4),), step=0, level=2)
+
+            first = agent._build_user_message("first", level_one)
+            later = agent._build_user_message("later", later_level_one)
+            next_level = agent._build_user_message("next", level_two)
+
+        self.assertIsInstance(first["content"], list)
+        self.assertEqual(later, {"role": "user", "content": "later"})
+        self.assertIsInstance(next_level["content"], list)
+
+    def test_current_grid_multimodal_mode_still_attaches_every_turn(self) -> None:
+        with mock.patch.dict(os.environ, {"MULTIMODAL_CONTEXT": "current_grid"}):
+            agent = self._agent()
+            frame = Frame(grid=((1,),), step=0, level=1)
+
+            first = agent._build_user_message("first", frame)
+            second = agent._build_user_message("second", frame)
+
+        self.assertIsInstance(first["content"], list)
+        self.assertIsInstance(second["content"], list)
+
+    def test_tool_schema_and_token_estimate_are_cached_per_decode_mode(self) -> None:
+        agent = self._agent()
+        state_path = Path("state.json")
+        fast_tools = agent._tools(state_path, strict=False)
+        strict_tools = agent._tools(state_path, strict=True)
+
+        self.assertIs(fast_tools, agent._tools(state_path, strict=False))
+        self.assertIs(strict_tools, agent._tools(state_path, strict=True))
+        self.assertIsNot(fast_tools, strict_tools)
+        first = agent._estimate_request_input_tokens(
+            [{"role": "user", "content": "inspect"}],
+            tools=fast_tools,
+        )
+        second = agent._estimate_request_input_tokens(
+            [{"role": "user", "content": "inspect"}],
+            tools=fast_tools,
+        )
+        self.assertEqual(first, second)
+        self.assertIn(False, agent._tool_token_estimates)
+
+    def test_disabled_request_logging_skips_prompt_snapshot_serialization(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1,),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            agent = self._agent()
+            agent._tool_steps = 1
+            response = _ChatCompletionResult(
+                message={"content": "inspect next"},
+                finish_reason="stop",
+                usage={"completion_tokens": 2},
+            )
+            with (
+                mock.patch.object(agent, "_chat_completion", return_value=response),
+                mock.patch(
+                    "inference.agent.tool_agent._write_prompt_log_snapshot"
+                ) as snapshot,
+            ):
+                agent.analyze(state_path, 0, valid_actions=["LEFT"])
+
+        snapshot.assert_not_called()
+
+    def test_runtime_state_uses_compact_internal_json(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1, 2), (3, 4)), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+
+            encoded = state_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("\n", encoded)
+        self.assertNotIn(": ", encoded)
+        self.assertIn('"current_frame":', encoded)
 
     def test_python_action_batch_is_bounded_before_host_dispatch(self) -> None:
         agent = self._agent()
@@ -413,6 +505,41 @@ class BuildSystemPromptTests(TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, compact)
+
+    def test_32k_kaggle_context_uses_compact_system_prompt(self) -> None:
+        compact = _build_system_prompt(
+            tool_output_tokens=512,
+            context_window_tokens=32768,
+        )
+        full = _build_system_prompt(tool_output_tokens=512)
+
+        self.assertLess(len(compact), len(full) // 2)
+        self.assertIn("ProgramIR", compact)
+
+    def test_persistent_history_has_fixed_prefill_budget(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": "system"}
+        ]
+        for index in range(12):
+            messages.extend(
+                [
+                    {"role": "user", "content": f"turn {index}"},
+                    {"role": "assistant", "content": "p" * 2000},
+                    {"role": "tool", "content": "r" * 2000},
+                ]
+            )
+
+        history = agent._persistent_history_messages(messages)
+
+        self.assertLessEqual(_estimate_tokens(history), 4096)
+        self.assertEqual(history[0]["role"], "user")
+        self.assertEqual(history[-1]["role"], "tool")
+        self.assertIn("turn 11", str(history))
 
     def test_program_ir_request_has_usable_headroom_in_8k_context(self) -> None:
         compact = _build_system_prompt(

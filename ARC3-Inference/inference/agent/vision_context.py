@@ -36,7 +36,7 @@ def multimodal_context() -> str:
 
 
 def current_grid_image_enabled() -> bool:
-    return multimodal_context() == "current_grid"
+    return multimodal_context() in {"current_grid", "level_start"}
 
 
 def current_grid_image_upscale() -> int:

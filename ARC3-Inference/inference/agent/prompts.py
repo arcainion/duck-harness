@@ -80,7 +80,7 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
 
 MULTIMODAL_CONTEXT_ADDENDUM = (
     "\n\nMultimodal context:\n"
-    "- User turns include an attached image of the current ARC grid.\n"
+    "- User turns may include an attached image of the current ARC grid, especially when a level starts.\n"
     "- The image and `current_frame.ascii` are two representations of the same current frame.\n"
     "- You can use images and other tools to understand the game state and guide your strategy, each may be useful depending on the current uncertainty.\n"
 )
@@ -155,9 +155,9 @@ COMPACT_TOOL_SESSION_ADDENDUM = (
 
 
 def build_small_context_prompt(*, tool_output_tokens: int) -> str:
-    """Return the complete, non-redundant contract for <=16K contexts."""
+    """Return the complete, non-redundant contract for <=32K contexts."""
     image_guidance = (
-        " The attached image and current_frame describe the same current board."
+        " When attached, the image and current_frame describe the same current board."
         if current_grid_image_enabled()
         else ""
     )

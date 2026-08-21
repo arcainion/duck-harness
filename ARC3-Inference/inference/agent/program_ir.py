@@ -7,7 +7,9 @@ self-modification features are intentionally excluded from the runtime.
 from __future__ import annotations
 
 import ast
+import copy
 from difflib import get_close_matches
+from functools import lru_cache
 import hashlib
 import json
 import keyword
@@ -1491,8 +1493,9 @@ def compile_program(payload: Any) -> CompiledProgram:
     )
 
 
-def program_tool_parameters_schema() -> dict[str, Any]:
-    """Return a function-tool schema with ProgramIR definitions hoisted correctly."""
+@lru_cache(maxsize=1)
+def _cached_program_tool_parameters_schema() -> dict[str, Any]:
+    """Build the immutable template for the ProgramIR function-tool schema."""
     program_schema = ProgramIR.model_json_schema()
     definitions = program_schema.pop("$defs", {})
     program_schema["description"] = (
@@ -1535,6 +1538,42 @@ def program_tool_parameters_schema() -> dict[str, Any]:
         elif isinstance(current, list):
             stack.extend(current)
     return schema
+
+
+def program_tool_parameters_schema() -> dict[str, Any]:
+    """Return an isolated copy of the cached ProgramIR function-tool schema."""
+    return copy.deepcopy(_cached_program_tool_parameters_schema())
+
+
+@lru_cache(maxsize=1)
+def _cached_fast_program_tool_parameters_schema() -> dict[str, Any]:
+    """Return model guidance for unconstrained first attempts without safety-only bulk."""
+    schema = copy.deepcopy(_cached_program_tool_parameters_schema())
+    program_schema = schema["properties"]["program"]
+    stack: list[Any] = [schema]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key in (
+                "description",
+                "discriminator",
+                "default",
+                "maxItems",
+                "minItems",
+                "maxProperties",
+            ):
+                current.pop(key, None)
+            if current is not schema and current is not program_schema:
+                current.pop("additionalProperties", None)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return schema
+
+
+def fast_program_tool_parameters_schema() -> dict[str, Any]:
+    """Return the lean schema used by the validated, unconstrained fast path."""
+    return copy.deepcopy(_cached_fast_program_tool_parameters_schema())
 
 
 def program_to_source(payload: Any) -> str:

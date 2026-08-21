@@ -41,6 +41,7 @@ from inference.agent.program_ir import (
     ProgramCompileError,
     compiler_runtime_metadata,
     compile_program,
+    fast_program_tool_parameters_schema,
     program_tool_parameters_schema,
 )
 from inference.agent.python_tool_sandbox import run_sandboxed_python
@@ -53,6 +54,7 @@ from inference.agent.runtime_state import (
 from inference.agent.vision_context import (
     current_grid_image_enabled,
     current_grid_image_part,
+    multimodal_context,
 )
 from inference.utils.openai_compat import build_chat_payload, build_headers, normalize_provider
 
@@ -178,9 +180,11 @@ _LOCAL_ANALYZER_TOP_K = _get_env_int("LOCAL_ANALYZER_TOP_K", 20)
 _LOCAL_ANALYZER_SEED = _get_env_int("LOCAL_ANALYZER_SEED", -1)
 _REQUEST_SAFETY_MARGIN_TOKENS = 512
 _CONTEXT_OVERFLOW_RETRY_TRIM_TOKENS = 512
-_PERSISTENT_HISTORY_ASSISTANT_TURNS = 30
+_PERSISTENT_HISTORY_ASSISTANT_TURNS = 6
+_PERSISTENT_HISTORY_TOKEN_BUDGET = 4096
 _RESPONSE_META_MAX_CHARS = 4000
 _TOOL_NAME_MAX_CHARS = 80
+_TOOL_CALL_ID_MAX_CHARS = 128
 
 _PYTHON_TOOL_DESCRIPTION = (
     "Compile and run one ephemeral structured ProgramIR against preloaded ASCII game state. "
@@ -371,6 +375,17 @@ def _turn_tool_choice(
     )
 
 
+def _tool_result_requires_strict_retry(content: str) -> bool:
+    """Use guided decoding only after the fast path produced invalid structure."""
+    try:
+        payload = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("stage") == "schema" and bool(
+        payload.get("error")
+    )
+
+
 def _normalize_tool_name(value: Any) -> str:
     raw = str(value or "").strip()
     cleaned = "".join(
@@ -425,7 +440,7 @@ def _build_system_prompt(
     tool_output_tokens: int,
     context_window_tokens: int | None = None,
 ) -> str:
-    if context_window_tokens is not None and context_window_tokens <= 16_384:
+    if context_window_tokens is not None and context_window_tokens <= 32_768:
         return build_small_context_prompt(tool_output_tokens=tool_output_tokens)
     prompt = "You are a coding agent solving a grid-based puzzle game."
     prompt += GAME_OVERVIEW_ADDENDUM
@@ -1052,6 +1067,46 @@ class ToolAgent:
         self._summarized_knowledge = _empty_world_model()
         self._controller_config = InferenceControllerConfig.from_env()
         self._strategy_memory: dict[str, Any] = {}
+        self._last_image_level: int | None = None
+        self._tool_specs: dict[bool, list[dict[str, Any]]] = {}
+        self._tool_token_estimates: dict[bool, int] = {}
+        self._next_synthetic_tool_call_id = 1
+        # One ToolAgent is scoped to one game. Reuse its localhost vLLM
+        # connection across turns instead of paying TCP setup for every call.
+        self._http_session = requests.Session()
+
+    def close(self) -> None:
+        """Release HTTP connection-pool resources owned by this game agent."""
+        self._http_session.close()
+
+    def _normalize_tool_calls(
+        self, tool_calls: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Ensure assistant/tool message pairing has unique, non-empty IDs."""
+        normalized: list[dict[str, Any]] = []
+        used_ids: set[str] = set()
+        for raw_tool_call in tool_calls:
+            tool_call = dict(raw_tool_call)
+            tool_call_id = "".join(
+                character
+                for character in str(tool_call.get("id") or "")
+                if character.isprintable()
+            ).strip()[:_TOOL_CALL_ID_MAX_CHARS]
+            if not tool_call_id or tool_call_id in used_ids:
+                while True:
+                    candidate = (
+                        f"duck-synthetic-call-{self._next_synthetic_tool_call_id}"
+                    )
+                    self._next_synthetic_tool_call_id += 1
+                    if candidate not in used_ids:
+                        tool_call_id = candidate
+                        break
+            used_ids.add(tool_call_id)
+            tool_call["id"] = tool_call_id
+            tool_call["type"] = "function"
+            tool_call["function"] = dict(tool_call["function"])
+            normalized.append(tool_call)
+        return normalized
 
     def _headers(self) -> dict[str, str]:
         api_key = (
@@ -1080,6 +1135,7 @@ class ToolAgent:
             self._last_action_result = None
             self._summarized_knowledge = _empty_world_model()
             self._strategy_memory = {}
+            self._last_image_level = None
 
     def _record_strategy(self, update: dict[str, Any]) -> dict[str, Any]:
         def short_text(value: Any, max_chars: int = 280) -> str:
@@ -1385,7 +1441,15 @@ class ToolAgent:
         ]
 
     def _build_user_message(self, user_prompt: str, current_frame: Frame | None) -> dict[str, Any]:
-        image_part = current_grid_image_part(current_frame)
+        include_image = False
+        image_mode = multimodal_context()
+        if current_frame is not None and image_mode == "current_grid":
+            include_image = True
+        elif current_frame is not None and image_mode == "level_start":
+            include_image = current_frame.level != self._last_image_level
+            if include_image:
+                self._last_image_level = current_frame.level
+        image_part = current_grid_image_part(current_frame) if include_image else None
         if image_part is None:
             return {"role": "user", "content": user_prompt}
 
@@ -1578,25 +1642,40 @@ class ToolAgent:
             lines.append("If you use MOUSE, include integer row and col arguments.")
         return "\n".join(lines)
 
-    def _tools(self, state_path: Path) -> list[dict[str, Any]]:
+    def _tools(
+        self,
+        state_path: Path,
+        *,
+        strict: bool = True,
+    ) -> list[dict[str, Any]]:
         self._ensure_session(state_path)
+        strict_vllm = normalize_provider(self._model.provider) == "vllm" and strict
+        cached = self._tool_specs.get(strict_vllm)
+        if cached is not None:
+            return cached
         function: dict[str, Any] = {
             "name": "python",
             "description": _PYTHON_TOOL_DESCRIPTION,
-            "parameters": program_tool_parameters_schema(),
+            "parameters": (
+                program_tool_parameters_schema()
+                if strict or normalize_provider(self._model.provider) != "vllm"
+                else fast_program_tool_parameters_schema()
+            ),
         }
         # Modern vLLM applies schema-constrained decoding to auto-selected tool
         # calls only when the function opts into strict mode. Other compatible
         # providers retain their existing request shape because support varies
         # by upstream route/model.
-        if normalize_provider(self._model.provider) == "vllm":
+        if strict_vllm:
             function["strict"] = True
-        return [
+        tools = [
             {
                 "type": "function",
                 "function": function,
             }
         ]
+        self._tool_specs[strict_vllm] = tools
+        return tools
 
     def _chat_completion(
         self,
@@ -1623,12 +1702,40 @@ class ToolAgent:
             ),
             seed=_LOCAL_ANALYZER_SEED,
         )
+        configured_timeout = (
+            request_timeout_seconds
+            if request_timeout_seconds is not None
+            else self._timeout
+        )
+        request_deadline = (
+            time.monotonic() + configured_timeout
+            if configured_timeout is not None
+            else None
+        )
+
+        def remaining_request_timeout() -> float | None:
+            if request_deadline is None:
+                return None
+            remaining = request_deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise requests.Timeout("analyzer request deadline exceeded")
+            return max(0.001, remaining)
+
+        def sleep_before_retry(retry_index: int) -> None:
+            delay = min(2 ** retry_index * 0.5, 4.0)
+            if request_deadline is not None:
+                remaining = request_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise requests.Timeout("analyzer request deadline exceeded")
+                delay = min(delay, remaining)
+            time.sleep(delay)
+
         def post_chat(request_payload: dict[str, Any]) -> requests.Response:
-            return requests.post(
+            return self._http_session.post(
                 f"{self._model.base_url.rstrip('/')}/chat/completions",
                 headers=self._headers(),
                 json=request_payload,
-                timeout=request_timeout_seconds if request_timeout_seconds is not None else self._timeout,
+                timeout=remaining_request_timeout(),
             )
 
         _RETRYABLE_HTTP_CODES = {408, 429, 502, 503, 504}
@@ -1640,36 +1747,70 @@ class ToolAgent:
             except requests.ConnectionError:
                 if _retry == _max_retries - 1:
                     raise
-                time.sleep(min(2 ** _retry * 0.5, 4.0))
+                sleep_before_retry(_retry)
                 continue
             if response.status_code not in _RETRYABLE_HTTP_CODES:
                 break
             if _retry < _max_retries - 1:
-                time.sleep(min(2 ** _retry * 0.5, 4.0))
+                response.close()
+                sleep_before_retry(_retry)
+        assert response is not None
         try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            detail = response.text.strip()
-            message = f"{exc}"
-            if detail:
-                message += f" | response: {detail}"
-            raise requests.RequestException(message) from exc
-        if getattr(response, "status_code", 200) >= 400:
-            detail = response.text.strip()
-            message = f"{response.status_code} Error"
-            if detail:
-                message += f" | response: {detail}"
-            raise requests.RequestException(message)
-        payload = response.json()
-        choices = payload.get("choices", [])
-        if not choices:
-            raise requests.RequestException("server returned no choices")
-        choice = choices[0]
-        return _ChatCompletionResult(
-            message=choice.get("message", {}),
-            finish_reason=str(choice.get("finish_reason", "") or ""),
-            usage=payload.get("usage"),
-        )
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                detail = response.text.strip()
+                message = f"{exc}"
+                if detail:
+                    message += f" | response: {detail}"
+                raise requests.RequestException(message) from exc
+            if getattr(response, "status_code", 200) >= 400:
+                detail = response.text.strip()
+                message = f"{response.status_code} Error"
+                if detail:
+                    message += f" | response: {detail}"
+                raise requests.RequestException(message)
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise requests.RequestException(
+                    "server returned invalid JSON"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise requests.RequestException("server returned a non-object response")
+            choices = payload.get("choices", [])
+            if not isinstance(choices, list) or not choices:
+                raise requests.RequestException("server returned no choices")
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                raise requests.RequestException("server returned an invalid choice")
+            message = choice.get("message", {})
+            if not isinstance(message, dict):
+                raise requests.RequestException("server returned an invalid message")
+            tool_calls = message.get("tool_calls")
+            if tool_calls is not None and not isinstance(tool_calls, list):
+                raise requests.RequestException("server returned invalid tool_calls")
+            if isinstance(tool_calls, list) and any(
+                not isinstance(tool_call, dict) for tool_call in tool_calls
+            ):
+                raise requests.RequestException("server returned an invalid tool call")
+            if isinstance(tool_calls, list) and any(
+                not isinstance(tool_call.get("function"), dict)
+                for tool_call in tool_calls
+            ):
+                raise requests.RequestException(
+                    "server returned an invalid tool function"
+                )
+            if isinstance(tool_calls, list):
+                message = dict(message)
+                message["tool_calls"] = self._normalize_tool_calls(tool_calls)
+            return _ChatCompletionResult(
+                message=message,
+                finish_reason=str(choice.get("finish_reason", "") or ""),
+                usage=payload.get("usage"),
+            )
+        finally:
+            response.close()
 
     def _trim_tool_text(self, text: str) -> tuple[str, bool]:
         if len(text) <= self._tool_output_chars:
@@ -2316,11 +2457,30 @@ class ToolAgent:
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> int:
-        payload: dict[str, Any] = {"messages": messages}
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = _request_tool_choice(tools)
-        return _estimate_tokens(payload)
+        if not tools:
+            return _estimate_tokens({"messages": messages})
+        for strict_vllm, cached_tools in self._tool_specs.items():
+            if tools is not cached_tools:
+                continue
+            tool_tokens = self._tool_token_estimates.get(strict_vllm)
+            if tool_tokens is None:
+                tool_tokens = _estimate_tokens(
+                    {
+                        "tools": tools,
+                        "tool_choice": _request_tool_choice(tools),
+                    }
+                )
+                self._tool_token_estimates[strict_vllm] = tool_tokens
+            # Eight conservative tokens cover the separators between the two
+            # independently rendered payload fragments.
+            return _estimate_tokens({"messages": messages}) + tool_tokens + 8
+        return _estimate_tokens(
+            {
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": _request_tool_choice(tools),
+            }
+        )
 
     def _drop_oldest_history_block(self, history: list[dict[str, Any]], *, preserve_recent: int) -> bool:
         removable = len(history) - preserve_recent
@@ -2376,6 +2536,16 @@ class ToolAgent:
             trimmed_history,
             max_turns=_PERSISTENT_HISTORY_ASSISTANT_TURNS,
         )
+        while (
+            sum(
+                str(message.get("role", "")).strip() == "assistant"
+                for message in history
+            )
+            > 1
+            and _estimate_tokens(history) > _PERSISTENT_HISTORY_TOKEN_BUDGET
+        ):
+            self._drop_oldest_history_block(history, preserve_recent=0)
+        history = self._drop_until_first_user_message(history)
         if (
             history
             and str(history[0].get("role", "")).strip() != "user"
@@ -2527,9 +2697,11 @@ class ToolAgent:
 
         previous_history_messages = list(self._history_messages)
         preserve_history = True
+        strict_tool_retry = False
+        initial_tools = self._tools(state_path, strict=False)
         messages: list[dict[str, Any]] = self._trim_messages_for_context(
             [{"role": "system", "content": self._system_prompt}, *self._history_messages, self._build_user_message(user_prompt, current_frame)],
-            tools=self._tools(state_path),
+            tools=initial_tools,
             preserve_recent=1,
         )
         step_executed = False
@@ -2560,7 +2732,7 @@ class ToolAgent:
                 if yielded_control_reason is not None:
                     break
                 turn_count += 1
-                tools = self._tools(state_path)
+                tools = self._tools(state_path, strict=strict_tool_retry)
                 tool_choice = _turn_tool_choice(
                     tools,
                     provider=self._model.provider,
@@ -2568,22 +2740,23 @@ class ToolAgent:
                     step_executed=step_executed,
                 )
                 messages = self._trim_messages_for_context(messages, tools=tools)
-                latest_request_messages = json.loads(json.dumps(messages))
-                latest_request_tools = json.loads(json.dumps(tools))
                 latest_request_tool_choice = tool_choice
                 latest_request_index = turn_count
-                _write_prompt_log_snapshot(
-                    prompt_log,
-                    model_id=self._model.model_id,
-                    base_url=self._model.base_url,
-                    display_action_num=display_action_num,
-                    analysis_step=analysis_step,
-                    request_index=turn_count,
-                    messages=latest_request_messages,
-                    tools=latest_request_tools,
-                    tool_choice=tool_choice,
-                    transcript="".join(transcript_parts),
-                )
+                if self._save_request_logs:
+                    latest_request_messages = json.loads(json.dumps(messages))
+                    latest_request_tools = json.loads(json.dumps(tools))
+                    _write_prompt_log_snapshot(
+                        prompt_log,
+                        model_id=self._model.model_id,
+                        base_url=self._model.base_url,
+                        display_action_num=display_action_num,
+                        analysis_step=analysis_step,
+                        request_index=turn_count,
+                        messages=latest_request_messages,
+                        tools=latest_request_tools,
+                        tool_choice=tool_choice,
+                        transcript="".join(transcript_parts),
+                    )
                 try:
                     request_kwargs: dict[str, Any] = {
                         "tools": tools,
@@ -2642,6 +2815,8 @@ class ToolAgent:
                 if not tool_calls and tool_call_markup_in_text:
                     tool_calls = _recover_tool_calls_from_markup(raw_reasoning, raw_content)
                     recovered_tool_calls_from_markup = bool(tool_calls)
+                if tool_calls:
+                    tool_calls = self._normalize_tool_calls(tool_calls)
                 reasoning = _strip_tool_call_markup(raw_reasoning) if tool_call_markup_in_text else raw_reasoning
                 content = _strip_tool_call_markup(raw_content) if tool_call_markup_in_text else raw_content
                 malformed_argument_errors: list[str] = []
@@ -2675,6 +2850,7 @@ class ToolAgent:
                     assistant_message["reasoning"] = reasoning
 
                 if not tool_calls:
+                    strict_tool_retry = True
                     if content:
                         self._update_summarized_knowledge_from_assistant(content)
                         append_transcript("ASSISTANT", content)
@@ -2758,6 +2934,8 @@ class ToolAgent:
                         tool_name,
                         arguments,
                     )
+                    if _tool_result_requires_strict_retry(dispatch.content):
+                        strict_tool_retry = True
                     if dispatch.step_executed:
                         step_executed = True
                         last_tool_error = ""
@@ -2828,7 +3006,10 @@ class ToolAgent:
             return None
         finally:
             if preserve_history:
-                self._history_messages = self._persistent_history_messages(messages, tools=self._tools(state_path))
+                self._history_messages = self._persistent_history_messages(
+                    messages,
+                    tools=self._tools(state_path, strict=strict_tool_retry),
+                )
             else:
                 self._history_messages = previous_history_messages
             self._step_env_callback = None
