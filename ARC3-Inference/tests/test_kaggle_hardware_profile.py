@@ -122,6 +122,29 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("earliest worker failure", message)
         self.assertIn("latest engine failure", message)
 
+    def test_setup_runs_real_programir_codegen_smoke_before_benchmark(self) -> None:
+        command = duck_kaggle_setup_command(
+            duck_kaggle_vllm_config_for_accelerator("NvidiaRtxPro6000")
+        )
+
+        for required in (
+            "def run_programir_codegen_smoke_test() -> None:",
+            "program_tool_parameters_schema",
+            "'tool_choice': 'required'",
+            "compile_program(generated_program)",
+            "run_sandboxed_python(",
+            "execution.get('result') == 220",
+            "duck_programir_codegen_smoke.json",
+            "run_programir_codegen_smoke_test()",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, command)
+
+        self.assertLess(
+            command.index("run_programir_codegen_smoke_test()\nsetup_env"),
+            command.index("setup_env_path ="),
+        )
+
     def test_unknown_accelerator_uses_defaults(self) -> None:
         config = duck_kaggle_vllm_config_for_accelerator("NvidiaUnknownGPU")
         self.assertEqual(config.tensor_parallel_size, 1)

@@ -425,6 +425,7 @@ class BuildSystemPromptTests(TestCase):
                 "name": "python",
                 "description": "Compile and execute structured ProgramIR.",
                 "parameters": program_tool_parameters_schema(),
+                "strict": True,
             },
         }]
         base_request = {

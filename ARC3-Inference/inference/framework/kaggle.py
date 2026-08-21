@@ -260,6 +260,7 @@ def vllm_env() -> dict[str, str]:
             'TRANSFORMERS_NO_TF': '1',
             'TRANSFORMERS_NO_TORCHVISION': '1',
             'VLLM_NO_USAGE_STATS': '1',
+            'VLLM_ENFORCE_STRICT_TOOL_CALLING': 'true',
         }
     )
     return env
@@ -406,6 +407,118 @@ def run_vllm_api_smoke_test() -> None:
     print('=' * 88 + '\n', flush=True)
 
 
+def run_programir_codegen_smoke_test() -> None:
+    # Require the deployed model to generate code Duck can compile and run.
+    from inference.agent.program_ir import COMPILER_VERSION, compile_program, program_tool_parameters_schema
+    from inference.agent.python_tool_sandbox import run_sandboxed_python
+
+    report_path = WORKING_DIR / 'duck_programir_codegen_smoke.json'
+    report = {
+        'status': 'FAIL',
+        'model': SERVED_MODEL_NAME,
+        'compiler_version': COMPILER_VERSION,
+    }
+    try:
+        tools = [{
+            'type': 'function',
+            'function': {
+                'name': 'python',
+                'description': 'Compile and execute structured Duck ProgramIR.',
+                'parameters': program_tool_parameters_schema(),
+                'strict': True,
+            },
+        }]
+        prompt = (
+            'Emit exactly one python tool call. Build ProgramIR version 1 that assigns result '
+            'to the sum of the squares of every even integer from 1 through 10 inclusive. '
+            'Compute it with a generator_comprehension passed to sum, using range, '
+            'multiplication, modulo, and equality. Do not hard-code 220 or explain.'
+        )
+        payload = {
+            'model': SERVED_MODEL_NAME,
+            'messages': [
+                {
+                    'role': 'system',
+                    'content': 'Generate valid Duck ProgramIR tool arguments and follow the schema exactly.',
+                },
+                {'role': 'user', 'content': prompt},
+            ],
+            'tools': tools,
+            # vLLM 0.19 constrains tool arguments for required/named calls.
+            'tool_choice': 'required',
+            'temperature': 0.0,
+            'top_p': 1.0,
+            'top_k': 1,
+            'max_tokens': 4096,
+            'chat_template_kwargs': {'enable_thinking': False},
+        }
+        response = request_json(
+            f'{VLLM_BASE_URL}/chat/completions',
+            payload=payload,
+            timeout=300,
+        )
+        message = response['choices'][0]['message']
+        tool_calls = message.get('tool_calls') or []
+        assert len(tool_calls) == 1, f'Expected exactly one tool call, got: {message}'
+        function = tool_calls[0].get('function') or {}
+        assert function.get('name') == 'python', function
+        raw_arguments = function.get('arguments')
+        arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+        assert isinstance(arguments, dict) and isinstance(arguments.get('program'), dict), arguments
+        generated_program = arguments['program']
+
+        result_assignments = [
+            statement
+            for statement in generated_program.get('body', [])
+            if statement.get('kind') == 'assign'
+            and any(
+                target.get('kind') == 'name_target' and target.get('name') == 'result'
+                for target in statement.get('targets', [])
+            )
+        ]
+        assert len(result_assignments) == 1, 'Model must assign result exactly once.'
+        result_value = result_assignments[0].get('value') or {}
+        assert result_value.get('kind') == 'call', 'result must be produced by sum.'
+        assert (result_value.get('function') or {}).get('name') == 'sum', 'result must call sum.'
+        generators = [
+            argument
+            for argument in result_value.get('args', [])
+            if argument.get('kind') == 'generator_comprehension'
+        ]
+        assert len(generators) == 1, 'sum must receive one generator_comprehension.'
+        canonical = json.dumps(generated_program, sort_keys=True, separators=(',', ':'))
+        for fragment in ('"op":"mul"', '"op":"mod"', '"ops":["eq"]'):
+            assert fragment in canonical, f'Missing required computation node: {fragment}'
+
+        compiled = compile_program(generated_program)
+        execution = run_sandboxed_python(
+            code=compiled.source,
+            timeout_seconds=10,
+            initial_state={},
+            action_handler=lambda actions: {},
+            strategy_handler=lambda update: update,
+        )
+        assert not execution.get('error'), execution
+        assert execution.get('result') == 220, execution
+        report.update({
+            'status': 'PASS',
+            'result': execution['result'],
+            'compiler': compiled.metadata(),
+            'lowered_source': compiled.source,
+            'generated_program': generated_program,
+        })
+        print('\n' + '=' * 88, flush=True)
+        print('DUCK PROGRAMIR LLM CODE-GENERATION SMOKE TEST: PASS', flush=True)
+        print(compiled.source, flush=True)
+        print(f'Result: {execution["result"]}', flush=True)
+        print('=' * 88 + '\n', flush=True)
+    except Exception as exc:
+        report['error'] = f'{type(exc).__name__}: {exc}'
+        raise
+    finally:
+        report_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
+
+
 print(f'vLLM wheelhouse path: {WHEELHOUSE}', flush=True)
 print(f'Qwen model path: {MODEL_PATH}', flush=True)
 assert_expected_cuda_gpu()
@@ -414,6 +527,7 @@ if missing:
     raise FileNotFoundError('Missing attached dataset path(s): ' + ', '.join(missing))
 start_vllm_server()
 run_vllm_api_smoke_test()
+run_programir_codegen_smoke_test()
 setup_env = {
     'USE_TF': '0',
     'TRANSFORMERS_NO_TF': '1',

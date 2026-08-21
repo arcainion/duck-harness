@@ -54,7 +54,7 @@ from inference.agent.vision_context import (
     current_grid_image_enabled,
     current_grid_image_part,
 )
-from inference.utils.openai_compat import build_chat_payload, build_headers
+from inference.utils.openai_compat import build_chat_payload, build_headers, normalize_provider
 
 log = logging.getLogger(__name__)
 
@@ -345,8 +345,30 @@ def _empty_world_model() -> dict[str, str]:
     }
 
 
-def _request_tool_choice(tools: list[dict[str, Any]] | None) -> str | None:
-    return "auto" if tools else None
+def _request_tool_choice(
+    tools: list[dict[str, Any]] | None,
+    *,
+    required: bool = False,
+) -> str | None:
+    if not tools:
+        return None
+    return "required" if required else "auto"
+
+
+def _turn_tool_choice(
+    tools: list[dict[str, Any]] | None,
+    *,
+    provider: str,
+    turn_count: int,
+    step_executed: bool,
+) -> str | None:
+    require_schema_constrained_tool = not step_executed and (
+        turn_count > 1 or normalize_provider(provider) == "vllm"
+    )
+    return _request_tool_choice(
+        tools,
+        required=require_schema_constrained_tool,
+    )
 
 
 def _normalize_tool_name(value: Any) -> str:
@@ -1558,14 +1580,21 @@ class ToolAgent:
 
     def _tools(self, state_path: Path) -> list[dict[str, Any]]:
         self._ensure_session(state_path)
+        function: dict[str, Any] = {
+            "name": "python",
+            "description": _PYTHON_TOOL_DESCRIPTION,
+            "parameters": program_tool_parameters_schema(),
+        }
+        # Modern vLLM applies schema-constrained decoding to auto-selected tool
+        # calls only when the function opts into strict mode. Other compatible
+        # providers retain their existing request shape because support varies
+        # by upstream route/model.
+        if normalize_provider(self._model.provider) == "vllm":
+            function["strict"] = True
         return [
             {
                 "type": "function",
-                "function": {
-                    "name": "python",
-                    "description": _PYTHON_TOOL_DESCRIPTION,
-                    "parameters": program_tool_parameters_schema(),
-                },
+                "function": function,
             }
         ]
 
@@ -1574,6 +1603,7 @@ class ToolAgent:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None,
+        tool_choice: str | None = None,
         request_timeout_seconds: float | None = None,
     ) -> _ChatCompletionResult:
         payload = build_chat_payload(
@@ -1586,7 +1616,11 @@ class ToolAgent:
             top_k=_LOCAL_ANALYZER_TOP_K,
             thinking=bool(_LOCAL_ANALYZER_ENABLE_THINKING),
             tools=tools,
-            tool_choice=_request_tool_choice(tools),
+            tool_choice=(
+                tool_choice
+                if tool_choice is not None
+                else _request_tool_choice(tools)
+            ),
             seed=_LOCAL_ANALYZER_SEED,
         )
         def post_chat(request_payload: dict[str, Any]) -> requests.Response:
@@ -2527,9 +2561,12 @@ class ToolAgent:
                     break
                 turn_count += 1
                 tools = self._tools(state_path)
-                tool_choice = _request_tool_choice(tools)
-                if turn_count > 1 and not step_executed:
-                    tool_choice = "required"
+                tool_choice = _turn_tool_choice(
+                    tools,
+                    provider=self._model.provider,
+                    turn_count=turn_count,
+                    step_executed=step_executed,
+                )
                 messages = self._trim_messages_for_context(messages, tools=tools)
                 latest_request_messages = json.loads(json.dumps(messages))
                 latest_request_tools = json.loads(json.dumps(tools))
@@ -2548,7 +2585,10 @@ class ToolAgent:
                     transcript="".join(transcript_parts),
                 )
                 try:
-                    request_kwargs: dict[str, Any] = {"tools": tools}
+                    request_kwargs: dict[str, Any] = {
+                        "tools": tools,
+                        "tool_choice": tool_choice,
+                    }
                     if request_timeout_seconds is not None:
                         request_kwargs["request_timeout_seconds"] = request_timeout_seconds
                     if self._save_request_logs:

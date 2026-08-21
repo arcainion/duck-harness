@@ -1,0 +1,20 @@
+{
+  "id": "arcainionprime/duck-programir-codegen-smoke",
+  "title": "Duck ProgramIR LLM Code Generation Smoke Test",
+  "code_file": "duck_programir_codegen_smoke.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "competition_sources": [],
+  "dataset_sources": [
+    "arcainionprime/taaf-kaggle-source",
+    "driessmit1/arc3-vllm-h100-wheelhouse-v3",
+    "driessmit1/vrfai-qwen3-6-27b-fp8-hf-snapshot"
+  ],
+  "kernel_sources": [],
+  "model_sources": [],
+  "machine_shape": "NvidiaRtxPro6000"
+}

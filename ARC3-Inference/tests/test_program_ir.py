@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from inference.agent.program_ir import (
     COMPILER_VERSION,
@@ -21,7 +21,7 @@ from inference.agent.program_ir import (
     program_tool_parameters_schema,
 )
 from inference.agent.python_tool_sandbox import run_sandboxed_python
-from inference.agent.tool_agent import ToolAgent
+from inference.agent.tool_agent import ToolAgent, _turn_tool_choice
 
 
 def name(value: str) -> dict:
@@ -1268,9 +1268,72 @@ class ProgramIRToolAgentTests(unittest.TestCase):
 
     def test_tool_requires_program_not_code(self) -> None:
         with TemporaryDirectory() as tmp:
-            schema = self.agent._tools(Path(tmp) / "state.json")[0]["function"]["parameters"]
+            function = self.agent._tools(Path(tmp) / "state.json")[0]["function"]
+            schema = function["parameters"]
         self.assertEqual(schema["required"], ["program"])
         self.assertNotIn("code", schema["properties"])
+        self.assertIs(function["strict"], True)
+
+    def test_non_vllm_provider_retains_compatible_tool_shape(self) -> None:
+        agent = ToolAgent(
+            model="m",
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        with TemporaryDirectory() as tmp:
+            function = agent._tools(Path(tmp) / "state.json")[0]["function"]
+        self.assertNotIn("strict", function)
+
+    def test_vllm_requires_constrained_tool_until_action_executes(self) -> None:
+        tools = [{"type": "function", "function": {"name": "python"}}]
+        self.assertEqual(
+            _turn_tool_choice(
+                tools,
+                provider="vllm",
+                turn_count=1,
+                step_executed=False,
+            ),
+            "required",
+        )
+        self.assertEqual(
+            _turn_tool_choice(
+                tools,
+                provider="vllm",
+                turn_count=2,
+                step_executed=True,
+            ),
+            "auto",
+        )
+        self.assertEqual(
+            _turn_tool_choice(
+                tools,
+                provider="openrouter",
+                turn_count=1,
+                step_executed=False,
+            ),
+            "auto",
+        )
+
+    def test_chat_completion_sends_selected_tool_choice_and_strict_schema(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tools = self.agent._tools(Path(tmp) / "state.json")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+        }
+        with patch(
+            "inference.agent.tool_agent.requests.post",
+            return_value=response,
+        ) as post:
+            self.agent._chat_completion(
+                [{"role": "user", "content": "inspect"}],
+                tools=tools,
+                tool_choice="required",
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["tool_choice"], "required")
+        self.assertIs(payload["tools"][0]["function"]["strict"], True)
 
     def test_malformed_provider_arguments_preserve_json_diagnostic(self) -> None:
         arguments, dispatch = self.agent._decode_tool_arguments(
