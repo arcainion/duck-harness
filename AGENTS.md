@@ -25,3 +25,76 @@
 - The older `nervous_mirzakhani` container is a stopped one-shot container
   with no persistent command, repository mount, or GPU request. Do not use it
   for Duck deployment testing.
+
+## Running `make kaggle-duck` (Kaggle deployment)
+
+- The target lives in `ARC3-Inference/Makefile` (lines 407-422) and must be run
+  from inside `ARC3-Inference/`. It delegates to TAAF's `kaggle` deployment:
+  the current `tufa-arc-agi-framework` + `ARC3-Inference` sources are bundled
+  into a Kaggle source dataset, a private notebook is pushed, and the notebook
+  boots a local vLLM server and runs the duck against it.
+- It must be run inside the `duck-kaggle-dev` container, which has the repo at
+  `/workspace/duck-harness` (see "Docker / Kaggle development container"
+  above). The container is a `kaggle/python` image, so the `kaggle` CLI and
+  `make install`ed venv must be set up there. Use the wrapper
+  `ARC3-Inference/kaggle-duck.sh`, which runs `make kaggle-duck` with sensible
+  defaults and prints the notebook/dataset URLs plus a best-effort
+  `kaggle kernels status` after a live push. Run it from the Windows host as:
+
+  ```powershell
+  $dockerCli = 'C:\Users\arcai\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe'
+  & $dockerCli exec duck-kaggle-dev bash /workspace/duck-harness/ARC3-Inference/kaggle-duck.sh
+  ```
+
+  or interactively from a shell inside the container
+  (`& $dockerCli exec -it duck-kaggle-dev bash`), working from
+  `/workspace/duck-harness/ARC3-Inference/`:
+
+  ```bash
+  ./kaggle-duck.sh
+  ```
+
+- The wrapper defaults to `RUN_NAME=duck-harness-kaggle`,
+  `KAGGLE_KERNEL_SLUG=taaf-<RUN_NAME>`, and
+  `KAGGLE_DATASET_REF=<KAGGLE_USERNAME>/taaf-kaggle-source-<RUN_NAME>`.
+  Override any value by exporting it first, e.g.
+  `RUN_NAME=duck-harness-20260816 ./kaggle-duck.sh`; `KAGGLE_DRY_RUN=true`
+  stages without pushing. Its status check uses the credential export
+  workaround for the container's `kaggle` CLI.
+- Prerequisites: run `make install` first (the target uses `uv run --no-sync`),
+  the `kaggle` CLI must be installed and on `PATH` inside the container
+  (`python -m pip install kaggle`), and credentials must resolve inside the
+  container from `KAGGLE_USERNAME` + `KAGGLE_KEY` (or
+  `~/.kaggle/kaggle.json`). The CLI is verified with `kaggle kernels list
+  --mine` before pushing.
+- `LOCAL_ANALYZER_PROVIDER` must be vLLM/OpenAI-compatible; the setup rejects
+  anything else (e.g. `openrouter`) because the notebook runs its own vLLM.
+- Typical per-run overrides (inside the container, via the wrapper):
+
+  ```bash
+  RUN_NAME=duck-harness-20260816 \
+  KAGGLE_KERNEL_SLUG=taaf-duck-harness-20260816 \
+  KAGGLE_DATASET_REF=arcainionprime/taaf-kaggle-source-duck-harness-20260816 \
+  ./kaggle-duck.sh
+  ```
+
+  The kernel title must slugify to the kernel slug. Use
+  `DEPLOYMENT_WAIT=true` to block until the notebook finishes and pull the
+  output back into the run directory, and `KAGGLE_DRY_RUN=true` to stage the
+  bundles and metadata without calling the Kaggle API.
+- Target defaults (Makefile, not the README): `AGENT=duck-harness`,
+  `MODEL=local`, `KAGGLE_DUCK_PUBLIC_HARNESS=true` (the 25 official
+  ARC-AGI-3 games), `N_PASSES=1`, `CONCURRENT_JOBS=28`,
+  `MAX_RUNTIME_MINUTES=132`, `MAX_EXPERIMENT_RUNTIME_MINUTES=540`,
+  `ANALYZER_TIMEOUT=900`.
+- The notebook attaches the duck solver's declared datasets:
+  `driessmit1/arc3-vllm-h100-wheelhouse-v3` (vLLM wheelhouse, installed
+  offline into a temporary target dir) and
+  `driessmit1/vrfai-qwen3-6-27b-fp8-hf-snapshot` (served as
+  `vrfai/Qwen3.6-27B-FP8`). The setup asserts the expected GPU shape before
+  starting vLLM.
+- Accelerator defaults to `NvidiaRtxPro6000` (rtx-pro-6000 profile,
+  `max_model_len=65536`, TP=1). With `KAGGLE_ACCELERATOR=NvidiaTeslaT4` the
+  profile switches to `max_model_len=8192`, TP=2 across the two exposed T4s.
+  Pass `KAGGLE_ACCELERATOR=...` as a Make override to match the requested
+  allocation; Kaggle hardware is not identical to the local T4 machine.
