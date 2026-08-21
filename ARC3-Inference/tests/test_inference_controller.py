@@ -7,9 +7,11 @@ from inference.agent.inference_controller import (
     OUTCOME_AWARE_POLICY,
     InferenceControllerConfig,
     action_family,
+    action_guard_decision,
     action_guard_reason,
     build_experience_snapshot,
     evaluate_outcome_match,
+    _masked_grid_fingerprint,
     frame_fingerprint,
     normalize_action_key,
     transition_metadata,
@@ -37,6 +39,31 @@ class InferenceControllerTests(TestCase):
 
         self.assertEqual(frame_fingerprint(first), frame_fingerprint(same_visible_state))
         self.assertNotEqual(frame_fingerprint(first), frame_fingerprint(next_level))
+
+    def test_action_guard_decision_scans_noop_history_once(self) -> None:
+        state = _frame(1, step=2)
+        with mock.patch(
+            "inference.agent.inference_controller.action_noop_trials",
+            return_value=2,
+        ) as noop_trials:
+            code, reason = action_guard_decision([], state, "LEFT", self.config)
+
+        self.assertEqual(code, "repeated_exact_noop")
+        self.assertIn("2 confirmed no-op trials", reason)
+        noop_trials.assert_called_once_with([], state, "LEFT")
+
+    def test_masked_fingerprint_cache_serves_behavioral_rechecks(self) -> None:
+        _masked_grid_fingerprint.cache_clear()
+        grid = tuple(tuple((row + column) % 4 for column in range(20)) for row in range(20))
+        masked = frozenset({(0, 0), (5, 5)})
+
+        first = _masked_grid_fingerprint(1, grid, masked)
+        second = _masked_grid_fingerprint(1, grid, masked)
+
+        self.assertEqual(first, second)
+        cache = _masked_grid_fingerprint.cache_info()
+        self.assertEqual(cache.misses, 1)
+        self.assertEqual(cache.hits, 1)
 
     def test_absent_configuration_preserves_legacy_disabled_default(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):

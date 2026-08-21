@@ -300,6 +300,59 @@ class SolverControllerTests(TestCase):
         self.assertEqual(result["stop_reason"], "action_error")
         self.assertEqual(result["stop_detail"], "RuntimeError: second action failed")
 
+    def test_action_batch_coalesces_runtime_state_writes(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        frame = Frame(grid=((0,),), step=0, level=1)
+        action = SimpleNamespace(
+            id=SimpleNamespace(value=arcengine.GameAction.ACTION1.value, name="ACTION1"),
+            data={},
+        )
+        session.controller_config = InferenceControllerConfig(enabled=False)
+        session.history_entries = [HistoryEntry(action="", frame=frame)]
+        session._runtime_state_dirty = False
+        session.game = SimpleNamespace(
+            current_state=SimpleNamespace(
+                available_actions={arcengine.GameAction.ACTION1.value}
+            )
+        )
+        session._normalize_actions = lambda arguments: ([action, action, action], None)
+        session.current_frame = lambda: frame
+        session.should_stop = lambda: False
+        session.write_viewer_payload = lambda: None
+        runtime_writes: list[Frame | None] = []
+
+        def write_state(*, current_frame: Frame | None = None) -> None:
+            runtime_writes.append(current_frame)
+            session._runtime_state_dirty = False
+
+        def execute(*_args, **kwargs):
+            self.assertFalse(kwargs["flush_runtime_state"])
+            session.history_entries.append(HistoryEntry(action="UP", frame=frame))
+            session._runtime_state_dirty = True
+            return {
+                "executed": True,
+                "action_num": len(session.history_entries) - 1,
+                "level": 1,
+                "score": 0,
+                "reward": 0.0,
+                "state": "NOT_FINISHED",
+                "valid_actions": ["UP"],
+                "board_changed": False,
+                "done": False,
+                "level_completed": False,
+                "game_over": False,
+                "run_complete": False,
+                "action_display": "UP",
+            }
+
+        session.write_runtime_state = write_state
+        session._execute_action = execute
+
+        result = session.step_env({"actions": ["UP", "UP", "UP"]})
+
+        self.assertEqual(result["executed_count"], 3)
+        self.assertEqual(runtime_writes, [frame])
+
     def test_prediction_result_is_structured(self) -> None:
         result = _evaluate_strategy_prediction(
             {"test_action": "SPACE", "expected_outcome": "new_state"},

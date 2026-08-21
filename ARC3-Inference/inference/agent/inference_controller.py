@@ -87,11 +87,11 @@ class InferenceControllerConfig:
         )
 
 
-@lru_cache(maxsize=2_048)
 def _grid_fingerprint(level: int, grid: tuple[tuple[int, ...], ...]) -> str:
     return _masked_grid_fingerprint(level, grid, frozenset())
 
 
+@lru_cache(maxsize=2_048)
 def _masked_grid_fingerprint(
     level: int,
     grid: tuple[tuple[int, ...], ...],
@@ -274,20 +274,31 @@ def action_noop_trials(history: list[HistoryEntry], current_frame: Frame | None,
 def action_guard_reason_code(
     history: list[HistoryEntry], current_frame: Frame | None, action: str, config: InferenceControllerConfig
 ) -> str | None:
+    return action_guard_decision(history, current_frame, action, config)[0]
+
+
+def action_guard_decision(
+    history: list[HistoryEntry],
+    current_frame: Frame | None,
+    action: str,
+    config: InferenceControllerConfig,
+) -> tuple[str | None, str | None]:
+    """Return a guard code and message from one history scan."""
     if not config.enabled:
-        return None
-    if action_noop_trials(history, current_frame, action) >= config.same_state_noop_limit:
-        return "repeated_exact_noop"
-    return None
+        return None, None
+    trials = action_noop_trials(history, current_frame, action)
+    if trials < config.same_state_noop_limit:
+        return None, None
+    return (
+        "repeated_exact_noop",
+        f"exact state/action pair already produced {trials} confirmed no-op trials",
+    )
 
 
 def action_guard_reason(
     history: list[HistoryEntry], current_frame: Frame | None, action: str, config: InferenceControllerConfig
 ) -> str | None:
-    if action_guard_reason_code(history, current_frame, action, config) is None:
-        return None
-    trials = action_noop_trials(history, current_frame, action)
-    return f"exact state/action pair already produced {trials} confirmed no-op trials"
+    return action_guard_decision(history, current_frame, action, config)[1]
 
 
 def _rank_actions(

@@ -33,8 +33,7 @@ from inference.agent.action_names import (
 from inference.agent.inference_controller import (
     InferenceControllerConfig,
     action_family,
-    action_guard_reason,
-    action_guard_reason_code,
+    action_guard_decision,
     build_experience_snapshot,
     evaluate_outcome_match,
     frame_fingerprint,
@@ -388,6 +387,7 @@ class _HarnessGameSession:
         default_factory=InferenceControllerConfig.from_env
     )
     _viewer_events_flushed: int = field(default=0, init=False, repr=False)
+    _runtime_state_dirty: bool = field(default=False, init=False, repr=False)
 
     def current_frame(self) -> Frame:
         return Frame(
@@ -396,12 +396,19 @@ class _HarnessGameSession:
             level=_level_number(self.game),
         )
 
-    def write_runtime_state(self) -> None:
+    def write_runtime_state(self, *, current_frame: Frame | None = None) -> None:
         write_runtime_state(
             self.state_path,
-            current_frame=self.current_frame(),
+            current_frame=current_frame or self.current_frame(),
             history=self.history_entries,
         )
+        self._runtime_state_dirty = False
+
+    def _flush_runtime_state_if_dirty(self) -> None:
+        if not getattr(self, "_runtime_state_dirty", False):
+            return
+        latest_frame = self.history_entries[-1].frame if self.history_entries else None
+        self.write_runtime_state(current_frame=latest_frame)
 
     def seed_initial_history(self) -> None:
         if not self.history_entries:
@@ -923,19 +930,13 @@ class _HarnessGameSession:
                 return self._error_payload(message)
 
             action_display = _format_action_display(action.id.name, dict(action.data))
-            guard_reason = action_guard_reason(
+            guard_reason_code, guard_reason = action_guard_decision(
                 self.history_entries,
                 self.current_frame(),
                 action_display,
                 self.controller_config,
             )
             if guard_reason is not None:
-                guard_reason_code = action_guard_reason_code(
-                    self.history_entries,
-                    self.current_frame(),
-                    action_display,
-                    self.controller_config,
-                )
                 stop_reason = "loop_guard"
                 stop_detail = guard_reason
                 current = self.current_frame()
@@ -1000,8 +1001,10 @@ class _HarnessGameSession:
                     batch_size=batch_size,
                     strategy_prediction=strategy_prediction,
                     flush_viewer_payload=False,
+                    flush_runtime_state=False,
                 )
             except Exception as exc:
+                self._flush_runtime_state_if_dirty()
                 if executed_payloads:
                     stop_reason = "action_error"
                     stop_detail = f"{type(exc).__name__}: {exc}"
@@ -1080,6 +1083,7 @@ class _HarnessGameSession:
             final_payload["stop_reason"] = stop_reason
             if stop_detail is not None:
                 final_payload["stop_detail"] = stop_detail
+        self._flush_runtime_state_if_dirty()
         self.write_viewer_payload()
         return final_payload
 
@@ -1096,6 +1100,7 @@ class _HarnessGameSession:
         strategy_prediction: dict[str, Any] | None = None,
         generated_tokens: int | None = None,
         flush_viewer_payload: bool = True,
+        flush_runtime_state: bool = True,
     ) -> dict[str, Any]:
         previous_grid = _grid_from_state(self.game.current_state)
         previous_frame = self.current_frame()
@@ -1120,7 +1125,9 @@ class _HarnessGameSession:
         self.history_entries.append(
             HistoryEntry(action=action_display, frame=current_frame)
         )
-        self.write_runtime_state()
+        self._runtime_state_dirty = True
+        if flush_runtime_state:
+            self.write_runtime_state(current_frame=current_frame)
 
         completed = int(new_state.levels_completed)
         reward = float(completed - previous_completed) / max(

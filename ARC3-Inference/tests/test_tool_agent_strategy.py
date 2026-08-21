@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import requests
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase, mock
@@ -12,16 +14,20 @@ from inference.agent.python_tool_policy import (
     RUNTIME_HELPER_SIGNATURES,
 )
 from inference.agent.program_ir import program_tool_parameters_schema
+from inference.agent.prompts import TOOL_CALL_FORMAT_GUIDANCE
 from inference.agent.runtime_state import Frame, HistoryEntry, write_runtime_state
 from inference.agent.tool_agent import (
     ToolAgent,
     _ChatCompletionResult,
     _build_system_prompt,
+    _compact_multimodal_history_message,
+    _compact_no_tool_retry_message,
     _contains_tool_call_markup,
     _estimate_tokens,
     _extract_labeled_blocks,
     _extract_scientist_note,
     _format_action_span,
+    _message_contains_image,
     _normalize_summary_text,
     _render_tool_call_markup,
     _render_tool_result_display,
@@ -85,6 +91,113 @@ class ToolAgentStrategyTests(TestCase):
         self.assertIsInstance(first["content"], list)
         self.assertIsInstance(second["content"], list)
 
+    def test_multimodal_history_omits_image_bytes_but_keeps_text(self) -> None:
+        original = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "inspect this grid"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64," + ("A" * 100_000)},
+                },
+            ],
+        }
+
+        compact = _compact_multimodal_history_message(original)
+
+        rendered = json.dumps(compact)
+        self.assertIn("inspect this grid", rendered)
+        self.assertIn("image omitted from retained history", rendered)
+        self.assertNotIn("data:image/png;base64", rendered)
+        self.assertLess(_estimate_tokens(compact), _estimate_tokens(original) // 100)
+
+    def test_failed_request_does_not_consume_level_start_image(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1, 2),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            with mock.patch.dict(os.environ, {"MULTIMODAL_CONTEXT": "level_start"}):
+                agent = self._agent()
+                agent._tool_steps = 1
+                with mock.patch.object(
+                    agent,
+                    "_chat_completion",
+                    side_effect=requests.ConnectionError("unavailable"),
+                ):
+                    result = agent.analyze(state_path, 0, valid_actions=["LEFT"])
+
+        self.assertTrue(result.retryable_failure)
+        self.assertIsNone(agent._last_image_level)
+
+    def test_stop_before_first_request_does_not_commit_unsent_history(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1, 2),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            with mock.patch.dict(os.environ, {"MULTIMODAL_CONTEXT": "level_start"}):
+                agent = self._agent()
+                agent._ensure_session(state_path)
+                previous_history = [
+                    {"role": "user", "content": "previous turn"},
+                    {"role": "assistant", "content": "previous answer"},
+                ]
+                agent._history_messages = list(previous_history)
+                with mock.patch.object(agent, "_chat_completion") as completion:
+                    result = agent.analyze(
+                        state_path,
+                        0,
+                        valid_actions=["LEFT"],
+                        should_stop=lambda: True,
+                    )
+
+        completion.assert_not_called()
+        self.assertTrue(result.yielded_control)
+        self.assertEqual(agent._history_messages, previous_history)
+        self.assertIsNone(agent._last_image_level)
+
+    def test_context_trimmed_image_is_not_marked_as_delivered(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1, 2),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            huge_image = {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64," + ("A" * 100_000)},
+            }
+            captured_messages: list[list[dict]] = []
+
+            def complete(messages: list[dict], **_kwargs: object) -> _ChatCompletionResult:
+                captured_messages.append(json.loads(json.dumps(messages)))
+                return _ChatCompletionResult(message={"content": "no action"})
+
+            with (
+                mock.patch.dict(os.environ, {"MULTIMODAL_CONTEXT": "level_start"}),
+                mock.patch(
+                    "inference.agent.tool_agent.current_grid_image_part",
+                    return_value=huge_image,
+                ),
+            ):
+                agent = self._agent()
+                agent._tool_steps = 1
+                agent._context_budget_tokens = 6_000
+                with mock.patch.object(agent, "_chat_completion", side_effect=complete):
+                    agent.analyze(state_path, 0, valid_actions=["LEFT"])
+
+        self.assertFalse(any(_message_contains_image(item) for item in captured_messages[0]))
+        self.assertIsNone(agent._last_image_level)
+
     def test_tool_schema_and_token_estimate_are_cached_per_decode_mode(self) -> None:
         agent = self._agent()
         state_path = Path("state.json")
@@ -130,6 +243,60 @@ class ToolAgentStrategyTests(TestCase):
                 agent.analyze(state_path, 0, valid_actions=["LEFT"])
 
         snapshot.assert_not_called()
+
+    def test_no_tool_retry_compacts_failed_attempt_in_request_and_history(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            frame = Frame(grid=((1,),), step=0, level=1)
+            write_runtime_state(
+                state_path,
+                current_frame=frame,
+                history=[HistoryEntry(action="", frame=frame)],
+            )
+            agent = self._agent()
+            agent._tool_steps = 2
+            long_content = "PLAN_START " + ("c" * 8_000) + " PLAN_TAIL"
+            long_reasoning = "REASON_START " + ("r" * 8_000) + " REASON_TAIL"
+            responses = iter(
+                [
+                    _ChatCompletionResult(
+                        message={"content": long_content, "reasoning": long_reasoning},
+                        finish_reason="stop",
+                        usage={},
+                    ),
+                    _ChatCompletionResult(
+                        message={"content": "still no tool"},
+                        finish_reason="stop",
+                        usage={},
+                    ),
+                ]
+            )
+            captured_requests: list[list[dict]] = []
+
+            def complete(messages: list[dict], **_kwargs: object) -> _ChatCompletionResult:
+                captured_requests.append(json.loads(json.dumps(messages)))
+                return next(responses)
+
+            with mock.patch.object(agent, "_chat_completion", side_effect=complete):
+                agent.analyze(state_path, 0, valid_actions=["LEFT"])
+
+        retry_messages = captured_requests[1]
+        compact = next(message for message in retry_messages if message.get("role") == "assistant")
+        self.assertNotIn("reasoning", compact)
+        self.assertLess(len(compact["content"]), 400)
+        self.assertIn("compacted for retry", compact["content"])
+        retry_payload = json.dumps(retry_messages)
+        history_payload = json.dumps(agent._history_messages)
+        self.assertNotIn("PLAN_TAIL", retry_payload)
+        self.assertNotIn("REASON_TAIL", retry_payload)
+        self.assertNotIn("PLAN_TAIL", history_payload)
+        self.assertNotIn("REASON_TAIL", history_payload)
+
+    def test_no_tool_retry_compactor_uses_reasoning_when_content_is_empty(self) -> None:
+        compact = _compact_no_tool_retry_message("", "reasoning-only plan")
+        self.assertEqual(compact["role"], "assistant")
+        self.assertIn("reasoning-only plan", compact["content"])
+        self.assertNotIn("reasoning", compact.keys())
 
     def test_runtime_state_uses_compact_internal_json(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -269,6 +436,24 @@ class ToolAgentStrategyTests(TestCase):
         self.assertIn("Experience controller:", prompt)
         self.assertNotIn("[[1, 2], [3, 4]]", prompt)
         self.assertLess(len(prompt), 10_000)
+
+    def test_turn_prompt_does_not_repeat_cached_system_instructions(self) -> None:
+        agent = self._agent()
+        frame = Frame(grid=((1, 2), (3, 4)), step=0, level=1)
+
+        prompt = agent._build_user_prompt(
+            0,
+            valid_actions=["LEFT", "RIGHT", "SPACE"],
+            current_frame=frame,
+            history_entries=[HistoryEntry(action="", frame=frame)],
+            experience_snapshot=None,
+        )
+
+        self.assertLess(_estimate_tokens(prompt), 250)
+        self.assertNotIn("Before writing code", prompt)
+        self.assertNotIn(TOOL_CALL_FORMAT_GUIDANCE, prompt)
+        self.assertNotIn("You may call `action(actions)` more than once", prompt)
+        self.assertIn("Act now with minimal ProgramIR", prompt)
 
     def test_context_trim_drops_summary_if_summary_would_exceed_budget(self) -> None:
         agent = self._agent()

@@ -185,6 +185,7 @@ _PERSISTENT_HISTORY_TOKEN_BUDGET = 4096
 _RESPONSE_META_MAX_CHARS = 4000
 _TOOL_NAME_MAX_CHARS = 80
 _TOOL_CALL_ID_MAX_CHARS = 128
+_NO_TOOL_RETRY_EXCERPT_CHARS = 240
 
 _PYTHON_TOOL_DESCRIPTION = (
     "Compile and run one ephemeral structured ProgramIR against preloaded ASCII game state. "
@@ -262,6 +263,51 @@ def _normalize_summary_text(value: Any, *, max_chars: int | None = 280) -> str:
         return text
     omitted = len(text) - max_chars
     return f"{text[:max_chars].rstrip()}... [{omitted} chars omitted]"
+
+
+def _compact_no_tool_retry_message(content: str, reasoning: str) -> dict[str, str]:
+    """Keep a failed no-tool attempt useful without replaying its full token cost."""
+    source = content.strip() or reasoning.strip()
+    excerpt = _normalize_summary_text(source, max_chars=_NO_TOOL_RETRY_EXCERPT_CHARS)
+    message = "[No tool call was produced; the previous analysis was compacted for retry."
+    if excerpt:
+        message += f" Summary: {excerpt}"
+    message += "]"
+    return {"role": "assistant", "content": message}
+
+
+def _message_contains_image(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        isinstance(part, dict) and str(part.get("type", "")).strip() == "image_url"
+        for part in content
+    )
+
+
+def _compact_multimodal_history_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Remove image bytes after their request while retaining textual context."""
+    content = message.get("content")
+    if str(message.get("role", "")).strip() != "user" or not isinstance(content, list):
+        return message
+    if not _message_contains_image(message):
+        return message
+    retained_parts = [
+        part
+        for part in content
+        if not (isinstance(part, dict) and str(part.get("type", "")).strip() == "image_url")
+    ]
+    retained_parts.append(
+        {
+            "type": "text",
+            "text": (
+                "[Previously supplied grid image omitted from retained history; "
+                "inspect current_frame for exact current data.]"
+            ),
+        }
+    )
+    compact = dict(message)
+    compact["content"] = retained_parts
+    return compact
 
 
 def _extract_labeled_blocks(content: str, labels: list[str]) -> dict[str, str]:
@@ -1447,11 +1493,11 @@ class ToolAgent:
             include_image = True
         elif current_frame is not None and image_mode == "level_start":
             include_image = current_frame.level != self._last_image_level
-            if include_image:
-                self._last_image_level = current_frame.level
         image_part = current_grid_image_part(current_frame) if include_image else None
         if image_part is None:
             return {"role": "user", "content": user_prompt}
+        if image_mode == "level_start" and current_frame is not None:
+            self._last_image_level = current_frame.level
 
         return {
             "role": "user",
@@ -1602,7 +1648,7 @@ class ToolAgent:
         lines.extend(
             [
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-                "See system prompt for runtime variable reference. Use Python to inspect the evidence and call `action(actions)` with the best valid action.",
+                "Use one minimal `python` call to inspect only the evidence needed and act.",
             ]
         )
         if experience_snapshot and experience_snapshot.get("enabled"):
@@ -1612,15 +1658,11 @@ class ToolAgent:
                     [
                         "Experience controller:",
                         compressed_exp,
-                        "Follow the controller phase and action budget: orient with one compact inspection, explore with a controlled falsifiable probe, continue progress when evidence supports it, and abandon or revise the current hypothesis in recover. Never retry a discouraged action in the same visible state.",
+                        "Follow the reported phase and action budget; do not repeat a discouraged action in the same visible state.",
                     ]
                 )
-        lines.append(
-            "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, "
-            "but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`."
-        )
         lines.extend(self._summarized_knowledge_lines())
-        lines.append("end of world model. ")
+        lines.append("End of world model.")
         if action_num == 0:
             lines.append(
                 "Ground yourself in `current_frame` before acting, but start with a compact structural summary rather than restating the full frame."
@@ -1629,14 +1671,9 @@ class ToolAgent:
             lines.append(
                 "Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes."
             )
-        lines.extend(
-            [
-                "Before writing code, quickly state in one line: (a) what you think the board contains, (b) what the goal is, (c) what you will test. Then write minimal code to test it.",
-                "When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. Batch only a short sequence supported by observed action effects; use single probes while orienting, exploring, or recovering.",
-                "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.",
-                "If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.",
-                TOOL_CALL_FORMAT_GUIDANCE,
-            ]
+        lines.append(
+            "Act now with minimal ProgramIR: use a single probe while uncertain, or only a short "
+            "evidence-backed action batch."
         )
         if "MOUSE" in _normalize_valid_actions(valid_actions):
             lines.append("If you use MOUSE, include integer row and col arguments.")
@@ -2528,7 +2565,11 @@ class ToolAgent:
         return trimmed
 
     def _persistent_history_messages(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-        trimmed = self._trim_messages_for_context(messages, tools=tools)
+        compact_messages = [
+            _compact_multimodal_history_message(message)
+            for message in messages
+        ]
+        trimmed = self._trim_messages_for_context(compact_messages, tools=tools)
         if not trimmed:
             return []
         trimmed_history = trimmed[1:]
@@ -2699,8 +2740,13 @@ class ToolAgent:
         preserve_history = True
         strict_tool_retry = False
         initial_tools = self._tools(state_path, strict=False)
+        previous_image_level = self._last_image_level
+        user_message = self._build_user_message(user_prompt, current_frame)
+        level_start_image_marked = self._last_image_level != previous_image_level
+        response_received = False
+        level_start_image_delivered = False
         messages: list[dict[str, Any]] = self._trim_messages_for_context(
-            [{"role": "system", "content": self._system_prompt}, *self._history_messages, self._build_user_message(user_prompt, current_frame)],
+            [{"role": "system", "content": self._system_prompt}, *self._history_messages, user_message],
             tools=initial_tools,
             preserve_recent=1,
         )
@@ -2776,6 +2822,11 @@ class ToolAgent:
                             request_index_within_turn=latest_request_index,
                         )
                     result = self._chat_completion(messages, **request_kwargs)
+                    response_received = True
+                    if level_start_image_marked and any(
+                        _message_contains_image(message) for message in messages
+                    ):
+                        level_start_image_delivered = True
                     self._accumulate_usage_tokens(result.usage)
                     if self._save_request_logs:
                         _append_request_snapshot(
@@ -2859,7 +2910,7 @@ class ToolAgent:
                         assistant_message["content"] = None
 
                     if content or reasoning:
-                        messages.append(assistant_message)
+                        messages.append(_compact_no_tool_retry_message(content, reasoning))
                     yielded_control_reason = control_yield_reason()
                     if yielded_control_reason is not None:
                         break
@@ -3005,7 +3056,9 @@ class ToolAgent:
             log.warning("analyzer failed at action %d: %s", display_action_num, exc)
             return None
         finally:
-            if preserve_history:
+            if level_start_image_marked and not level_start_image_delivered:
+                self._last_image_level = previous_image_level
+            if preserve_history and response_received:
                 self._history_messages = self._persistent_history_messages(
                     messages,
                     tools=self._tools(state_path, strict=strict_tool_retry),
