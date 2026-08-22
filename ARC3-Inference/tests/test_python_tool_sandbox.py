@@ -765,3 +765,25 @@ class PythonToolSandboxTests(TestCase):
             self.assertEqual(sandbox_module._SANDBOX_PREWARM_STARTING, 0)
 
         worker.close.assert_called_once_with(terminate=True)
+
+    def test_sandbox_cancellation_interrupts_running_generated_code(self) -> None:
+        response = run_sandboxed_python(
+            code="while True:\n    pass",
+            timeout_seconds=5,
+            initial_state={
+                "current_frame": None,
+                "history": [],
+                "valid_actions": [],
+                "last_action_result": {},
+                "experience": {},
+                "strategy": {},
+                "memory": {},
+            },
+            action_handler=lambda _actions: {"action_result": {}, "state": {}},
+            should_stop=lambda: True,
+        )
+
+        self.assertEqual(response["error"], "Tool execution cancelled by host.")
+        self.assertEqual(response["diagnostic"]["type"], "CancelledError")
+        self.assertEqual(response["diagnostic"]["retry"], "do_not_retry")
+        self.assertLess(response["efficiency"]["elapsed_seconds"], 2)

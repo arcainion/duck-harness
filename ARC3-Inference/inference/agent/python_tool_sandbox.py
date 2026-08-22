@@ -5088,6 +5088,7 @@ def run_sandboxed_python(
     action_handler: Callable[[list[dict[str, Any]]], dict[str, Any]],
     strategy_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     memory_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
     transport_state = dict(initial_state)
@@ -5165,6 +5166,28 @@ def run_sandboxed_python(
 
         deadline = time.monotonic() + max(1, int(timeout_seconds))
         while True:
+            if should_stop is not None:
+                try:
+                    cancelled = bool(should_stop())
+                except Exception:  # noqa: BLE001 - cancellation checks are advisory
+                    cancelled = False
+                if cancelled:
+                    _kill_process_group(process)
+                    finish_process()
+                    return {
+                        "error": "Tool execution cancelled by host.",
+                        "diagnostic": {
+                            "type": "CancelledError",
+                            "line": None,
+                            "column": None,
+                            "source": None,
+                            "hint": "The enclosing run requested cancellation.",
+                            "retry": "do_not_retry",
+                        },
+                        "stdout": "",
+                        "action_results": list(host_action_results),
+                        "efficiency": efficiency(),
+                    }
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _kill_process_group(process)
@@ -5186,7 +5209,8 @@ def run_sandboxed_python(
                 }
 
             try:
-                line = stdout_queue.get(timeout=remaining)
+                poll_timeout = min(remaining, 0.1) if should_stop is not None else remaining
+                line = stdout_queue.get(timeout=poll_timeout)
             except queue.Empty:
                 continue
             if line is None:

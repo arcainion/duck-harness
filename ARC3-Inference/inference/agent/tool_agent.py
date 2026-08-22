@@ -1,6 +1,7 @@
 """Direct OpenAI-compatible tool-calling analyzer for ARC puzzle runs."""
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
@@ -107,6 +108,31 @@ def _strip_tool_call_markup(text: str) -> str:
     return stripped.strip()
 
 
+class _GeneratedCodeLimitError(ValueError):
+    """Raised when generated source exceeds a host-side parsing limit."""
+
+
+def _parse_bounded_generated_python(code: str) -> ast.AST:
+    source_bytes = len(code.encode("utf-8"))
+    if source_bytes > _LOCAL_ANALYZER_MAX_CODE_BYTES:
+        raise _GeneratedCodeLimitError(
+            f"Python code is limited to {_LOCAL_ANALYZER_MAX_CODE_BYTES} UTF-8 bytes; "
+            f"received {source_bytes}."
+        )
+    try:
+        tree = ast.parse(code, filename="<python_tool>", mode="exec")
+    except (MemoryError, RecursionError) as exc:
+        raise _GeneratedCodeLimitError(
+            "Python code is too deeply nested or complex to parse safely."
+        ) from exc
+    for node_count, _node in enumerate(ast.walk(tree), start=1):
+        if node_count > _LOCAL_ANALYZER_MAX_AST_NODES:
+            raise _GeneratedCodeLimitError(
+                f"Python code is limited to {_LOCAL_ANALYZER_MAX_AST_NODES} syntax nodes."
+            )
+    return tree
+
+
 def _normalize_generated_python_code(value: Any) -> str:
     """Recover unambiguous executable Python from common model wrappers.
 
@@ -121,8 +147,15 @@ def _normalize_generated_python_code(value: Any) -> str:
             return None
         candidate = candidate.rstrip()
         try:
-            compile(candidate, "<python_tool>", "exec")
-        except (SyntaxError, ValueError, OverflowError):
+            tree = _parse_bounded_generated_python(candidate)
+            compile(tree, "<python_tool>", "exec")
+        except (
+            SyntaxError,
+            ValueError,
+            OverflowError,
+            MemoryError,
+            RecursionError,
+        ):
             return None
         return candidate
 
@@ -243,10 +276,27 @@ _LOCAL_ANALYZER_TEMPERATURE = _get_env_float("LOCAL_ANALYZER_TEMPERATURE", 0.6)
 _LOCAL_ANALYZER_TOP_P = _get_env_float("LOCAL_ANALYZER_TOP_P", 0.95)
 _LOCAL_ANALYZER_TOP_K = _get_env_int("LOCAL_ANALYZER_TOP_K", 20)
 _LOCAL_ANALYZER_SEED = _get_env_int("LOCAL_ANALYZER_SEED", -1)
+_LOCAL_ANALYZER_HTTP_MAX_ATTEMPTS = max(
+    1, _get_env_int("LOCAL_ANALYZER_HTTP_MAX_ATTEMPTS", 3)
+)
+_LOCAL_ANALYZER_HTTP_RETRY_BASE_SECONDS = max(
+    0.0, _get_env_float("LOCAL_ANALYZER_HTTP_RETRY_BASE_SECONDS", 0.25)
+)
+_LOCAL_ANALYZER_HTTP_RETRY_MAX_SECONDS = max(
+    _LOCAL_ANALYZER_HTTP_RETRY_BASE_SECONDS,
+    _get_env_float("LOCAL_ANALYZER_HTTP_RETRY_MAX_SECONDS", 2.0),
+)
+_LOCAL_ANALYZER_MAX_CODE_BYTES = max(
+    1024, _get_env_int("LOCAL_ANALYZER_MAX_CODE_BYTES", 65_536)
+)
+_LOCAL_ANALYZER_MAX_AST_NODES = max(
+    256, _get_env_int("LOCAL_ANALYZER_MAX_AST_NODES", 20_000)
+)
 _REQUEST_SAFETY_MARGIN_TOKENS = 512
 _CONTEXT_OVERFLOW_RETRY_TRIM_TOKENS = 512
 _PERSISTENT_HISTORY_ASSISTANT_TURNS = 30
 _RESPONSE_META_MAX_CHARS = 4000
+_TRANSIENT_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 _PYTHON_TOOL_DESCRIPTION = (
     "Run one ephemeral Python snippet against preloaded letter-coded game state. Globals: "
@@ -1297,6 +1347,10 @@ class ToolAgent:
         self._http_session = requests.Session()
         self._forced_tool_choice_supported: bool | None = None
         self._turn_efficiency_metrics: dict[str, float | int] = {}
+        self._http_max_attempts = _LOCAL_ANALYZER_HTTP_MAX_ATTEMPTS
+        self._http_retry_base_seconds = _LOCAL_ANALYZER_HTTP_RETRY_BASE_SECONDS
+        self._http_retry_max_seconds = _LOCAL_ANALYZER_HTTP_RETRY_MAX_SECONDS
+        self._should_stop_callback: Callable[[], bool] | None = None
 
     def close(self) -> None:
         self._http_session.close()
@@ -1940,29 +1994,105 @@ class ToolAgent:
             tool_choice=tool_choice,
             seed=_LOCAL_ANALYZER_SEED,
         )
+        started_at = time.monotonic()
+        deadline = (
+            started_at + request_timeout_seconds
+            if request_timeout_seconds is not None
+            else None
+        )
+        request_attempts = 0
+
+        def stop_requested() -> bool:
+            if self._should_stop_callback is None:
+                return False
+            try:
+                return bool(self._should_stop_callback())
+            except Exception as exc:  # noqa: BLE001
+                log.warning("analyzer HTTP stop check failed: %s", exc)
+                return False
+
         def post_chat(request_payload: dict[str, Any]) -> requests.Response:
+            nonlocal request_attempts
+            if stop_requested():
+                raise requests.RequestException("analyzer request cancelled")
+            timeout = (
+                request_timeout_seconds
+                if request_timeout_seconds is not None
+                else self._timeout
+            )
+            if deadline is not None:
+                timeout = max(0.1, deadline - time.monotonic())
+            request_attempts += 1
             return self._http_session.post(
                 f"{self._model.base_url.rstrip('/')}/chat/completions",
                 headers=self._headers(),
                 json=request_payload,
-                timeout=request_timeout_seconds if request_timeout_seconds is not None else self._timeout,
+                timeout=timeout,
             )
 
-        started_at = time.monotonic()
-        response = post_chat(payload)
-        request_attempts = 1
+        def retry_delay(response: requests.Response | None) -> float:
+            delay = min(
+                self._http_retry_max_seconds,
+                self._http_retry_base_seconds * (2 ** max(0, request_attempts - 1)),
+            )
+            headers = getattr(response, "headers", {}) if response is not None else {}
+            try:
+                retry_after = float(headers.get("Retry-After", ""))
+            except (AttributeError, TypeError, ValueError):
+                retry_after = 0.0
+            if retry_after > 0:
+                delay = min(self._http_retry_max_seconds, retry_after)
+            return max(0.0, delay)
+
+        def wait_to_retry(response: requests.Response | None) -> bool:
+            delay = retry_delay(response)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                delay = min(delay, remaining)
+            end = time.monotonic() + delay
+            while True:
+                if stop_requested():
+                    raise requests.RequestException("analyzer request cancelled")
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return True
+                time.sleep(min(0.05, remaining))
+
+        def post_with_retry(request_payload: dict[str, Any]) -> requests.Response:
+            while True:
+                try:
+                    candidate = post_chat(request_payload)
+                except requests.RequestException:
+                    if request_attempts >= self._http_max_attempts or not wait_to_retry(None):
+                        raise
+                    continue
+                if (
+                    candidate.status_code in _TRANSIENT_HTTP_STATUS_CODES
+                    and request_attempts < self._http_max_attempts
+                ):
+                    candidate.close()
+                    if wait_to_retry(candidate):
+                        continue
+                return candidate
+
+        response = post_with_retry(payload)
         forced_tool_fallback = False
-        if isinstance(tool_choice, dict) and response.status_code in {400, 404, 422}:
+        if (
+            isinstance(tool_choice, dict)
+            and response.status_code in {400, 404, 422}
+            and request_attempts < self._http_max_attempts
+        ):
             detail = response.text.lower()
             if "tool_choice" in detail or "function" in detail or "tool choice" in detail:
                 fallback_payload = dict(payload)
                 fallback_payload["tool_choice"] = "auto"
                 response.close()
-                response = post_chat(fallback_payload)
-                request_attempts += 1
+                response = post_with_retry(fallback_payload)
                 forced_tool_fallback = True
                 self._forced_tool_choice_supported = False
-        elif isinstance(tool_choice, dict):
+        elif isinstance(tool_choice, dict) and response.status_code < 400:
             self._forced_tool_choice_supported = True
         try:
             response.raise_for_status()
@@ -1971,22 +2101,40 @@ class ToolAgent:
             message = f"{exc}"
             if detail:
                 message += f" | response: {detail}"
+            response.close()
             raise requests.RequestException(message) from exc
         if getattr(response, "status_code", 200) >= 400:
             detail = response.text.strip()
             message = f"{response.status_code} Error"
             if detail:
                 message += f" | response: {detail}"
+            response.close()
             raise requests.RequestException(message)
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            response.close()
+            raise requests.RequestException("server returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            response.close()
+            raise requests.RequestException("server returned a non-object response")
         choices = payload.get("choices", [])
-        if not choices:
+        if not isinstance(choices, list) or not choices:
+            response.close()
             raise requests.RequestException("server returned no choices")
         choice = choices[0]
+        if not isinstance(choice, dict):
+            response.close()
+            raise requests.RequestException("server returned an invalid choice")
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            response.close()
+            raise requests.RequestException("server returned a choice without a message")
+        usage = payload.get("usage")
         return _ChatCompletionResult(
-            message=choice.get("message", {}),
+            message=message,
             finish_reason=str(choice.get("finish_reason", "") or ""),
-            usage=payload.get("usage"),
+            usage=usage if isinstance(usage, dict) else None,
             latency_seconds=time.monotonic() - started_at,
             request_attempts=request_attempts,
             forced_tool_fallback=forced_tool_fallback,
@@ -2058,15 +2206,38 @@ class ToolAgent:
                 action_name = item.strip()
                 if not action_name:
                     raise ValueError(f"Action {index} is empty.")
-                normalized.append({"action": action_name})
+                canonical_name = to_model_action(to_engine_action(action_name) or action_name)
+                if self._current_valid_actions and canonical_name not in self._current_valid_actions:
+                    raise ValueError(
+                        f"Action {index} ({canonical_name}) is not currently valid; "
+                        f"choose one of {self._current_valid_actions}."
+                    )
+                normalized.append({"action": canonical_name})
                 continue
             if isinstance(item, dict):
                 action_name = str(item.get("action", "")).strip()
                 if not action_name:
                     raise ValueError(f"Action {index} is missing an `action` field.")
-                entry = {"action": action_name}
-                if action_name.upper() == "MOUSE" and ("x" in item or "y" in item):
+                canonical_name = to_model_action(to_engine_action(action_name) or action_name)
+                if self._current_valid_actions and canonical_name not in self._current_valid_actions:
+                    raise ValueError(
+                        f"Action {index} ({canonical_name}) is not currently valid; "
+                        f"choose one of {self._current_valid_actions}."
+                    )
+                entry = {"action": canonical_name}
+                if canonical_name == "MOUSE" and ("x" in item or "y" in item):
                     raise ValueError(f"Action {index} uses legacy MOUSE x/y fields; use row and col.")
+                if canonical_name == "MOUSE":
+                    if "row" not in item or "col" not in item:
+                        raise ValueError(
+                            f"Action {index} MOUSE requires integer `row` and `col` fields."
+                        )
+                    for coordinate in ("row", "col"):
+                        value = item.get(coordinate)
+                        if isinstance(value, bool) or not isinstance(value, int):
+                            raise ValueError(
+                                f"Action {index} MOUSE `{coordinate}` must be an integer."
+                            )
                 if "row" in item:
                     entry["row"] = item.get("row")
                 if "col" in item:
@@ -2175,7 +2346,27 @@ class ToolAgent:
                 {"error": "python requires a non-empty `code` string."}, separators=(",", ":")
             ))
         try:
-            compile(code, "<python_tool>", "exec")
+            tree = _parse_bounded_generated_python(code)
+            compile(tree, "<python_tool>", "exec")
+        except _GeneratedCodeLimitError as exc:
+            payload = _python_tool_payload(
+                {
+                    "error": f"Python validation error: {exc}",
+                    "diagnostic": {
+                        "type": "GeneratedCodeLimitError",
+                        "line": None,
+                        "column": None,
+                        "source": None,
+                        "hint": "Use a smaller bounded program and retry.",
+                        "retry": "correct_and_retry",
+                    },
+                    "stdout": "",
+                    "action_results": [],
+                }
+            )
+            return _ToolDispatchResult(
+                self._render_tool_payload(payload, truncate_fields=("error",))
+            )
         except SyntaxError as exc:
             payload = _python_tool_payload(
                 {
@@ -2248,6 +2439,19 @@ class ToolAgent:
                 normalized_actions = self._normalize_python_actions(actions)
             except (TypeError, ValueError) as exc:
                 raise SandboxHostActionError(str(exc)) from exc
+            live_frame, _live_history = load_runtime_state(state_path)
+            if live_frame is not None:
+                rows, cols = live_frame.shape
+                for index, action in enumerate(normalized_actions, start=1):
+                    if action.get("action") != "MOUSE":
+                        continue
+                    row = int(action["row"])
+                    col = int(action["col"])
+                    if not (0 <= row < rows and 0 <= col < cols):
+                        raise SandboxHostActionError(
+                            f"Action {index} MOUSE coordinate ({row}, {col}) is outside "
+                            f"the current frame shape {rows}x{cols}."
+                        )
             if terminal_action_result is not None:
                 reason = _terminal_action_reason(terminal_action_result) or "terminal_state"
                 compact_payload = {
@@ -2328,6 +2532,7 @@ class ToolAgent:
             action_handler=_handle_action,
             strategy_handler=self._record_strategy,
             memory_handler=self._record_python_memory,
+            should_stop=self._should_stop_callback,
         )
         self._record_efficiency("sandbox_calls", 1)
         self._record_efficiency(
@@ -2619,6 +2824,7 @@ class ToolAgent:
                 return "turn_time_budget"
             return None
 
+        self._should_stop_callback = should_stop
         try:
             turn_count = 0
             while self._tool_steps is None or turn_count < self._tool_steps:
@@ -2894,6 +3100,7 @@ class ToolAgent:
                 self._history_messages = previous_history_messages
             self._step_env_callback = None
             self._current_valid_actions = []
+            self._should_stop_callback = None
 
         if step_executed:
             status_message = "Step executed."

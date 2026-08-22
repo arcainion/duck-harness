@@ -443,3 +443,64 @@ class ToolAgentCodeGenerationTests(TestCase):
             payload["result"]["last_action_result"]["action_display"],
             "UP",
         )
+
+    def test_generated_python_limits_block_source_before_sandbox_execution(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        for limit_name, limit_value, code in (
+            ("_LOCAL_ANALYZER_MAX_CODE_BYTES", 16, "result = '" + "x" * 32 + "'"),
+            ("_LOCAL_ANALYZER_MAX_AST_NODES", 5, "values = [1, 2, 3]\nresult = sum(values)"),
+        ):
+            with (
+                self.subTest(limit=limit_name),
+                patch.object(tool_agent_module, limit_name, limit_value),
+                patch.object(tool_agent_module, "run_sandboxed_python") as sandbox,
+            ):
+                response = agent._run_python_tool(
+                    Path("unused/tool_runtime_state.json"), {"code": code}
+                )
+
+            payload = json.loads(response.content)
+            self.assertEqual(payload["diagnostic"]["type"], "GeneratedCodeLimitError")
+            self.assertIn("smaller bounded program", payload["diagnostic"]["hint"])
+            sandbox.assert_not_called()
+
+    def test_mouse_action_outside_current_frame_is_rejected_before_dispatch(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._current_valid_actions = ["MOUSE"]
+
+        def unexpected_step(_request: dict) -> dict:
+            raise AssertionError("out-of-bounds action reached the environment")
+
+        agent._step_env_callback = unexpected_step
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "current_frame": {
+                            "grid": [[0, 0], [0, 0]],
+                            "step": 0,
+                            "level": 1,
+                        },
+                        "history": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            response = agent._run_python_tool(
+                state_path,
+                {"code": "action({'action': 'MOUSE', 'row': 2, 'col': 0})"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertIn("outside the current frame shape 2x2", payload["error"])
+        self.assertFalse(response.step_executed)

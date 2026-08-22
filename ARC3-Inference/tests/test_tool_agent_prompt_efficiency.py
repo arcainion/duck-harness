@@ -271,6 +271,8 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
 
     def test_failed_auto_fallback_propagates_second_response(self) -> None:
         agent = ToolAgent(model="unit-test-model")
+        agent._http_max_attempts = 2
+        agent._http_retry_base_seconds = 0
         rejected = _Response(422, "function tool_choice is unsupported", {})
         fallback_failure = _Response(503, "server overloaded", {})
         agent._http_session.post = Mock(side_effect=[rejected, fallback_failure])
@@ -289,6 +291,65 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
 
         with self.assertRaisesRegex(requests.RequestException, "no choices"):
             agent._chat_completion([{"role": "user", "content": "go"}], tools=None)
+
+    def test_chat_completion_recovers_from_transient_status_and_connection_error(self) -> None:
+        for first_failure in (
+            _Response(503, "temporarily unavailable", {}),
+            requests.ConnectionError("connection reset"),
+        ):
+            with self.subTest(failure=type(first_failure).__name__):
+                agent = ToolAgent(model="unit-test-model")
+                agent._http_retry_base_seconds = 0
+                success = _Response(
+                    200,
+                    "",
+                    {"choices": [{"message": {"content": "ok"}}]},
+                )
+                agent._http_session.post = Mock(side_effect=[first_failure, success])
+
+                result = agent._chat_completion(
+                    [{"role": "user", "content": "go"}], tools=None
+                )
+
+                self.assertEqual(result.message, {"content": "ok"})
+                self.assertEqual(result.request_attempts, 2)
+                self.assertEqual(agent._http_session.post.call_count, 2)
+                if isinstance(first_failure, _Response):
+                    self.assertTrue(first_failure.closed)
+
+    def test_chat_completion_bounds_transient_retries(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._http_max_attempts = 3
+        agent._http_retry_base_seconds = 0
+        failures = [_Response(503, "overloaded", {}) for _ in range(3)]
+        agent._http_session.post = Mock(side_effect=failures)
+
+        with self.assertRaisesRegex(requests.RequestException, "overloaded"):
+            agent._chat_completion([{"role": "user", "content": "go"}], tools=None)
+
+        self.assertEqual(agent._http_session.post.call_count, 3)
+        self.assertTrue(all(response.closed for response in failures))
+
+    def test_chat_completion_rejects_malformed_success_envelopes(self) -> None:
+        invalid_json = _Response(200, "", {})
+        invalid_json.json = Mock(side_effect=ValueError("invalid json"))
+        cases = (
+            (invalid_json, "invalid JSON"),
+            (_Response(200, "", []), "non-object response"),
+            (_Response(200, "", {"choices": [None]}), "invalid choice"),
+            (_Response(200, "", {"choices": [{}]}), "without a message"),
+        )
+        for response, expected in cases:
+            with self.subTest(expected=expected):
+                agent = ToolAgent(model="unit-test-model")
+                agent._http_session.post = Mock(return_value=response)
+
+                with self.assertRaisesRegex(requests.RequestException, expected):
+                    agent._chat_completion(
+                        [{"role": "user", "content": "go"}], tools=None
+                    )
+
+                self.assertTrue(response.closed)
 
 
 if __name__ == "__main__":

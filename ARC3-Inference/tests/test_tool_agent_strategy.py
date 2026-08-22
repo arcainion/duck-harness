@@ -177,3 +177,29 @@ class ToolAgentStrategyTests(TestCase):
             prompt,
         )
         self.assertLess(len(prompt), 10_000)
+
+    def test_python_actions_are_canonicalized_and_checked_against_current_actions(self) -> None:
+        agent = self._agent()
+        agent._current_valid_actions = ["LEFT", "MOUSE"]
+
+        self.assertEqual(
+            agent._normalize_python_actions(["ACTION3"]),
+            [{"action": "LEFT"}],
+        )
+        with self.assertRaisesRegex(ValueError, "RIGHT.*not currently valid"):
+            agent._normalize_python_actions(["RIGHT"])
+
+    def test_mouse_actions_require_integer_row_and_col(self) -> None:
+        agent = self._agent()
+        agent._current_valid_actions = ["MOUSE"]
+
+        for action in (
+            {"action": "MOUSE"},
+            {"action": "MOUSE", "row": 1},
+            {"action": "MOUSE", "row": True, "col": 2},
+            {"action": "MOUSE", "row": 1, "col": 2.5},
+        ):
+            with self.subTest(action=action), self.assertRaisesRegex(
+                ValueError, "requires integer|must be an integer"
+            ):
+                agent._normalize_python_actions([action])
