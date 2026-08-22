@@ -504,3 +504,62 @@ class ToolAgentCodeGenerationTests(TestCase):
         payload = json.loads(response.content)
         self.assertIn("outside the current frame shape 2x2", payload["error"])
         self.assertFalse(response.step_executed)
+
+    def test_analyze_returns_structured_missing_state_failure(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        result = agent.analyze(Path("missing/tool_runtime_state.json"), action_num=0)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.failure_category, "state_missing")
+        self.assertIn("does not exist", result.failure_detail)
+
+    def test_diagnostic_io_failures_do_not_abort_analyzer_turn(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._tool_steps = 1
+        agent._chat_completion = lambda *_args, **_kwargs: _ChatCompletionResult(
+            message={
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "python",
+                            "arguments": '{"code":"result=42"}',
+                        },
+                    }
+                ]
+            },
+            finish_reason="tool_calls",
+        )
+
+        def failed_callback(_transcript: str) -> None:
+            raise RuntimeError("viewer disconnected")
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}), encoding="utf-8"
+            )
+            with patch.object(
+                tool_agent_module,
+                "_write_prompt_log_snapshot",
+                side_effect=OSError("disk unavailable"),
+            ), patch.object(tool_agent_module.log, "warning"):
+                result = agent.analyze(
+                    state_path,
+                    action_num=0,
+                    transcript_updated=failed_callback,
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.failure_category, "tool_step_exhausted")
+        self.assertTrue(result.exhausted)

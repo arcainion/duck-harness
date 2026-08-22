@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import io
 import json
 import logging
 import os
@@ -292,6 +293,12 @@ _LOCAL_ANALYZER_MAX_CODE_BYTES = max(
 _LOCAL_ANALYZER_MAX_AST_NODES = max(
     256, _get_env_int("LOCAL_ANALYZER_MAX_AST_NODES", 20_000)
 )
+_LOCAL_ANALYZER_CANDIDATES = min(
+    4, max(1, _get_env_int("LOCAL_ANALYZER_CANDIDATES", 1))
+)
+_LOCAL_ANALYZER_DURABLE_STATE_BYTES = max(
+    16_384, _get_env_int("LOCAL_ANALYZER_DURABLE_STATE_BYTES", 1_048_576)
+)
 _REQUEST_SAFETY_MARGIN_TOKENS = 512
 _CONTEXT_OVERFLOW_RETRY_TRIM_TOKENS = 512
 _PERSISTENT_HISTORY_ASSISTANT_TURNS = 30
@@ -532,6 +539,10 @@ class AnalyzerTurnResult:
     reasoning: str = ""
     yielded_control: bool = False
     efficiency_metrics: dict[str, float | int] | None = None
+    failure_category: str | None = None
+    failure_detail: str = ""
+    attempts: int = 0
+    exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -758,6 +769,36 @@ def _resolve_analyzer_model(model: str) -> AnalyzerModelConfig:
     return AnalyzerModelConfig(provider=provider, base_url=base_url, model_id=requested)
 
 
+def _resolve_fallback_models() -> list[AnalyzerModelConfig]:
+    raw = os.environ.get("LOCAL_ANALYZER_FALLBACKS_JSON", "").strip()
+    if not raw:
+        return []
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.warning("LOCAL_ANALYZER_FALLBACKS_JSON ignored: %s", exc)
+        return []
+    if not isinstance(values, list):
+        log.warning("LOCAL_ANALYZER_FALLBACKS_JSON must contain a JSON list")
+        return []
+    resolved: list[AnalyzerModelConfig] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        model_id = str(value.get("model") or value.get("model_id") or "").strip()
+        base_url = str(value.get("base_url") or "").strip()
+        provider = str(value.get("provider") or "vllm").strip().lower()
+        if model_id and base_url:
+            resolved.append(
+                AnalyzerModelConfig(
+                    provider=provider or "vllm",
+                    base_url=_host_accessible_base_url(base_url),
+                    model_id=model_id,
+                )
+            )
+    return resolved
+
+
 def _append_transcript_section(log_path: Path, label: str, content: str) -> None:
     rendered_content = content.strip()
     if not rendered_content:
@@ -772,13 +813,22 @@ class _TranscriptBuffer:
     """Append-only transcript with one file handle and lazy full rendering."""
 
     def __init__(self, log_path: Path, header: str) -> None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = open(log_path, "a", encoding="utf-8")
+        self._handle: Any = io.StringIO()
         self._parts = [header]
         self._rendered: str | None = header
         self._closed = False
-        self._handle.write(header)
-        self._handle.flush()
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = open(log_path, "a", encoding="utf-8")
+            self._handle.write(header)
+            self._handle.flush()
+        except OSError as exc:
+            log.warning("analyzer transcript unavailable at %s: %s", log_path, exc)
+            try:
+                self._handle.close()
+            except (OSError, ValueError):
+                pass
+            self._handle = io.StringIO()
 
     def append(self, label: str, content: str) -> str:
         section = _render_transcript_section(label, content)
@@ -786,8 +836,16 @@ class _TranscriptBuffer:
             return ""
         self._parts.append(section)
         self._rendered = None
-        self._handle.write(section)
-        self._handle.flush()
+        try:
+            self._handle.write(section)
+            self._handle.flush()
+        except (OSError, ValueError) as exc:
+            log.warning("analyzer transcript write failed: %s", exc)
+            try:
+                self._handle.close()
+            except (OSError, ValueError):
+                pass
+            self._handle = io.StringIO()
         return section
 
     def render(self) -> str:
@@ -797,7 +855,10 @@ class _TranscriptBuffer:
 
     def close(self) -> None:
         if not self._closed:
-            self._handle.close()
+            try:
+                self._handle.close()
+            except (OSError, ValueError):
+                pass
             self._closed = True
 
     def __del__(self) -> None:
@@ -1236,6 +1297,20 @@ def _write_prompt_log_snapshot(
         f.write("\n")
 
 
+def _safe_append_request_snapshot(*args: Any, **kwargs: Any) -> None:
+    try:
+        _append_request_snapshot(*args, **kwargs)
+    except OSError as exc:
+        log.warning("analyzer request log write failed: %s", exc)
+
+
+def _safe_write_prompt_log_snapshot(*args: Any, **kwargs: Any) -> None:
+    try:
+        _write_prompt_log_snapshot(*args, **kwargs)
+    except OSError as exc:
+        log.warning("analyzer prompt log write failed: %s", exc)
+
+
 def _normalize_message_content(content: Any) -> str:
     def _strip_think_tags(text: str) -> str:
         cleaned = _THINK_TAG_RE.sub("", text)
@@ -1278,6 +1353,9 @@ class _ChatCompletionResult:
     latency_seconds: float = 0.0
     request_attempts: int = 1
     forced_tool_fallback: bool = False
+    candidate_count: int = 1
+    selected_candidate_index: int = 0
+    valid_candidate_count: int = 1
 
 
 class ToolAgent:
@@ -1305,6 +1383,7 @@ class ToolAgent:
                 model_id=resolved_model.model_id,
             )
         self._model = resolved_model
+        self._fallback_models = _resolve_fallback_models()
         configured_timeout = _LOCAL_ANALYZER_TIMEOUT if timeout is None else timeout
         self._timeout = None if configured_timeout is None or configured_timeout <= 0 else float(configured_timeout)
         self._api_key = str(api_key or "").strip()
@@ -1350,7 +1429,26 @@ class ToolAgent:
         self._http_max_attempts = _LOCAL_ANALYZER_HTTP_MAX_ATTEMPTS
         self._http_retry_base_seconds = _LOCAL_ANALYZER_HTTP_RETRY_BASE_SECONDS
         self._http_retry_max_seconds = _LOCAL_ANALYZER_HTTP_RETRY_MAX_SECONDS
+        self._candidate_count = _LOCAL_ANALYZER_CANDIDATES
+        self._tokenizer_path = os.environ.get("LOCAL_ANALYZER_TOKENIZER_PATH", "").strip()
+        self._tokenizer: Any | None = None
+        self._tokenizer_load_attempted = False
         self._should_stop_callback: Callable[[], bool] | None = None
+
+    def _activate_next_fallback_model(self) -> bool:
+        if not self._fallback_models:
+            return False
+        previous = self._model
+        self._model = self._fallback_models.pop(0)
+        self._forced_tool_choice_supported = None
+        log.warning(
+            "analyzer failover: %s at %s -> %s at %s",
+            previous.model_id,
+            previous.base_url,
+            self._model.model_id,
+            self._model.base_url,
+        )
+        return True
 
     def close(self) -> None:
         self._http_session.close()
@@ -1371,6 +1469,40 @@ class ToolAgent:
         if request_index <= 1:
             return self._max_output_tokens
         return max(1, min(self._max_output_tokens, _LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT))
+
+    def _exact_request_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> int | None:
+        if not self._tokenizer_path:
+            return None
+        if not self._tokenizer_load_attempted:
+            self._tokenizer_load_attempted = True
+            try:
+                from transformers import AutoTokenizer
+
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    self._tokenizer_path,
+                    local_files_only=True,
+                    trust_remote_code=False,
+                )
+            except Exception as exc:  # noqa: BLE001 - optional optimization
+                log.warning("analyzer tokenizer unavailable at %s: %s", self._tokenizer_path, exc)
+                self._tokenizer = None
+        if self._tokenizer is None:
+            return None
+        try:
+            tokens = self._tokenizer.apply_chat_template(
+                messages,
+                tools=tools or None,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            return max(1, len(tokens))
+        except Exception as exc:  # noqa: BLE001 - fall back to conservative estimate
+            log.warning("analyzer exact token count failed: %s", exc)
+            return None
 
     def _record_efficiency(self, key: str, value: float | int) -> None:
         existing = self._turn_efficiency_metrics.get(key, 0)
@@ -1407,6 +1539,91 @@ class ToolAgent:
             self._frame_payload_cache = None
             self._experience_snapshot_cache = None
             self._generated_tool_call_count = 0
+            self._load_durable_state()
+
+    def _durable_state_path(self) -> Path | None:
+        if getattr(self, "_session_runtime_dir", None) is None:
+            return None
+        path = self._session_runtime_dir
+        return path.with_name(f"{path.stem}_agent_state.json")
+
+    def _load_durable_state(self) -> None:
+        path = self._durable_state_path()
+        if path is None or not path.is_file():
+            return
+        try:
+            if path.stat().st_size > _LOCAL_ANALYZER_DURABLE_STATE_BYTES:
+                raise ValueError("durable agent state exceeds its configured size limit")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                raise ValueError("unsupported durable agent state")
+            for attribute, key in (
+                ("_summarized_knowledge", "summarized_knowledge"),
+                ("_strategy_memory", "strategy_memory"),
+                ("_python_memory", "python_memory"),
+            ):
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    setattr(self, attribute, dict(value))
+            history = payload.get("history_messages")
+            if isinstance(history, list):
+                self._history_messages = [dict(item) for item in history if isinstance(item, dict)]
+            for attribute, key in (
+                ("_last_step_summary", "last_step_summary"),
+                ("_last_action_result", "last_action_result"),
+            ):
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    setattr(self, attribute, dict(value))
+            self._session_total_tokens = max(0, int(payload.get("total_tokens", 0) or 0))
+            self._session_generated_tokens = max(
+                0, int(payload.get("generated_tokens", 0) or 0)
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            log.warning("durable analyzer state ignored at %s: %s", path, exc)
+
+    def _persist_durable_state(self) -> None:
+        path = self._durable_state_path()
+        if path is None:
+            return
+        history = list(self._history_messages)
+        payload = {
+            "version": 1,
+            "summarized_knowledge": self._summarized_knowledge,
+            "strategy_memory": self._strategy_memory,
+            "python_memory": self._python_memory,
+            "history_messages": history,
+            "last_step_summary": self._last_step_summary,
+            "last_action_result": self._last_action_result,
+            "total_tokens": self._session_total_tokens,
+            "generated_tokens": self._session_generated_tokens,
+        }
+        try:
+            encoded = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":"), default=str
+            )
+            while (
+                len(encoded.encode("utf-8")) > _LOCAL_ANALYZER_DURABLE_STATE_BYTES
+                and history
+            ):
+                history.pop(0)
+                payload["history_messages"] = history
+                encoded = json.dumps(
+                    payload, ensure_ascii=False, separators=(",", ":"), default=str
+                )
+            if len(encoded.encode("utf-8")) > _LOCAL_ANALYZER_DURABLE_STATE_BYTES:
+                payload["history_messages"] = []
+                encoded = json.dumps(
+                    payload, ensure_ascii=False, separators=(",", ":"), default=str
+                )
+            if len(encoded.encode("utf-8")) > _LOCAL_ANALYZER_DURABLE_STATE_BYTES:
+                raise ValueError("durable analyzer state exceeds its configured size limit")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(f"{path.suffix}.tmp")
+            temporary.write_text(encoded, encoding="utf-8")
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError) as exc:
+            log.warning("durable analyzer state write failed at %s: %s", path, exc)
 
     def _cached_frame_payloads(
         self,
@@ -1499,6 +1716,7 @@ class ToolAgent:
     def _record_python_memory(self, update: dict[str, Any]) -> dict[str, Any]:
         persisted = _bounded_python_memory(update)
         self._python_memory = persisted
+        self._persist_durable_state()
         return dict(persisted)
 
     def _record_strategy(self, update: dict[str, Any]) -> dict[str, Any]:
@@ -1573,6 +1791,7 @@ class ToolAgent:
             )
         if persisted.get("next_test"):
             self._summarized_knowledge["current_plan"] = str(persisted["next_test"])
+        self._persist_durable_state()
         return dict(self._strategy_memory)
 
     def _consume_strategy_prediction(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -1971,6 +2190,58 @@ class ToolAgent:
             }
         ]
 
+    def _score_candidate_choice(self, choice: Any) -> tuple[int, bool]:
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            return -10_000, False
+        message = choice["message"]
+        score = 0
+        valid = False
+        raw_tool_calls = message.get("tool_calls")
+        if isinstance(raw_tool_calls, list) and raw_tool_calls:
+            for raw_call in raw_tool_calls:
+                if not isinstance(raw_call, dict):
+                    score -= 100
+                    continue
+                function = raw_call.get("function")
+                if not isinstance(function, dict) or str(function.get("name", "")).strip() != "python":
+                    score -= 50
+                    continue
+                try:
+                    arguments = _normalize_tool_call_arguments(function.get("arguments", "{}"))
+                    code = _normalize_generated_python_code(arguments.get("code", ""))
+                    if not code:
+                        raise ValueError("empty Python code")
+                    tree = _parse_bounded_generated_python(code)
+                    compile(tree, "<python_tool_candidate>", "exec")
+                except (SyntaxError, TypeError, ValueError, OverflowError):
+                    score -= 100
+                    continue
+                score += 100
+                valid = True
+                for node in ast.walk(tree):
+                    if not (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "action"
+                        and node.args
+                    ):
+                        continue
+                    try:
+                        literal_actions = ast.literal_eval(node.args[0])
+                        self._normalize_python_actions(literal_actions)
+                    except (TypeError, ValueError, SyntaxError):
+                        score -= 40
+                    else:
+                        score += 20
+        content = _normalize_message_content(message.get("content", ""))
+        reasoning = _extract_reasoning_text(message)
+        if content or reasoning:
+            score += 10
+            valid = True
+        if str(choice.get("finish_reason", "")) == "length":
+            score -= 20
+        return score, valid
+
     def _chat_completion(
         self,
         messages: list[dict[str, Any]],
@@ -1993,6 +2264,7 @@ class ToolAgent:
             tools=tools,
             tool_choice=tool_choice,
             seed=_LOCAL_ANALYZER_SEED,
+            candidates=self._candidate_count,
         )
         started_at = time.monotonic()
         deadline = (
@@ -2122,7 +2394,12 @@ class ToolAgent:
         if not isinstance(choices, list) or not choices:
             response.close()
             raise requests.RequestException("server returned no choices")
-        choice = choices[0]
+        candidate_scores = [self._score_candidate_choice(choice) for choice in choices]
+        selected_candidate_index = max(
+            range(len(choices)),
+            key=lambda index: (candidate_scores[index][0], -index),
+        )
+        choice = choices[selected_candidate_index]
         if not isinstance(choice, dict):
             response.close()
             raise requests.RequestException("server returned an invalid choice")
@@ -2138,6 +2415,9 @@ class ToolAgent:
             latency_seconds=time.monotonic() - started_at,
             request_attempts=request_attempts,
             forced_tool_fallback=forced_tool_fallback,
+            candidate_count=len(choices),
+            selected_candidate_index=selected_candidate_index,
+            valid_candidate_count=sum(1 for _score, valid in candidate_scores if valid),
         )
 
     def _trim_tool_text(self, text: str) -> tuple[str, bool]:
@@ -2581,6 +2861,9 @@ class ToolAgent:
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> int:
+        exact = self._exact_request_tokens(messages, tools)
+        if exact is not None:
+            return exact
         payload: dict[str, Any] = {"messages": messages}
         if tools:
             payload["tools"] = tools
@@ -2701,6 +2984,12 @@ class ToolAgent:
         history_chars_total = sum(history_chars)
 
         def estimated_tokens() -> int:
+            exact = self._exact_request_tokens(
+                [system_message, *history],
+                tools,
+            )
+            if exact is not None:
+                return exact
             # Replacing the payload's empty `[]` adds each rendered message plus
             # `, ` between adjacent items. The system message is always retained.
             rendered_chars = (
@@ -2748,7 +3037,11 @@ class ToolAgent:
         should_stop: Callable[[], bool] | None = None,
     ) -> AnalyzerTurnResult | None:
         if not state_path.exists():
-            return None
+            return AnalyzerTurnResult(
+                step_executed=False,
+                failure_category="state_missing",
+                failure_detail=f"Runtime state does not exist: {state_path}",
+            )
         self._ensure_session(state_path)
         self._step_env_callback = step_env
         self._current_valid_actions = _normalize_valid_actions(valid_actions)
@@ -2783,7 +3076,10 @@ class ToolAgent:
         def append_transcript(label: str, content: str) -> None:
             section = transcript_buffer.append(label, content)
             if section and transcript_updated is not None:
-                transcript_updated(transcript_buffer.render())
+                try:
+                    transcript_updated(transcript_buffer.render())
+                except Exception as exc:  # noqa: BLE001 - diagnostics are best-effort
+                    log.warning("analyzer transcript callback failed: %s", exc)
 
         append_transcript("SYSTEM PROMPT", self._system_prompt)
         append_transcript("USER PROMPT", user_prompt)
@@ -2854,7 +3150,7 @@ class ToolAgent:
                     if request_timeout_seconds is not None:
                         request_kwargs["request_timeout_seconds"] = request_timeout_seconds
                     if self._save_request_logs:
-                        _append_request_snapshot(
+                        _safe_append_request_snapshot(
                             _resolve_request_log_path(state_path),
                             messages=latest_request_messages,
                             tools=latest_request_tools,
@@ -2867,11 +3163,18 @@ class ToolAgent:
                     result = self._chat_completion(messages, **request_kwargs)
                     self._record_efficiency("model_calls", result.request_attempts)
                     self._record_efficiency("model_seconds", result.latency_seconds)
+                    self._record_efficiency("model_candidates", result.candidate_count)
+                    self._record_efficiency(
+                        "valid_model_candidates", result.valid_candidate_count
+                    )
+                    self._record_efficiency(
+                        "selected_candidate_index", result.selected_candidate_index
+                    )
                     if result.forced_tool_fallback:
                         self._record_efficiency("forced_tool_fallbacks", 1)
                     self._accumulate_usage_tokens(result.usage)
                     if self._save_request_logs:
-                        _append_request_snapshot(
+                        _safe_append_request_snapshot(
                             _resolve_request_log_path(state_path),
                             messages=latest_request_messages,
                             tools=latest_request_tools,
@@ -2884,6 +3187,13 @@ class ToolAgent:
                         )
                 except requests.RequestException as exc:
                     if not _is_context_length_error(exc):
+                        if self._activate_next_fallback_model():
+                            self._record_efficiency("model_failovers", 1)
+                            append_transcript(
+                                "ANALYZER STATUS",
+                                f"model_failover: retrying with {self._model.model_id} after {exc}",
+                            )
+                            continue
                         raise
                     trimmed_messages = self._trim_messages_for_context(
                         messages,
@@ -3049,7 +3359,7 @@ class ToolAgent:
             append_transcript("ANALYZER STATUS", f"request_error: {exc}")
             preserve_history = False
             if latest_request_messages is not None:
-                _write_prompt_log_snapshot(
+                _safe_write_prompt_log_snapshot(
                     prompt_log,
                     model_id=self._model.model_id,
                     base_url=self._model.base_url,
@@ -3068,12 +3378,15 @@ class ToolAgent:
                 retryable_failure=True,
                 reasoning=captured_reasoning,
                 efficiency_metrics=dict(self._turn_efficiency_metrics),
+                failure_category="transport",
+                failure_detail=str(exc),
+                attempts=latest_request_index,
             )
         except Exception as exc:
             append_transcript("ANALYZER STATUS", f"error: {exc}")
             preserve_history = False
             if latest_request_messages is not None:
-                _write_prompt_log_snapshot(
+                _safe_write_prompt_log_snapshot(
                     prompt_log,
                     model_id=self._model.model_id,
                     base_url=self._model.base_url,
@@ -3087,7 +3400,14 @@ class ToolAgent:
                 )
             log.warning("analyzer failed at action %d: %s", display_action_num, exc)
             transcript_buffer.close()
-            return None
+            return AnalyzerTurnResult(
+                step_executed=False,
+                reasoning=captured_reasoning,
+                efficiency_metrics=dict(self._turn_efficiency_metrics),
+                failure_category="internal",
+                failure_detail=f"{type(exc).__name__}: {exc}",
+                attempts=latest_request_index,
+            )
         finally:
             if preserve_history:
                 self._history_messages = self._persistent_history_messages(
@@ -3098,6 +3418,7 @@ class ToolAgent:
                 )
             else:
                 self._history_messages = previous_history_messages
+            self._persist_durable_state()
             self._step_env_callback = None
             self._current_valid_actions = []
             self._should_stop_callback = None
@@ -3127,7 +3448,7 @@ class ToolAgent:
         )
         append_transcript("ANALYZER STATUS", status)
         if latest_request_messages is not None:
-            _write_prompt_log_snapshot(
+            _safe_write_prompt_log_snapshot(
                 prompt_log,
                 model_id=self._model.model_id,
                 base_url=self._model.base_url,
@@ -3140,9 +3461,23 @@ class ToolAgent:
                 transcript=transcript_buffer.render(),
             )
         transcript_buffer.close()
+        exhausted = bool(
+            not step_executed
+            and yielded_control_reason is None
+            and self._tool_steps is not None
+            and turn_count >= self._tool_steps
+        )
         return AnalyzerTurnResult(
             step_executed=step_executed,
             reasoning=captured_reasoning,
             yielded_control=yielded_control_reason is not None,
             efficiency_metrics=dict(self._turn_efficiency_metrics),
+            failure_category="tool_step_exhausted" if exhausted else None,
+            failure_detail=(
+                "Analyzer exhausted its tool-step budget without executing an action."
+                if exhausted
+                else ""
+            ),
+            attempts=latest_request_index,
+            exhausted=exhausted,
         )

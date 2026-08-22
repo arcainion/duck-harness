@@ -6,8 +6,10 @@ from typing import Any
 
 def normalize_provider(value: str | None) -> str:
     provider = str(value or "").strip().lower()
-    if provider in {"", "openai", "openai-compatible", "compat"}:
+    if provider in {"", "openai-compatible", "compat"}:
         return "vllm"
+    if provider in {"openai", "official-openai"}:
+        return "openai"
     if provider in {"openrouter", "router"}:
         return "openrouter"
     return provider
@@ -46,6 +48,7 @@ def build_chat_payload(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     seed: int | None = None,
+    candidates: int = 1,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
@@ -56,6 +59,8 @@ def build_chat_payload(
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    if candidates > 1:
+        payload["n"] = min(4, max(1, int(candidates)))
     if tools:
         payload["tools"] = tools
         if tool_choice:

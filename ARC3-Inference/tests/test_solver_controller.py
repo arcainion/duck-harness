@@ -4,10 +4,12 @@ import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import TestCase
+from unittest import TestCase, mock
 
 import arcengine
 
+from inference.agent.tool_agent import AnalyzerTurnResult
+from inference.framework import solver as solver_module
 from inference.agent.action_names import (
     MAX_ACTION_BATCH,
     to_engine_action,
@@ -26,6 +28,76 @@ from inference.framework.solver import (
 
 
 class SolverControllerTests(TestCase):
+    def test_analyzer_retry_circuit_breaker_stops_repeated_transport_failures(self) -> None:
+        run = SimpleNamespace(
+            state="playing",
+            history=[],
+            final_score=None,
+            solver_note=None,
+            solver_analysis_html=None,
+        )
+        state = SimpleNamespace(
+            raw=SimpleNamespace(state=arcengine.GameState.NOT_FINISHED),
+            available_actions={arcengine.GameAction.ACTION1.value},
+        )
+
+        def finish_game() -> None:
+            run.final_score = 0
+
+        game = SimpleNamespace(
+            current_state=state,
+            game_run=run,
+            finish_game=finish_game,
+        )
+        solver = SimpleNamespace(
+            max_runtime_s_per_game=None,
+            max_actions_per_game=None,
+            soft_time_remaining_seconds=lambda: None,
+        )
+        analyzer = SimpleNamespace(
+            total_tokens=0,
+            analyze=lambda *_args, **_kwargs: AnalyzerTurnResult(
+                step_executed=False,
+                retryable_failure=True,
+                failure_category="transport",
+                failure_detail="server unavailable",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = _HarnessGameSession(
+                solver=solver,
+                game=game,
+                analyzer=analyzer,
+                game_index=0,
+                pass_index=0,
+                state_path=root / "state.json",
+                transcript_path=root / "transcript.txt",
+                analysis_html_relpath="analysis.html",
+                stop_event=threading.Event(),
+                viewer_data_path=root / "viewer.json",
+                controller_config=InferenceControllerConfig(enabled=False),
+            )
+            for method_name in (
+                "seed_initial_history",
+                "write_runtime_state",
+                "_append_initial_viewer_event",
+                "write_viewer_payload",
+                "_write_analysis_html",
+            ):
+                setattr(session, method_name, lambda: None)
+            session._read_transcript_bytes = lambda: 0
+            session._transcript_delta_since = lambda _offset: ""
+
+            with (
+                mock.patch.object(solver_module, "ANALYZER_MAX_CONSECUTIVE_FAILURES", 2),
+                mock.patch.object(solver_module.time, "sleep"),
+            ):
+                session.play()
+
+        self.assertEqual(run.state, "crashed")
+        self.assertIn("circuit breaker opened", run.solver_note)
+
     def test_action7_round_trips_through_normalize_actions(self) -> None:
         self.assertEqual(to_engine_action("ACTION7"), "ACTION7")
         self.assertEqual(to_model_action("ACTION7"), "ACTION7")

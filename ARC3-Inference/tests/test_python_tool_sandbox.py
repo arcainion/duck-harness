@@ -178,6 +178,14 @@ class PythonToolSandboxTests(TestCase):
         self.assertLess(len(_SANDBOX_LAUNCHER), 256)
         self.assertLess(len(_SANDBOX_LAUNCHER), len(_SANDBOX_BOOTSTRAP) // 100)
 
+    def test_strict_os_isolation_fails_closed_without_bubblewrap(self) -> None:
+        with (
+            mock.patch.object(sandbox_module, "_SANDBOX_REQUIRE_OS_ISOLATION", True),
+            mock.patch.object(sandbox_module.shutil, "which", return_value=None),
+        ):
+            with self.assertRaisesRegex(OSError, "bubblewrap is unavailable"):
+                sandbox_module._sandbox_command()
+
     def test_sandbox_executes_supported_python(self) -> None:
         response = _run("result = sum(range(5))")
 

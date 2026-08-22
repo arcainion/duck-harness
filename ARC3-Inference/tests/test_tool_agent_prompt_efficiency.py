@@ -351,6 +351,76 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
 
                 self.assertTrue(response.closed)
 
+    def test_chat_completion_ranks_multiple_verified_candidates(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._candidate_count = 2
+        agent._current_valid_actions = ["LEFT"]
+        response = _Response(
+            200,
+            "",
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "python",
+                                        "arguments": '{"code":"for"}',
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "python",
+                                        "arguments": '{"code":"action(\\"LEFT\\")"}',
+                                    }
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    },
+                ]
+            },
+        )
+        agent._http_session.post = Mock(return_value=response)
+
+        result = agent._chat_completion(
+            [{"role": "user", "content": "go"}], tools=None
+        )
+
+        self.assertEqual(result.selected_candidate_index, 1)
+        self.assertEqual(result.candidate_count, 2)
+        self.assertEqual(result.valid_candidate_count, 1)
+        request_payload = agent._http_session.post.call_args.kwargs["json"]
+        self.assertEqual(request_payload["n"], 2)
+
+    def test_agent_activates_configured_fallback_model(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        config_type = type(agent._model)
+        agent._forced_tool_choice_supported = False
+        agent._fallback_models = [
+            config_type(
+                provider="openai",
+                base_url="https://fallback.invalid/v1",
+                model_id="fallback-model",
+            )
+        ]
+
+        with self.assertLogs("inference.agent.tool_agent", level="WARNING"):
+            activated = agent._activate_next_fallback_model()
+
+        self.assertTrue(activated)
+        self.assertEqual(agent._model.model_id, "fallback-model")
+        self.assertEqual(agent._model.provider, "openai")
+        self.assertIsNone(agent._forced_tool_choice_supported)
+        self.assertFalse(agent._activate_next_fallback_model())
+
 
 if __name__ == "__main__":
     unittest.main()

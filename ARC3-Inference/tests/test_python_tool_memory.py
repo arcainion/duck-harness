@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from inference.agent.tool_agent import ToolAgent, _bounded_python_memory
 
@@ -60,6 +61,31 @@ class PythonToolMemoryTests(unittest.TestCase):
             agent._session_runtime_dir,
             Path("shared-session/second.json").resolve(),
         )
+
+    def test_durable_state_restores_memory_strategy_history_and_usage(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text('{"current_frame":null,"history":[]}', encoding="utf-8")
+            first = ToolAgent(model="unit-test-model")
+            first._ensure_session(state_path)
+            first._record_python_memory({"route": ["LEFT"]})
+            first._record_strategy(
+                {"goal": "reach target", "hypothesis": "LEFT advances", "confidence": 0.8}
+            )
+            first._history_messages = [{"role": "user", "content": "persist me"}]
+            first._session_total_tokens = 17
+            first._session_generated_tokens = 5
+            first._persist_durable_state()
+
+            restored = ToolAgent(model="unit-test-model")
+            restored._ensure_session(state_path)
+
+        self.assertEqual(restored._python_memory, {"route": ["LEFT"]})
+        self.assertEqual(restored._strategy_memory["goal"], "reach target")
+        self.assertIn("LEFT advances", restored._summarized_knowledge["world_model"])
+        self.assertEqual(restored._history_messages, [{"role": "user", "content": "persist me"}])
+        self.assertEqual(restored.total_tokens, 17)
+        self.assertEqual(restored.generated_tokens, 5)
 
 
 if __name__ == "__main__":

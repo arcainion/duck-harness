@@ -75,6 +75,19 @@ from inference.utils.viewer_artifacts import (
 AnalyzerFactory = Callable[[taaf.game.Game, int], Any]
 
 ANALYZER_RETRY_BACKOFF_SECONDS = 1.0
+try:
+    ANALYZER_MAX_CONSECUTIVE_FAILURES = max(
+        1, int(os.environ.get("ANALYZER_MAX_CONSECUTIVE_FAILURES", "5"))
+    )
+except ValueError:
+    ANALYZER_MAX_CONSECUTIVE_FAILURES = 5
+try:
+    ANALYZER_RETRY_MAX_BACKOFF_SECONDS = max(
+        ANALYZER_RETRY_BACKOFF_SECONDS,
+        float(os.environ.get("ANALYZER_RETRY_MAX_BACKOFF_SECONDS", "16")),
+    )
+except ValueError:
+    ANALYZER_RETRY_MAX_BACKOFF_SECONDS = 16.0
 DEFAULT_CANCEL_DRAIN_TIMEOUT_SECONDS = 120.0
 _LOCAL_SERVER_PROCESS_ENV_KEYS = (
     "LOCAL_ANALYZER_API_KEY",
@@ -435,6 +448,7 @@ class _HarnessGameSession:
         self.write_viewer_payload()
         try:
             retry_analysis_step: int | None = None
+            consecutive_failures = 0
             while not self.should_stop():
                 if (
                     _is_engine_game_over(self.game)
@@ -472,13 +486,40 @@ class _HarnessGameSession:
                 if result is None:
                     raise RuntimeError("Analyzer did not return a result.")
                 if result.retryable_failure:
+                    consecutive_failures += 1
+                    if consecutive_failures >= ANALYZER_MAX_CONSECUTIVE_FAILURES:
+                        raise RuntimeError(
+                            "Analyzer circuit breaker opened after "
+                            f"{consecutive_failures} consecutive failures: "
+                            f"{getattr(result, 'failure_detail', '')}"
+                        )
                     retry_analysis_step = analysis_step
                     if self.should_stop():
                         break
-                    time.sleep(ANALYZER_RETRY_BACKOFF_SECONDS)
+                    time.sleep(
+                        min(
+                            ANALYZER_RETRY_MAX_BACKOFF_SECONDS,
+                            ANALYZER_RETRY_BACKOFF_SECONDS
+                            * (2 ** max(0, consecutive_failures - 1)),
+                        )
+                    )
                     continue
 
                 retry_analysis_step = None
+                failure_category = getattr(result, "failure_category", None)
+                if failure_category in {"internal", "state_missing"}:
+                    raise RuntimeError(
+                        f"Analyzer {failure_category} failure: "
+                        f"{getattr(result, 'failure_detail', '')}"
+                    )
+                if failure_category == "tool_step_exhausted":
+                    consecutive_failures += 1
+                    if consecutive_failures >= ANALYZER_MAX_CONSECUTIVE_FAILURES:
+                        raise RuntimeError(
+                            "Analyzer circuit breaker opened after repeated tool-step exhaustion."
+                        )
+                    continue
+                consecutive_failures = 0
                 if getattr(result, "yielded_control", False):
                     retry_analysis_step = analysis_step
                     continue

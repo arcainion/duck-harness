@@ -25,6 +25,10 @@ from typing import Any, Callable
 from inference.utils import segmentation as _segmentation
 from inference.utils.grid_utils import ARC_COLOR_CHARS
 
+_SANDBOX_REQUIRE_OS_ISOLATION = os.environ.get(
+    "LOCAL_ANALYZER_REQUIRE_OS_SANDBOX", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
 
 class SandboxHostActionError(Exception):
     """Raised when the sandbox host rejects an action request with a safe message."""
@@ -4900,6 +4904,10 @@ def _sandbox_command() -> tuple[list[str], str | None]:
     python_command = [sys.executable, "-I", "-S", "-c", _SANDBOX_LAUNCHER]
     bubblewrap = shutil.which("bwrap") if os.name == "posix" else None
     if bubblewrap is None:
+        if _SANDBOX_REQUIRE_OS_ISOLATION:
+            raise OSError(
+                "LOCAL_ANALYZER_REQUIRE_OS_SANDBOX is enabled, but bubblewrap is unavailable."
+            )
         return python_command, None
     return (
         [
@@ -5102,8 +5110,8 @@ def run_sandboxed_python(
             sandbox_dir = prepared.temp_dir
             stdout_queue = prepared.stdout_queue
         else:
-            command, isolated_cwd = _sandbox_command()
             try:
+                command, isolated_cwd = _sandbox_command()
                 process = subprocess.Popen(
                     command,
                     stdin=subprocess.PIPE,
@@ -5117,7 +5125,11 @@ def run_sandboxed_python(
                 )
             except OSError:
                 return {
-                    "error": "Sandbox process could not start.",
+                    "error": (
+                        "Sandbox process could not start because strict OS isolation is unavailable."
+                        if _SANDBOX_REQUIRE_OS_ISOLATION
+                        else "Sandbox process could not start."
+                    ),
                     "stdout": "",
                     "action_results": [],
                 }

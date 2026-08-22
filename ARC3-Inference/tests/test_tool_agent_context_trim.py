@@ -146,6 +146,38 @@ class ToolAgentContextTrimTests(unittest.TestCase):
         self.assertEqual(second_call_count, first_call_count)
         self.assertEqual(estimate_length.call_count, first_call_count + 1)
 
+    def test_configured_exact_tokenizer_replaces_character_estimate(self) -> None:
+        class FakeTokenizer:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[dict], list[dict]]] = []
+
+            def apply_chat_template(
+                self,
+                messages: list[dict],
+                *,
+                tools: list[dict],
+                tokenize: bool,
+                add_generation_prompt: bool,
+            ) -> list[int]:
+                self.calls.append((messages, tools))
+                self.assertions = (tokenize, add_generation_prompt)
+                return list(range(7))
+
+        agent = ToolAgent(model="unit-test-model")
+        tokenizer = FakeTokenizer()
+        agent._tokenizer_path = "configured-tokenizer"
+        agent._tokenizer_load_attempted = True
+        agent._tokenizer = tokenizer
+        messages = self._messages()
+        tools = [{"type": "function", "function": {"name": "python"}}]
+
+        self.assertEqual(
+            agent._estimate_request_input_tokens(messages, tools=tools),
+            7,
+        )
+        self.assertEqual(tokenizer.calls, [(messages, tools)])
+        self.assertEqual(tokenizer.assertions, (True, True))
+
 
 if __name__ == "__main__":
     unittest.main()
