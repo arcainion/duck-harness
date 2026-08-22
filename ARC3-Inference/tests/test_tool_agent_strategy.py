@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from unittest import TestCase
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from inference.agent.action_names import MAX_ACTION_BATCH
 from inference.agent.inference_controller import InferenceControllerConfig
@@ -70,6 +72,12 @@ class ToolAgentStrategyTests(TestCase):
                 "current_subgoal": "align the selector",
                 "plan_steps": [f"step {index}" for index in range(12)],
                 "success_criteria": "the score increases",
+                "causal_model": {
+                    "entities": [{"id": "selector", "kind": "cursor", "confidence": 0.8}],
+                    "relations": [{"cause": "SPACE", "effect": "selector advances", "support": 2, "confidence": 0.9}],
+                    "subgoals": [{"id": "align", "description": "align selector", "status": "active"}],
+                    "predictions": [{"action": "SPACE", "expected_changes": "selector advances"}],
+                },
             }
         )
 
@@ -79,6 +87,7 @@ class ToolAgentStrategyTests(TestCase):
         self.assertEqual(len(saved["subgoals"]), 6)
         self.assertEqual(len(saved["plan_steps"]), 8)
         self.assertEqual(saved["current_subgoal"], "align the selector")
+        self.assertEqual(saved["causal_model"]["relations"][0]["support"], 2)
 
     def test_cross_trial_store_exposes_verified_progress_without_raw_frames(self) -> None:
         store = TrialKnowledgeStore()
@@ -102,6 +111,29 @@ class ToolAgentStrategyTests(TestCase):
         self.assertEqual(snapshot["progress_lessons"][0]["pass_index"], 1)
         self.assertNotIn("grid", str(snapshot).lower())
 
+    def test_cross_trial_store_resumes_from_atomic_json(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "knowledge.json"
+            store = TrialKnowledgeStore(persistence_path=path)
+            store.observe(
+                "game",
+                {
+                    "executed": True,
+                    "before_state_id": "state-a",
+                    "after_state_id": "state-b",
+                    "behavioral_before_state_id": "behavior-a",
+                    "behavioral_after_state_id": "behavior-b",
+                    "action_display": "RIGHT",
+                    "outcome_class": "novel",
+                },
+                pass_index=2,
+            )
+
+            resumed = TrialKnowledgeStore(persistence_path=path).snapshot("game")
+
+            self.assertEqual(resumed["observations"], 1)
+            self.assertEqual(resumed["transition_records"][0]["pass_index"], 2)
+
     def test_semantic_candidate_score_prefers_plan_and_avoids_known_mouse_noop(self) -> None:
         agent = self._agent()
         agent._current_valid_actions = ["RIGHT", "MOUSE"]
@@ -123,6 +155,21 @@ class ToolAgentStrategyTests(TestCase):
         )[0]
 
         self.assertGreater(planned, noop)
+
+    def test_semantic_candidate_score_uses_empirical_outcomes(self) -> None:
+        agent = self._agent()
+        agent._current_experience_snapshot = {
+            "action_budget": 1,
+            "transition_models_here": [
+                {"action": "RIGHT", "predicted_outcome": "level_progress", "confidence": 1.0, "contradictions": 0},
+                {"action": "LEFT", "predicted_outcome": "exact_noop", "confidence": 1.0, "contradictions": 0},
+            ],
+        }
+
+        self.assertGreater(
+            agent._semantic_action_score([[{"action": "RIGHT"}]]),
+            agent._semantic_action_score([[{"action": "LEFT"}]]),
+        )
 
     def test_prediction_is_evaluated_once_then_consumed(self) -> None:
         agent = self._agent()

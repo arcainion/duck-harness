@@ -4686,6 +4686,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             success_criteria=None,
             risk=None,
             abort_condition=None,
+            causal_model=None,
         ):
             update = {
                 "goal": goal,
@@ -4704,6 +4705,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 "success_criteria": success_criteria,
                 "risk": risk,
                 "abort_condition": abort_condition,
+                "causal_model": causal_model,
             }
             _send({"type": "strategy", "update": _json_safe(update)})
             reply = _recv()

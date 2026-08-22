@@ -761,6 +761,13 @@ def _solver_args_for_local_server_pool(
     )
 
 
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default)) or default))
+    except ValueError:
+        return default
+
+
 def _write_run_config(
     args: argparse.Namespace,
     *,
@@ -812,6 +819,15 @@ def _write_run_config(
         "concurrent_jobs_scope": "per_gpu" if concurrency_multiplier > 1 else "total",
         "effective_concurrent_jobs": effective_concurrent_jobs,
         "analyzer_timeout_seconds": getattr(args, "analyzer_timeout", 120),
+        "inference_capabilities": {
+            "controller_policy": os.environ.get(
+                "LOCAL_ANALYZER_STRATEGY_POLICY", "outcome_aware"
+            ).strip().lower().replace("-", "_"),
+            "candidate_count": _positive_env_int("LOCAL_ANALYZER_CANDIDATES", 2),
+            "plan_min_support": _positive_env_int("LOCAL_ANALYZER_PLAN_MIN_SUPPORT", 2),
+            "durable_cross_trial_knowledge": True,
+            "structured_causal_model": True,
+        },
         "wave_count": wave_count,
         "max_actions": args.max_actions,
         "max_runtime_minutes_per_game": max_runtime_minutes_per_game,

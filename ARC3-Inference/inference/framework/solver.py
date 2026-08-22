@@ -1305,6 +1305,11 @@ class HarnessSolver(Solver):
         )
 
     def _setup(self) -> None:
+        knowledge_path = os.environ.get("LOCAL_ANALYZER_KNOWLEDGE_PATH", "").strip()
+        if not knowledge_path and self.job_dir is not None:
+            knowledge_path = str(Path(self.job_dir) / "cross_trial_knowledge.json")
+        if knowledge_path:
+            self._knowledge_store.configure_path(Path(knowledge_path))
         if self.start_local_server:
             self._start_local_servers()
         self._worker_pool = ThreadPoolExecutor(

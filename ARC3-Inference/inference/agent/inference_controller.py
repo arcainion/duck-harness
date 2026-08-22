@@ -64,6 +64,9 @@ class InferenceControllerConfig:
     explore_action_budget: int = 1
     recover_action_budget: int = 1
     progress_action_budget: int = 4
+    plan_min_support: int = 2
+    plan_min_confidence: float = 0.75
+    plan_max_depth: int = 6
 
     @property
     def outcome_aware(self) -> bool:
@@ -85,6 +88,11 @@ class InferenceControllerConfig:
             explore_action_budget=max(1, min(12, _env_int("LOCAL_ANALYZER_EXPLORE_ACTION_BUDGET", 1))),
             recover_action_budget=max(1, min(12, _env_int("LOCAL_ANALYZER_RECOVER_ACTION_BUDGET", 1))),
             progress_action_budget=max(1, min(12, _env_int("LOCAL_ANALYZER_PROGRESS_ACTION_BUDGET", 4))),
+            plan_min_support=max(1, _env_int("LOCAL_ANALYZER_PLAN_MIN_SUPPORT", 2)),
+            plan_min_confidence=max(
+                0.5, min(1.0, _env_float("LOCAL_ANALYZER_PLAN_MIN_CONFIDENCE", 0.75))
+            ),
+            plan_max_depth=max(1, min(12, _env_int("LOCAL_ANALYZER_PLAN_MAX_DEPTH", 6))),
         )
 
 
@@ -201,38 +209,101 @@ def _mouse_search_summary(transitions: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _plan_candidates(
-    transitions: list[dict[str, Any]], current_behavioral_id: str, *, max_depth: int = 6
+    transitions: list[dict[str, Any]],
+    current_behavioral_id: str,
+    *,
+    max_depth: int = 6,
+    min_support: int = 2,
+    min_confidence: float = 0.75,
+    current_state_id: str = "",
 ) -> list[dict[str, Any]]:
-    """Find short verified routes from the current state to observed progress."""
+    """Find short progress routes supported by repeatable transition evidence."""
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for raw in transitions:
+        action = normalize_action_key(raw.get("action") or raw.get("action_display") or "")
+        pairs = {
+            (
+                str(raw.get("behavioral_before_state_id") or ""),
+                str(raw.get("behavioral_after_state_id") or ""),
+            ),
+            (
+                str(raw.get("before_state_id") or ""),
+                str(raw.get("after_state_id") or ""),
+            ),
+        }
+        for before, after in pairs:
+            if before and after and action:
+                sample = dict(raw)
+                sample["planner_after_state_id"] = after
+                grouped.setdefault((before, action), []).append(sample)
+
     adjacency: dict[str, list[dict[str, Any]]] = {}
-    for item in transitions:
-        if item.get("outcome_class") in {"exact_noop", "volatile_only"}:
+    for (before, action), samples in grouped.items():
+        outcomes = Counter(
+            (
+                str(item.get("planner_after_state_id") or ""),
+                str(item.get("outcome_class") or "unknown") == "level_progress",
+            )
+            for item in samples
+        )
+        (after, progresses), support = min(outcomes.items(), key=lambda item: (-item[1], item[0]))
+        matching_outcomes = Counter(
+            str(item.get("outcome_class") or "unknown")
+            for item in samples
+            if str(item.get("planner_after_state_id") or "") == after
+        )
+        outcome = "level_progress" if progresses else min(
+            matching_outcomes.items(), key=lambda item: (-item[1], item[0])
+        )[0]
+        trials = len(samples)
+        confidence = support / trials
+        if (
+            support < min_support
+            or confidence < min_confidence
+            or outcome in {"exact_noop", "volatile_only"}
+        ):
             continue
-        adjacency.setdefault(str(item["behavioral_before_state_id"]), []).append(item)
-    queue = deque([(current_behavioral_id, [])])
-    best_depth = {current_behavioral_id: 0}
+        adjacency.setdefault(before, []).append({
+            "action": action,
+            "behavioral_after_state_id": after,
+            "outcome_class": outcome,
+            "support": support,
+            "contradictions": trials - support,
+            "confidence": confidence,
+        })
+    for edges in adjacency.values():
+        edges.sort(key=lambda edge: (-float(edge["confidence"]), -int(edge["support"]), str(edge["action"])))
+
+    start_ids = {current_behavioral_id, current_state_id} - {""}
+    queue = deque((state_id, [], 1.0, 0) for state_id in sorted(start_ids))
+    best_confidence = {state_id: 1.0 for state_id in start_ids}
     plans: list[dict[str, Any]] = []
     while queue and len(plans) < 4:
-        state_id, path = queue.popleft()
+        state_id, path, path_confidence, contradictions = queue.popleft()
         if len(path) >= max_depth:
             continue
         for edge in adjacency.get(state_id, []):
             next_path = [*path, str(edge["action"])]
+            next_confidence = path_confidence * float(edge["confidence"])
+            next_contradictions = contradictions + int(edge["contradictions"])
             if edge.get("outcome_class") == "level_progress":
                 plans.append(
                     {
                         "actions": next_path,
                         "target": "level_progress",
                         "verified_steps": len(next_path),
+                        "confidence": round(next_confidence, 3),
+                        "support": int(edge["support"]),
+                        "contradictions": next_contradictions,
                     }
                 )
                 continue
             next_state = str(edge["behavioral_after_state_id"])
-            if best_depth.get(next_state, max_depth + 1) <= len(next_path):
+            if best_confidence.get(next_state, -1.0) >= next_confidence:
                 continue
-            best_depth[next_state] = len(next_path)
-            queue.append((next_state, next_path))
-    plans.sort(key=lambda item: (len(item["actions"]), item["actions"]))
+            best_confidence[next_state] = next_confidence
+            queue.append((next_state, next_path, next_confidence, next_contradictions))
+    plans.sort(key=lambda item: (-item["confidence"], len(item["actions"]), item["actions"]))
     return plans
 
 
@@ -456,7 +527,8 @@ def _transition_models_here(
 
 
 def build_experience_snapshot(
-    history: list[HistoryEntry], current_frame: Frame | None, valid_actions: Iterable[str], config: InferenceControllerConfig
+    history: list[HistoryEntry], current_frame: Frame | None, valid_actions: Iterable[str], config: InferenceControllerConfig,
+    external_transitions: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     masked_cells = _volatile_cells(history, current_frame, config)
     transitions = _transitions(history, masked_cells)
@@ -540,7 +612,14 @@ def build_experience_snapshot(
         "progress": config.progress_action_budget,
     }.get(phase, 1)
     plan_candidates = (
-        _plan_candidates(transitions, behavioral_id) if config.outcome_aware else []
+        _plan_candidates(
+            [*transitions, *(external_transitions or ())],
+            behavioral_id,
+            max_depth=config.plan_max_depth,
+            min_support=config.plan_min_support,
+            min_confidence=config.plan_min_confidence,
+            current_state_id=current_id,
+        ) if config.outcome_aware else []
     )
     return {
         "enabled": config.enabled,

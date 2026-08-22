@@ -8,6 +8,16 @@
     "max_repeated_noop_rate": 0.04,
     "max_terminal_state_violations": 0,
     "min_trace_count": 25,
+    "min_trial_count": 25,
+    "min_whole_game_win_rate": 0.01,
+    "min_level_completion_rate": 0.05,
+    "min_outcome_aware_enabled": 1,
+    "min_candidate_count": 2,
+    "min_verified_plan_support": 2,
+    "max_crash_rate": 0.02,
+    "max_cancel_rate": 0.05,
+    "max_generated_tokens_per_level": 1000000,
+    "max_actions_per_level": 1000,
     "min_score_ratio_vs_baseline": 1.0
   }
 }

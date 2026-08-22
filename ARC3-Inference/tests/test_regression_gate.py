@@ -50,6 +50,29 @@ class RegressionGateTests(TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(len(result.failures), 6)
 
+    def test_gate_rejects_score_only_run_without_wins_or_required_capabilities(self) -> None:
+        result = evaluate_gate(
+            {
+                "overall_score": 2.0,
+                "whole_game_win_rate": 0.0,
+                "level_completion_rate": 0.0,
+                "outcome_aware_enabled": 0.0,
+                "candidate_count": 1.0,
+                "verified_plan_min_support": 0.0,
+            },
+            {
+                "min_overall_score": 1.5,
+                "min_whole_game_win_rate": 0.01,
+                "min_level_completion_rate": 0.05,
+                "min_outcome_aware_enabled": 1,
+                "min_candidate_count": 2,
+                "min_verified_plan_support": 2,
+            },
+        )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(len(result.failures), 5)
+
 
 if __name__ == "__main__":
     import unittest

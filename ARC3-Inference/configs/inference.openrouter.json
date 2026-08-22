@@ -66,6 +66,9 @@
     "same_state_noop_limit": 2,
     "stagnation_window": 12,
     "cycle_window": 8,
+    "plan_min_support": 2,
+    "plan_min_confidence": 0.75,
+    "plan_max_depth": 6,
     "save_request_logs": false
   },
   "chat": {

@@ -153,8 +153,9 @@ Useful sections in `configs/inference.json`:
   controller is configured by `strategy_enabled`, `same_state_noop_limit`,
   `stagnation_window`, and `cycle_window`. `strategy_policy` accepts
   `outcome_aware` (the default) or `legacy`. Outcome-aware mode exposes exact
-  mouse-coordinate outcomes, short verified transition-graph plans, and
-  phase-specific action budgets.
+  mouse-coordinate outcomes, support-weighted transition-graph plans, and
+  phase-specific action budgets. Plans require repeated evidence by default;
+  tune `plan_min_support`, `plan_min_confidence`, and `plan_max_depth`.
   The outcome-aware volatility detector can be tuned with `volatile_window`,
   `volatile_min_samples`, and `volatile_ratio`.
 
@@ -164,11 +165,14 @@ Restore the previous controller for an ablation:
 LOCAL_ANALYZER_STRATEGY_POLICY=legacy make interactive
 ```
 - `analyzer.candidates` defaults to two. Compilable candidates are ranked
-  against the current action rankings, discouraged exact actions, mouse search
-  history, action budget, and recommended verified plan.
+  against empirical transition outcomes and contradictions as well as current
+  action rankings, discouraged exact actions, mouse search history, action
+  budget, and the confidence of any recommended plan.
 - Passes of the same game run sequentially and share bounded progress lessons;
-  different games remain concurrent. Shared knowledge contains opaque state
-  IDs and compact strategy evidence, never raw frames.
+  different games remain concurrent. Shared knowledge is atomically persisted
+  to `cross_trial_knowledge.json` in the run directory (or the path in
+  `LOCAL_ANALYZER_KNOWLEDGE_PATH`) so interrupted runs can resume. It contains
+  opaque state IDs and compact strategy/causal evidence, never raw frames.
 - `chat.*`: direct chat probing with `make chat`.
 - `viewer.port`: default viewer port.
 - `multimodal.*`: image context for the current grid.
@@ -430,10 +434,13 @@ Check both score and closed-loop behavior before accepting a run:
 make regression-gate REGRESSION_RUN_DIR=/path/to/run
 ```
 
-`configs/regression.json` defines minimum score, rewarding-action rate and
-trace count, plus maximum no-op, repeated-no-op, and terminal-violation rates.
-It can also require a score ratio against `baseline_run_dir`. The command exits
-nonzero and reports every failed threshold.
+`configs/regression.json` requires whole-game wins and level completion in
+addition to score, trace coverage, and the declared outcome-aware/candidate/
+verified-planner configuration. It also caps no-ops, crashes, cancellations,
+tokens per completed level, actions per completed level, and terminal-state
+violations. This intentionally rejects the old score-only zero-win example as
+evidence. It can also require a score ratio against `baseline_run_dir`. The
+command exits nonzero and reports every failed threshold.
 
 ## Trace Export
 

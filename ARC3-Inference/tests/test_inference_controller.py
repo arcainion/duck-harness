@@ -260,7 +260,9 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(snapshot["mouse_search"]["recent"][0]["row"], 1)
 
     def test_verified_transition_graph_proposes_short_progress_plan(self) -> None:
-        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        config = InferenceControllerConfig(
+            enabled=True, policy=OUTCOME_AWARE_POLICY, volatile_min_samples=20
+        )
         a = _frame(1, step=0)
         b = _frame(2, step=1)
         progressed = _frame(3, step=2, level=2)
@@ -269,12 +271,59 @@ class InferenceControllerTests(TestCase):
             HistoryEntry(action="RIGHT", frame=b),
             HistoryEntry(action="SPACE", frame=progressed),
             HistoryEntry(action="RESET", frame=_frame(1, step=3)),
+            HistoryEntry(action="RIGHT", frame=_frame(2, step=4)),
+            HistoryEntry(action="SPACE", frame=_frame(3, step=5, level=2)),
+            HistoryEntry(action="RESET", frame=_frame(1, step=6)),
         ]
 
         snapshot = build_experience_snapshot(history, history[-1].frame, ["RIGHT"], config)
 
         self.assertEqual(snapshot["recommended_plan"]["actions"], ["RIGHT", "SPACE"])
         self.assertEqual(snapshot["recommended_plan"]["target"], "level_progress")
+        self.assertEqual(snapshot["recommended_plan"]["confidence"], 1.0)
+
+    def test_single_observation_is_not_mislabeled_as_verified_plan(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        history = [
+            HistoryEntry(action="", frame=_frame(1, step=0)),
+            HistoryEntry(action="RIGHT", frame=_frame(2, step=1)),
+            HistoryEntry(action="SPACE", frame=_frame(3, step=2, level=2)),
+            HistoryEntry(action="RESET", frame=_frame(1, step=3)),
+        ]
+
+        snapshot = build_experience_snapshot(history, history[-1].frame, ["RIGHT"], config)
+
+        self.assertIsNone(snapshot["recommended_plan"])
+
+    def test_persisted_exact_state_evidence_can_supply_a_verified_plan(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True, policy=OUTCOME_AWARE_POLICY, volatile_min_samples=20
+        )
+        a, b, progressed = _frame(1, step=0), _frame(2, step=1), _frame(3, step=2, level=2)
+        a_id, b_id, progress_id = map(frame_fingerprint, (a, b, progressed))
+        external = [
+            {
+                "before_state_id": before,
+                "after_state_id": after,
+                "action_display": action,
+                "outcome_class": outcome,
+            }
+            for _ in range(2)
+            for before, after, action, outcome in (
+                (a_id, b_id, "RIGHT", "novel"),
+                (b_id, progress_id, "SPACE", "level_progress"),
+            )
+        ]
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=a)],
+            a,
+            ["RIGHT"],
+            config,
+            external_transitions=external,
+        )
+
+        self.assertEqual(snapshot["recommended_plan"]["actions"], ["RIGHT", "SPACE"])
 
     def test_outcome_metadata_reports_level_progress(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)

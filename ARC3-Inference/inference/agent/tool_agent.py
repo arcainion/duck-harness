@@ -17,6 +17,7 @@ from urllib.parse import urlparse, urlunparse
 import requests
 
 from inference.agent.action_names import MAX_ACTION_BATCH, to_engine_action, to_model_action
+from inference.agent.causal_model import normalize_causal_model
 from inference.agent.inference_controller import (
     InferenceControllerConfig,
     action_family,
@@ -1684,13 +1685,17 @@ class ToolAgent:
         ):
             return cached.payload
 
+        cross_trial = None
+        if self._knowledge_store is not None and self._knowledge_game_id:
+            cross_trial = self._knowledge_store.snapshot(self._knowledge_game_id)
         payload = build_experience_snapshot(
             history_entries,
             current_frame,
             valid_actions,
             self._controller_config,
+            external_transitions=(cross_trial or {}).get("transition_records"),
         )
-        if self._knowledge_store is not None and self._knowledge_game_id:
+        if cross_trial is not None:
             payload = dict(payload)
             payload["cross_trial"] = self._knowledge_store.snapshot(
                 self._knowledge_game_id,
@@ -1795,6 +1800,9 @@ class ToolAgent:
             contradictions = [single_contradiction] if single_contradiction else []
         if contradictions:
             persisted["contradictions"] = contradictions
+
+        if isinstance(update.get("causal_model"), dict):
+            persisted["causal_model"] = normalize_causal_model(update["causal_model"])
 
         try:
             if update.get("confidence") is not None:
@@ -2171,9 +2179,16 @@ class ToolAgent:
                     "recommended_plan",
                     "transition_models_here",
                     "model_conflicts_here",
-                    "cross_trial",
                 )
             }
+            cross_trial = experience_snapshot.get("cross_trial")
+            if isinstance(cross_trial, dict):
+                compact_experience["cross_trial"] = {
+                    key: cross_trial.get(key)
+                    for key in (
+                        "prior_trials", "observations", "state_action_evidence", "progress_lessons"
+                    )
+                }
             lines.extend(
                 [
                     "Deterministic experience controller snapshot:",
@@ -2300,12 +2315,32 @@ class ToolAgent:
             for item in snapshot.get("ranked_actions") or []
             if isinstance(item, dict)
         }
+        empirical = {
+            normalize_action_key(item.get("action") or ""): item
+            for item in snapshot.get("transition_models_here") or []
+            if isinstance(item, dict) and item.get("action")
+        }
+        cross_evidence = {
+            normalize_action_key(item.get("action") or ""): item
+            for item in (snapshot.get("cross_trial") or {}).get("state_action_evidence", [])
+            if isinstance(item, dict) and item.get("action")
+        }
         mouse_recent = {
             (int(item["row"]), int(item["col"])): str(item.get("outcome") or "")
             for item in (snapshot.get("mouse_search") or {}).get("recent", [])
             if isinstance(item, dict) and "row" in item and "col" in item
         }
-        planned = list((snapshot.get("recommended_plan") or {}).get("actions") or [])
+        recommended_plan = snapshot.get("recommended_plan") or {}
+        planned = list(recommended_plan.get("actions") or [])
+        plan_confidence = float(recommended_plan.get("confidence") or 0.0)
+        outcome_values = {
+            "level_progress": 120,
+            "novel": 45,
+            "revisit": 10,
+            "unknown": 0,
+            "volatile_only": -45,
+            "exact_noop": -90,
+        }
         for index, item in enumerate(actions):
             name = str(item.get("action") or "")
             if name == "MOUSE":
@@ -2323,8 +2358,24 @@ class ToolAgent:
             ranking = rankings.get(action_family(key))
             if ranking is not None:
                 score += max(0, 40 - 10 * int(ranking.get("priority") or 0))
+            model = empirical.get(key)
+            if model is not None:
+                confidence = float(model.get("confidence") or 0.0)
+                score += round(
+                    outcome_values.get(str(model.get("predicted_outcome") or "unknown"), 0)
+                    * confidence
+                )
+                score -= 25 * int(model.get("contradictions") or 0)
+            evidence = cross_evidence.get(key)
+            if evidence is not None:
+                outcomes = evidence.get("outcomes") or {}
+                trials = max(1, int(evidence.get("trials") or 1))
+                score += round(
+                    sum(outcome_values.get(str(outcome), 0) * int(count or 0) for outcome, count in outcomes.items())
+                    / trials
+                )
             if index < len(planned) and normalize_action_key(planned[index]) == key:
-                score += 60
+                score += round(80 * plan_confidence)
         return score
 
     def _chat_completion(
@@ -3143,13 +3194,17 @@ class ToolAgent:
         analyzer_log = transcript_path or (state_path.parent / f"{state_path.stem}_analyzer.txt")
         prompt_log = _resolve_prompt_log_path(state_path)
         current_frame, history_entries = load_runtime_state(state_path)
+        cross_trial = None
+        if self._knowledge_store is not None and self._knowledge_game_id:
+            cross_trial = self._knowledge_store.snapshot(self._knowledge_game_id)
         experience_snapshot = build_experience_snapshot(
             history_entries,
             current_frame,
             self._current_valid_actions,
             self._controller_config,
+            external_transitions=(cross_trial or {}).get("transition_records"),
         )
-        if self._knowledge_store is not None and self._knowledge_game_id:
+        if cross_trial is not None:
             experience_snapshot = dict(experience_snapshot)
             experience_snapshot["cross_trial"] = self._knowledge_store.snapshot(
                 self._knowledge_game_id,
