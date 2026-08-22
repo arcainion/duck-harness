@@ -1,0 +1,13 @@
+{
+  "run_dir": "../example-run",
+  "baseline_run_dir": "",
+  "thresholds": {
+    "min_overall_score": 1.5,
+    "min_rewarding_action_rate": 0.004,
+    "max_noop_rate": 0.12,
+    "max_repeated_noop_rate": 0.04,
+    "max_terminal_state_violations": 0,
+    "min_trace_count": 25,
+    "min_score_ratio_vs_baseline": 1.0
+  }
+}

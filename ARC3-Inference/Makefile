@@ -145,8 +145,9 @@ LOCAL_ANALYZER_TOP_K ?= $(shell $(CONFIG_VALUE) analyzer.top_k 20)
 LOCAL_ANALYZER_TOOL_STEPS ?= $(shell $(CONFIG_VALUE) analyzer.tool_steps 0)
 LOCAL_ANALYZER_TOOL_TIMEOUT ?= $(shell $(CONFIG_VALUE) analyzer.tool_timeout 30)
 LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS ?= $(shell $(CONFIG_VALUE) analyzer.tool_output_tokens 1024)
-LOCAL_ANALYZER_STRATEGY_ENABLED ?= $(shell $(CONFIG_VALUE) analyzer.strategy_enabled false)
-LOCAL_ANALYZER_STRATEGY_POLICY ?= $(shell $(CONFIG_VALUE) analyzer.strategy_policy legacy)
+LOCAL_ANALYZER_CANDIDATES ?= $(shell $(CONFIG_VALUE) analyzer.candidates 2)
+LOCAL_ANALYZER_STRATEGY_ENABLED ?= $(shell $(CONFIG_VALUE) analyzer.strategy_enabled true)
+LOCAL_ANALYZER_STRATEGY_POLICY ?= $(shell $(CONFIG_VALUE) analyzer.strategy_policy outcome_aware)
 LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT ?= $(shell $(CONFIG_VALUE) analyzer.same_state_noop_limit 2)
 LOCAL_ANALYZER_STAGNATION_WINDOW ?= $(shell $(CONFIG_VALUE) analyzer.stagnation_window 12)
 LOCAL_ANALYZER_CYCLE_WINDOW ?= $(shell $(CONFIG_VALUE) analyzer.cycle_window 8)
@@ -181,6 +182,8 @@ EVAL_CONFIG_PATH ?= configs/eval.json
 SCORE_OUTPUT_PATH ?=
 SCORE_RUN_DIR ?=
 SIGNIFICANCE_CONFIG_PATH ?= configs/significance.json
+REGRESSION_CONFIG_PATH ?= configs/regression.json
+REGRESSION_RUN_DIR ?=
 BASELINE_SCORE ?=
 CANDIDATE_SCORE ?=
 ALLOW_INTERSECTION ?=
@@ -207,6 +210,7 @@ export LOCAL_ANALYZER_TOP_K
 export LOCAL_ANALYZER_TOOL_STEPS
 export LOCAL_ANALYZER_TOOL_TIMEOUT
 export LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS
+export LOCAL_ANALYZER_CANDIDATES
 export LOCAL_ANALYZER_STRATEGY_ENABLED
 export LOCAL_ANALYZER_STRATEGY_POLICY
 export LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT
@@ -527,6 +531,9 @@ significance:
 		$(if $(BOOTSTRAP_SAMPLES),--bootstrap-samples "$(BOOTSTRAP_SAMPLES)") \
 		$(if $(BOOTSTRAP_SEED),--bootstrap-seed "$(BOOTSTRAP_SEED)") \
 		$(if $(filter true TRUE 1 yes YES on ON,$(ALLOW_INTERSECTION)),--allow-intersection)
+
+regression-gate:
+	$(UV_RUN) python -m inference.tools.regression_gate --config "$(REGRESSION_CONFIG_PATH)" $(if $(REGRESSION_RUN_DIR),"$(REGRESSION_RUN_DIR)")
 
 view:
 	$(UV_RUN) inference-view \

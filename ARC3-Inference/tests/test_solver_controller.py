@@ -16,6 +16,7 @@ from inference.agent.action_names import (
     to_model_action,
 )
 from inference.agent.inference_controller import (
+    LEGACY_POLICY,
     OUTCOME_AWARE_POLICY,
     InferenceControllerConfig,
 )
@@ -372,7 +373,9 @@ class SolverControllerTests(TestCase):
                 analysis_html_relpath="analysis.html",
                 stop_event=threading.Event(),
                 viewer_data_path=root / "viewer.json",
-                controller_config=InferenceControllerConfig(enabled=True),
+                controller_config=InferenceControllerConfig(
+                    enabled=True, policy=LEGACY_POLICY
+                ),
             )
             session._normalize_actions = lambda arguments: ([action, action], None)
             session._execute_action = lambda *args, **kwargs: {

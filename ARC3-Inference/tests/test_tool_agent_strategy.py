@@ -6,6 +6,7 @@ from inference.agent.action_names import MAX_ACTION_BATCH
 from inference.agent.inference_controller import InferenceControllerConfig
 from inference.agent.runtime_state import Frame, HistoryEntry
 from inference.agent.tool_agent import ToolAgent
+from inference.agent.trial_knowledge import TrialKnowledgeStore
 
 
 class ToolAgentStrategyTests(TestCase):
@@ -65,12 +66,63 @@ class ToolAgentStrategyTests(TestCase):
                 "confidence": 4,
                 "open_question": "which color is selected?",
                 "next_test": "press SPACE once",
+                "subgoals": [f"subgoal {index}" for index in range(10)],
+                "current_subgoal": "align the selector",
+                "plan_steps": [f"step {index}" for index in range(12)],
+                "success_criteria": "the score increases",
             }
         )
 
         self.assertLessEqual(len(saved["goal"]), 280)
         self.assertEqual(saved["confidence"], 1.0)
         self.assertEqual(agent._summarized_knowledge["current_plan"], "press SPACE once")
+        self.assertEqual(len(saved["subgoals"]), 6)
+        self.assertEqual(len(saved["plan_steps"]), 8)
+        self.assertEqual(saved["current_subgoal"], "align the selector")
+
+    def test_cross_trial_store_exposes_verified_progress_without_raw_frames(self) -> None:
+        store = TrialKnowledgeStore()
+        store.observe(
+            "game",
+            {
+                "executed": True,
+                "before_state_id": "state-a",
+                "after_state_id": "state-b",
+                "action_display": "SPACE",
+                "outcome_class": "level_progress",
+                "level_completed": True,
+            },
+            strategy={"hypothesis": "SPACE confirms a complete arrangement"},
+            pass_index=1,
+        )
+
+        snapshot = store.snapshot("game", state_id="state-a")
+
+        self.assertEqual(snapshot["state_action_evidence"][0]["action"], "SPACE")
+        self.assertEqual(snapshot["progress_lessons"][0]["pass_index"], 1)
+        self.assertNotIn("grid", str(snapshot).lower())
+
+    def test_semantic_candidate_score_prefers_plan_and_avoids_known_mouse_noop(self) -> None:
+        agent = self._agent()
+        agent._current_valid_actions = ["RIGHT", "MOUSE"]
+        agent._current_experience_snapshot = {
+            "action_budget": 1,
+            "ranked_actions": [{"action": "RIGHT", "priority": 0}],
+            "discouraged_actions": ["MOUSE(row=1, col=1)"],
+            "mouse_search": {
+                "recent": [{"row": 1, "col": 1, "outcome": "exact_noop"}]
+            },
+            "recommended_plan": {"actions": ["RIGHT"]},
+        }
+
+        planned = agent._score_candidate_choice(
+            {"message": {"tool_calls": [{"function": {"name": "python", "arguments": '{"code":"action([\\"RIGHT\\"])"}'}}]}}
+        )[0]
+        noop = agent._score_candidate_choice(
+            {"message": {"tool_calls": [{"function": {"name": "python", "arguments": '{"code":"action([{\\"action\\":\\"MOUSE\\",\\"row\\":1,\\"col\\":1}])"}'}}]}}
+        )[0]
+
+        self.assertGreater(planned, noop)
 
     def test_prediction_is_evaluated_once_then_consumed(self) -> None:
         agent = self._agent()

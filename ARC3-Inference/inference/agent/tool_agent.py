@@ -44,6 +44,7 @@ from inference.agent.runtime_state import (
     HistoryEntry,
     load_runtime_state,
 )
+from inference.agent.trial_knowledge import TrialKnowledgeStore
 from inference.agent.vision_context import (
     current_grid_image_enabled,
     current_grid_image_part,
@@ -1370,6 +1371,9 @@ class ToolAgent:
         api_key: str | None = None,
         base_url: str | None = None,
         provider: str | None = None,
+        knowledge_store: TrialKnowledgeStore | None = None,
+        game_id: str = "",
+        pass_index: int = 0,
     ) -> None:
         resolved_model = _resolve_analyzer_model(model)
         if base_url is not None or provider is not None:
@@ -1418,6 +1422,10 @@ class ToolAgent:
         self._last_action_result: dict[str, Any] | None = None
         self._summarized_knowledge = _empty_world_model()
         self._controller_config = InferenceControllerConfig.from_env()
+        self._knowledge_store = knowledge_store
+        self._knowledge_game_id = str(game_id or "")
+        self._knowledge_pass_index = max(0, int(pass_index))
+        self._current_experience_snapshot: dict[str, Any] = {}
         self._strategy_memory: dict[str, Any] = {}
         self._python_memory: dict[str, Any] = {}
         self._frame_payload_cache: _FramePayloadCache | None = None
@@ -1682,6 +1690,12 @@ class ToolAgent:
             valid_actions,
             self._controller_config,
         )
+        if self._knowledge_store is not None and self._knowledge_game_id:
+            payload = dict(payload)
+            payload["cross_trial"] = self._knowledge_store.snapshot(
+                self._knowledge_game_id,
+                state_id=str(payload.get("state_id") or ""),
+            )
         self._experience_snapshot_cache = _ExperienceSnapshotCache(
             current_frame=current_frame,
             history_entries=tuple(history_entries),
@@ -1724,7 +1738,17 @@ class ToolAgent:
             return _normalize_summary_text(value, max_chars=max_chars)[:max_chars]
 
         persisted = dict(self._strategy_memory)
-        for key in ("goal", "hypothesis", "open_question", "next_test", "fallback"):
+        for key in (
+            "goal",
+            "hypothesis",
+            "open_question",
+            "next_test",
+            "fallback",
+            "current_subgoal",
+            "success_criteria",
+            "risk",
+            "abort_condition",
+        ):
             value = short_text(update.get(key))
             if value:
                 persisted[key] = value
@@ -1753,6 +1777,14 @@ class ToolAgent:
             evidence = [single_evidence] if single_evidence else []
         if evidence:
             persisted["evidence"] = evidence
+
+        for key, limit in (("subgoals", 6), ("plan_steps", 8)):
+            raw_items = update.get(key)
+            if isinstance(raw_items, (list, tuple)):
+                items = [short_text(item, 200) for item in raw_items]
+                items = [item for item in items if item][:limit]
+                if items:
+                    persisted[key] = items
 
         raw_contradictions = update.get("contradictions")
         if isinstance(raw_contradictions, (list, tuple)):
@@ -2134,8 +2166,12 @@ class ToolAgent:
                     "suggested_actions",
                     "discouraged_actions",
                     "ranked_actions",
+                    "mouse_search",
+                    "plan_candidates",
+                    "recommended_plan",
                     "transition_models_here",
                     "model_conflicts_here",
+                    "cross_trial",
                 )
             }
             lines.extend(
@@ -2218,6 +2254,7 @@ class ToolAgent:
                     continue
                 score += 100
                 valid = True
+                literal_action_batches: list[list[dict[str, Any]]] = []
                 for node in ast.walk(tree):
                     if not (
                         isinstance(node, ast.Call)
@@ -2228,11 +2265,13 @@ class ToolAgent:
                         continue
                     try:
                         literal_actions = ast.literal_eval(node.args[0])
-                        self._normalize_python_actions(literal_actions)
+                        normalized_actions = self._normalize_python_actions(literal_actions)
                     except (TypeError, ValueError, SyntaxError):
                         score -= 40
                     else:
                         score += 20
+                        literal_action_batches.append(normalized_actions)
+                score += self._semantic_action_score(literal_action_batches)
         content = _normalize_message_content(message.get("content", ""))
         reasoning = _extract_reasoning_text(message)
         if content or reasoning:
@@ -2241,6 +2280,52 @@ class ToolAgent:
         if str(choice.get("finish_reason", "")) == "length":
             score -= 20
         return score, valid
+
+    def _semantic_action_score(
+        self, action_batches: list[list[dict[str, Any]]]
+    ) -> int:
+        """Rank executable candidates against current empirical evidence."""
+        snapshot = self._current_experience_snapshot or {}
+        if not snapshot or not action_batches:
+            return 0
+        actions = [item for batch in action_batches for item in batch]
+        budget = max(1, int(snapshot.get("action_budget") or 1))
+        score = -40 * max(0, len(actions) - budget)
+        discouraged = {
+            normalize_action_key(item)
+            for item in snapshot.get("discouraged_actions") or []
+        }
+        rankings = {
+            str(item.get("action") or ""): item
+            for item in snapshot.get("ranked_actions") or []
+            if isinstance(item, dict)
+        }
+        mouse_recent = {
+            (int(item["row"]), int(item["col"])): str(item.get("outcome") or "")
+            for item in (snapshot.get("mouse_search") or {}).get("recent", [])
+            if isinstance(item, dict) and "row" in item and "col" in item
+        }
+        planned = list((snapshot.get("recommended_plan") or {}).get("actions") or [])
+        for index, item in enumerate(actions):
+            name = str(item.get("action") or "")
+            if name == "MOUSE":
+                coordinate = (int(item["row"]), int(item["col"]))
+                key = f"MOUSE(ROW={coordinate[0]}, COL={coordinate[1]})"
+                score += (
+                    -70
+                    if mouse_recent.get(coordinate) in {"exact_noop", "volatile_only"}
+                    else 20
+                )
+            else:
+                key = normalize_action_key(name)
+            if key in discouraged:
+                score -= 100
+            ranking = rankings.get(action_family(key))
+            if ranking is not None:
+                score += max(0, 40 - 10 * int(ranking.get("priority") or 0))
+            if index < len(planned) and normalize_action_key(planned[index]) == key:
+                score += 60
+        return score
 
     def _chat_completion(
         self,
@@ -2836,6 +2921,14 @@ class ToolAgent:
             for item in sandbox_result.get("action_results") or []
             if isinstance(item, dict)
         ]
+        if self._knowledge_store is not None and self._knowledge_game_id:
+            for action_result in action_results:
+                self._knowledge_store.observe(
+                    self._knowledge_game_id,
+                    action_result,
+                    strategy=self._strategy_memory,
+                    pass_index=self._knowledge_pass_index,
+                )
         payload = _python_tool_payload(sandbox_result)
 
         step_executed = any(bool(item.get("executed")) for item in action_results)
@@ -3056,6 +3149,13 @@ class ToolAgent:
             self._current_valid_actions,
             self._controller_config,
         )
+        if self._knowledge_store is not None and self._knowledge_game_id:
+            experience_snapshot = dict(experience_snapshot)
+            experience_snapshot["cross_trial"] = self._knowledge_store.snapshot(
+                self._knowledge_game_id,
+                state_id=str(experience_snapshot.get("state_id") or ""),
+            )
+        self._current_experience_snapshot = experience_snapshot
         user_prompt = self._build_user_prompt(
             action_num,
             valid_actions=valid_actions,

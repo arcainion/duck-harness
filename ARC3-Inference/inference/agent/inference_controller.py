@@ -4,7 +4,8 @@ from __future__ import annotations
 import hashlib
 import math
 import os
-from collections import Counter
+import re
+from collections import Counter, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -50,8 +51,8 @@ def _normalize_policy(value: Any) -> str:
 
 @dataclass(frozen=True)
 class InferenceControllerConfig:
-    enabled: bool = False
-    policy: str = LEGACY_POLICY
+    enabled: bool = True
+    policy: str = OUTCOME_AWARE_POLICY
     same_state_noop_limit: int = 2
     stagnation_window: int = 12
     cycle_window: int = 8
@@ -71,8 +72,8 @@ class InferenceControllerConfig:
     @classmethod
     def from_env(cls) -> InferenceControllerConfig:
         return cls(
-            enabled=_env_bool("LOCAL_ANALYZER_STRATEGY_ENABLED", False),
-            policy=_normalize_policy(os.environ.get("LOCAL_ANALYZER_STRATEGY_POLICY", LEGACY_POLICY)),
+            enabled=_env_bool("LOCAL_ANALYZER_STRATEGY_ENABLED", True),
+            policy=_normalize_policy(os.environ.get("LOCAL_ANALYZER_STRATEGY_POLICY", OUTCOME_AWARE_POLICY)),
             same_state_noop_limit=max(1, _env_int("LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT", 2)),
             stagnation_window=max(2, _env_int("LOCAL_ANALYZER_STAGNATION_WINDOW", 12)),
             cycle_window=max(2, _env_int("LOCAL_ANALYZER_CYCLE_WINDOW", 8)),
@@ -160,6 +161,79 @@ def normalize_action_key(action: str) -> str:
 def action_family(action: str) -> str:
     key = normalize_action_key(action)
     return "MOUSE" if key.startswith("MOUSE") else key
+
+
+_MOUSE_COORDINATE_RE = re.compile(
+    r"^MOUSE\s*\(\s*ROW\s*=\s*(-?\d+)\s*,\s*COL\s*=\s*(-?\d+)\s*\)$"
+)
+
+
+def action_coordinate(action: str) -> tuple[int, int] | None:
+    """Return the exact model-facing mouse coordinate, when present."""
+    match = _MOUSE_COORDINATE_RE.match(normalize_action_key(action))
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _mouse_search_summary(transitions: list[dict[str, Any]]) -> dict[str, Any]:
+    observations = []
+    outcome_counts: Counter[str] = Counter()
+    for item in transitions:
+        coordinate = action_coordinate(str(item.get("action") or ""))
+        if coordinate is None:
+            continue
+        outcome = str(item.get("outcome_class") or "unknown")
+        outcome_counts[outcome] += 1
+        observations.append(
+            {
+                "row": coordinate[0],
+                "col": coordinate[1],
+                "outcome": outcome,
+                "changed": bool(item.get("behavioral_changed")),
+            }
+        )
+    unique_coordinates = {(item["row"], item["col"]) for item in observations}
+    return {
+        "trials": len(observations),
+        "unique_coordinates": len(unique_coordinates),
+        "outcomes": dict(sorted(outcome_counts.items())),
+        "recent": observations[-16:],
+    }
+
+
+def _plan_candidates(
+    transitions: list[dict[str, Any]], current_behavioral_id: str, *, max_depth: int = 6
+) -> list[dict[str, Any]]:
+    """Find short verified routes from the current state to observed progress."""
+    adjacency: dict[str, list[dict[str, Any]]] = {}
+    for item in transitions:
+        if item.get("outcome_class") in {"exact_noop", "volatile_only"}:
+            continue
+        adjacency.setdefault(str(item["behavioral_before_state_id"]), []).append(item)
+    queue = deque([(current_behavioral_id, [])])
+    best_depth = {current_behavioral_id: 0}
+    plans: list[dict[str, Any]] = []
+    while queue and len(plans) < 4:
+        state_id, path = queue.popleft()
+        if len(path) >= max_depth:
+            continue
+        for edge in adjacency.get(state_id, []):
+            next_path = [*path, str(edge["action"])]
+            if edge.get("outcome_class") == "level_progress":
+                plans.append(
+                    {
+                        "actions": next_path,
+                        "target": "level_progress",
+                        "verified_steps": len(next_path),
+                    }
+                )
+                continue
+            next_state = str(edge["behavioral_after_state_id"])
+            if best_depth.get(next_state, max_depth + 1) <= len(next_path):
+                continue
+            best_depth[next_state] = len(next_path)
+            queue.append((next_state, next_path))
+    plans.sort(key=lambda item: (len(item["actions"]), item["actions"]))
+    return plans
 
 
 def _transitions(
@@ -465,6 +539,9 @@ def build_experience_snapshot(
         "recover": config.recover_action_budget,
         "progress": config.progress_action_budget,
     }.get(phase, 1)
+    plan_candidates = (
+        _plan_candidates(transitions, behavioral_id) if config.outcome_aware else []
+    )
     return {
         "enabled": config.enabled,
         "policy": _normalize_policy(config.policy),
@@ -488,6 +565,9 @@ def build_experience_snapshot(
         "suggested_actions": suggested,
         "discouraged_actions": discouraged,
         "ranked_actions": ranked_actions,
+        "mouse_search": _mouse_search_summary(transitions),
+        "plan_candidates": plan_candidates,
+        "recommended_plan": plan_candidates[0] if plan_candidates else None,
         "transition_models_here": transition_models,
         "model_conflicts_here": model_conflicts,
         "recent_transitions": transitions[-config.recent_transition_limit :],

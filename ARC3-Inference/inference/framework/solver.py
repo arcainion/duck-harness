@@ -47,6 +47,7 @@ from inference.agent.runtime_state import (
     write_runtime_state,
 )
 from inference.agent.tool_agent import ToolAgent
+from inference.agent.trial_knowledge import TrialKnowledgeStore
 from inference.framework.kaggle import (
     DEFAULT_EXPECTED_GPU_COUNT,
     DEFAULT_EXPECTED_GPU_TYPE,
@@ -1215,6 +1216,9 @@ class HarnessSolver(Solver):
     # Python's default executor, capped at min(32, cpu+4) — which would
     # silently cap real concurrency below self.concurrency.
     _worker_pool: ThreadPoolExecutor | None = field(default=None, init=False, repr=False, compare=False)
+    _knowledge_store: TrialKnowledgeStore = field(
+        default_factory=TrialKnowledgeStore, init=False, repr=False, compare=False
+    )
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -1228,6 +1232,7 @@ class HarnessSolver(Solver):
         state.pop("_local_servers", None)
         state.pop("_local_server_original_env", None)
         state.pop("_worker_pool", None)
+        state.pop("_knowledge_store", None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -1241,6 +1246,7 @@ class HarnessSolver(Solver):
         self._local_servers = []
         self._local_server_original_env = {}
         self._worker_pool = None
+        self._knowledge_store = TrialKnowledgeStore()
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "HarnessSolver":
         cls = type(self)
@@ -1257,6 +1263,8 @@ class HarnessSolver(Solver):
                 object.__setattr__(new, key, {})
             elif key == "_worker_pool":
                 object.__setattr__(new, key, None)
+            elif key == "_knowledge_store":
+                object.__setattr__(new, key, TrialKnowledgeStore())
             else:
                 object.__setattr__(new, key, copy.deepcopy(value, memo))
         return new
@@ -1315,24 +1323,30 @@ class HarnessSolver(Solver):
         self._stop_event.clear()
         semaphore = asyncio.Semaphore(max(1, int(self.concurrency)))
         pass_indices_by_game_id: dict[str, int] = {}
+        game_locks: dict[str, asyncio.Lock] = {}
         loop = asyncio.get_running_loop()
         pool = self._worker_pool
 
-        async def run_one(index: int, pass_index: int, game: taaf.game.Game) -> None:
-            async with semaphore:
-                args = (game, index, pass_index, self._local_server_for_game_index(index))
-                if pool is not None:
-                    await loop.run_in_executor(pool, functools.partial(self._play_one, *args))
-                else:
-                    # _setup wasn't called (direct test invocation).
-                    await asyncio.to_thread(self._play_one, *args)
+        async def run_one(
+            index: int, pass_index: int, game_id: str, game: taaf.game.Game
+        ) -> None:
+            # Passes of one game are intentionally ordered so later passes can
+            # consume verified mechanics without reducing cross-game parallelism.
+            async with game_locks.setdefault(game_id, asyncio.Lock()):
+                async with semaphore:
+                    args = (game, index, pass_index, self._local_server_for_game_index(index))
+                    if pool is not None:
+                        await loop.run_in_executor(pool, functools.partial(self._play_one, *args))
+                    else:
+                        # _setup wasn't called (direct test invocation).
+                        await asyncio.to_thread(self._play_one, *args)
 
         tasks: list[asyncio.Task[None]] = []
         for index, game in enumerate(games):
             game_id = game.game_run.game_id if game.game_run is not None else str(index)
             pass_index = pass_indices_by_game_id.get(game_id, 0)
             pass_indices_by_game_id[game_id] = pass_index + 1
-            tasks.append(asyncio.create_task(run_one(index, pass_index, game)))
+            tasks.append(asyncio.create_task(run_one(index, pass_index, game_id, game)))
         try:
             await asyncio.gather(
                 *(asyncio.shield(task) for task in tasks), return_exceptions=True
@@ -1601,6 +1615,8 @@ class HarnessSolver(Solver):
         game: taaf.game.Game,
         index: int,
         local_server: _LocalServerRuntime | None = None,
+        *,
+        pass_index: int = 0,
     ) -> Any:
         if self.analyzer_factory is not None:
             return self.analyzer_factory(game, index)
@@ -1621,6 +1637,9 @@ class HarnessSolver(Solver):
             )
             or None,
             provider="vllm" if local_server is not None else None,
+            knowledge_store=self._knowledge_store,
+            game_id=(game.game_run.game_id if game.game_run is not None else str(index)),
+            pass_index=pass_index,
         )
 
     def _play_one(
@@ -1638,7 +1657,9 @@ class HarnessSolver(Solver):
             viewer_data_path = self._artifacts_dir() / f"{run_stem}_viewer_data.json"
             transcript_path = self._transcripts_dir() / f"{run_stem}.txt"
             analysis_relpath = f"solver_analysis/{run_stem}.html"
-            analyzer = self._make_analyzer(game, index, local_server)
+            analyzer = self._make_analyzer(
+                game, index, local_server, pass_index=pass_index
+            )
             session = _HarnessGameSession(
                 solver=self,
                 game=game,

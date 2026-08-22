@@ -4680,6 +4680,12 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             expected_outcome=None,
             fallback=None,
             contradictions=None,
+            subgoals=None,
+            current_subgoal=None,
+            plan_steps=None,
+            success_criteria=None,
+            risk=None,
+            abort_condition=None,
         ):
             update = {
                 "goal": goal,
@@ -4692,6 +4698,12 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 "expected_outcome": expected_outcome,
                 "fallback": fallback,
                 "contradictions": contradictions,
+                "subgoals": subgoals,
+                "current_subgoal": current_subgoal,
+                "plan_steps": plan_steps,
+                "success_criteria": success_criteria,
+                "risk": risk,
+                "abort_condition": abort_condition,
             }
             _send({"type": "strategy", "update": _json_safe(update)})
             reply = _recv()

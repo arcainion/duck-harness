@@ -151,16 +151,24 @@ Useful sections in `configs/inference.json`:
 - `analyzer.*`: duck sampling/tool settings. This key is still named
   `analyzer` for compatibility with existing code and configs. The inference
   controller is configured by `strategy_enabled`, `same_state_noop_limit`,
-  `stagnation_window`, and `cycle_window`. `strategy_policy` accepts `legacy`
-  or the opt-in `outcome_aware` policy; missing keys preserve legacy behavior.
+  `stagnation_window`, and `cycle_window`. `strategy_policy` accepts
+  `outcome_aware` (the default) or `legacy`. Outcome-aware mode exposes exact
+  mouse-coordinate outcomes, short verified transition-graph plans, and
+  phase-specific action budgets.
   The outcome-aware volatility detector can be tuned with `volatile_window`,
   `volatile_min_samples`, and `volatile_ratio`.
 
-Try the candidate policy without changing the checked-in default:
+Restore the previous controller for an ablation:
 
 ```bash
-LOCAL_ANALYZER_STRATEGY_POLICY=outcome_aware make interactive
+LOCAL_ANALYZER_STRATEGY_POLICY=legacy make interactive
 ```
+- `analyzer.candidates` defaults to two. Compilable candidates are ranked
+  against the current action rankings, discouraged exact actions, mouse search
+  history, action budget, and recommended verified plan.
+- Passes of the same game run sequentially and share bounded progress lessons;
+  different games remain concurrent. Shared knowledge contains opaque state
+  IDs and compact strategy evidence, never raw frames.
 - `chat.*`: direct chat probing with `make chat`.
 - `viewer.port`: default viewer port.
 - `multimodal.*`: image context for the current grid.
@@ -413,6 +421,19 @@ P(true_delta > 0 | results) >= 0.90
 
 The output also includes win rate, a bootstrap 90% interval, and TAAF paired
 test p-values as robustness checks.
+
+## Behavioral Regression Gate
+
+Check both score and closed-loop behavior before accepting a run:
+
+```bash
+make regression-gate REGRESSION_RUN_DIR=/path/to/run
+```
+
+`configs/regression.json` defines minimum score, rewarding-action rate and
+trace count, plus maximum no-op, repeated-no-op, and terminal-violation rates.
+It can also require a score ratio against `baseline_run_dir`. The command exits
+nonzero and reports every failed threshold.
 
 ## Trace Export
 

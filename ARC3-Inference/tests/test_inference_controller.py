@@ -26,6 +26,7 @@ class InferenceControllerTests(TestCase):
             same_state_noop_limit=2,
             stagnation_window=3,
             cycle_window=4,
+            volatile_min_samples=10,
         )
 
     def test_fingerprint_is_stable_and_level_sensitive(self) -> None:
@@ -36,15 +37,15 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(frame_fingerprint(first), frame_fingerprint(same_visible_state))
         self.assertNotEqual(frame_fingerprint(first), frame_fingerprint(next_level))
 
-    def test_absent_configuration_preserves_legacy_disabled_default(self) -> None:
+    def test_absent_configuration_enables_outcome_aware_default(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             config = InferenceControllerConfig.from_env()
 
-        self.assertFalse(config.enabled)
+        self.assertTrue(config.enabled)
         self.assertEqual(config.same_state_noop_limit, 2)
         self.assertEqual(config.stagnation_window, 12)
         self.assertEqual(config.cycle_window, 8)
-        self.assertEqual(config.policy, "legacy")
+        self.assertEqual(config.policy, OUTCOME_AWARE_POLICY)
 
     def test_environment_enables_and_bounds_outcome_aware_policy(self) -> None:
         with mock.patch.dict(
@@ -255,6 +256,25 @@ class InferenceControllerTests(TestCase):
         self.assertIsNone(
             action_guard_reason(history, history[-1].frame, "MOUSE(row=2, col=2)", config)
         )
+        self.assertEqual(snapshot["mouse_search"]["unique_coordinates"], 1)
+        self.assertEqual(snapshot["mouse_search"]["recent"][0]["row"], 1)
+
+    def test_verified_transition_graph_proposes_short_progress_plan(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        a = _frame(1, step=0)
+        b = _frame(2, step=1)
+        progressed = _frame(3, step=2, level=2)
+        history = [
+            HistoryEntry(action="", frame=a),
+            HistoryEntry(action="RIGHT", frame=b),
+            HistoryEntry(action="SPACE", frame=progressed),
+            HistoryEntry(action="RESET", frame=_frame(1, step=3)),
+        ]
+
+        snapshot = build_experience_snapshot(history, history[-1].frame, ["RIGHT"], config)
+
+        self.assertEqual(snapshot["recommended_plan"]["actions"], ["RIGHT", "SPACE"])
+        self.assertEqual(snapshot["recommended_plan"]["target"], "level_progress")
 
     def test_outcome_metadata_reports_level_progress(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
