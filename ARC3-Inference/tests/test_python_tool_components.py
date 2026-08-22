@@ -111,6 +111,50 @@ class PythonToolComponentTests(unittest.TestCase):
                 diagonal=1,
             )
 
+    def test_absent_symbol_returns_empty_summary(self) -> None:
+        summary = _bounded_frame_components(
+            [[0, 0]],
+            shape=(1, 2),
+            color_chars=ARC_COLOR_CHARS,
+            symbol=ARC_COLOR_CHARS[1],
+        )
+
+        self.assertEqual(summary["count"], 0)
+        self.assertEqual(summary["components"], [])
+        self.assertEqual(summary["sampled_cells"], 0)
+
+    def test_zero_limits_preserve_component_count(self) -> None:
+        summary = _bounded_frame_components(
+            [[1, 0, 1]],
+            shape=(1, 3),
+            color_chars=ARC_COLOR_CHARS,
+            symbol=ARC_COLOR_CHARS[1],
+            limit=0,
+            cell_limit=0,
+        )
+
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["components"], [])
+        self.assertEqual(summary["truncated_components"], 2)
+
+    def test_rejects_boolean_component_limits(self) -> None:
+        with self.assertRaisesRegex(TypeError, "limit"):
+            _bounded_frame_components(
+                [[1]],
+                shape=(1, 1),
+                color_chars=ARC_COLOR_CHARS,
+                symbol=ARC_COLOR_CHARS[1],
+                limit=True,
+            )
+        with self.assertRaisesRegex(TypeError, "cell_limit"):
+            _bounded_frame_components(
+                [[1]],
+                shape=(1, 1),
+                color_chars=ARC_COLOR_CHARS,
+                symbol=ARC_COLOR_CHARS[1],
+                cell_limit=False,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

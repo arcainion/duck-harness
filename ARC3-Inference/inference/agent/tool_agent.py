@@ -109,30 +109,75 @@ def _strip_tool_call_markup(text: str) -> str:
 def _normalize_generated_python_code(value: Any) -> str:
     """Recover unambiguous executable Python from common model wrappers.
 
-    Raw Python remains authoritative.  If it does not compile, accept a single
-    Python (or unlabelled) Markdown fence when the fenced body does compile.
-    Multiple fences stay untouched so we never guess which program to run.
+    Exact nested code payloads are unwrapped first. Otherwise raw Python remains
+    authoritative. If it does not compile, accept one unambiguous Python wrapper
+    whose body does compile. Multiple blocks stay untouched so we never guess.
     """
+    python_languages = {"", "py", "py3", "python", "python3"}
+
+    def executable(candidate: Any) -> str | None:
+        if not isinstance(candidate, str):
+            return None
+        candidate = candidate.rstrip()
+        try:
+            compile(candidate, "<python_tool>", "exec")
+        except (SyntaxError, ValueError, OverflowError):
+            return None
+        return candidate
+
+    def nested_code(payload: Any) -> str | None:
+        if not isinstance(payload, dict) or set(payload) not in (
+            {"code"},
+            {"code", "language"},
+        ):
+            return None
+        language = str(payload.get("language") or "").strip().lower()
+        if language not in python_languages:
+            return None
+        return executable(payload.get("code"))
+
+    direct_nested = nested_code(value)
+    if direct_nested is not None:
+        return direct_nested
+
     code = str(value or "").rstrip()
     try:
-        compile(code, "<python_tool>", "exec")
-    except (SyntaxError, ValueError, OverflowError):
-        pass
-    else:
-        return code
+        decoded = json.loads(code)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        decoded = None
+    decoded_nested = nested_code(decoded)
+    if decoded_nested is not None:
+        return decoded_nested
+
+    raw = executable(code)
+    if raw is not None:
+        return raw
 
     matches = list(_MARKDOWN_CODE_FENCE_RE.finditer(code))
-    if len(matches) != 1:
-        return code
-    match = matches[0]
-    if str(match.group("language") or "").lower() not in {"", "py", "python"}:
-        return code
-    candidate = str(match.group("code") or "").rstrip()
-    try:
-        compile(candidate, "<python_tool>", "exec")
-    except (SyntaxError, ValueError, OverflowError):
-        return code
-    return candidate
+    if len(matches) == 1:
+        match = matches[0]
+        if str(match.group("language") or "").lower() in python_languages:
+            fenced = executable(str(match.group("code") or ""))
+            if fenced is not None:
+                return fenced
+
+    xml_match = re.fullmatch(
+        r"\s*<(?:python|code(?:\s+language=['\"](?:py|python|python3)['\"])?)>"
+        r"(?P<code>.*?)</(?:python|code)>\s*",
+        code,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if xml_match is not None:
+        xml_code = executable(str(xml_match.group("code") or "").strip("\r\n"))
+        if xml_code is not None:
+            return xml_code
+
+    lines = code.splitlines()
+    if lines and lines[0].strip().lower() in {"py", "py:", "python", "python:"}:
+        labelled = executable("\n".join(lines[1:]))
+        if labelled is not None:
+            return labelled
+    return code
 
 
 def _recover_tool_calls_from_markup(*chunks: str) -> list[dict[str, Any]]:
@@ -204,16 +249,28 @@ _PYTHON_TOOL_DESCRIPTION = (
     "`valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, "
     "`record_strategy(...)`, bounded `memory`, `remember(key, value)`, `forget(key=None)`, "
     "and `action(actions)` for executing one or more real environment actions. "
+    "Repeated identical structural analyses on the same frame are memoized with mutation-safe results. "
     "`current_frame` and each `history[*].frame` expose `.ascii`, `.segmentation`, `.step`, `.level`, and `.shape`; "
     "frames also expose `.crop(top, left, bottom, right)` for a letter-coded region using half-open bounds, "
     "`.cell(row, col)` and `.neighbors(row, col, diagonal=False)` for local letter-coded queries, "
-    "`.find(symbol, limit=64)` for bounded color-coordinate searches, "
+    "`.ray(row, col, direction, stop_at=None, include_start=False, limit=64)` for bounded line-of-sight scans, "
+    "`.find(symbol, limit=64)` for bounded color-coordinate searches, `.color_summary(limit=16)` for dominant-first palette and edge statistics, "
+    "`.runs(symbol=None, directions='HV', min_length=2, limit=64)` for maximal same-color lines, "
+    "`.rectangles(symbol=None, kind='any', min_size=2, limit=64)` for filled boxes and closed outlines, "
+    "`.enclosed_regions(symbol=None, diagonal=False, limit=64, cell_limit=128)` for surrounded regions and boundary colors, "
     "`.components(symbol, diagonal=False, limit=64, cell_limit=128)` for bounded connected-component geometry, "
     "`.objects(background=None, diagonal=False, limit=64, cell_limit=128)` for bounded multi-color object geometry, "
-    "`.find_pattern(pattern, wildcard=None, transforms=False, limit=64)` for bounded repeated-pattern searches, "
-    "`.shortest_path(start, goal, passable=...)` for bounded letter-coded BFS, "
+    "`.object_relations(background=None, diagonal=False, object_limit=32, relation_limit=64)` for pairwise spatial comparisons, "
+    "`.track_objects(other, background=None, diagonal=False, limit=64)` for object movement, additions, and removals, "
+    "`.transform_relation(other, allow_recolor=True)` for rotations, reflections, and consistent color mappings, "
+    "`.symmetry(sample_limit=8)` for exact and approximate reflection or rotational symmetry, "
+    "`.periodicity(candidate_limit=8, sample_limit=8)` for exact and near row or column repetition, "
+    "`.find_pattern(pattern, wildcard=None, transforms=False, max_mismatches=0, mismatch_limit=8, limit=64)` for exact or approximate repeated-pattern searches, "
+    "`.reachable_region(start, passable=...)` for bounded reachable-space and blocked-frontier analysis, "
+    "`.shortest_path(start, goal_or_symbols, passable=...)` for bounded letter-coded BFS to coordinates or the nearest target color, "
     "`.shortest_path_to_any(start, goals, passable=...)` for nearest-goal BFS, "
-    "`.diff(other, limit=64)`, and transitions expose `.diff(limit=64)` for bounded change summaries; "
+    "`.diff(other, limit=64)` for bounded change summaries, and `.color_transitions(other, ...)` for aggregate recoloring rules; "
+    "transitions expose both `.diff(...)` and `.color_transitions(...)`; "
     "`history[-1].frame` is the current post-action frame, not the previous frame. "
     "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
     "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
@@ -462,6 +519,22 @@ class _AsciiHistoryEntryView:
     __repr__ = __str__
 
 
+@dataclass(frozen=True)
+class _FramePayloadCache:
+    current_frame: Frame | None
+    history_entries: tuple[HistoryEntry, ...]
+    current_payload: dict[str, Any] | None
+    history_payload: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _ExperienceSnapshotCache:
+    current_frame: Frame | None
+    history_entries: tuple[HistoryEntry, ...]
+    valid_actions: tuple[str, ...]
+    payload: dict[str, Any]
+
+
 def _to_ascii_frame_view(frame: Frame | None) -> _AsciiFrameView | None:
     if frame is None:
         return None
@@ -496,14 +569,66 @@ def _ascii_frame_view_payload(frame: Frame | None) -> dict[str, Any] | None:
     }
 
 
+def _ascii_frame_delta_payload(
+    before: Frame,
+    after: Frame,
+) -> dict[str, Any] | None:
+    if len(before.grid) != len(after.grid) or any(
+        len(before_row) != len(after_row)
+        for before_row, after_row in zip(before.grid, after.grid)
+    ):
+        return None
+    cell_count = sum(len(row) for row in after.grid)
+    changes = [
+        [row, col, after_value]
+        for row, (before_row, after_row) in enumerate(zip(before.grid, after.grid))
+        for col, (before_value, after_value) in enumerate(zip(before_row, after_row))
+        if before_value != after_value
+    ]
+    if changes and len(changes) * 6 >= max(1, cell_count):
+        return None
+    return {
+        "step": after.step,
+        "level": after.level,
+        "shape": [int(after.shape[0]), int(after.shape[1])],
+        "changes": changes,
+    }
+
+
 def _ascii_history_view_payload(history_entries: list[HistoryEntry]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
+    previous_frame: Frame | None = None
     for entry in history_entries:
-        frame_payload = _ascii_frame_view_payload(entry.frame)
-        if frame_payload is None:
-            continue
-        payload.append({"action": entry.action, "frame": frame_payload})
+        delta_payload = (
+            _ascii_frame_delta_payload(previous_frame, entry.frame)
+            if previous_frame is not None
+            else None
+        )
+        if delta_payload is not None:
+            payload.append({"action": entry.action, "frame_delta": delta_payload})
+        else:
+            frame_payload = _ascii_frame_view_payload(entry.frame)
+            if frame_payload is not None:
+                payload.append({"action": entry.action, "frame": frame_payload})
+        previous_frame = entry.frame
     return payload
+
+
+def _current_frame_transport_payload(
+    current_frame: Frame | None,
+    history_entries: list[HistoryEntry],
+    full_payload: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if current_frame is None or not history_entries:
+        return full_payload
+    latest = history_entries[-1].frame
+    if (
+        current_frame.step == latest.step
+        and current_frame.level == latest.level
+        and current_frame.grid == latest.grid
+    ):
+        return {"history_index": len(history_entries) - 1}
+    return full_payload
 
 
 def _format_action_span(start_action_num: int | None, end_action_num: int | None) -> str | None:
@@ -517,11 +642,14 @@ def _format_action_span(start_action_num: int | None, end_action_num: int | None
 
 
 def _estimate_tokens(value: Any) -> int:
+    return max(1, (_estimated_json_length(value) + 2) // 3)
+
+
+def _estimated_json_length(value: Any) -> int:
     try:
-        rendered = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
+        return len(json.dumps(value, ensure_ascii=True, sort_keys=True, default=str))
     except TypeError:
-        rendered = str(value)
-    return max(1, (len(rendered) + 2) // 3)
+        return len(str(value))
 
 
 def _host_accessible_base_url(base_url: str) -> str:
@@ -686,23 +814,41 @@ def _normalize_tool_call_arguments(arguments: Any) -> dict[str, Any]:
             recovered_tool_calls = _recover_tool_calls_from_markup(stripped)
             if recovered_tool_calls:
                 recovered_arguments = recovered_tool_calls[0].get("function", {}).get("arguments", "{}")
-                return json.loads(str(recovered_arguments))
+                return _normalize_tool_call_arguments(recovered_arguments)
             return {}
-        parsed = json.loads(stripped)
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError as json_error:
+            code = _normalize_generated_python_code(stripped)
+            try:
+                compile(code, "<python_tool_arguments>", "exec")
+            except (SyntaxError, TypeError, ValueError):
+                raise json_error
+            return {"code": code}
         if isinstance(parsed, dict):
             return parsed
         raise ValueError("tool call arguments must decode to a JSON object")
     raise ValueError("tool call arguments must be a JSON object or JSON object string")
 
 
-def _render_tool_call_markup(tool_name: str, arguments: Any) -> str:
+def _render_tool_call_markup(
+    tool_name: str,
+    arguments: Any,
+    *,
+    arguments_normalized: bool = False,
+) -> str:
     name = str(tool_name or "").strip()
     if not name:
         return ""
-    try:
-        parsed_arguments = _normalize_tool_call_arguments(arguments)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return ""
+    if arguments_normalized:
+        if not isinstance(arguments, dict):
+            return ""
+        parsed_arguments = arguments
+    else:
+        try:
+            parsed_arguments = _normalize_tool_call_arguments(arguments)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
 
     lines = ["<tool_call>", f"<function={name}>"]
     for parameter_name, parameter_value in parsed_arguments.items():
@@ -1096,6 +1242,8 @@ class ToolAgent:
         self._controller_config = InferenceControllerConfig.from_env()
         self._strategy_memory: dict[str, Any] = {}
         self._python_memory: dict[str, Any] = {}
+        self._frame_payload_cache: _FramePayloadCache | None = None
+        self._experience_snapshot_cache: _ExperienceSnapshotCache | None = None
         self._generated_tool_call_count = 0
 
     def _headers(self) -> dict[str, str]:
@@ -1126,7 +1274,74 @@ class ToolAgent:
             self._summarized_knowledge = _empty_world_model()
             self._strategy_memory = {}
             self._python_memory = {}
+            self._frame_payload_cache = None
+            self._experience_snapshot_cache = None
             self._generated_tool_call_count = 0
+
+    def _cached_frame_payloads(
+        self,
+        current_frame: Frame | None,
+        history_entries: list[HistoryEntry],
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        cached = self._frame_payload_cache
+        if (
+            cached is not None
+            and cached.current_frame is current_frame
+            and len(cached.history_entries) == len(history_entries)
+            and all(
+                cached_entry is current_entry
+                for cached_entry, current_entry in zip(
+                    cached.history_entries, history_entries
+                )
+            )
+        ):
+            return cached.current_payload, cached.history_payload
+
+        current_payload = _ascii_frame_view_payload(current_frame)
+        history_payload = _ascii_history_view_payload(history_entries)
+        self._frame_payload_cache = _FramePayloadCache(
+            current_frame=current_frame,
+            history_entries=tuple(history_entries),
+            current_payload=current_payload,
+            history_payload=history_payload,
+        )
+        return current_payload, history_payload
+
+    def _cached_experience_snapshot(
+        self,
+        current_frame: Frame | None,
+        history_entries: list[HistoryEntry],
+        valid_actions: list[str],
+    ) -> dict[str, Any]:
+        action_key = tuple(valid_actions)
+        cached = self._experience_snapshot_cache
+        if (
+            cached is not None
+            and cached.current_frame is current_frame
+            and cached.valid_actions == action_key
+            and len(cached.history_entries) == len(history_entries)
+            and all(
+                cached_entry is current_entry
+                for cached_entry, current_entry in zip(
+                    cached.history_entries, history_entries
+                )
+            )
+        ):
+            return cached.payload
+
+        payload = build_experience_snapshot(
+            history_entries,
+            current_frame,
+            valid_actions,
+            self._controller_config,
+        )
+        self._experience_snapshot_cache = _ExperienceSnapshotCache(
+            current_frame=current_frame,
+            history_entries=tuple(history_entries),
+            valid_actions=action_key,
+            payload=payload,
+        )
+        return payload
 
     def _normalize_response_tool_calls(self, value: Any) -> list[dict[str, Any]]:
         raw_calls = value if isinstance(value, list) else []
@@ -1544,7 +1759,7 @@ class ToolAgent:
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
                 "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, bounded `memory`, `record_strategy(...)`, `remember(key, value)`, `forget(key=None)`, and `action(actions)`.",
                 "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
-                "Keep tool output compact: use `current_frame.segmentation` as the primary view, `current_frame.find(symbol)` to locate colors, `current_frame.cell(row, col)` / `.neighbors(row, col)` for local checks, `current_frame.shortest_path(start, goal, passable=...)` or `.shortest_path_to_any(start, goals, passable=...)` for bounded navigation, and `current_frame.crop(top, left, bottom, right)` for a small letter-coded region; never print full boards.",
+                "Keep tool output compact: use `current_frame.segmentation` as the primary view, `current_frame.find(symbol)` to locate colors, `current_frame.cell(row, col)` / `.neighbors(row, col)` for local checks, `current_frame.shortest_path(start, goal_or_symbols, passable=...)` or `.shortest_path_to_any(start, goals, passable=...)` for bounded navigation, and `current_frame.crop(top, left, bottom, right)` for a small letter-coded region; never print full boards.",
                 "For the most recent change, call `current_frame.diff(previous_frame)` or `last_transition.diff()`; `history[-1].frame` is the current frame, not the previous one. Inspect `last_action_result['animation']` for bounded temporal evidence that may have disappeared from the final frame.",
                 "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
                 "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
@@ -1896,9 +2111,16 @@ class ToolAgent:
             *,
             next_valid_actions: list[str] | None = None,
             last_action_result: dict[str, Any] | None = None,
+            runtime_state: tuple[Frame | None, list[HistoryEntry]] | None = None,
         ) -> dict[str, Any]:
-            refreshed_frame, refreshed_history = load_runtime_state(state_path)
-            current_frame_payload = _ascii_frame_view_payload(refreshed_frame)
+            if runtime_state is None:
+                refreshed_frame, refreshed_history = load_runtime_state(state_path)
+            else:
+                refreshed_frame, refreshed_history = runtime_state
+            current_frame_payload, history_payload = self._cached_frame_payloads(
+                refreshed_frame,
+                refreshed_history,
+            )
             if isinstance(next_valid_actions, list):
                 sanitized_actions = [str(item).strip() for item in next_valid_actions if str(item).strip()]
             else:
@@ -1909,14 +2131,17 @@ class ToolAgent:
                 else self._last_action_result
             )
             return {
-                "current_frame": current_frame_payload,
-                "history": _ascii_history_view_payload(refreshed_history),
-                "valid_actions": sanitized_actions,
-                "experience": build_experience_snapshot(
-                    refreshed_history,
+                "current_frame": _current_frame_transport_payload(
                     refreshed_frame,
+                    refreshed_history,
+                    current_frame_payload,
+                ),
+                "history": history_payload,
+                "valid_actions": sanitized_actions,
+                "experience": self._cached_experience_snapshot(
+                    refreshed_frame,
+                    refreshed_history,
                     sanitized_actions,
-                    self._controller_config,
                 ),
                 "strategy": dict(self._strategy_memory),
                 "memory": dict(self._python_memory),
@@ -1999,7 +2224,9 @@ class ToolAgent:
         sandbox_result = run_sandboxed_python(
             code=code,
             timeout_seconds=self._python_timeout,
-            initial_state=_serialized_runtime_state(),
+            initial_state=_serialized_runtime_state(
+                runtime_state=(current_frame, history_entries)
+            ),
             action_handler=_handle_action,
             strategy_handler=self._record_strategy,
             memory_handler=self._record_python_memory,
@@ -2117,9 +2344,33 @@ class ToolAgent:
         history = list(messages[1:])
         preserve_recent = max(0, preserve_recent)
         budget_tokens = max(1, self._context_budget_tokens - max(0, extra_safety_tokens))
-        while history and self._estimate_request_input_tokens([system_message, *history], tools=tools) > budget_tokens:
+        empty_payload: dict[str, Any] = {"messages": []}
+        if tools:
+            empty_payload["tools"] = tools
+            empty_payload["tool_choice"] = _request_tool_choice(tools)
+        request_chars = _estimated_json_length(empty_payload)
+        system_chars = _estimated_json_length(system_message)
+        history_chars = [_estimated_json_length(message) for message in history]
+        history_chars_total = sum(history_chars)
+
+        def estimated_tokens() -> int:
+            # Replacing the payload's empty `[]` adds each rendered message plus
+            # `, ` between adjacent items. The system message is always retained.
+            rendered_chars = (
+                request_chars
+                + system_chars
+                + history_chars_total
+                + 2 * len(history_chars)
+            )
+            return max(1, (rendered_chars + 2) // 3)
+
+        while history and estimated_tokens() > budget_tokens:
+            previous_length = len(history)
             if not self._drop_oldest_history_block(history, preserve_recent=preserve_recent):
                 break
+            removed_count = previous_length - len(history)
+            history_chars_total -= sum(history_chars[:removed_count])
+            del history_chars[:removed_count]
         history = self._drop_until_first_user_message(history)
         return [system_message, *history]
 
@@ -2194,9 +2445,10 @@ class ToolAgent:
 
         previous_history_messages = list(self._history_messages)
         preserve_history = True
+        tools = self._tools(state_path)
         messages: list[dict[str, Any]] = self._trim_messages_for_context(
             [{"role": "system", "content": self._system_prompt}, *self._history_messages, self._build_user_message(user_prompt, current_frame)],
-            tools=self._tools(state_path),
+            tools=tools,
             preserve_recent=1,
         )
         step_executed = False
@@ -2226,7 +2478,6 @@ class ToolAgent:
                 if yielded_control_reason is not None:
                     break
                 turn_count += 1
-                tools = self._tools(state_path)
                 tool_choice = _request_tool_choice(tools)
                 messages = self._trim_messages_for_context(messages, tools=tools)
                 latest_request_messages = json.loads(json.dumps(messages))
@@ -2306,15 +2557,26 @@ class ToolAgent:
                     recovered_tool_calls_from_markup = bool(tool_calls)
                 reasoning = _strip_tool_call_markup(raw_reasoning) if tool_call_markup_in_text else raw_reasoning
                 content = _strip_tool_call_markup(raw_content) if tool_call_markup_in_text else raw_content
+                normalized_tool_arguments: list[dict[str, Any] | None] = []
+                tool_argument_errors: list[str | None] = []
                 malformed_argument_errors: list[str] = []
                 for tool_call in tool_calls:
                     function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
                     tool_name = str(function.get("name", "")).strip() or "unknown"
                     raw_arguments = function.get("arguments", "{}")
                     try:
-                        _normalize_tool_call_arguments(raw_arguments)
+                        normalized_tool_arguments.append(
+                            _normalize_tool_call_arguments(raw_arguments)
+                        )
+                        tool_argument_errors.append(None)
                     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                        malformed_argument_errors.append(f"{tool_name}: invalid arguments ({exc})")
+                        issue = f"{tool_name}: invalid arguments ({exc})"
+                        normalized_tool_arguments.append(None)
+                        tool_argument_errors.append(
+                            f"Invalid arguments for tool {tool_name}: {exc}. "
+                            "Provide one JSON object and retry."
+                        )
+                        malformed_argument_errors.append(issue)
                 response_meta = _format_model_response_meta(
                     finish_reason=result.finish_reason,
                     reasoning=reasoning,
@@ -2381,16 +2643,14 @@ class ToolAgent:
                     function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
                     tool_name = str(function.get("name", "")).strip()
                     raw_args = function.get("arguments", "{}")
-                    try:
-                        arguments = _normalize_tool_call_arguments(raw_args)
-                        argument_error = None
-                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                        arguments = {}
-                        argument_error = (
-                            f"Invalid arguments for tool {tool_name or 'unknown'}: {exc}. "
-                            "Provide one JSON object and retry."
-                        )
-                    rendered_tool_call = _render_tool_call_markup(tool_name, raw_args)
+                    normalized_arguments = normalized_tool_arguments[tool_index]
+                    arguments = normalized_arguments or {}
+                    argument_error = tool_argument_errors[tool_index]
+                    rendered_tool_call = _render_tool_call_markup(
+                        tool_name,
+                        arguments if normalized_arguments is not None else raw_args,
+                        arguments_normalized=normalized_arguments is not None,
+                    )
                     append_transcript(
                         f"TOOL CALL: {tool_name}",
                         rendered_tool_call or (json.dumps(arguments, indent=2) if arguments else "{}"),
@@ -2469,7 +2729,7 @@ class ToolAgent:
             return None
         finally:
             if preserve_history:
-                self._history_messages = self._persistent_history_messages(messages, tools=self._tools(state_path))
+                self._history_messages = self._persistent_history_messages(messages, tools=tools)
             else:
                 self._history_messages = previous_history_messages
             self._step_env_callback = None

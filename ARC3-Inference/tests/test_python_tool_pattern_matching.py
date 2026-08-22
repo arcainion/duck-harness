@@ -66,6 +66,49 @@ class PythonToolPatternMatchingTests(unittest.TestCase):
         self.assertEqual(transformed["count"], 1)
         self.assertEqual(transformed["matches"][0]["transform"], "ROTATE_90")
 
+    def test_approximate_matches_are_ranked_with_mismatch_evidence(self) -> None:
+        summary = _bounded_frame_find_pattern(
+            [[0, 2, 9, 0, 1], [1, 0, 9, 1, 0]],
+            shape=(2, 5),
+            color_chars=ARC_COLOR_CHARS,
+            pattern=[
+                ARC_COLOR_CHARS[0] + ARC_COLOR_CHARS[1],
+                ARC_COLOR_CHARS[1] + ARC_COLOR_CHARS[0],
+            ],
+            max_mismatches=1,
+        )
+
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["matches"][0]["left"], 3)
+        self.assertEqual(summary["matches"][0]["mismatches"], 0)
+        self.assertEqual(summary["matches"][1]["left"], 0)
+        self.assertEqual(summary["matches"][1]["mismatches"], 1)
+        self.assertEqual(
+            summary["matches"][1]["mismatch_samples"],
+            [
+                {
+                    "cell": [0, 1],
+                    "actual": ARC_COLOR_CHARS[2],
+                    "expected": ARC_COLOR_CHARS[1],
+                }
+            ],
+        )
+
+    def test_approximate_match_evidence_is_bounded_and_ignores_wildcards(self) -> None:
+        summary = _bounded_frame_find_pattern(
+            [[2, 3]],
+            shape=(1, 2),
+            color_chars=ARC_COLOR_CHARS,
+            pattern=["?" + ARC_COLOR_CHARS[0]],
+            wildcard="?",
+            max_mismatches=2,
+            mismatch_limit=0,
+        )
+
+        self.assertEqual(summary["matches"][0]["mismatches"], 1)
+        self.assertEqual(summary["matches"][0]["mismatch_samples"], [])
+        self.assertEqual(summary["matches"][0]["truncated_mismatches"], 1)
+
     def test_deduplicates_symmetric_variants_and_bounds_matches(self) -> None:
         summary = _bounded_frame_find_pattern(
             [[0, 0, 0]],
@@ -94,8 +137,14 @@ class PythonToolPatternMatchingTests(unittest.TestCase):
         )
 
         summary = frame.find_pattern([ARC_COLOR_CHARS[:2]])
+        approximate = frame.find_pattern(
+            [ARC_COLOR_CHARS[0] + ARC_COLOR_CHARS[2]],
+            max_mismatches=1,
+        )
 
         self.assertEqual(summary["count"], 1)
+        self.assertEqual(approximate["count"], 1)
+        self.assertEqual(approximate["matches"][0]["mismatches"], 1)
 
     def test_rejects_invalid_patterns(self) -> None:
         with self.assertRaisesRegex(ValueError, "equal lengths"):
@@ -112,6 +161,64 @@ class PythonToolPatternMatchingTests(unittest.TestCase):
                 color_chars=ARC_COLOR_CHARS,
                 pattern=[ARC_COLOR_CHARS[0]],
                 wildcard=ARC_COLOR_CHARS[1],
+            )
+
+    def test_pattern_larger_than_frame_has_no_matches(self) -> None:
+        summary = _bounded_frame_find_pattern(
+            [[0]],
+            shape=(1, 1),
+            color_chars=ARC_COLOR_CHARS,
+            pattern=[ARC_COLOR_CHARS[:2], ARC_COLOR_CHARS[:2]],
+        )
+
+        self.assertEqual(summary["count"], 0)
+        self.assertEqual(summary["matches"], [])
+
+    def test_negative_limit_counts_without_returning_matches(self) -> None:
+        summary = _bounded_frame_find_pattern(
+            [[0, 0]],
+            shape=(1, 2),
+            color_chars=ARC_COLOR_CHARS,
+            pattern=[ARC_COLOR_CHARS[0]],
+            limit=-5,
+        )
+
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["matches"], [])
+        self.assertEqual(summary["truncated_matches"], 2)
+
+    def test_rejects_boolean_options_and_oversized_pattern(self) -> None:
+        with self.assertRaisesRegex(TypeError, "transforms"):
+            _bounded_frame_find_pattern(
+                [[0]],
+                shape=(1, 1),
+                color_chars=ARC_COLOR_CHARS,
+                pattern=[ARC_COLOR_CHARS[0]],
+                transforms=1,
+            )
+        with self.assertRaisesRegex(TypeError, "limit"):
+            _bounded_frame_find_pattern(
+                [[0]],
+                shape=(1, 1),
+                color_chars=ARC_COLOR_CHARS,
+                pattern=[ARC_COLOR_CHARS[0]],
+                limit=True,
+            )
+        for name in ("max_mismatches", "mismatch_limit"):
+            with self.subTest(name=name), self.assertRaisesRegex(TypeError, name):
+                _bounded_frame_find_pattern(
+                    [[0]],
+                    shape=(1, 1),
+                    color_chars=ARC_COLOR_CHARS,
+                    pattern=[ARC_COLOR_CHARS[0]],
+                    **{name: True},
+                )
+        with self.assertRaisesRegex(ValueError, "at most 256"):
+            _bounded_frame_find_pattern(
+                [[0]],
+                shape=(1, 1),
+                color_chars=ARC_COLOR_CHARS,
+                pattern=[ARC_COLOR_CHARS[0] * 257],
             )
 
 

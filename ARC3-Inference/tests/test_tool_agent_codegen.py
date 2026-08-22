@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 from inference.agent.python_tool_sandbox import _SANDBOX_BOOTSTRAP
 from inference.agent.tool_agent import (
@@ -41,6 +42,31 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertEqual(_normalize_generated_python_code(value), "result = 3")
 
+    def test_recovers_python3_fence(self) -> None:
+        value = "```python3\nresult = 3\n```"
+
+        self.assertEqual(_normalize_generated_python_code(value), "result = 3")
+
+    def test_recovers_exact_nested_code_mapping(self) -> None:
+        value = {"language": "python", "code": "result = 5"}
+
+        self.assertEqual(_normalize_generated_python_code(value), "result = 5")
+
+    def test_recovers_json_encoded_code_mapping(self) -> None:
+        value = json.dumps({"code": "result = 8"})
+
+        self.assertEqual(_normalize_generated_python_code(value), "result = 8")
+
+    def test_recovers_exact_xml_python_wrapper(self) -> None:
+        value = "<python>\nresult = 13\n</python>"
+
+        self.assertEqual(_normalize_generated_python_code(value), "result = 13")
+
+    def test_recovers_standalone_python_label(self) -> None:
+        value = "Python:\nresult = 21"
+
+        self.assertEqual(_normalize_generated_python_code(value), "result = 21")
+
     def test_does_not_guess_between_multiple_code_fences(self) -> None:
         value = (
             "```python\nresult = 1\n```\n"
@@ -54,11 +80,49 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertEqual(_normalize_generated_python_code(value), value)
 
+    def test_does_not_unwrap_invalid_or_ambiguous_nested_payload(self) -> None:
+        invalid = json.dumps({"code": "for"})
+        ambiguous = json.dumps({"code": "result = 1", "alternative": "result = 2"})
+
+        self.assertEqual(_normalize_generated_python_code(invalid), invalid)
+        self.assertEqual(_normalize_generated_python_code(ambiguous), ambiguous)
+
+    def test_does_not_extract_non_python_xml_wrapper(self) -> None:
+        value = '<code language="javascript">result = 1</code>'
+
+        self.assertEqual(_normalize_generated_python_code(value), value)
+
     def test_rejects_non_object_tool_arguments(self) -> None:
         with self.assertRaisesRegex(ValueError, "JSON object"):
             _normalize_tool_call_arguments('["not", "an", "object"]')
         with self.assertRaisesRegex(ValueError, "JSON object"):
             _normalize_tool_call_arguments(["not", "an", "object"])
+
+    def test_recovers_direct_python_tool_arguments(self) -> None:
+        arguments = _normalize_tool_call_arguments(
+            "counts = current_frame.color_counts\nresult = max(counts, key=counts.get)"
+        )
+
+        self.assertEqual(
+            arguments,
+            {
+                "code": (
+                    "counts = current_frame.color_counts\n"
+                    "result = max(counts, key=counts.get)"
+                )
+            },
+        )
+
+    def test_recovers_wrapped_python_tool_arguments(self) -> None:
+        arguments = _normalize_tool_call_arguments(
+            "Here is the program:\n```python\nresult = current_frame.shape\n```"
+        )
+
+        self.assertEqual(arguments, {"code": "result = current_frame.shape"})
+
+    def test_rejects_invalid_direct_python_tool_arguments(self) -> None:
+        with self.assertRaises(json.JSONDecodeError):
+            _normalize_tool_call_arguments("for item in")
 
     def test_preserves_valid_raw_python_containing_backticks(self) -> None:
         value = 'result = "```python\\nnot executable\\n```"'
@@ -186,6 +250,55 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertIsNotNone(result)
         self.assertFalse(result.step_executed)
         self.assertIn("Provide one JSON object and retry", transcript)
+
+    def test_analyze_executes_direct_python_tool_arguments(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._tool_steps = 1
+        agent._chat_completion = lambda *_args, **_kwargs: _ChatCompletionResult(
+            message={
+                "tool_calls": [
+                    {
+                        "id": "direct-python",
+                        "type": "function",
+                        "function": {"name": "python", "arguments": "result = 42"},
+                    }
+                ]
+            },
+            finish_reason="tool_calls",
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            with (
+                patch(
+                    "inference.agent.tool_agent._normalize_tool_call_arguments",
+                    wraps=_normalize_tool_call_arguments,
+                ) as normalize_arguments,
+                patch.object(agent, "_tools", wraps=agent._tools) as build_tools,
+            ):
+                result = agent.analyze(
+                    state_path,
+                    action_num=0,
+                    valid_actions=["LEFT"],
+                )
+            transcript = state_path.with_name("tool_runtime_state_analyzer.txt").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.step_executed)
+        self.assertIn("[TOOL RESULT: python]\n42", transcript)
+        self.assertNotIn("Provide one JSON object and retry", transcript)
+        self.assertEqual(normalize_arguments.call_count, 1)
+        self.assertEqual(build_tools.call_count, 1)
 
     def test_usage_aliases_are_not_double_counted(self) -> None:
         agent = ToolAgent(

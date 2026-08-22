@@ -22,6 +22,19 @@ class PythonToolDiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic["type"], "NameError")
         self.assertEqual(diagnostic["line"], 2)
         self.assertEqual(diagnostic["source"], "result = missing_name + value")
+        self.assertEqual(diagnostic["name"], "missing_name")
+        self.assertEqual(
+            diagnostic["context"],
+            [
+                {"line": 1, "source": "value = 1", "current": False},
+                {
+                    "line": 2,
+                    "source": "result = missing_name + value",
+                    "current": True,
+                },
+            ],
+        )
+        self.assertEqual(diagnostic["retry"], "correct_and_retry")
         self.assertIn("starts fresh", diagnostic["hint"])
 
     def test_syntax_error_reports_line_column_and_source(self) -> None:
@@ -37,7 +50,48 @@ class PythonToolDiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic["line"], 1)
         self.assertIsInstance(diagnostic["column"], int)
         self.assertEqual(diagnostic["source"], "if True")
+        self.assertIsInstance(diagnostic["end_column"], int)
         self.assertIn("syntax", diagnostic["hint"].lower())
+
+    def test_name_error_suggests_nearby_generated_variable(self) -> None:
+        code = "current_frame = 1\nresult = current_fram"
+        try:
+            exec(compile(code, "<python_tool>", "exec"), {})
+        except NameError as exc:
+            diagnostic = _sandbox_exception_diagnostic(exc, code)
+        else:  # pragma: no cover
+            self.fail("Expected generated code to raise NameError")
+
+        self.assertEqual(diagnostic["suggestions"], ["current_frame"])
+
+    def test_attribute_error_suggests_documented_frame_method(self) -> None:
+        frame_type = type("FrameView", (), {})
+        code = "result = current_frame.objcts()"
+        try:
+            exec(
+                compile(code, "<python_tool>", "exec"),
+                {"current_frame": frame_type()},
+            )
+        except AttributeError as exc:
+            diagnostic = _sandbox_exception_diagnostic(exc, code)
+        else:  # pragma: no cover
+            self.fail("Expected generated code to raise AttributeError")
+
+        self.assertEqual(diagnostic["object_type"], "FrameView")
+        self.assertEqual(diagnostic["attribute"], "objcts")
+        self.assertEqual(diagnostic["suggestions"][0], "objects")
+        self.assertIn("closest", diagnostic["hint"].lower())
+
+    def test_key_error_reports_missing_scalar_key(self) -> None:
+        code = "result = {'count': 1}['counts']"
+        try:
+            exec(compile(code, "<python_tool>", "exec"), {})
+        except KeyError as exc:
+            diagnostic = _sandbox_exception_diagnostic(exc, code)
+        else:  # pragma: no cover
+            self.fail("Expected generated code to raise KeyError")
+
+        self.assertEqual(diagnostic["key"], "counts")
 
     def test_tool_payload_preserves_structured_diagnostic(self) -> None:
         diagnostic = {

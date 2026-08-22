@@ -3,6 +3,9 @@ from __future__ import annotations
 from unittest import TestCase
 
 from inference.agent.python_tool_sandbox import (
+    _SANDBOX_BOOTSTRAP,
+    _SANDBOX_LAUNCHER,
+    _sandbox_command,
     SandboxHostActionError,
     run_sandboxed_python,
 )
@@ -25,6 +28,13 @@ def _run(code: str) -> dict:
 
 
 class PythonToolSandboxTests(TestCase):
+    def test_sandbox_launcher_uses_compact_precompiled_bootstrap(self) -> None:
+        command, _isolated_cwd = _sandbox_command()
+
+        self.assertEqual(command[-1], _SANDBOX_LAUNCHER)
+        self.assertLess(len(_SANDBOX_LAUNCHER), 256)
+        self.assertLess(len(_SANDBOX_LAUNCHER), len(_SANDBOX_BOOTSTRAP) // 100)
+
     def test_sandbox_executes_supported_python(self) -> None:
         response = _run("result = sum(range(5))")
 
@@ -36,6 +46,26 @@ class PythonToolSandboxTests(TestCase):
 
         self.assertEqual(response["error"], "")
         self.assertEqual(response["result"], 10)
+
+    def test_sandbox_timeout_returns_structured_diagnostic(self) -> None:
+        response = run_sandboxed_python(
+            code="while True:\n    pass",
+            timeout_seconds=1,
+            initial_state={
+                "current_frame": None,
+                "history": [],
+                "valid_actions": [],
+                "last_action_result": {},
+                "experience": {},
+                "strategy": {},
+                "memory": {},
+            },
+            action_handler=lambda actions: {"action_result": {}, "state": {}},
+        )
+
+        self.assertIn("timed out after 1s", response["error"])
+        self.assertEqual(response["diagnostic"]["type"], "TimeoutError")
+        self.assertIn("bounded computation", response["diagnostic"]["hint"])
 
     def test_sandbox_bounds_stdout_before_host_transport(self) -> None:
         response = _run("print('x' * 50000)")

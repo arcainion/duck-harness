@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +44,29 @@ class Frame:
 class HistoryEntry:
     action: str
     frame: Frame
+
+
+_RUNTIME_STATE_CACHE_LIMIT = 64
+_runtime_state_cache: OrderedDict[
+    str,
+    tuple[
+        tuple[int, int, int],
+        Frame | None,
+        tuple[HistoryEntry, ...],
+    ],
+] = OrderedDict()
+_runtime_state_cache_lock = threading.Lock()
+
+
+def _runtime_state_signature(path: Path) -> tuple[int, int, int]:
+    metadata = path.stat()
+    return metadata.st_mtime_ns, metadata.st_size, metadata.st_ino
+
+
+def _invalidate_runtime_state_cache(path: Path) -> None:
+    cache_key = str(path.resolve())
+    with _runtime_state_cache_lock:
+        _runtime_state_cache.pop(cache_key, None)
 
 
 def normalize_grid(raw: Any) -> tuple[tuple[int, ...], ...]:
@@ -105,10 +130,8 @@ def history_entry_to_payload(entry: HistoryEntry) -> dict[str, Any]:
     }
 
 
-def load_runtime_state(path: Path) -> tuple[Frame | None, list[HistoryEntry]]:
-    if not path.exists():
-        return None, []
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def _decode_runtime_state(text: str) -> tuple[Frame | None, list[HistoryEntry]]:
+    payload = json.loads(text)
     current_frame = frame_from_payload(payload.get("current_frame"))
     history_entries = [
         entry
@@ -117,6 +140,45 @@ def load_runtime_state(path: Path) -> tuple[Frame | None, list[HistoryEntry]]:
         if entry is not None
     ]
     return current_frame, history_entries
+
+
+def load_runtime_state(path: Path) -> tuple[Frame | None, list[HistoryEntry]]:
+    cache_key = str(path.resolve())
+    latest: tuple[Frame | None, list[HistoryEntry]] = (None, [])
+    for _attempt in range(3):
+        try:
+            signature = _runtime_state_signature(path)
+        except FileNotFoundError:
+            with _runtime_state_cache_lock:
+                _runtime_state_cache.pop(cache_key, None)
+            return None, []
+
+        with _runtime_state_cache_lock:
+            cached = _runtime_state_cache.get(cache_key)
+            if cached is not None and cached[0] == signature:
+                _runtime_state_cache.move_to_end(cache_key)
+                return cached[1], list(cached[2])
+
+        try:
+            latest = _decode_runtime_state(path.read_text(encoding="utf-8"))
+            final_signature = _runtime_state_signature(path)
+        except FileNotFoundError:
+            continue
+        if final_signature != signature:
+            continue
+
+        current_frame, history_entries = latest
+        with _runtime_state_cache_lock:
+            _runtime_state_cache[cache_key] = (
+                final_signature,
+                current_frame,
+                tuple(history_entries),
+            )
+            _runtime_state_cache.move_to_end(cache_key)
+            while len(_runtime_state_cache) > _RUNTIME_STATE_CACHE_LIMIT:
+                _runtime_state_cache.popitem(last=False)
+        return current_frame, history_entries
+    return latest
 
 
 def write_runtime_state(
@@ -133,3 +195,4 @@ def write_runtime_state(
     tmp_path = path.with_suffix(f"{path.suffix}.tmp")
     tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp_path.replace(path)
+    _invalidate_runtime_state_cache(path)

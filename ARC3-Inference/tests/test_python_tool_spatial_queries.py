@@ -104,6 +104,39 @@ class PythonToolSpatialQueryTests(unittest.TestCase):
             ["RIGHT", "DOWN"],
         )
 
+    def test_ragged_or_invalid_cells_return_unknown_symbol(self) -> None:
+        ragged = _frame_cell_symbol(
+            [[0], []],
+            shape=(2, 2),
+            color_chars=ARC_COLOR_CHARS,
+            row=0,
+            col=1,
+        )
+        invalid = _frame_cell_symbol(
+            [[99]],
+            shape=(1, 1),
+            color_chars=ARC_COLOR_CHARS,
+            row=0,
+            col=0,
+        )
+
+        self.assertEqual(ragged, "?")
+        self.assertEqual(invalid, "?")
+
+    def test_neighbors_preserve_unknown_ragged_cells(self) -> None:
+        result = _bounded_frame_neighbors(
+            [[0], []],
+            shape=(2, 2),
+            color_chars=ARC_COLOR_CHARS,
+            row=0,
+            col=0,
+        )
+
+        self.assertEqual(
+            [(item["direction"], item["symbol"]) for item in result["neighbors"]],
+            [("RIGHT", "?"), ("DOWN", "?")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -113,6 +113,58 @@ class PythonToolObjectTests(unittest.TestCase):
                 diagonal=1,
             )
 
+    def test_multiple_background_colors_are_excluded(self) -> None:
+        summary = _bounded_frame_objects(
+            [[0, 1, 2, 1, 0]],
+            shape=(1, 5),
+            color_chars=ARC_COLOR_CHARS,
+            background=ARC_COLOR_CHARS[:2],
+        )
+
+        self.assertEqual(summary["background"], ARC_COLOR_CHARS[:2])
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["objects"][0]["colors"], {ARC_COLOR_CHARS[2]: 1})
+
+    def test_all_background_returns_no_objects(self) -> None:
+        summary = _bounded_frame_objects(
+            [[0, 0], [0, 0]],
+            shape=(2, 2),
+            color_chars=ARC_COLOR_CHARS,
+            background=ARC_COLOR_CHARS[0],
+        )
+
+        self.assertEqual(summary["count"], 0)
+        self.assertEqual(summary["objects"], [])
+        self.assertEqual(summary["sampled_cells"], 0)
+
+    def test_large_object_omits_unbounded_pattern(self) -> None:
+        grid = [[1] * 17 for _row in range(17)]
+        summary = _bounded_frame_objects(
+            grid,
+            shape=(17, 17),
+            color_chars=ARC_COLOR_CHARS,
+            background=ARC_COLOR_CHARS[0],
+        )
+
+        self.assertEqual(summary["objects"][0]["size"], 289)
+        self.assertIsNone(summary["objects"][0]["pattern"])
+        self.assertTrue(summary["objects"][0]["truncated_pattern"])
+
+    def test_zero_limits_preserve_counts_without_samples(self) -> None:
+        summary = _bounded_frame_objects(
+            [[1, 0, 2]],
+            shape=(1, 3),
+            color_chars=ARC_COLOR_CHARS,
+            background=ARC_COLOR_CHARS[0],
+            limit=0,
+            cell_limit=0,
+        )
+
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["objects"], [])
+        self.assertEqual(summary["sampled_cells"], 0)
+        self.assertEqual(summary["truncated_objects"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import base64
+import difflib
+import hashlib
+import marshal
 import os
 import queue
 import shutil
@@ -14,6 +18,7 @@ import threading
 import textwrap
 import time
 import traceback
+import zlib
 from typing import Any, Callable
 
 from inference.utils import segmentation as _segmentation
@@ -178,6 +183,126 @@ def _bounded_frame_neighbors(
     }
 
 
+def _bounded_frame_ray(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    row: int,
+    col: int,
+    direction: str,
+    stop_at: Any = None,
+    include_start: bool = False,
+    limit: int = 64,
+) -> dict[str, Any]:
+    """Scan one of eight grid directions with bounded letter-coded samples."""
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (row, col)
+    ):
+        raise TypeError("frame.ray(row, col, ...) expects integer coordinates.")
+    row_count, column_count = shape
+    if row < 0 or row >= row_count or col < 0 or col >= column_count:
+        raise ValueError("frame.ray(row, col, ...) coordinates are outside the frame.")
+    if not isinstance(direction, str):
+        raise TypeError("frame.ray(..., direction) expects a direction name.")
+    direction_name = direction.strip().upper().replace("-", "_")
+    directions = {
+        "UP": (-1, 0),
+        "UP_RIGHT": (-1, 1),
+        "RIGHT": (0, 1),
+        "DOWN_RIGHT": (1, 1),
+        "DOWN": (1, 0),
+        "DOWN_LEFT": (1, -1),
+        "LEFT": (0, -1),
+        "UP_LEFT": (-1, -1),
+    }
+    if direction_name not in directions:
+        raise ValueError(
+            "frame.ray(..., direction) expects one of: "
+            + ", ".join(directions)
+            + "."
+        )
+    if not isinstance(include_start, bool):
+        raise TypeError("frame.ray(..., include_start=...) expects a boolean.")
+    if isinstance(limit, bool):
+        raise TypeError("frame.ray(..., limit=...) expects an integer.")
+    try:
+        cell_limit = max(0, min(256, int(limit)))
+    except (TypeError, ValueError) as exc:
+        raise TypeError("frame.ray(..., limit=...) expects an integer.") from exc
+
+    if stop_at is None:
+        stop_symbols: list[str] = []
+    elif isinstance(stop_at, str):
+        stop_symbols = list(stop_at)
+    elif isinstance(stop_at, (list, tuple, set)):
+        stop_symbols = list(stop_at)
+    else:
+        raise TypeError("frame.ray(..., stop_at=...) expects color symbols.")
+    if any(
+        not isinstance(symbol, str)
+        or len(symbol) != 1
+        or symbol not in color_chars
+        for symbol in stop_symbols
+    ):
+        raise ValueError(
+            f"frame.ray(..., stop_at=...) expects symbols from {color_chars!r}."
+        )
+    stop_set = set(stop_symbols)
+    normalized_stop = "".join(symbol for symbol in color_chars if symbol in stop_set)
+
+    cells: list[dict[str, Any]] = []
+
+    def append_cell(cell_row: int, cell_col: int, distance: int) -> dict[str, Any]:
+        entry = {
+            "row": cell_row,
+            "col": cell_col,
+            "symbol": _frame_cell_symbol(
+                grid,
+                shape=shape,
+                color_chars=color_chars,
+                row=cell_row,
+                col=cell_col,
+            ),
+            "distance": distance,
+        }
+        if len(cells) < cell_limit:
+            cells.append(entry)
+        return entry
+
+    sampled_total = 0
+    if include_start:
+        append_cell(row, col, 0)
+        sampled_total += 1
+    row_delta, col_delta = directions[direction_name]
+    current_row = row + row_delta
+    current_col = col + col_delta
+    length = 0
+    hit = None
+    while 0 <= current_row < row_count and 0 <= current_col < column_count:
+        length += 1
+        entry = append_cell(current_row, current_col, length)
+        sampled_total += 1
+        if entry["symbol"] in stop_set:
+            hit = entry
+            break
+        current_row += row_delta
+        current_col += col_delta
+
+    return {
+        "origin": [row, col],
+        "direction": direction_name,
+        "delta": [row_delta, col_delta],
+        "stop_at": normalized_stop,
+        "length": length,
+        "cells": cells,
+        "hit": hit,
+        "reached_edge": hit is None,
+        "truncated_cells": max(0, sampled_total - len(cells)),
+    }
+
+
 def _bounded_frame_find(
     grid: list[list[Any]],
     *,
@@ -229,6 +354,529 @@ def _bounded_frame_find(
             else None
         ),
         "truncated": max(0, count - len(cells)),
+    }
+
+
+def _bounded_frame_color_summary(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    limit: int = 16,
+) -> dict[str, Any]:
+    """Summarize the frame palette without exposing raw numeric color ids."""
+    if isinstance(limit, bool):
+        raise TypeError("frame.color_summary(..., limit=...) expects an integer.")
+    try:
+        color_limit = max(0, min(len(color_chars), int(limit)))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "frame.color_summary(..., limit=...) expects an integer."
+        ) from exc
+
+    row_count, column_count = shape
+    total_cells = row_count * column_count
+    stats = [
+        {
+            "symbol": symbol,
+            "count": 0,
+            "min_row": None,
+            "min_col": None,
+            "max_row": None,
+            "max_col": None,
+            "edge_cells": 0,
+            "edge_counts": {"top": 0, "right": 0, "bottom": 0, "left": 0},
+        }
+        for symbol in color_chars
+    ]
+    observed_cells = 0
+    for row in range(row_count):
+        source_row = grid[row] if row < len(grid) else []
+        for col in range(column_count):
+            value = source_row[col] if col < len(source_row) else None
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value >= len(color_chars)
+            ):
+                continue
+            observed_cells += 1
+            item = stats[value]
+            item["count"] += 1
+            item["min_row"] = row if item["min_row"] is None else min(item["min_row"], row)
+            item["min_col"] = col if item["min_col"] is None else min(item["min_col"], col)
+            item["max_row"] = row if item["max_row"] is None else max(item["max_row"], row)
+            item["max_col"] = col if item["max_col"] is None else max(item["max_col"], col)
+            on_edge = False
+            for edge, touches in (
+                ("top", row == 0),
+                ("right", col == column_count - 1),
+                ("bottom", row == row_count - 1),
+                ("left", col == 0),
+            ):
+                if touches:
+                    item["edge_counts"][edge] += 1
+                    on_edge = True
+            if on_edge:
+                item["edge_cells"] += 1
+
+    ranked = sorted(
+        ((index, item) for index, item in enumerate(stats) if item["count"]),
+        key=lambda pair: (-pair[1]["count"], pair[0]),
+    )
+    colors: list[dict[str, Any]] = []
+    for _index, item in ranked[:color_limit]:
+        edge_counts = item["edge_counts"]
+        colors.append(
+            {
+                "symbol": item["symbol"],
+                "count": item["count"],
+                "fraction": item["count"] / total_cells if total_cells else 0.0,
+                "bbox": [
+                    item["min_row"],
+                    item["min_col"],
+                    item["max_row"],
+                    item["max_col"],
+                ],
+                "touches_edges": [
+                    edge
+                    for edge in ("top", "right", "bottom", "left")
+                    if edge_counts[edge]
+                ],
+                "edge_cells": item["edge_cells"],
+                "edge_counts": edge_counts,
+            }
+        )
+    omitted = ranked[color_limit:]
+    return {
+        "shape": [row_count, column_count],
+        "total_cells": total_cells,
+        "observed_cells": observed_cells,
+        "unknown_cells": max(0, total_cells - observed_cells),
+        "color_count": len(ranked),
+        "colors": colors,
+        "omitted_colors": len(omitted),
+        "omitted_cells": sum(item["count"] for _index, item in omitted),
+    }
+
+
+def _bounded_frame_runs(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    symbol: str | None = None,
+    directions: str = "HV",
+    min_length: int = 2,
+    limit: int = 64,
+) -> dict[str, Any]:
+    """Find maximal same-color horizontal, vertical, and diagonal runs."""
+    if symbol is not None and (
+        not isinstance(symbol, str) or len(symbol) != 1 or symbol not in color_chars
+    ):
+        raise ValueError(
+            f"frame.runs(..., symbol=...) expects one of {color_chars!r} or None."
+        )
+    if not isinstance(directions, str) or not directions.strip():
+        raise ValueError("frame.runs(..., directions=...) expects H, V, and/or D.")
+    direction_codes = directions.strip().upper()
+    if any(code not in "HVD" for code in direction_codes):
+        raise ValueError("frame.runs(..., directions=...) expects H, V, and/or D.")
+
+    def bounded_integer(value: Any, name: str, minimum: int) -> int:
+        if isinstance(value, bool):
+            raise TypeError(f"frame.runs(..., {name}=...) expects an integer.")
+        try:
+            return max(minimum, min(256, int(value)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"frame.runs(..., {name}=...) expects an integer."
+            ) from exc
+
+    required_length = bounded_integer(min_length, "min_length", 1)
+    run_limit = bounded_integer(limit, "limit", 0)
+    target = color_chars.index(symbol) if symbol is not None else None
+    axes: list[tuple[str, int, int]] = []
+    if "H" in direction_codes:
+        axes.append(("HORIZONTAL", 0, 1))
+    if "V" in direction_codes:
+        axes.append(("VERTICAL", 1, 0))
+    if "D" in direction_codes:
+        axes.extend(
+            [
+                ("DIAGONAL_DOWN", 1, 1),
+                ("DIAGONAL_UP", -1, 1),
+            ]
+        )
+
+    row_count, column_count = shape
+
+    def cell(row: int, col: int) -> int | None:
+        if not (0 <= row < row_count and 0 <= col < column_count):
+            return None
+        if row >= len(grid) or col >= len(grid[row]):
+            return None
+        value = grid[row][col]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(color_chars)
+        ):
+            return None
+        return value
+
+    runs: list[dict[str, Any]] = []
+    run_count = 0
+    counts_by_direction = {name: 0 for name, _row_delta, _col_delta in axes}
+    counts_by_symbol: dict[str, int] = {}
+    for name, row_delta, col_delta in axes:
+        for row in range(row_count):
+            for col in range(column_count):
+                value = cell(row, col)
+                if value is None or (target is not None and value != target):
+                    continue
+                if cell(row - row_delta, col - col_delta) == value:
+                    continue
+                end_row, end_col = row, col
+                length = 1
+                while cell(end_row + row_delta, end_col + col_delta) == value:
+                    end_row += row_delta
+                    end_col += col_delta
+                    length += 1
+                if length < required_length:
+                    continue
+                run_count += 1
+                counts_by_direction[name] += 1
+                color_symbol = color_chars[value]
+                counts_by_symbol[color_symbol] = counts_by_symbol.get(color_symbol, 0) + 1
+                if len(runs) < run_limit:
+                    runs.append(
+                        {
+                            "symbol": color_symbol,
+                            "direction": name,
+                            "start": [row, col],
+                            "end": [end_row, end_col],
+                            "delta": [row_delta, col_delta],
+                            "length": length,
+                        }
+                    )
+
+    return {
+        "symbol": symbol,
+        "directions": [name for name, _row_delta, _col_delta in axes],
+        "min_length": required_length,
+        "count": run_count,
+        "runs": runs,
+        "counts_by_direction": counts_by_direction,
+        "counts_by_symbol": counts_by_symbol,
+        "truncated_runs": max(0, run_count - len(runs)),
+    }
+
+
+def _bounded_frame_rectangles(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    symbol: str | None = None,
+    kind: str = "any",
+    min_size: int = 2,
+    limit: int = 64,
+) -> dict[str, Any]:
+    """Detect maximal filled rectangles and closed rectangular outlines."""
+    if symbol is not None and (
+        not isinstance(symbol, str) or len(symbol) != 1 or symbol not in color_chars
+    ):
+        raise ValueError(
+            f"frame.rectangles(..., symbol=...) expects one of {color_chars!r} or None."
+        )
+    if not isinstance(kind, str) or kind.lower() not in {"any", "filled", "outline"}:
+        raise ValueError(
+            "frame.rectangles(..., kind=...) expects 'any', 'filled', or 'outline'."
+        )
+    requested_kind = kind.lower()
+
+    def bounded_integer(value: Any, name: str, minimum: int) -> int:
+        if isinstance(value, bool):
+            raise TypeError(f"frame.rectangles(..., {name}=...) expects an integer.")
+        try:
+            return max(minimum, min(256, int(value)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"frame.rectangles(..., {name}=...) expects an integer."
+            ) from exc
+
+    required_size = bounded_integer(min_size, "min_size", 1)
+    rectangle_limit = bounded_integer(limit, "limit", 0)
+    target = color_chars.index(symbol) if symbol is not None else None
+    row_count, column_count = shape
+
+    def cell(row: int, col: int) -> int | None:
+        if not (0 <= row < row_count and 0 <= col < column_count):
+            return None
+        if row >= len(grid) or col >= len(grid[row]):
+            return None
+        value = grid[row][col]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(color_chars)
+        ):
+            return None
+        return value
+
+    visited: set[tuple[int, int]] = set()
+    rectangles: list[dict[str, Any]] = []
+    rectangle_count = 0
+    counts_by_kind = {"filled": 0, "outline": 0}
+    counts_by_symbol: dict[str, int] = {}
+    for start_row in range(row_count):
+        for start_col in range(column_count):
+            start_value = cell(start_row, start_col)
+            start = (start_row, start_col)
+            if (
+                start in visited
+                or start_value is None
+                or (target is not None and start_value != target)
+            ):
+                continue
+            stack = [start]
+            visited.add(start)
+            cells: list[tuple[int, int]] = []
+            min_row = max_row = start_row
+            min_col = max_col = start_col
+            while stack:
+                row, col = stack.pop()
+                cells.append((row, col))
+                min_row = min(min_row, row)
+                min_col = min(min_col, col)
+                max_row = max(max_row, row)
+                max_col = max(max_col, col)
+                for row_delta, col_delta in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    neighbor = (row + row_delta, col + col_delta)
+                    if neighbor not in visited and cell(*neighbor) == start_value:
+                        visited.add(neighbor)
+                        stack.append(neighbor)
+
+            height = max_row - min_row + 1
+            width = max_col - min_col + 1
+            if height < required_size or width < required_size:
+                continue
+            area = height * width
+            filled = len(cells) == area and all(
+                cell(row, col) == start_value
+                for row in range(min_row, max_row + 1)
+                for col in range(min_col, max_col + 1)
+            )
+            border_complete = all(
+                cell(row, col) == start_value
+                for row in range(min_row, max_row + 1)
+                for col in range(min_col, max_col + 1)
+                if row in {min_row, max_row} or col in {min_col, max_col}
+            )
+            detected_kind = "filled" if filled else "outline" if border_complete else None
+            if detected_kind is None or (
+                requested_kind != "any" and requested_kind != detected_kind
+            ):
+                continue
+
+            rectangle_count += 1
+            counts_by_kind[detected_kind] += 1
+            color_symbol = color_chars[start_value]
+            counts_by_symbol[color_symbol] = counts_by_symbol.get(color_symbol, 0) + 1
+            if len(rectangles) >= rectangle_limit:
+                continue
+            interior_colors: dict[str, int] = {}
+            for row in range(min_row + 1, max_row):
+                for col in range(min_col + 1, max_col):
+                    value = cell(row, col)
+                    interior_symbol = (
+                        color_chars[value] if value is not None else "?"
+                    )
+                    interior_colors[interior_symbol] = (
+                        interior_colors.get(interior_symbol, 0) + 1
+                    )
+            border_cells = area if height <= 2 or width <= 2 else 2 * height + 2 * width - 4
+            rectangles.append(
+                {
+                    "symbol": color_symbol,
+                    "kind": detected_kind,
+                    "bbox": [min_row, min_col, max_row, max_col],
+                    "shape": [height, width],
+                    "area": area,
+                    "border_cells": border_cells,
+                    "interior_area": max(0, height - 2) * max(0, width - 2),
+                    "component_size": len(cells),
+                    "fill_ratio": len(cells) / area,
+                    "touches_edge": (
+                        min_row == 0
+                        or min_col == 0
+                        or max_row == row_count - 1
+                        or max_col == column_count - 1
+                    ),
+                    "interior_colors": interior_colors,
+                }
+            )
+
+    return {
+        "symbol": symbol,
+        "kind": requested_kind,
+        "min_size": required_size,
+        "count": rectangle_count,
+        "rectangles": rectangles,
+        "counts_by_kind": counts_by_kind,
+        "counts_by_symbol": counts_by_symbol,
+        "truncated_rectangles": max(0, rectangle_count - len(rectangles)),
+    }
+
+
+def _bounded_frame_enclosed_regions(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    symbol: str | None = None,
+    diagonal: bool = False,
+    limit: int = 64,
+    cell_limit: int = 128,
+) -> dict[str, Any]:
+    """Summarize equal-color regions that do not touch the frame edge."""
+    if symbol is not None and (
+        not isinstance(symbol, str) or len(symbol) != 1 or symbol not in color_chars
+    ):
+        raise ValueError(
+            "frame.enclosed_regions(..., symbol=...) expects a color symbol or None."
+        )
+    if not isinstance(diagonal, bool):
+        raise TypeError(
+            "frame.enclosed_regions(..., diagonal=...) expects a boolean."
+        )
+
+    def bounded_integer(value: Any, name: str, maximum: int) -> int:
+        if isinstance(value, bool):
+            raise TypeError(
+                f"frame.enclosed_regions(..., {name}=...) expects an integer."
+            )
+        try:
+            return max(0, min(maximum, int(value)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"frame.enclosed_regions(..., {name}=...) expects an integer."
+            ) from exc
+
+    region_limit = bounded_integer(limit, "limit", 128)
+    sample_limit = bounded_integer(cell_limit, "cell_limit", 256)
+    target = color_chars.index(symbol) if symbol is not None else None
+    row_count, column_count = shape
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    if diagonal:
+        directions.extend([(-1, -1), (-1, 1), (1, -1), (1, 1)])
+
+    def cell(row: int, col: int) -> int | None:
+        if not (0 <= row < row_count and 0 <= col < column_count):
+            return None
+        if row >= len(grid) or col >= len(grid[row]):
+            return None
+        value = grid[row][col]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(color_chars)
+        ):
+            return None
+        return value
+
+    visited: set[tuple[int, int]] = set()
+    regions: list[dict[str, Any]] = []
+    region_count = 0
+    sampled_cells = 0
+    counts_by_symbol: dict[str, int] = {}
+    for start_row in range(row_count):
+        for start_col in range(column_count):
+            start = (start_row, start_col)
+            start_value = cell(*start)
+            if (
+                start in visited
+                or start_value is None
+                or (target is not None and start_value != target)
+            ):
+                continue
+            stack = [start]
+            visited.add(start)
+            component: list[tuple[int, int]] = []
+            row_sum = 0
+            col_sum = 0
+            min_row = max_row = start_row
+            min_col = max_col = start_col
+            touches_edge = False
+            while stack:
+                row, col = stack.pop()
+                component.append((row, col))
+                row_sum += row
+                col_sum += col
+                min_row = min(min_row, row)
+                min_col = min(min_col, col)
+                max_row = max(max_row, row)
+                max_col = max(max_col, col)
+                touches_edge = (
+                    touches_edge
+                    or row in {0, row_count - 1}
+                    or col in {0, column_count - 1}
+                )
+                for row_delta, col_delta in directions:
+                    neighbor = (row + row_delta, col + col_delta)
+                    if neighbor not in visited and cell(*neighbor) == start_value:
+                        visited.add(neighbor)
+                        stack.append(neighbor)
+            if touches_edge:
+                continue
+
+            region_count += 1
+            color_symbol = color_chars[start_value]
+            counts_by_symbol[color_symbol] = counts_by_symbol.get(color_symbol, 0) + 1
+            if len(regions) >= region_limit:
+                continue
+            component_set = set(component)
+            boundary_coordinates: set[tuple[int, int]] = set()
+            for row, col in component:
+                for row_delta, col_delta in directions:
+                    neighbor = (row + row_delta, col + col_delta)
+                    if neighbor not in component_set:
+                        boundary_coordinates.add(neighbor)
+            boundary_colors: dict[str, int] = {}
+            for row, col in sorted(boundary_coordinates):
+                value = cell(row, col)
+                boundary_symbol = color_chars[value] if value is not None else "?"
+                boundary_colors[boundary_symbol] = (
+                    boundary_colors.get(boundary_symbol, 0) + 1
+                )
+            remaining_samples = max(0, sample_limit - sampled_cells)
+            sampled = [[row, col] for row, col in component[:remaining_samples]]
+            sampled_cells += len(sampled)
+            size = len(component)
+            regions.append(
+                {
+                    "id": region_count - 1,
+                    "symbol": color_symbol,
+                    "size": size,
+                    "bbox": [min_row, min_col, max_row, max_col],
+                    "centroid": [row_sum / size, col_sum / size],
+                    "boundary_cells": len(boundary_coordinates),
+                    "boundary_colors": boundary_colors,
+                    "cells": sampled,
+                    "truncated_cells": max(0, size - len(sampled)),
+                }
+            )
+
+    return {
+        "symbol": symbol,
+        "connectivity": 8 if diagonal else 4,
+        "count": region_count,
+        "regions": regions,
+        "counts_by_symbol": counts_by_symbol,
+        "sampled_cells": sampled_cells,
+        "truncated_regions": max(0, region_count - len(regions)),
     }
 
 
@@ -470,6 +1118,18 @@ def _bounded_frame_objects(
             objects.append(
                 {
                     "id": object_count - 1,
+                    "signature": hashlib.sha1(
+                        repr(
+                            sorted(
+                                (
+                                    row - min_row,
+                                    col - min_col,
+                                    color_chars[grid[row][col]],
+                                )
+                                for row, col in cells
+                            )
+                        ).encode("utf-8")
+                    ).hexdigest()[:16],
                     "size": size,
                     "bbox": [min_row, min_col, max_row, max_col],
                     "centroid": [row_sum / size, col_sum / size],
@@ -495,6 +1155,727 @@ def _bounded_frame_objects(
     }
 
 
+def _bounded_frame_object_relations(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    background: str | None = None,
+    diagonal: bool = False,
+    object_limit: int = 32,
+    relation_limit: int = 64,
+) -> dict[str, Any]:
+    """Describe bounded pairwise spatial and visual relations between objects."""
+    for value, name, maximum in (
+        (object_limit, "object_limit", 64),
+        (relation_limit, "relation_limit", 256),
+    ):
+        if isinstance(value, bool):
+            raise TypeError(
+                f"frame.object_relations(..., {name}=...) expects an integer."
+            )
+        try:
+            parsed = max(0, min(maximum, int(value)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"frame.object_relations(..., {name}=...) expects an integer."
+            ) from exc
+        if name == "object_limit":
+            bounded_object_limit = parsed
+        else:
+            bounded_relation_limit = parsed
+
+    object_result = _bounded_frame_objects(
+        grid,
+        shape=shape,
+        color_chars=color_chars,
+        background=background,
+        diagonal=diagonal,
+        limit=bounded_object_limit,
+        cell_limit=0,
+    )
+    objects = object_result["objects"]
+
+    def summary(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: item[key]
+            for key in ("id", "signature", "size", "bbox", "centroid", "colors")
+        }
+
+    relations: list[dict[str, Any]] = []
+    relation_count = 0
+    counts = {
+        "same_signature": 0,
+        "same_size": 0,
+        "row_overlap": 0,
+        "column_overlap": 0,
+        "bbox_contains": 0,
+    }
+    for index, first in enumerate(objects):
+        for second in objects[index + 1 :]:
+            relation_count += 1
+            first_box = first["bbox"]
+            second_box = second["bbox"]
+            row_overlap = max(
+                0,
+                min(first_box[2], second_box[2])
+                - max(first_box[0], second_box[0])
+                + 1,
+            )
+            column_overlap = max(
+                0,
+                min(first_box[3], second_box[3])
+                - max(first_box[1], second_box[1])
+                + 1,
+            )
+            row_gap = max(
+                0,
+                second_box[0] - first_box[2] - 1,
+                first_box[0] - second_box[2] - 1,
+            )
+            column_gap = max(
+                0,
+                second_box[1] - first_box[3] - 1,
+                first_box[1] - second_box[3] - 1,
+            )
+            vertical = (
+                "ABOVE"
+                if first_box[2] < second_box[0]
+                else "BELOW"
+                if second_box[2] < first_box[0]
+                else "OVERLAP"
+            )
+            horizontal = (
+                "LEFT"
+                if first_box[3] < second_box[1]
+                else "RIGHT"
+                if second_box[3] < first_box[1]
+                else "OVERLAP"
+            )
+            first_contains = (
+                first_box[0] <= second_box[0]
+                and first_box[1] <= second_box[1]
+                and first_box[2] >= second_box[2]
+                and first_box[3] >= second_box[3]
+            )
+            second_contains = (
+                second_box[0] <= first_box[0]
+                and second_box[1] <= first_box[1]
+                and second_box[2] >= first_box[2]
+                and second_box[3] >= first_box[3]
+            )
+            containment = (
+                "FIRST_CONTAINS_SECOND"
+                if first_contains
+                else "SECOND_CONTAINS_FIRST"
+                if second_contains
+                else None
+            )
+            same_signature = first["signature"] == second["signature"]
+            same_size = first["size"] == second["size"]
+            counts["same_signature"] += same_signature
+            counts["same_size"] += same_size
+            counts["row_overlap"] += row_overlap > 0
+            counts["column_overlap"] += column_overlap > 0
+            counts["bbox_contains"] += containment is not None
+            if len(relations) < bounded_relation_limit:
+                relations.append(
+                    {
+                        "first_id": first["id"],
+                        "second_id": second["id"],
+                        "vertical": vertical,
+                        "horizontal": horizontal,
+                        "row_overlap": row_overlap,
+                        "column_overlap": column_overlap,
+                        "row_gap": row_gap,
+                        "column_gap": column_gap,
+                        "bbox_gap": row_gap + column_gap,
+                        "containment": containment,
+                        "centroid_delta": [
+                            second["centroid"][0] - first["centroid"][0],
+                            second["centroid"][1] - first["centroid"][1],
+                        ],
+                        "same_size": same_size,
+                        "same_signature": same_signature,
+                        "shared_colors": sorted(
+                            set(first["colors"]) & set(second["colors"])
+                        ),
+                    }
+                )
+
+    return {
+        "background": object_result["background"],
+        "background_inferred": object_result["background_inferred"],
+        "connectivity": object_result["connectivity"],
+        "object_count": object_result["count"],
+        "objects": [summary(item) for item in objects],
+        "truncated_objects": object_result["truncated_objects"],
+        "complete_object_set": object_result["truncated_objects"] == 0,
+        "relation_count": relation_count,
+        "relations": relations,
+        "counts": counts,
+        "truncated_relations": max(0, relation_count - len(relations)),
+    }
+
+
+def _bounded_frame_object_changes(
+    before_grid: list[list[Any]],
+    after_grid: list[list[Any]],
+    *,
+    before_shape: tuple[int, int],
+    after_shape: tuple[int, int],
+    color_chars: str,
+    background: str | None = None,
+    diagonal: bool = False,
+    limit: int = 64,
+) -> dict[str, Any]:
+    """Match translation-invariant multi-color objects across two frames."""
+    if not isinstance(diagonal, bool):
+        raise TypeError("frame.track_objects(..., diagonal=...) expects a boolean.")
+    if isinstance(limit, bool):
+        raise TypeError("frame.track_objects(..., limit=...) expects an integer.")
+    try:
+        event_limit = max(0, min(256, int(limit)))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "frame.track_objects(..., limit=...) expects an integer."
+        ) from exc
+
+    inferred_background = background is None
+    if inferred_background:
+        counts: dict[int, int] = {}
+        for grid, shape in (
+            (before_grid, before_shape),
+            (after_grid, after_shape),
+        ):
+            row_count, column_count = shape
+            for row in range(min(row_count, len(grid))):
+                for value in grid[row][:column_count]:
+                    if isinstance(value, int) and 0 <= value < len(color_chars):
+                        counts[value] = counts.get(value, 0) + 1
+        inferred = max(counts, key=lambda value: (counts[value], -value)) if counts else 0
+        shared_background = color_chars[inferred]
+    else:
+        shared_background = background
+
+    before = _bounded_frame_objects(
+        before_grid,
+        shape=before_shape,
+        color_chars=color_chars,
+        background=shared_background,
+        diagonal=diagonal,
+        limit=128,
+        cell_limit=0,
+    )
+    after = _bounded_frame_objects(
+        after_grid,
+        shape=after_shape,
+        color_chars=color_chars,
+        background=shared_background,
+        diagonal=diagonal,
+        limit=128,
+        cell_limit=0,
+    )
+
+    before_by_signature: dict[str, list[dict[str, Any]]] = {}
+    after_by_signature: dict[str, list[dict[str, Any]]] = {}
+    for item in before["objects"]:
+        before_by_signature.setdefault(item["signature"], []).append(item)
+    for item in after["objects"]:
+        after_by_signature.setdefault(item["signature"], []).append(item)
+
+    matched: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    removed: list[dict[str, Any]] = []
+    added: list[dict[str, Any]] = []
+    all_signatures = sorted(set(before_by_signature) | set(after_by_signature))
+    for signature in all_signatures:
+        old_items = before_by_signature.get(signature, [])
+        new_items = after_by_signature.get(signature, [])
+        candidates = sorted(
+            (
+                abs(old["centroid"][0] - new["centroid"][0])
+                + abs(old["centroid"][1] - new["centroid"][1]),
+                old["id"],
+                new["id"],
+                old,
+                new,
+            )
+            for old in old_items
+            for new in new_items
+        )
+        used_old: set[int] = set()
+        used_new: set[int] = set()
+        for _, old_id, new_id, old, new in candidates:
+            if old_id not in used_old and new_id not in used_new:
+                used_old.add(old_id)
+                used_new.add(new_id)
+                matched.append((old, new))
+        removed.extend(item for item in old_items if item["id"] not in used_old)
+        added.extend(item for item in new_items if item["id"] not in used_new)
+
+    def summary(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: item[key]
+            for key in ("id", "signature", "size", "bbox", "centroid", "colors")
+        }
+
+    events: list[dict[str, Any]] = []
+    moved_count = 0
+    unchanged_count = 0
+    for old, new in sorted(matched, key=lambda pair: pair[0]["id"]):
+        delta = [
+            new["bbox"][0] - old["bbox"][0],
+            new["bbox"][1] - old["bbox"][1],
+        ]
+        event_type = "unchanged" if delta == [0, 0] else "moved"
+        moved_count += event_type == "moved"
+        unchanged_count += event_type == "unchanged"
+        events.append(
+            {
+                "type": event_type,
+                "delta": delta,
+                "distance": abs(delta[0]) + abs(delta[1]),
+                "before": summary(old),
+                "after": summary(new),
+            }
+        )
+    events.extend({"type": "removed", "before": summary(item)} for item in removed)
+    events.extend({"type": "added", "after": summary(item)} for item in added)
+
+    counts = {
+        "matched": len(matched),
+        "moved": moved_count,
+        "unchanged": unchanged_count,
+        "added": len(added),
+        "removed": len(removed),
+    }
+    return {
+        "background": shared_background,
+        "background_inferred": inferred_background,
+        "connectivity": 8 if diagonal else 4,
+        "before_count": before["count"],
+        "after_count": after["count"],
+        "counts": counts,
+        "events": events[:event_limit],
+        "truncated_events": max(0, len(events) - event_limit),
+        "truncated_input": {
+            "before": before["truncated_objects"],
+            "after": after["truncated_objects"],
+        },
+    }
+
+
+def _bounded_frame_transform_relation(
+    before_grid: list[list[Any]],
+    after_grid: list[list[Any]],
+    *,
+    before_shape: tuple[int, int],
+    after_shape: tuple[int, int],
+    color_chars: str,
+    allow_recolor: bool = True,
+) -> dict[str, Any]:
+    """Score D4 transforms from a prior frame to the current frame."""
+    if not isinstance(allow_recolor, bool):
+        raise TypeError(
+            "frame.transform_relation(..., allow_recolor=...) expects a boolean."
+        )
+
+    def materialize(
+        grid: list[list[Any]], shape: tuple[int, int]
+    ) -> tuple[tuple[Any, ...], ...]:
+        row_count, column_count = shape
+        return tuple(
+            tuple(
+                grid[row][col]
+                if row < len(grid) and col < len(grid[row])
+                else None
+                for col in range(column_count)
+            )
+            for row in range(row_count)
+        )
+
+    def rotate(matrix: tuple[tuple[Any, ...], ...]) -> tuple[tuple[Any, ...], ...]:
+        return tuple(tuple(row) for row in zip(*matrix[::-1])) if matrix else ()
+
+    def flip_horizontal(
+        matrix: tuple[tuple[Any, ...], ...],
+    ) -> tuple[tuple[Any, ...], ...]:
+        return tuple(tuple(reversed(row)) for row in matrix)
+
+    source = materialize(before_grid, before_shape)
+    target = materialize(after_grid, after_shape)
+    transformed: list[tuple[str, tuple[tuple[Any, ...], ...]]] = [
+        ("IDENTITY", source)
+    ]
+    rotated = source
+    for name in ("ROTATE_90", "ROTATE_180", "ROTATE_270"):
+        rotated = rotate(rotated)
+        transformed.append((name, rotated))
+    reflected = flip_horizontal(source)
+    transformed.append(("FLIP_HORIZONTAL", reflected))
+    for name in (
+        "FLIP_HORIZONTAL_ROTATE_90",
+        "FLIP_HORIZONTAL_ROTATE_180",
+        "FLIP_HORIZONTAL_ROTATE_270",
+    ):
+        reflected = rotate(reflected)
+        transformed.append((name, reflected))
+
+    target_rows, target_cols = after_shape
+    cell_count = target_rows * target_cols
+
+    def symbol(value: Any) -> str:
+        if isinstance(value, int) and 0 <= value < len(color_chars):
+            return color_chars[value]
+        return "?"
+
+    candidates: list[dict[str, Any]] = []
+    for name, matrix in transformed:
+        matrix_shape = (len(matrix), len(matrix[0]) if matrix else 0)
+        compatible = matrix_shape == after_shape
+        candidate: dict[str, Any] = {
+            "transform": name,
+            "shape": list(matrix_shape),
+            "compatible_shape": compatible,
+        }
+        if not compatible:
+            candidates.append(candidate)
+            continue
+
+        exact_mismatches = sum(
+            source_value != target[row][col]
+            for row, source_row in enumerate(matrix)
+            for col, source_value in enumerate(source_row)
+        )
+        candidate.update(
+            {
+                "exact_mismatches": exact_mismatches,
+                "exact_match_ratio": (
+                    (cell_count - exact_mismatches) / cell_count
+                    if cell_count
+                    else 1.0
+                ),
+            }
+        )
+        if allow_recolor:
+            frequencies: dict[Any, dict[Any, int]] = {}
+            for row, source_row in enumerate(matrix):
+                for col, source_value in enumerate(source_row):
+                    target_value = target[row][col]
+                    counts = frequencies.setdefault(source_value, {})
+                    counts[target_value] = counts.get(target_value, 0) + 1
+            mapping: dict[Any, Any] = {}
+            recolor_mismatches = 0
+            for source_value, counts in frequencies.items():
+                chosen = max(counts, key=lambda value: (counts[value], -int(value or 0)))
+                mapping[source_value] = chosen
+                recolor_mismatches += sum(counts.values()) - counts[chosen]
+            candidate.update(
+                {
+                    "recolor_mismatches": recolor_mismatches,
+                    "recolor_match_ratio": (
+                        (cell_count - recolor_mismatches) / cell_count
+                        if cell_count
+                        else 1.0
+                    ),
+                    "color_map": {
+                        symbol(source_value): symbol(target_value)
+                        for source_value, target_value in sorted(
+                            mapping.items(), key=lambda item: str(item[0])
+                        )
+                    },
+                }
+            )
+        candidates.append(candidate)
+
+    compatible_candidates = [
+        candidate for candidate in candidates if candidate["compatible_shape"]
+    ]
+    def score(candidate: dict[str, Any]) -> tuple[int, ...]:
+        if allow_recolor:
+            return (
+                candidate["recolor_mismatches"],
+                candidate["exact_mismatches"],
+            )
+        return (candidate["exact_mismatches"],)
+
+    best_score = (
+        min(score(candidate) for candidate in compatible_candidates)
+        if compatible_candidates
+        else None
+    )
+    return {
+        "before_shape": list(before_shape),
+        "after_shape": list(after_shape),
+        "allow_recolor": allow_recolor,
+        "exact_matches": [
+            candidate["transform"]
+            for candidate in compatible_candidates
+            if candidate["exact_mismatches"] == 0
+        ],
+        "recolor_matches": (
+            [
+                candidate["transform"]
+                for candidate in compatible_candidates
+                if candidate["recolor_mismatches"] == 0
+            ]
+            if allow_recolor
+            else []
+        ),
+        "best": [
+            candidate["transform"]
+            for candidate in compatible_candidates
+            if score(candidate) == best_score
+        ],
+        "candidates": candidates,
+    }
+
+
+def _bounded_frame_symmetry(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    sample_limit: int = 8,
+) -> dict[str, Any]:
+    """Score exact and approximate reflection and rotational frame symmetries."""
+    if isinstance(sample_limit, bool):
+        raise TypeError("frame.symmetry(..., sample_limit=...) expects an integer.")
+    try:
+        mismatch_limit = max(0, min(32, int(sample_limit)))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "frame.symmetry(..., sample_limit=...) expects an integer."
+        ) from exc
+
+    row_count, column_count = shape
+
+    def cell(row: int, col: int) -> Any:
+        if not (0 <= row < row_count and 0 <= col < column_count):
+            return None
+        if row >= len(grid) or col >= len(grid[row]):
+            return None
+        value = grid[row][col]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(color_chars)
+        ):
+            return None
+        return value
+
+    def symbol(value: Any) -> str:
+        return color_chars[value] if value is not None else "?"
+
+    square = row_count == column_count
+    transforms: list[tuple[str, bool, Any]] = [
+        ("HORIZONTAL_AXIS", True, lambda row, col: (row_count - 1 - row, col)),
+        ("VERTICAL_AXIS", True, lambda row, col: (row, column_count - 1 - col)),
+        (
+            "ROTATE_180",
+            True,
+            lambda row, col: (row_count - 1 - row, column_count - 1 - col),
+        ),
+        ("ROTATE_90", square, lambda row, col: (row_count - 1 - col, row)),
+        ("ROTATE_270", square, lambda row, col: (col, column_count - 1 - row)),
+        ("MAIN_DIAGONAL", square, lambda row, col: (col, row)),
+        (
+            "ANTI_DIAGONAL",
+            square,
+            lambda row, col: (row_count - 1 - col, column_count - 1 - row),
+        ),
+    ]
+    cell_count = row_count * column_count
+    candidates: list[dict[str, Any]] = []
+    for name, compatible, coordinate in transforms:
+        candidate: dict[str, Any] = {
+            "symmetry": name,
+            "compatible_shape": compatible,
+        }
+        if not compatible:
+            candidates.append(candidate)
+            continue
+        mismatched_cells = 0
+        mismatch_samples: list[dict[str, Any]] = []
+        for row in range(row_count):
+            for col in range(column_count):
+                other_row, other_col = coordinate(row, col)
+                value = cell(row, col)
+                other_value = cell(other_row, other_col)
+                if value == other_value:
+                    continue
+                mismatched_cells += 1
+                if len(mismatch_samples) < mismatch_limit:
+                    mismatch_samples.append(
+                        {
+                            "cell": [row, col],
+                            "counterpart": [other_row, other_col],
+                            "actual": symbol(value),
+                            "expected": symbol(other_value),
+                        }
+                    )
+        candidate.update(
+            {
+                "mismatched_cells": mismatched_cells,
+                "match_ratio": (
+                    (cell_count - mismatched_cells) / cell_count
+                    if cell_count
+                    else 1.0
+                ),
+                "mismatches": mismatch_samples,
+                "truncated_mismatches": max(
+                    0, mismatched_cells - len(mismatch_samples)
+                ),
+            }
+        )
+        candidates.append(candidate)
+
+    compatible_candidates = [
+        candidate for candidate in candidates if candidate["compatible_shape"]
+    ]
+    best_score = min(
+        (candidate["mismatched_cells"] for candidate in compatible_candidates),
+        default=None,
+    )
+    return {
+        "shape": list(shape),
+        "symmetries": [
+            candidate["symmetry"]
+            for candidate in compatible_candidates
+            if candidate["mismatched_cells"] == 0
+        ],
+        "best": [
+            candidate["symmetry"]
+            for candidate in compatible_candidates
+            if candidate["mismatched_cells"] == best_score
+        ],
+        "candidates": candidates,
+    }
+
+
+def _bounded_frame_periodicity(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    candidate_limit: int = 8,
+    sample_limit: int = 8,
+) -> dict[str, Any]:
+    """Score exact and approximate finite row and column periods."""
+    parsed_limits: dict[str, int] = {}
+    for value, name in (
+        (candidate_limit, "candidate_limit"),
+        (sample_limit, "sample_limit"),
+    ):
+        if isinstance(value, bool):
+            raise TypeError(f"frame.periodicity(..., {name}=...) expects an integer.")
+        try:
+            parsed_limits[name] = max(0, min(32, int(value)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"frame.periodicity(..., {name}=...) expects an integer."
+            ) from exc
+    result_limit = parsed_limits["candidate_limit"]
+    mismatch_limit = parsed_limits["sample_limit"]
+    row_count, column_count = shape
+
+    def cell(row: int, col: int) -> Any:
+        if not (0 <= row < row_count and 0 <= col < column_count):
+            return None
+        if row >= len(grid) or col >= len(grid[row]):
+            return None
+        value = grid[row][col]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(color_chars)
+        ):
+            return None
+        return value
+
+    def symbol(value: Any) -> str:
+        return color_chars[value] if value is not None else "?"
+
+    def analyze(axis: str, length: int) -> dict[str, Any]:
+        candidates: list[dict[str, Any]] = []
+        for period in range(1, length):
+            comparisons = (
+                (row_count - period) * column_count
+                if axis == "rows"
+                else row_count * (column_count - period)
+            )
+            mismatches = 0
+            samples: list[dict[str, Any]] = []
+            row_range = range(period, row_count) if axis == "rows" else range(row_count)
+            col_range = (
+                range(column_count)
+                if axis == "rows"
+                else range(period, column_count)
+            )
+            for row in row_range:
+                for col in col_range:
+                    other_row = row - period if axis == "rows" else row
+                    other_col = col if axis == "rows" else col - period
+                    value = cell(row, col)
+                    expected = cell(other_row, other_col)
+                    if value == expected:
+                        continue
+                    mismatches += 1
+                    if len(samples) < mismatch_limit:
+                        samples.append(
+                            {
+                                "cell": [row, col],
+                                "counterpart": [other_row, other_col],
+                                "actual": symbol(value),
+                                "expected": symbol(expected),
+                            }
+                        )
+            candidates.append(
+                {
+                    "period": period,
+                    "complete_tiles": length % period == 0,
+                    "comparisons": comparisons,
+                    "mismatches": mismatches,
+                    "match_ratio": (
+                        (comparisons - mismatches) / comparisons
+                        if comparisons
+                        else 1.0
+                    ),
+                    "mismatch_samples": samples,
+                    "truncated_mismatches": max(0, mismatches - len(samples)),
+                }
+            )
+
+        exact_periods = [
+            candidate["period"]
+            for candidate in candidates
+            if candidate["mismatches"] == 0
+        ]
+
+        def score(candidate: dict[str, Any]) -> tuple[float, int]:
+            comparisons = candidate["comparisons"]
+            mismatch_ratio = (
+                candidate["mismatches"] / comparisons if comparisons else 0.0
+            )
+            return mismatch_ratio, candidate["period"]
+
+        ranked = sorted(candidates, key=score)
+        return {
+            "exact_periods": exact_periods,
+            "fundamental_period": min(exact_periods, default=None),
+            "best_period": ranked[0]["period"] if ranked else None,
+            "scanned_candidates": len(candidates),
+            "candidates": ranked[:result_limit],
+            "truncated_candidates": max(0, len(ranked) - result_limit),
+        }
+
+    return {
+        "shape": list(shape),
+        "rows": analyze("rows", row_count),
+        "columns": analyze("columns", column_count),
+    }
+
+
 def _bounded_frame_find_pattern(
     grid: list[list[Any]],
     *,
@@ -503,9 +1884,11 @@ def _bounded_frame_find_pattern(
     pattern: Any,
     wildcard: str | None = None,
     transforms: bool = False,
+    max_mismatches: int = 0,
+    mismatch_limit: int = 8,
     limit: int = 64,
 ) -> dict[str, Any]:
-    """Find bounded exact or wildcard pattern matches, optionally under D4 transforms."""
+    """Find bounded exact or approximate patterns, optionally under D4 transforms."""
     if isinstance(pattern, (str, bytes)) or not isinstance(pattern, (list, tuple)):
         raise TypeError("frame.find_pattern(pattern) expects a non-empty list of rows.")
     if not pattern:
@@ -520,14 +1903,25 @@ def _bounded_frame_find_pattern(
         )
     if not isinstance(transforms, bool):
         raise TypeError("frame.find_pattern(..., transforms=...) expects a boolean.")
-    if isinstance(limit, bool):
-        raise TypeError("frame.find_pattern(..., limit=...) expects an integer.")
-    try:
-        match_limit = max(0, min(256, int(limit)))
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            "frame.find_pattern(..., limit=...) expects an integer."
-        ) from exc
+    parsed_limits: dict[str, int] = {}
+    for value, name, upper_bound in (
+        (max_mismatches, "max_mismatches", 256),
+        (mismatch_limit, "mismatch_limit", 32),
+        (limit, "limit", 256),
+    ):
+        if isinstance(value, bool):
+            raise TypeError(
+                f"frame.find_pattern(..., {name}=...) expects an integer."
+            )
+        try:
+            parsed_limits[name] = max(0, min(upper_bound, int(value)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"frame.find_pattern(..., {name}=...) expects an integer."
+            ) from exc
+    allowed_mismatches = parsed_limits["max_mismatches"]
+    mismatch_sample_limit = parsed_limits["mismatch_limit"]
+    match_limit = parsed_limits["limit"]
 
     normalized_rows: list[tuple[str, ...]] = []
     width: int | None = None
@@ -559,6 +1953,7 @@ def _bounded_frame_find_pattern(
     cell_count = len(normalized_rows) * int(width or 0)
     if cell_count > 256:
         raise ValueError("frame.find_pattern(pattern) accepts at most 256 cells.")
+    allowed_mismatches = min(allowed_mismatches, cell_count)
 
     identity = tuple(normalized_rows)
 
@@ -596,50 +1991,242 @@ def _bounded_frame_find_pattern(
             variants.append((name, matrix))
 
     row_count, column_count = shape
-    matches: list[dict[str, Any]] = []
+    ranked_matches: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
     match_count = 0
-    for transform, matrix in variants:
+    for variant_index, (transform, matrix) in enumerate(variants):
         pattern_rows = len(matrix)
         pattern_cols = len(matrix[0])
         for top in range(max(0, row_count - pattern_rows + 1)):
             for left in range(max(0, column_count - pattern_cols + 1)):
-                matched = True
+                mismatch_count = 0
+                mismatch_samples: list[dict[str, Any]] = []
                 for row_offset, pattern_row in enumerate(matrix):
                     grid_row = top + row_offset
-                    if grid_row >= len(grid):
-                        matched = False
-                        break
                     for col_offset, symbol in enumerate(pattern_row):
                         grid_col = left + col_offset
                         if symbol == wildcard:
                             continue
-                        if (
-                            grid_col >= len(grid[grid_row])
-                            or grid[grid_row][grid_col] != color_chars.index(symbol)
-                        ):
-                            matched = False
+                        actual_value = (
+                            grid[grid_row][grid_col]
+                            if grid_row < len(grid) and grid_col < len(grid[grid_row])
+                            else None
+                        )
+                        expected_value = color_chars.index(symbol)
+                        if actual_value != expected_value:
+                            mismatch_count += 1
+                            if len(mismatch_samples) < mismatch_sample_limit:
+                                actual_symbol = (
+                                    color_chars[actual_value]
+                                    if isinstance(actual_value, int)
+                                    and not isinstance(actual_value, bool)
+                                    and 0 <= actual_value < len(color_chars)
+                                    else None
+                                )
+                                mismatch_samples.append(
+                                    {
+                                        "cell": [grid_row, grid_col],
+                                        "actual": actual_symbol,
+                                        "expected": symbol,
+                                    }
+                                )
+                        if mismatch_count > allowed_mismatches:
                             break
-                    if not matched:
+                    if mismatch_count > allowed_mismatches:
                         break
-                if not matched:
+                if mismatch_count > allowed_mismatches:
                     continue
                 match_count += 1
-                if len(matches) < match_limit:
-                    matches.append(
-                        {
-                            "top": top,
-                            "left": left,
-                            "bottom": top + pattern_rows,
-                            "right": left + pattern_cols,
-                            "transform": transform,
-                        }
+                match = {
+                    "top": top,
+                    "left": left,
+                    "bottom": top + pattern_rows,
+                    "right": left + pattern_cols,
+                    "transform": transform,
+                }
+                if allowed_mismatches:
+                    match["mismatches"] = mismatch_count
+                    match["mismatch_samples"] = mismatch_samples
+                    match["truncated_mismatches"] = max(
+                        0, mismatch_count - len(mismatch_samples)
                     )
+                if match_limit:
+                    ranked_matches.append(
+                        ((mismatch_count, variant_index, top, left), match)
+                    )
+                    ranked_matches.sort(key=lambda item: item[0])
+                    if len(ranked_matches) > match_limit:
+                        ranked_matches.pop()
+
+    matches = [match for _rank, match in ranked_matches]
 
     return {
         "count": match_count,
         "matches": matches,
         "variants": [name for name, _matrix in variants],
         "truncated_matches": max(0, match_count - len(matches)),
+    }
+
+
+def _bounded_reachable_region(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    start: Any,
+    passable: Any,
+    diagonal: bool = False,
+    max_nodes: int = 4096,
+    cell_limit: int = 128,
+    frontier_limit: int = 64,
+) -> dict[str, Any]:
+    """Run bounded BFS and summarize reachable space plus its blocked frontier."""
+    row_count, column_count = shape
+    if not isinstance(start, (list, tuple)) or len(start) != 2:
+        raise TypeError("frame.reachable_region(start, ...) expects [row, col].")
+    start_row, start_col = start
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (start_row, start_col)
+    ):
+        raise TypeError(
+            "frame.reachable_region(start, ...) expects integer coordinates."
+        )
+    if not (0 <= start_row < row_count and 0 <= start_col < column_count):
+        raise ValueError("frame.reachable_region(start, ...) is outside the frame.")
+    if isinstance(passable, str):
+        symbols = list(passable)
+    elif isinstance(passable, (list, tuple, set)):
+        symbols = list(passable)
+    else:
+        raise TypeError(
+            "frame.reachable_region(..., passable=...) expects color symbols."
+        )
+    if not symbols or any(
+        not isinstance(symbol, str)
+        or len(symbol) != 1
+        or symbol not in color_chars
+        for symbol in symbols
+    ):
+        raise ValueError(
+            "frame.reachable_region(..., passable=...) expects valid color symbols."
+        )
+    if not isinstance(diagonal, bool):
+        raise TypeError(
+            "frame.reachable_region(..., diagonal=...) expects a boolean."
+        )
+
+    def bounded_integer(value: Any, name: str, maximum: int) -> int:
+        if isinstance(value, bool):
+            raise TypeError(
+                f"frame.reachable_region(..., {name}=...) expects an integer."
+            )
+        try:
+            return max(0, min(maximum, int(value)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"frame.reachable_region(..., {name}=...) expects an integer."
+            ) from exc
+
+    node_limit = bounded_integer(max_nodes, "max_nodes", 16384)
+    returned_cell_limit = bounded_integer(cell_limit, "cell_limit", 512)
+    returned_frontier_limit = bounded_integer(frontier_limit, "frontier_limit", 256)
+    passable_values = {color_chars.index(symbol) for symbol in symbols}
+    offsets = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+    if diagonal:
+        offsets.extend([(-1, 1), (1, 1), (1, -1), (-1, -1)])
+
+    def cell(row: int, col: int) -> int | None:
+        if not (0 <= row < row_count and 0 <= col < column_count):
+            return None
+        if row >= len(grid) or col >= len(grid[row]):
+            return -1
+        value = grid[row][col]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(color_chars)
+        ):
+            return -1
+        return value
+
+    start_cell = (start_row, start_col)
+    queue = [start_cell]
+    distances = {start_cell: 0}
+    cursor = 0
+    explored = 0
+    while cursor < len(queue) and explored < node_limit:
+        row, col = queue[cursor]
+        cursor += 1
+        explored += 1
+        for row_delta, col_delta in offsets:
+            neighbor = (row + row_delta, col + col_delta)
+            if neighbor in distances:
+                continue
+            value = cell(*neighbor)
+            if value not in passable_values:
+                continue
+            distances[neighbor] = distances[(row, col)] + 1
+            queue.append(neighbor)
+
+    reachable = list(distances)
+    min_row = min((row for row, _col in reachable), default=None)
+    min_col = min((col for _row, col in reachable), default=None)
+    max_row = max((row for row, _col in reachable), default=None)
+    max_col = max((col for _row, col in reachable), default=None)
+    maximum_distance = max(distances.values(), default=0)
+    farthest = [
+        list(coordinate)
+        for coordinate, distance in distances.items()
+        if distance == maximum_distance
+    ]
+
+    frontier_coordinates: set[tuple[int, int]] = set()
+    for row, col in reachable:
+        for row_delta, col_delta in offsets:
+            neighbor = (row + row_delta, col + col_delta)
+            neighbor_value = cell(*neighbor)
+            if (
+                neighbor_value is not None
+                and neighbor_value not in passable_values
+                and neighbor not in distances
+            ):
+                frontier_coordinates.add(neighbor)
+    frontier_colors: dict[str, int] = {}
+    frontier: list[dict[str, Any]] = []
+    for row, col in sorted(frontier_coordinates):
+        value = cell(row, col)
+        color_symbol = color_chars[value] if value != -1 else "?"
+        frontier_colors[color_symbol] = frontier_colors.get(color_symbol, 0) + 1
+        if len(frontier) < returned_frontier_limit:
+            frontier.append({"cell": [row, col], "symbol": color_symbol})
+
+    returned_cells = queue[:returned_cell_limit]
+    returned_farthest = farthest[:32]
+    return {
+        "start": list(start_cell),
+        "passable": sorted(set(symbols), key=color_chars.index),
+        "connectivity": 8 if diagonal else 4,
+        "reachable_count": len(reachable),
+        "bbox": (
+            [min_row, min_col, max_row, max_col]
+            if min_row is not None
+            else None
+        ),
+        "touches_edge": any(
+            row in {0, row_count - 1} or col in {0, column_count - 1}
+            for row, col in reachable
+        ),
+        "maximum_distance": maximum_distance,
+        "farthest_cells": returned_farthest,
+        "truncated_farthest_cells": max(0, len(farthest) - len(returned_farthest)),
+        "cells": [list(coordinate) for coordinate in returned_cells],
+        "truncated_cells": max(0, len(reachable) - len(returned_cells)),
+        "frontier_count": len(frontier_coordinates),
+        "frontier_colors": frontier_colors,
+        "frontier": frontier,
+        "truncated_frontier": max(0, len(frontier_coordinates) - len(frontier)),
+        "explored": explored,
+        "search_truncated": cursor < len(queue),
     }
 
 
@@ -680,7 +2267,28 @@ def _bounded_shortest_path(
             )
         )
 
-    if looks_like_coordinate(goal):
+    target_symbols: list[str] = []
+    if isinstance(goal, str) or (
+        isinstance(goal, (list, tuple, set))
+        and bool(goal)
+        and all(isinstance(item, str) for item in goal)
+    ):
+        raw_target_symbols = list(goal)
+        if not raw_target_symbols:
+            raise ValueError(
+                "frame.shortest_path(..., goal=...) requires at least one target symbol."
+            )
+        if any(
+            len(symbol) != 1 or symbol not in color_chars
+            for symbol in raw_target_symbols
+        ):
+            raise ValueError(
+                "frame.shortest_path(..., goal=...) target symbols must come from "
+                f"{color_chars!r}."
+            )
+        target_symbols = list(dict.fromkeys(raw_target_symbols))
+        raw_goals = []
+    elif looks_like_coordinate(goal):
         raw_goals = [goal]
     elif isinstance(goal, (list, tuple)):
         raw_goals = list(goal)
@@ -690,7 +2298,8 @@ def _bounded_shortest_path(
             raise ValueError("frame.shortest_path(...) is limited to 64 goals.")
     else:
         raise TypeError(
-            "frame.shortest_path(..., goal=...) expects [row, col] or a list of coordinates."
+            "frame.shortest_path(..., goal=...) expects color symbols, [row, col], "
+            "or a list of coordinates."
         )
 
     requested_goals = []
@@ -733,6 +2342,7 @@ def _bounded_shortest_path(
     node_limit = bounded_integer(max_nodes, "max_nodes", 16384)
     returned_path_limit = bounded_integer(path_limit, "path_limit", 512)
     passable_values = {color_chars.index(symbol) for symbol in symbols}
+    target_values = {color_chars.index(symbol) for symbol in target_symbols}
     offsets = [(-1, 0), (0, 1), (1, 0), (0, -1)]
     if diagonal:
         offsets.extend([(-1, 1), (1, 1), (1, -1), (-1, -1)])
@@ -747,7 +2357,12 @@ def _bounded_shortest_path(
         current = queue[cursor]
         cursor += 1
         explored += 1
-        if current in goal_cells:
+        current_row = grid[current[0]] if current[0] < len(grid) else []
+        try:
+            current_value = int(current_row[current[1]])
+        except (IndexError, TypeError, ValueError):
+            current_value = None
+        if current in goal_cells or current_value in target_values:
             found = True
             reached_goal = current
             break
@@ -767,7 +2382,11 @@ def _bounded_shortest_path(
                 cell_value = int(source_row[col])
             except (IndexError, TypeError, ValueError):
                 continue
-            if neighbor not in goal_cells and cell_value not in passable_values:
+            if (
+                neighbor not in goal_cells
+                and cell_value not in target_values
+                and cell_value not in passable_values
+            ):
                 continue
             parents[neighbor] = current
             queue.append(neighbor)
@@ -810,6 +2429,7 @@ def _bounded_shortest_path(
         "start": list(start_cell),
         "goal": list(reported_goal) if reported_goal is not None else None,
         "goals": [list(cell) for cell in requested_goals],
+        "target_symbols": target_symbols,
         "selected_goal": list(reached_goal) if reached_goal is not None else None,
         "distance": len(path) - 1 if found else None,
         "path": [list(cell) for cell in returned_path],
@@ -818,6 +2438,185 @@ def _bounded_shortest_path(
         "explored": explored,
         "search_truncated": not found and cursor < len(queue),
         "path_truncated": found and len(returned_path) < len(path),
+    }
+
+
+def _bounded_frame_color_transitions(
+    before_grid: list[list[Any]],
+    after_grid: list[list[Any]],
+    *,
+    before_shape: tuple[int, int],
+    after_shape: tuple[int, int],
+    color_chars: str,
+    include_unchanged: bool = False,
+    limit: int = 64,
+    cell_limit: int = 128,
+) -> dict[str, Any]:
+    """Aggregate per-cell color transitions between two frames."""
+    if not isinstance(include_unchanged, bool):
+        raise TypeError(
+            "frame.color_transitions(..., include_unchanged=...) expects a boolean."
+        )
+
+    def bounded_integer(value: Any, name: str, maximum: int) -> int:
+        if isinstance(value, bool):
+            raise TypeError(
+                f"frame.color_transitions(..., {name}=...) expects an integer."
+            )
+        try:
+            return max(0, min(maximum, int(value)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"frame.color_transitions(..., {name}=...) expects an integer."
+            ) from exc
+
+    transition_limit = bounded_integer(limit, "limit", 128)
+    sample_limit = bounded_integer(cell_limit, "cell_limit", 256)
+    row_count = max(before_shape[0], after_shape[0])
+    column_count = max(before_shape[1], after_shape[1])
+
+    def cell(
+        grid: list[list[Any]], shape: tuple[int, int], row: int, col: int
+    ) -> Any:
+        if not (0 <= row < shape[0] and 0 <= col < shape[1]):
+            return None
+        if row >= len(grid) or col >= len(grid[row]):
+            return None
+        value = grid[row][col]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(color_chars)
+        ):
+            return -1
+        return value
+
+    def symbol(value: Any) -> str | None:
+        if value is None:
+            return None
+        return color_chars[value] if value != -1 else "?"
+
+    def value_order(value: Any) -> int:
+        return -2 if value is None else int(value)
+
+    stats: dict[tuple[Any, Any], dict[str, Any]] = {}
+    source_targets: dict[Any, dict[Any, int]] = {}
+    changed_cells = 0
+    unchanged_cells = 0
+    for row in range(row_count):
+        for col in range(column_count):
+            before = cell(before_grid, before_shape, row, col)
+            after = cell(after_grid, after_shape, row, col)
+            changed = before != after
+            changed_cells += changed
+            unchanged_cells += not changed
+            if not changed and not include_unchanged:
+                continue
+            key = (before, after)
+            entry = stats.setdefault(
+                key,
+                {
+                    "count": 0,
+                    "min_row": row,
+                    "min_col": col,
+                    "max_row": row,
+                    "max_col": col,
+                },
+            )
+            entry["count"] += 1
+            entry["min_row"] = min(entry["min_row"], row)
+            entry["min_col"] = min(entry["min_col"], col)
+            entry["max_row"] = max(entry["max_row"], row)
+            entry["max_col"] = max(entry["max_col"], col)
+            targets = source_targets.setdefault(before, {})
+            targets[after] = targets.get(after, 0) + 1
+
+    ranked_keys = sorted(
+        stats,
+        key=lambda key: (
+            -stats[key]["count"],
+            value_order(key[0]),
+            value_order(key[1]),
+        ),
+    )
+    selected_keys = ranked_keys[:transition_limit]
+    selected_set = set(selected_keys)
+    samples: dict[tuple[Any, Any], list[list[int]]] = {
+        key: [] for key in selected_keys
+    }
+    sampled_cells = 0
+    for row in range(row_count):
+        for col in range(column_count):
+            if sampled_cells >= sample_limit:
+                break
+            key = (
+                cell(before_grid, before_shape, row, col),
+                cell(after_grid, after_shape, row, col),
+            )
+            if key in selected_set and (
+                include_unchanged or key[0] != key[1]
+            ):
+                samples[key].append([row, col])
+                sampled_cells += 1
+        if sampled_cells >= sample_limit:
+            break
+
+    transitions: list[dict[str, Any]] = []
+    for key in selected_keys:
+        entry = stats[key]
+        transition_samples = samples[key]
+        transitions.append(
+            {
+                "before": symbol(key[0]),
+                "after": symbol(key[1]),
+                "count": entry["count"],
+                "bbox": [
+                    entry["min_row"],
+                    entry["min_col"],
+                    entry["max_row"],
+                    entry["max_col"],
+                ],
+                "cells": transition_samples,
+                "truncated_cells": max(
+                    0, entry["count"] - len(transition_samples)
+                ),
+            }
+        )
+
+    source_mappings: list[dict[str, Any]] = []
+    for source, targets in sorted(
+        source_targets.items(), key=lambda item: value_order(item[0])
+    ):
+        dominant = max(
+            targets,
+            key=lambda target: (targets[target], -value_order(target)),
+        )
+        source_mappings.append(
+            {
+                "source": symbol(source),
+                "targets": [
+                    {"symbol": symbol(target), "count": count}
+                    for target, count in sorted(
+                        targets.items(), key=lambda item: value_order(item[0])
+                    )
+                ],
+                "dominant_target": symbol(dominant),
+                "deterministic": len(targets) == 1,
+            }
+        )
+
+    return {
+        "before_shape": list(before_shape),
+        "after_shape": list(after_shape),
+        "shape_changed": before_shape != after_shape,
+        "include_unchanged": include_unchanged,
+        "changed_cells": changed_cells,
+        "unchanged_cells": unchanged_cells,
+        "transition_types": len(ranked_keys),
+        "transitions": transitions,
+        "source_mappings": source_mappings,
+        "sampled_cells": sampled_cells,
+        "truncated_transitions": max(0, len(ranked_keys) - len(transitions)),
     }
 
 
@@ -932,10 +2731,43 @@ def _sandbox_exception_diagnostic(
     elif isinstance(exc, SyntaxError) and getattr(exc, "text", None):
         source = str(exc.text).strip()[:240]
 
+    context = [
+        {
+            "line": index + 1,
+            "source": code_lines[index].strip()[:240],
+            "current": index + 1 == parsed_line,
+        }
+        for index in range(
+            max(0, (parsed_line or 1) - 2),
+            min(len(code_lines), (parsed_line or 1) + 1),
+        )
+    ]
+    details: dict[str, Any] = {}
+    suggestions: list[str] = []
     error_type = exc.__class__.__name__[:80]
     if isinstance(exc, SyntaxError):
         hint = "Fix the Python syntax at the reported line and retry."
     elif isinstance(exc, NameError):
+        missing_name = str(getattr(exc, "name", "") or "")[:120]
+        if missing_name:
+            details["name"] = missing_name
+            available_names: set[str] = set()
+            current_traceback = exc.__traceback__
+            while current_traceback is not None:
+                frame = current_traceback.tb_frame
+                if frame.f_code.co_filename == "<python_tool>":
+                    available_names.update(
+                        name
+                        for name in (*frame.f_globals, *frame.f_locals)
+                        if isinstance(name, str) and not name.startswith("_")
+                    )
+                current_traceback = current_traceback.tb_next
+            suggestions = difflib.get_close_matches(
+                missing_name,
+                sorted(available_names),
+                n=3,
+                cutoff=0.5,
+            )
         hint = (
             "Define or import the missing name in this call; every Python call "
             "starts fresh."
@@ -944,8 +2776,65 @@ def _sandbox_exception_diagnostic(
         modules = ", ".join(sorted(allowed_modules or set()))
         hint = f"Use only approved modules: {modules}." if modules else "Use an approved module."
     elif isinstance(exc, AttributeError):
-        hint = "Check the documented sandbox object attributes and method names."
+        attribute = str(getattr(exc, "name", "") or "")[:120]
+        object_type = type(getattr(exc, "obj", None)).__name__[:80]
+        if attribute:
+            details["attribute"] = attribute
+        if object_type:
+            details["object_type"] = object_type
+        documented_attributes = {
+            "FrameView": [
+                "ascii",
+                "cell",
+                "color_transitions",
+                "components",
+                "crop",
+                "diff",
+                "enclosed_regions",
+                "find",
+                "find_pattern",
+                "level",
+                "neighbors",
+                "object_relations",
+                "objects",
+                "periodicity",
+                "ray",
+                "reachable_region",
+                "rectangles",
+                "runs",
+                "segmentation",
+                "shape",
+                "shortest_path",
+                "shortest_path_to_any",
+                "step",
+                "symmetry",
+                "track_objects",
+                "transform_relation",
+            ],
+            "TransitionView": [
+                "action",
+                "after_frame",
+                "before_frame",
+                "color_transitions",
+                "diff",
+                "frame",
+                "result",
+            ],
+        }
+        suggestions = difflib.get_close_matches(
+            attribute,
+            documented_attributes.get(object_type, []),
+            n=3,
+            cutoff=0.45,
+        )
+        hint = (
+            "Use the closest documented sandbox attribute and retry."
+            if suggestions
+            else "Check the documented sandbox object attributes and method names."
+        )
     elif isinstance(exc, KeyError):
+        if exc.args and isinstance(exc.args[0], (str, int, float, bool, type(None))):
+            details["key"] = exc.args[0]
         hint = "Check available mapping keys or use `.get(...)` for optional values."
     elif isinstance(exc, IndexError):
         hint = "Check frame shape and sequence bounds before indexing."
@@ -960,8 +2849,14 @@ def _sandbox_exception_diagnostic(
         "type": error_type,
         "line": parsed_line,
         "column": parsed_column,
+        "end_line": getattr(exc, "end_lineno", None),
+        "end_column": getattr(exc, "end_offset", None),
         "source": source or None,
+        "context": context,
+        "suggestions": suggestions,
         "hint": hint[:300],
+        "retry": "correct_and_retry",
+        **details,
     }
 
 
@@ -969,7 +2864,9 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     r"""
     import ast
     import builtins
+    import copy
     import contextlib
+    import difflib
     import io
     import json
     import os
@@ -989,11 +2886,23 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     __FRAME_CROP_SOURCE__
     __FRAME_CELL_SOURCE__
     __FRAME_NEIGHBORS_SOURCE__
+    __FRAME_RAY_SOURCE__
     __FRAME_FIND_SOURCE__
+    __FRAME_COLOR_SUMMARY_SOURCE__
+    __FRAME_RUNS_SOURCE__
+    __FRAME_RECTANGLES_SOURCE__
+    __FRAME_ENCLOSED_REGIONS_SOURCE__
     __FRAME_COMPONENTS_SOURCE__
     __FRAME_OBJECTS_SOURCE__
+    __FRAME_OBJECT_RELATIONS_SOURCE__
+    __FRAME_OBJECT_CHANGES_SOURCE__
+    __FRAME_TRANSFORM_RELATION_SOURCE__
+    __FRAME_SYMMETRY_SOURCE__
+    __FRAME_PERIODICITY_SOURCE__
     __FRAME_PATTERN_SOURCE__
+    __REACHABLE_REGION_SOURCE__
     __SHORTEST_PATH_SOURCE__
+    __FRAME_COLOR_TRANSITIONS_SOURCE__
     __FRAME_DIFF_SOURCE__
     __EXCEPTION_DIAGNOSTIC_SOURCE__
 
@@ -1141,6 +3050,46 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         return json.loads(line)
 
 
+    def _freeze_cache_value(value):
+        if isinstance(value, dict):
+            return tuple(
+                sorted(
+                    (str(key), _freeze_cache_value(item))
+                    for key, item in value.items()
+                )
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(_freeze_cache_value(item) for item in value)
+        if isinstance(value, set):
+            return tuple(
+                sorted(
+                    (_freeze_cache_value(item) for item in value),
+                    key=repr,
+                )
+            )
+        if isinstance(value, (str, int, float, bool, type(None))):
+            return value
+        return repr(value)
+
+
+    def _cached_frame_analysis(method):
+        def wrapped(self, *args, **kwargs):
+            key = (
+                method.__name__,
+                _freeze_cache_value(args),
+                _freeze_cache_value(kwargs),
+            )
+            if key not in self._analysis_cache:
+                if len(self._analysis_cache) >= 64:
+                    self._analysis_cache.pop(next(iter(self._analysis_cache)))
+                self._analysis_cache[key] = method(self, *args, **kwargs)
+            return copy.deepcopy(self._analysis_cache[key])
+
+        wrapped.__name__ = method.__name__
+        wrapped.__doc__ = method.__doc__
+        return wrapped
+
+
     class FrameView:
         def __init__(self, *, ascii, step, level, shape, grid):
             self.ascii = ascii
@@ -1149,12 +3098,36 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             self.shape = tuple(shape)
             self._grid = grid
             self._segmentation = None
+            self._analysis_cache = {}
 
         @property
         def segmentation(self):
             if self._segmentation is None:
                 self._segmentation = segment_layer(self._grid, COLOR_CHARS)
             return self._segmentation
+
+        def color_transitions(
+            self,
+            other,
+            *,
+            include_unchanged=False,
+            limit=64,
+            cell_limit=128,
+        ):
+            if not isinstance(other, FrameView):
+                raise TypeError(
+                    "frame.color_transitions(other) expects another FrameView."
+                )
+            return _bounded_frame_color_transitions(
+                other._grid,
+                self._grid,
+                before_shape=other.shape,
+                after_shape=self.shape,
+                color_chars=COLOR_CHARS,
+                include_unchanged=include_unchanged,
+                limit=limit,
+                cell_limit=cell_limit,
+            )
 
         def diff(self, other, *, limit=64):
             # Return a bounded summary of changes from other to this frame.
@@ -1202,6 +3175,28 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 diagonal=diagonal,
             )
 
+        def ray(
+            self,
+            row,
+            col,
+            direction,
+            *,
+            stop_at=None,
+            include_start=False,
+            limit=64,
+        ):
+            return _bounded_frame_ray(
+                self._grid,
+                shape=self.shape,
+                color_chars=COLOR_CHARS,
+                row=row,
+                col=col,
+                direction=direction,
+                stop_at=stop_at,
+                include_start=include_start,
+                limit=limit,
+            )
+
         def find(self, symbol, *, limit=64):
             # Return a bounded coordinate sample plus total count and bounds.
             return _bounded_frame_find(
@@ -1212,6 +3207,54 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 limit=limit,
             )
 
+        @_cached_frame_analysis
+        def color_summary(self, *, limit=16):
+            return _bounded_frame_color_summary(
+                self._grid,
+                shape=self.shape,
+                color_chars=COLOR_CHARS,
+                limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def runs(self, symbol=None, *, directions="HV", min_length=2, limit=64):
+            return _bounded_frame_runs(
+                self._grid,
+                shape=self.shape,
+                color_chars=COLOR_CHARS,
+                symbol=symbol,
+                directions=directions,
+                min_length=min_length,
+                limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def rectangles(self, symbol=None, *, kind="any", min_size=2, limit=64):
+            return _bounded_frame_rectangles(
+                self._grid,
+                shape=self.shape,
+                color_chars=COLOR_CHARS,
+                symbol=symbol,
+                kind=kind,
+                min_size=min_size,
+                limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def enclosed_regions(
+            self, symbol=None, *, diagonal=False, limit=64, cell_limit=128
+        ):
+            return _bounded_frame_enclosed_regions(
+                self._grid,
+                shape=self.shape,
+                color_chars=COLOR_CHARS,
+                symbol=symbol,
+                diagonal=diagonal,
+                limit=limit,
+                cell_limit=cell_limit,
+            )
+
+        @_cached_frame_analysis
         def components(self, symbol, *, diagonal=False, limit=64, cell_limit=128):
             return _bounded_frame_components(
                 self._grid,
@@ -1223,6 +3266,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 cell_limit=cell_limit,
             )
 
+        @_cached_frame_analysis
         def objects(self, *, background=None, diagonal=False, limit=64, cell_limit=128):
             return _bounded_frame_objects(
                 self._grid,
@@ -1234,7 +3278,83 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 cell_limit=cell_limit,
             )
 
-        def find_pattern(self, pattern, *, wildcard=None, transforms=False, limit=64):
+        @_cached_frame_analysis
+        def object_relations(
+            self,
+            *,
+            background=None,
+            diagonal=False,
+            object_limit=32,
+            relation_limit=64,
+        ):
+            return _bounded_frame_object_relations(
+                self._grid,
+                shape=self.shape,
+                color_chars=COLOR_CHARS,
+                background=background,
+                diagonal=diagonal,
+                object_limit=object_limit,
+                relation_limit=relation_limit,
+            )
+
+        def track_objects(self, other, *, background=None, diagonal=False, limit=64):
+            if not isinstance(other, FrameView):
+                raise TypeError("frame.track_objects(other) expects another FrameView.")
+            return _bounded_frame_object_changes(
+                other._grid,
+                self._grid,
+                before_shape=other.shape,
+                after_shape=self.shape,
+                color_chars=COLOR_CHARS,
+                background=background,
+                diagonal=diagonal,
+                limit=limit,
+            )
+
+        def transform_relation(self, other, *, allow_recolor=True):
+            if not isinstance(other, FrameView):
+                raise TypeError(
+                    "frame.transform_relation(other) expects another FrameView."
+                )
+            return _bounded_frame_transform_relation(
+                other._grid,
+                self._grid,
+                before_shape=other.shape,
+                after_shape=self.shape,
+                color_chars=COLOR_CHARS,
+                allow_recolor=allow_recolor,
+            )
+
+        @_cached_frame_analysis
+        def symmetry(self, *, sample_limit=8):
+            return _bounded_frame_symmetry(
+                self._grid,
+                shape=self.shape,
+                color_chars=COLOR_CHARS,
+                sample_limit=sample_limit,
+            )
+
+        @_cached_frame_analysis
+        def periodicity(self, *, candidate_limit=8, sample_limit=8):
+            return _bounded_frame_periodicity(
+                self._grid,
+                shape=self.shape,
+                color_chars=COLOR_CHARS,
+                candidate_limit=candidate_limit,
+                sample_limit=sample_limit,
+            )
+
+        @_cached_frame_analysis
+        def find_pattern(
+            self,
+            pattern,
+            *,
+            wildcard=None,
+            transforms=False,
+            max_mismatches=0,
+            mismatch_limit=8,
+            limit=64,
+        ):
             return _bounded_frame_find_pattern(
                 self._grid,
                 shape=self.shape,
@@ -1242,7 +3362,32 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 pattern=pattern,
                 wildcard=wildcard,
                 transforms=transforms,
+                max_mismatches=max_mismatches,
+                mismatch_limit=mismatch_limit,
                 limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def reachable_region(
+            self,
+            start,
+            *,
+            passable,
+            diagonal=False,
+            max_nodes=4096,
+            cell_limit=128,
+            frontier_limit=64,
+        ):
+            return _bounded_reachable_region(
+                self._grid,
+                shape=self.shape,
+                color_chars=COLOR_CHARS,
+                start=start,
+                passable=passable,
+                diagonal=diagonal,
+                max_nodes=max_nodes,
+                cell_limit=cell_limit,
+                frontier_limit=frontier_limit,
             )
 
         def shortest_path(
@@ -1318,6 +3463,18 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 return None
             return self.after_frame.diff(self.before_frame, limit=limit)
 
+        def color_transitions(
+            self, *, include_unchanged=False, limit=64, cell_limit=128
+        ):
+            if self.before_frame is None or self.after_frame is None:
+                return None
+            return self.after_frame.color_transitions(
+                self.before_frame,
+                include_unchanged=include_unchanged,
+                limit=limit,
+                cell_limit=cell_limit,
+            )
+
         def __str__(self):
             return (
                 "ActionTransitionView("
@@ -1341,15 +3498,66 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         )
 
 
+    def _frame_ascii(grid):
+        if not grid:
+            return "(empty grid)"
+        return "\n".join(
+            "".join(COLOR_CHARS[max(0, min(15, int(value)))] for value in row)
+            for row in grid
+        )
+
+
+    def _frame_from_delta(payload, previous_frame):
+        if not isinstance(payload, dict) or not isinstance(previous_frame, FrameView):
+            return None
+        shape = tuple(payload.get("shape", previous_frame.shape))
+        if shape != previous_frame.shape:
+            return None
+        grid = [list(row) for row in previous_frame._grid]
+        for change in payload.get("changes", []):
+            if not isinstance(change, (list, tuple)) or len(change) != 3:
+                return None
+            row, col, value = change
+            if (
+                isinstance(row, bool)
+                or isinstance(col, bool)
+                or isinstance(value, bool)
+                or not isinstance(row, int)
+                or not isinstance(col, int)
+                or not isinstance(value, int)
+                or row < 0
+                or row >= len(grid)
+                or col < 0
+                or col >= len(grid[row])
+                or value < 0
+                or value >= len(COLOR_CHARS)
+            ):
+                return None
+            grid[row][col] = value
+        return FrameView(
+            ascii=_frame_ascii(grid),
+            step=int(payload.get("step", 0)),
+            level=int(payload.get("level", 0)),
+            shape=shape,
+            grid=grid,
+        )
+
+
     def _history_from_payload(payload):
         items = []
         for entry in payload or []:
             if not isinstance(entry, dict):
                 continue
+            previous_frame = items[-1].frame if items else None
+            frame = _frame_from_payload(entry.get("frame"))
+            if frame is None:
+                frame = _frame_from_delta(entry.get("frame_delta"), previous_frame)
+            if frame is None:
+                continue
             items.append(
                 HistoryEntryView(
                     action=str(entry.get("action", "")),
-                    frame=_frame_from_payload(entry.get("frame")),
+                    frame=frame,
                 )
             )
         return items
@@ -1591,8 +3799,23 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         runtime_globals["__builtins__"]["getattr"] = _safe_getattr
 
         def _refresh_state(state_payload):
-            current_frame = _frame_from_payload(state_payload.get("current_frame"))
             history = _history_from_payload(state_payload.get("history"))
+            current_payload = state_payload.get("current_frame")
+            history_index = (
+                current_payload.get("history_index")
+                if isinstance(current_payload, dict)
+                else None
+            )
+            if (
+                not isinstance(history_index, bool)
+                and isinstance(history_index, int)
+                and 0 <= history_index < len(history)
+            ):
+                current_frame = history[history_index].frame
+            elif isinstance(current_payload, dict) and "history_index" in current_payload:
+                current_frame = None
+            else:
+                current_frame = _frame_from_payload(current_payload)
             last_action_result = state_payload.get("last_action_result")
             action_result = (
                 dict(last_action_result) if isinstance(last_action_result, dict) else {}
@@ -1743,20 +3966,67 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 ).replace(
     "__FRAME_NEIGHBORS_SOURCE__\n", inspect.getsource(_bounded_frame_neighbors)
 ).replace(
+    "__FRAME_RAY_SOURCE__\n", inspect.getsource(_bounded_frame_ray)
+).replace(
     "__FRAME_FIND_SOURCE__\n", inspect.getsource(_bounded_frame_find)
+).replace(
+    "__FRAME_COLOR_SUMMARY_SOURCE__\n",
+    inspect.getsource(_bounded_frame_color_summary),
+).replace(
+    "__FRAME_RUNS_SOURCE__\n", inspect.getsource(_bounded_frame_runs)
+).replace(
+    "__FRAME_RECTANGLES_SOURCE__\n", inspect.getsource(_bounded_frame_rectangles)
+).replace(
+    "__FRAME_ENCLOSED_REGIONS_SOURCE__\n",
+    inspect.getsource(_bounded_frame_enclosed_regions),
 ).replace(
     "__FRAME_COMPONENTS_SOURCE__\n", inspect.getsource(_bounded_frame_components)
 ).replace(
     "__FRAME_OBJECTS_SOURCE__\n", inspect.getsource(_bounded_frame_objects)
 ).replace(
+    "__FRAME_OBJECT_RELATIONS_SOURCE__\n",
+    inspect.getsource(_bounded_frame_object_relations),
+).replace(
+    "__FRAME_OBJECT_CHANGES_SOURCE__\n",
+    inspect.getsource(_bounded_frame_object_changes),
+).replace(
+    "__FRAME_TRANSFORM_RELATION_SOURCE__\n",
+    inspect.getsource(_bounded_frame_transform_relation),
+).replace(
+    "__FRAME_SYMMETRY_SOURCE__\n", inspect.getsource(_bounded_frame_symmetry)
+).replace(
+    "__FRAME_PERIODICITY_SOURCE__\n", inspect.getsource(_bounded_frame_periodicity)
+).replace(
     "__FRAME_PATTERN_SOURCE__\n", inspect.getsource(_bounded_frame_find_pattern)
 ).replace(
+    "__REACHABLE_REGION_SOURCE__\n", inspect.getsource(_bounded_reachable_region)
+).replace(
     "__SHORTEST_PATH_SOURCE__\n", inspect.getsource(_bounded_shortest_path)
+).replace(
+    "__FRAME_COLOR_TRANSITIONS_SOURCE__\n",
+    inspect.getsource(_bounded_frame_color_transitions),
 ).replace(
     "__FRAME_DIFF_SOURCE__\n", inspect.getsource(_bounded_frame_diff_summary)
 ).replace(
     "__EXCEPTION_DIAGNOSTIC_SOURCE__\n",
     inspect.getsource(_sandbox_exception_diagnostic),
+)
+
+_SANDBOX_BOOTSTRAP_PAYLOAD = base64.b64encode(
+    zlib.compress(
+        marshal.dumps(
+            compile(
+                _SANDBOX_BOOTSTRAP,
+                "<python_tool_sandbox_bootstrap>",
+                "exec",
+            )
+        ),
+        level=9,
+    )
+).decode("ascii")
+_SANDBOX_LAUNCHER = (
+    "import base64,marshal,sys,zlib;"
+    "exec(marshal.loads(zlib.decompress(base64.b64decode(sys.stdin.readline()))))"
 )
 
 
@@ -1783,7 +4053,7 @@ def _send_json_line(handle: Any, payload: dict[str, Any]) -> None:
 
 
 def _sandbox_command() -> tuple[list[str], str | None]:
-    python_command = [sys.executable, "-I", "-S", "-c", _SANDBOX_BOOTSTRAP]
+    python_command = [sys.executable, "-I", "-S", "-c", _SANDBOX_LAUNCHER]
     bubblewrap = shutil.which("bwrap") if os.name == "posix" else None
     if bubblewrap is None:
         return python_command, None
@@ -1890,6 +4160,7 @@ def run_sandboxed_python(
 
         threading.Thread(target=_stdout_reader, daemon=True).start()
 
+        process.stdin.write(_SANDBOX_BOOTSTRAP_PAYLOAD + "\n")
         _send_json_line(
             process.stdin,
             {

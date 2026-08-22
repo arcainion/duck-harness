@@ -96,6 +96,32 @@ class BoundedFrameCropTests(unittest.TestCase):
                 right=17,
             )
 
+    def test_ragged_and_missing_rows_are_rendered_as_unknown(self) -> None:
+        crop = _bounded_frame_crop(
+            [[0], []],
+            shape=(3, 2),
+            color_chars=ARC_COLOR_CHARS,
+            top=0,
+            left=0,
+            bottom=3,
+            right=2,
+        )
+
+        self.assertEqual(crop["rows"], [ARC_COLOR_CHARS[0] + "?", "??", "??"])
+
+    def test_invalid_color_values_are_rendered_as_unknown(self) -> None:
+        crop = _bounded_frame_crop(
+            [[-1, 16, "bad"]],
+            shape=(1, 3),
+            color_chars=ARC_COLOR_CHARS,
+            top=0,
+            left=0,
+            bottom=1,
+            right=3,
+        )
+
+        self.assertEqual(crop["rows"], ["???"])
+
 
 if __name__ == "__main__":
     unittest.main()
