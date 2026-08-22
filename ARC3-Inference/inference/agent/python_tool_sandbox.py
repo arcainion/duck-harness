@@ -1,11 +1,12 @@
 """Lightweight isolated runner for analyzer Python tool calls."""
 from __future__ import annotations
 
-import inspect
-import json
+import atexit
 import base64
 import difflib
 import hashlib
+import inspect
+import json
 import marshal
 import os
 import queue
@@ -3834,6 +3835,29 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 limit=limit,
             )
 
+        def analyze(self, calls):
+            # Run several bounded frame queries through one compact call.
+            if not isinstance(calls, (list, tuple)):
+                raise TypeError("frame.analyze(calls) expects a list of query objects.")
+            if len(calls) > 32:
+                raise ValueError("frame.analyze(calls) is limited to 32 queries.")
+            results = []
+            for index, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    raise TypeError(f"frame.analyze(calls)[{index}] must be an object.")
+                name = str(call.get("method") or call.get("name") or "").strip()
+                if not name or name.startswith("_") or name == "analyze":
+                    raise ValueError(f"frame.analyze(calls)[{index}] has an invalid method.")
+                method = getattr(self, name, None)
+                if not callable(method):
+                    raise ValueError(f"Unknown frame analysis method: {name}")
+                args = call.get("args") or []
+                kwargs = call.get("kwargs") or {}
+                if not isinstance(args, (list, tuple)) or not isinstance(kwargs, dict):
+                    raise TypeError(f"frame.analyze(calls)[{index}] args/kwargs are invalid.")
+                results.append({"method": name, "result": method(*args, **kwargs)})
+            return results
+
         @_cached_frame_analysis
         def color_summary(self, *, limit=16):
             return _bounded_frame_color_summary(
@@ -4565,6 +4589,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         runtime_globals["__builtins__"]["__import__"] = _safe_import
         runtime_globals["__builtins__"]["getattr"] = _safe_getattr
 
+        current_state_payload = dict(initial.get("state") or {})
+
         def _refresh_state(state_payload):
             history = _history_from_payload(state_payload.get("history"))
             current_payload = state_payload.get("current_frame")
@@ -4608,6 +4634,18 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             runtime_globals["strategy"] = dict(state_payload.get("strategy") or {})
             runtime_globals["memory"] = dict(state_payload.get("memory") or {})
 
+        def _apply_state_update(update):
+            nonlocal current_state_payload
+            merged = dict(current_state_payload)
+            history_append = update.get("history_append")
+            if isinstance(history_append, list):
+                merged["history"] = [*(merged.get("history") or []), *history_append]
+            for key, value in update.items():
+                if key != "history_append":
+                    merged[key] = value
+            current_state_payload = merged
+            _refresh_state(current_state_payload)
+
         def action(actions):
             normalized_actions = _normalize_actions(actions)
             _send({"type": "action", "actions": normalized_actions})
@@ -4618,7 +4656,12 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 raise RuntimeError("Invalid action response from sandbox host.")
             action_result = reply.get("action_result") or {}
             action_results.append(action_result)
-            _refresh_state(reply.get("state") or {})
+            if isinstance(reply.get("state_update"), dict):
+                _apply_state_update(reply["state_update"])
+            else:
+                current_state_payload.clear()
+                current_state_payload.update(reply.get("state") or {})
+                _refresh_state(current_state_payload)
             return action_result
 
         def record_strategy(
@@ -4686,7 +4729,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         runtime_globals["record_strategy"] = record_strategy
         runtime_globals["remember"] = remember
         runtime_globals["forget"] = forget
-        _refresh_state(initial.get("state") or {})
+        _refresh_state(current_state_payload)
 
         try:
             parsed = _prepare_user_code(str(initial.get("code", "")))
@@ -4820,11 +4863,37 @@ def _sandbox_env() -> dict[str, str]:
     }
 
 
-def _send_json_line(handle: Any, payload: dict[str, Any]) -> None:
-    handle.write(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
-    )
+def _send_json_line(handle: Any, payload: dict[str, Any]) -> int:
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    handle.write(encoded)
     handle.flush()
+    return len(encoded.encode("utf-8"))
+
+
+def _runtime_state_update(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    """Return an append-friendly update for sandbox runtime state."""
+    update: dict[str, Any] = {}
+    previous_history = previous.get("history")
+    current_history = current.get("history")
+    if isinstance(previous_history, list) and isinstance(current_history, list):
+        prefix_length = len(previous_history)
+        if current_history[:prefix_length] == previous_history:
+            if len(current_history) > prefix_length:
+                update["history_append"] = current_history[prefix_length:]
+        elif current_history != previous_history:
+            update["history"] = current_history
+    elif current_history != previous_history:
+        update["history"] = current_history
+
+    for key, value in current.items():
+        if key == "history":
+            continue
+        if previous.get(key) != value:
+            update[key] = value
+    return update
 
 
 def _sandbox_command() -> tuple[list[str], str | None]:
@@ -4863,8 +4932,11 @@ def _sandbox_command() -> tuple[list[str], str | None]:
 
 def _kill_process_group(process: subprocess.Popen[str]) -> None:
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except OSError:
+        if hasattr(os, "killpg"):
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except (AttributeError, OSError):
         try:
             process.kill()
         except OSError:
@@ -4891,6 +4963,123 @@ def _wait_for_process_exit(process: subprocess.Popen[str], *, timeout: float = 1
                 handle.close()
 
 
+class _PreparedSandboxProcess:
+    """A bootstrapped process that is consumed by exactly one tool call."""
+
+    def __init__(self) -> None:
+        self.temp_dir = tempfile.mkdtemp(prefix="rgb_python_tool_warm_")
+        command, self.isolated_cwd = _sandbox_command()
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                cwd=self.temp_dir,
+                env=_sandbox_env(),
+                start_new_session=True,
+            )
+        except BaseException:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            raise
+        assert self.process.stdin is not None
+        assert self.process.stdout is not None
+        self.stdout_queue: queue.Queue[str | None] = queue.Queue()
+
+        def stdout_reader() -> None:
+            for raw_line in self.process.stdout:
+                self.stdout_queue.put(raw_line)
+            self.stdout_queue.put(None)
+
+        threading.Thread(target=stdout_reader, daemon=True).start()
+        self.process.stdin.write(_SANDBOX_BOOTSTRAP_PAYLOAD + "\n")
+        self.process.stdin.flush()
+
+    def close(self, *, terminate: bool = False) -> None:
+        if terminate and self.process.poll() is None:
+            _kill_process_group(self.process)
+        _wait_for_process_exit(self.process)
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+
+try:
+    _SANDBOX_PREWARM_WORKERS = max(
+        0, int(os.environ.get("PYTHON_TOOL_PREWARM_WORKERS", "1") or 0)
+    )
+except ValueError:
+    _SANDBOX_PREWARM_WORKERS = 1
+_SANDBOX_PREWARM_QUEUE: queue.Queue[_PreparedSandboxProcess] = queue.Queue(
+    maxsize=max(1, _SANDBOX_PREWARM_WORKERS)
+)
+_SANDBOX_PREWARM_LOCK = threading.Lock()
+_SANDBOX_PREWARM_STARTING = 0
+
+
+def prewarm_sandbox() -> None:
+    """Fill the single-use worker queue without blocking the caller."""
+    global _SANDBOX_PREWARM_STARTING
+    if _SANDBOX_PREWARM_WORKERS <= 0:
+        return
+    with _SANDBOX_PREWARM_LOCK:
+        missing = (
+            _SANDBOX_PREWARM_WORKERS
+            - _SANDBOX_PREWARM_QUEUE.qsize()
+            - _SANDBOX_PREWARM_STARTING
+        )
+        _SANDBOX_PREWARM_STARTING += max(0, missing)
+
+    def start_one() -> None:
+        global _SANDBOX_PREWARM_STARTING
+        worker: _PreparedSandboxProcess | None = None
+        try:
+            worker = _PreparedSandboxProcess()
+            _SANDBOX_PREWARM_QUEUE.put_nowait(worker)
+            worker = None
+        except (OSError, queue.Full):
+            pass
+        finally:
+            if worker is not None:
+                worker.close(terminate=True)
+            with _SANDBOX_PREWARM_LOCK:
+                _SANDBOX_PREWARM_STARTING -= 1
+
+    for _ in range(max(0, missing)):
+        threading.Thread(target=start_one, daemon=True).start()
+
+
+def _take_prepared_sandbox() -> _PreparedSandboxProcess | None:
+    try:
+        worker = _SANDBOX_PREWARM_QUEUE.get_nowait()
+    except queue.Empty:
+        return None
+    if worker.process.poll() is not None:
+        worker.close()
+        prewarm_sandbox()
+        return None
+    prewarm_sandbox()
+    return worker
+
+
+def _close_prewarmed_sandboxes() -> None:
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            worker = _SANDBOX_PREWARM_QUEUE.get_nowait()
+        except queue.Empty:
+            with _SANDBOX_PREWARM_LOCK:
+                starting = _SANDBOX_PREWARM_STARTING
+            if starting <= 0 or time.monotonic() >= deadline:
+                return
+            time.sleep(0.01)
+            continue
+        worker.close(terminate=True)
+
+
+atexit.register(_close_prewarmed_sandboxes)
+
+
 def run_sandboxed_python(
     *,
     code: str,
@@ -4900,44 +5089,71 @@ def run_sandboxed_python(
     strategy_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     memory_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    started_at = time.monotonic()
+    transport_state = dict(initial_state)
     with tempfile.TemporaryDirectory(prefix="rgb_python_tool_") as sandbox_dir:
         host_action_results: list[dict[str, Any]] = []
         host_strategy_updates: list[dict[str, Any]] = []
-        command, isolated_cwd = _sandbox_command()
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                cwd=sandbox_dir,
-                env=_sandbox_env(),
-                start_new_session=True,
-            )
-        except OSError:
-            return {
-                "error": "Sandbox process could not start.",
-                "stdout": "",
-                "action_results": [],
-            }
+        prepared = _take_prepared_sandbox()
+        if prepared is not None:
+            process = prepared.process
+            isolated_cwd = prepared.isolated_cwd
+            sandbox_dir = prepared.temp_dir
+            stdout_queue = prepared.stdout_queue
+        else:
+            command, isolated_cwd = _sandbox_command()
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    cwd=sandbox_dir,
+                    env=_sandbox_env(),
+                    start_new_session=True,
+                )
+            except OSError:
+                return {
+                    "error": "Sandbox process could not start.",
+                    "stdout": "",
+                    "action_results": [],
+                }
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
 
-        stdout_queue: queue.Queue[str | None] = queue.Queue()
+        if prepared is None:
+            stdout_queue = queue.Queue()
 
-        def _stdout_reader() -> None:
-            for raw_line in process.stdout:
-                stdout_queue.put(raw_line)
-            stdout_queue.put(None)
+            def _stdout_reader() -> None:
+                for raw_line in process.stdout:
+                    stdout_queue.put(raw_line)
+                stdout_queue.put(None)
 
-        threading.Thread(target=_stdout_reader, daemon=True).start()
+            threading.Thread(target=_stdout_reader, daemon=True).start()
+            process.stdin.write(_SANDBOX_BOOTSTRAP_PAYLOAD + "\n")
 
-        process.stdin.write(_SANDBOX_BOOTSTRAP_PAYLOAD + "\n")
-        _send_json_line(
-            process.stdin,
+        def finish_process() -> None:
+            _wait_for_process_exit(process)
+            if prepared is not None:
+                shutil.rmtree(prepared.temp_dir, ignore_errors=True)
+
+        host_to_sandbox_bytes = 0
+
+        def send_to_sandbox(payload: dict[str, Any]) -> None:
+            nonlocal host_to_sandbox_bytes
+            host_to_sandbox_bytes += _send_json_line(process.stdin, payload)
+
+        def efficiency() -> dict[str, Any]:
+            return {
+                "prewarmed": prepared is not None,
+                "host_to_sandbox_bytes": host_to_sandbox_bytes,
+                "elapsed_seconds": time.monotonic() - started_at,
+            }
+
+        send_to_sandbox(
             {
                 "code": code,
                 "timeout_seconds": timeout_seconds,
@@ -4952,7 +5168,7 @@ def run_sandboxed_python(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _kill_process_group(process)
-                _wait_for_process_exit(process)
+                finish_process()
                 return {
                     "error": f"Tool timed out after {timeout_seconds}s",
                     "diagnostic": {
@@ -4975,7 +5191,7 @@ def run_sandboxed_python(
                 continue
             if line is None:
                 stderr = process.stderr.read()
-                _wait_for_process_exit(process)
+                finish_process()
                 return {
                     "error": _sanitize_host_error_text(stderr),
                     "stdout": "",
@@ -4987,7 +5203,7 @@ def run_sandboxed_python(
             except json.JSONDecodeError:
                 stderr = process.stderr.read()
                 _kill_process_group(process)
-                _wait_for_process_exit(process)
+                finish_process()
                 return {
                     "error": "Sandbox process returned an invalid response.",
                     "stdout": "",
@@ -4999,8 +5215,7 @@ def run_sandboxed_python(
                 try:
                     action_result_payload = action_handler(list(message.get("actions") or []))
                 except SandboxHostActionError as exc:
-                    _send_json_line(
-                        process.stdin,
+                    send_to_sandbox(
                         {
                             "type": "action_error",
                             "error": str(exc) or "action failed in sandbox host.",
@@ -5008,8 +5223,7 @@ def run_sandboxed_python(
                     )
                     continue
                 except Exception:  # noqa: BLE001
-                    _send_json_line(
-                        process.stdin,
+                    send_to_sandbox(
                         {
                             "type": "action_error",
                             "error": "action failed in sandbox host.",
@@ -5019,12 +5233,14 @@ def run_sandboxed_python(
                 raw_action_result = action_result_payload.get("action_result") or {}
                 if isinstance(raw_action_result, dict):
                     host_action_results.append(dict(raw_action_result))
-                _send_json_line(
-                    process.stdin,
+                next_state = action_result_payload.get("state") or {}
+                state_update = _runtime_state_update(transport_state, next_state)
+                transport_state = dict(next_state)
+                send_to_sandbox(
                     {
                         "type": "action_result",
                         "action_result": raw_action_result,
-                        "state": action_result_payload.get("state") or {},
+                        "state_update": state_update,
                     },
                 )
                 continue
@@ -5040,8 +5256,7 @@ def run_sandboxed_python(
                     except Exception:  # noqa: BLE001
                         persisted_strategy = {}
                 host_strategy_updates.append(dict(persisted_strategy))
-                _send_json_line(
-                    process.stdin,
+                send_to_sandbox(
                     {
                         "type": "strategy_result",
                         "strategy": persisted_strategy,
@@ -5058,8 +5273,7 @@ def run_sandboxed_python(
                             dict(message.get("memory") or {})
                         )
                     except (TypeError, ValueError) as exc:
-                        _send_json_line(
-                            process.stdin,
+                        send_to_sandbox(
                             {
                                 "type": "memory_error",
                                 "error": str(exc) or "memory update failed.",
@@ -5067,16 +5281,14 @@ def run_sandboxed_python(
                         )
                         continue
                     except Exception:  # noqa: BLE001
-                        _send_json_line(
-                            process.stdin,
+                        send_to_sandbox(
                             {
                                 "type": "memory_error",
                                 "error": "memory update failed.",
                             },
                         )
                         continue
-                _send_json_line(
-                    process.stdin,
+                send_to_sandbox(
                     {
                         "type": "memory_result",
                         "memory": persisted_memory,
@@ -5085,7 +5297,7 @@ def run_sandboxed_python(
                 continue
 
             if msg_type in {"final", "error"}:
-                _wait_for_process_exit(process)
+                finish_process()
                 return {
                     "stdout": str(message.get("stdout", "") or ""),
                     "result": message.get("result"),
@@ -5093,9 +5305,10 @@ def run_sandboxed_python(
                     "diagnostic": message.get("diagnostic"),
                     "action_results": list(message.get("action_results") or host_action_results),
                     "strategy_updates": list(host_strategy_updates),
+                    "efficiency": efficiency(),
                 }
 
-            _wait_for_process_exit(process)
+            finish_process()
             return {
                 "error": "Sandbox process returned an unknown message type.",
                 "stdout": "",

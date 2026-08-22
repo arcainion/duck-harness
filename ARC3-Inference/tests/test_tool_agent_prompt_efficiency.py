@@ -2,16 +2,40 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
+
+import requests
 
 from inference.agent.python_tool_sandbox import _send_json_line
 from inference.agent.tool_agent import (
     ToolAgent,
     _PYTHON_TOOL_DESCRIPTION,
+    _TranscriptBuffer,
     _build_system_prompt,
     _estimate_tokens,
+    _request_tool_choice,
 )
+
+
+class _Response:
+    def __init__(self, status_code: int, text: str, payload: dict) -> None:
+        self.status_code = status_code
+        self.text = text
+        self._payload = payload
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} error")
+
+    def json(self) -> dict:
+        return self._payload
 
 
 class ToolAgentPromptEfficiencyTests(unittest.TestCase):
@@ -60,11 +84,211 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
         handle = io.StringIO()
         payload = {"type": "result", "value": "π", "items": [1, 2]}
 
-        _send_json_line(handle, payload)
+        byte_count = _send_json_line(handle, payload)
 
         encoded = handle.getvalue()
         self.assertEqual(encoded, '{"type":"result","value":"π","items":[1,2]}\n')
         self.assertEqual(json.loads(encoded), payload)
+        self.assertEqual(byte_count, len(encoded.encode("utf-8")))
+
+    def test_single_python_tool_is_forced_with_auto_fallback_available(self) -> None:
+        tools = [{"type": "function", "function": {"name": "python"}}]
+
+        self.assertEqual(
+            _request_tool_choice(tools),
+            {"type": "function", "function": {"name": "python"}},
+        )
+        self.assertEqual(_request_tool_choice(tools, force=False), "auto")
+
+    def test_tool_choice_handles_empty_multiple_and_malformed_tools(self) -> None:
+        python_tool = {"type": "function", "function": {"name": "python"}}
+
+        self.assertIsNone(_request_tool_choice(None))
+        self.assertIsNone(_request_tool_choice([]))
+        self.assertEqual(_request_tool_choice([python_tool, python_tool]), "auto")
+        self.assertEqual(_request_tool_choice([{"type": "function"}]), "auto")
+        self.assertEqual(_request_tool_choice(["bad"]), "auto")
+
+    def test_model_facing_tool_payload_is_compact(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+
+        rendered = agent._render_tool_payload({"result": [1, 2], "ok": True})
+
+        self.assertEqual(rendered, '{"result":[1,2],"ok":true}')
+        self.assertNotIn("\n", rendered)
+
+    def test_tool_payload_truncates_only_requested_string_fields(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._tool_output_chars = 16
+
+        rendered = json.loads(
+            agent._render_tool_payload(
+                {"stdout": "x" * 40, "result": "y" * 40},
+                truncate_fields=("stdout",),
+            )
+        )
+
+        self.assertTrue(rendered["truncated"])
+        self.assertIn("truncated", rendered["stdout"])
+        self.assertEqual(rendered["result"], "y" * 40)
+        self.assertIn("token response budget", rendered["truncation_note"])
+
+    def test_tool_text_exact_boundary_is_not_truncated(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._tool_output_chars = 8
+
+        self.assertEqual(agent._trim_tool_text("12345678"), ("12345678", False))
+        shortened, truncated = agent._trim_tool_text("123456789")
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(shortened), agent._tool_output_chars + 80)
+
+    def test_default_output_limit_shrinks_after_initial_request(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+
+        self.assertGreaterEqual(
+            agent._adaptive_output_limit(1),
+            agent._adaptive_output_limit(2),
+        )
+        self.assertGreaterEqual(
+            agent._adaptive_output_limit(2),
+            agent._adaptive_output_limit(2, repair=True),
+        )
+
+    def test_adaptive_output_limit_treats_nonpositive_request_as_initial(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+
+        self.assertEqual(agent._adaptive_output_limit(0), agent._adaptive_output_limit(1))
+        self.assertGreaterEqual(agent._adaptive_output_limit(0), 1)
+        self.assertGreaterEqual(agent._adaptive_output_limit(100, repair=True), 1)
+
+    def test_efficiency_metrics_accumulate_ints_and_floats(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+
+        agent._record_efficiency("calls", 1)
+        agent._record_efficiency("calls", 2)
+        agent._record_efficiency("seconds", 0.25)
+        agent._record_efficiency("seconds", 0.5)
+
+        self.assertEqual(agent._turn_efficiency_metrics["calls"], 3)
+        self.assertEqual(agent._turn_efficiency_metrics["seconds"], 0.75)
+
+    def test_transcript_buffer_ignores_empty_sections_and_close_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "transcript.txt"
+            transcript = _TranscriptBuffer(path, "header\n")
+
+            self.assertEqual(transcript.append("EMPTY", "  \n"), "")
+            transcript.append("RESULT", " value ")
+            first_render = transcript.render()
+            self.assertIs(first_render, transcript.render())
+            transcript.close()
+            transcript.close()
+
+            self.assertEqual(first_render, "header\n[RESULT]\nvalue\n\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), first_render)
+
+    def test_chat_completion_reuses_session_and_downgrades_rejected_forced_choice(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        rejected = _Response(400, "tool_choice function form unsupported", {})
+        agent._http_session.post = Mock(
+            side_effect=[
+                rejected,
+                _Response(
+                    200,
+                    "",
+                    {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+                ),
+            ]
+        )
+        tools = [{"type": "function", "function": {"name": "python"}}]
+
+        result = agent._chat_completion([{"role": "user", "content": "go"}], tools=tools)
+
+        self.assertEqual(result.message["content"], "ok")
+        self.assertEqual(result.request_attempts, 2)
+        self.assertTrue(result.forced_tool_fallback)
+        self.assertFalse(agent._forced_tool_choice_supported)
+        self.assertEqual(agent._http_session.post.call_count, 2)
+        self.assertTrue(rejected.closed)
+        self.assertEqual(agent._http_session.post.call_args_list[1].kwargs["json"]["tool_choice"], "auto")
+
+    def test_chat_completion_does_not_retry_unrelated_client_error(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._http_session.post = Mock(
+            return_value=_Response(400, "messages are invalid", {})
+        )
+        tools = [{"type": "function", "function": {"name": "python"}}]
+
+        with self.assertRaises(requests.RequestException):
+            agent._chat_completion([{"role": "user", "content": "go"}], tools=tools)
+
+        self.assertEqual(agent._http_session.post.call_count, 1)
+        self.assertIsNone(agent._forced_tool_choice_supported)
+
+    def test_chat_completion_sticks_to_auto_after_forced_choice_fallback(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._forced_tool_choice_supported = False
+        agent._http_session.post = Mock(
+            return_value=_Response(
+                200,
+                "",
+                {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+            )
+        )
+        tools = [{"type": "function", "function": {"name": "python"}}]
+
+        result = agent._chat_completion(
+            [{"role": "user", "content": "go"}],
+            tools=tools,
+            max_output_tokens=321,
+        )
+
+        payload = agent._http_session.post.call_args.kwargs["json"]
+        self.assertEqual(payload["tool_choice"], "auto")
+        self.assertEqual(payload["max_tokens"], 321)
+        self.assertEqual(result.request_attempts, 1)
+        self.assertFalse(result.forced_tool_fallback)
+
+    def test_successful_forced_choice_marks_endpoint_supported(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._http_session.post = Mock(
+            return_value=_Response(
+                200,
+                "",
+                {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+            )
+        )
+        tools = [{"type": "function", "function": {"name": "python"}}]
+
+        agent._chat_completion([{"role": "user", "content": "go"}], tools=tools)
+
+        payload = agent._http_session.post.call_args.kwargs["json"]
+        self.assertEqual(
+            payload["tool_choice"],
+            {"type": "function", "function": {"name": "python"}},
+        )
+        self.assertTrue(agent._forced_tool_choice_supported)
+
+    def test_failed_auto_fallback_propagates_second_response(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        rejected = _Response(422, "function tool_choice is unsupported", {})
+        fallback_failure = _Response(503, "server overloaded", {})
+        agent._http_session.post = Mock(side_effect=[rejected, fallback_failure])
+        tools = [{"type": "function", "function": {"name": "python"}}]
+
+        with self.assertRaisesRegex(requests.RequestException, "server overloaded"):
+            agent._chat_completion([{"role": "user", "content": "go"}], tools=tools)
+
+        self.assertTrue(rejected.closed)
+        self.assertFalse(agent._forced_tool_choice_supported)
+        self.assertEqual(agent._http_session.post.call_count, 2)
+
+    def test_chat_completion_rejects_success_response_without_choices(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._http_session.post = Mock(return_value=_Response(200, "", {"choices": []}))
+
+        with self.assertRaisesRegex(requests.RequestException, "no choices"):
+            agent._chat_completion([{"role": "user", "content": "go"}], tools=None)
 
 
 if __name__ == "__main__":

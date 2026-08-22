@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
+from inference.agent import tool_agent as tool_agent_module
 from inference.agent.python_tool_sandbox import _SANDBOX_BOOTSTRAP
 from inference.agent.tool_agent import (
     ToolAgent,
@@ -299,6 +300,60 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertNotIn("Provide one JSON object and retry", transcript)
         self.assertEqual(normalize_arguments.call_count, 1)
         self.assertEqual(build_tools.call_count, 1)
+
+    def test_analyze_streams_monotonic_transcript_snapshots_and_writes_prompt_log_once(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._tool_steps = 1
+        agent._chat_completion = lambda *_args, **_kwargs: _ChatCompletionResult(
+            message={
+                "tool_calls": [
+                    {
+                        "id": "direct-python",
+                        "type": "function",
+                        "function": {"name": "python", "arguments": "result = 42"},
+                    }
+                ]
+            },
+            finish_reason="tool_calls",
+            latency_seconds=0.125,
+        )
+        transcript_updates: list[str] = []
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                tool_agent_module,
+                "_write_prompt_log_snapshot",
+                wraps=tool_agent_module._write_prompt_log_snapshot,
+            ) as write_prompt_log:
+                result = agent.analyze(
+                    state_path,
+                    action_num=0,
+                    valid_actions=["LEFT"],
+                    transcript_updated=transcript_updates.append,
+                )
+
+            prompt_log = tool_agent_module._resolve_prompt_log_path(state_path)
+            prompt_snapshot = prompt_log.read_text(encoding="utf-8")
+
+        self.assertIsNotNone(result)
+        self.assertGreaterEqual(len(transcript_updates), 4)
+        for previous, current in zip(transcript_updates, transcript_updates[1:]):
+            self.assertTrue(current.startswith(previous))
+        self.assertIn("[ANALYZER STATUS]", transcript_updates[-1])
+        self.assertIn("efficiency_metrics", transcript_updates[-1])
+        self.assertEqual(result.efficiency_metrics["model_calls"], 1)
+        self.assertEqual(result.efficiency_metrics["model_seconds"], 0.125)
+        self.assertEqual(write_prompt_log.call_count, 1)
+        self.assertIn("LATEST MODEL CALL SNAPSHOT", prompt_snapshot)
 
     def test_usage_aliases_are_not_double_counted(self) -> None:
         agent = ToolAgent(

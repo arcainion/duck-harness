@@ -10,6 +10,7 @@ from unittest import TestCase, mock
 
 from inference.framework.kaggle import (
     DEFAULT_VLLM_MAX_MODEL_LEN,
+    DuckKaggleVllmConfig,
     duck_kaggle_setup_command,
     duck_kaggle_vllm_config_for_accelerator,
 )
@@ -28,6 +29,21 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertEqual(config.expected_gpu_type, "t4")
         self.assertEqual(config.expected_gpu_count, 2)
 
+    def test_solver_propagates_scheduler_tuning(self) -> None:
+        solver = HarnessSolver(
+            kaggle_vllm_gpu_memory_utilization=0.81,
+            kaggle_vllm_max_num_seqs=7,
+            kaggle_vllm_max_num_batched_tokens=4096,
+            kaggle_vllm_enable_chunked_prefill=False,
+        )
+
+        config = solver._kaggle_vllm_config()
+
+        self.assertEqual(config.gpu_memory_utilization, 0.81)
+        self.assertEqual(config.max_num_seqs, 7)
+        self.assertEqual(config.max_num_batched_tokens, 4096)
+        self.assertFalse(config.enable_chunked_prefill)
+
     def test_t4_profile_matches_kaggle_dual_gpu_shape(self) -> None:
         config = duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
 
@@ -35,6 +51,16 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertEqual(config.expected_gpu_count, 2)
         self.assertEqual(config.tensor_parallel_size, 2)
         self.assertEqual(config.max_model_len, 8192)
+        self.assertEqual(config.max_num_seqs, 16)
+        self.assertEqual(config.max_num_batched_tokens, 8192)
+
+    def test_t4_accelerator_matching_ignores_case_and_punctuation(self) -> None:
+        for value in ("nvidia-tesla-t4", "NVIDIA TESLA T4", "NvidiaTeslaT4"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    duck_kaggle_vllm_config_for_accelerator(value).expected_gpu_type,
+                    "t4",
+                )
 
     def test_t4_setup_clamps_analyzer_context_to_server_limit(self) -> None:
         config = duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
@@ -53,6 +79,9 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("VLLM_TENSOR_PARALLEL_SIZE = 2", command)
         self.assertIn("EXPECTED_GPU_TYPE = 't4'", command)
         self.assertIn("EXPECTED_GPU_COUNT = 2", command)
+        self.assertIn("VLLM_MAX_NUM_SEQS = 16", command)
+        self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 8192", command)
+        self.assertIn("--enable-chunked-prefill", command)
 
     def test_rtx_pro_6000_profile_uses_single_gpu_defaults(self) -> None:
         config = duck_kaggle_vllm_config_for_accelerator("NvidiaRtxPro6000")
@@ -67,6 +96,79 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("VLLM_TENSOR_PARALLEL_SIZE = 1", command)
         self.assertIn("EXPECTED_GPU_TYPE = 'rtx-pro-6000'", command)
         self.assertIn("EXPECTED_GPU_COUNT = 1", command)
+        self.assertIn("VLLM_GPU_MEMORY_UTILIZATION = 0.92", command)
+        self.assertIn("VLLM_MAX_NUM_SEQS = 32", command)
+        self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 16384", command)
+
+    def test_custom_scheduler_values_are_rendered_and_capacities_are_bounded(self) -> None:
+        command = duck_kaggle_setup_command(
+            DuckKaggleVllmConfig(
+                gpu_memory_utilization=0.77,
+                max_num_seqs=0,
+                max_num_batched_tokens=-9,
+                enable_chunked_prefill=False,
+            )
+        )
+
+        self.assertIn("VLLM_GPU_MEMORY_UTILIZATION = 0.77", command)
+        self.assertIn("VLLM_MAX_NUM_SEQS = 1", command)
+        self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 1", command)
+        self.assertIn("VLLM_ENABLE_CHUNKED_PREFILL = False", command)
+
+    def test_setup_preserves_context_window_when_already_below_server_limit(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOCAL_ANALYZER_PROVIDER": "vllm",
+                "LOCAL_ANALYZER_CONTEXT_WINDOW": "4096",
+            },
+            clear=False,
+        ):
+            command = duck_kaggle_setup_command(
+                duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
+            )
+
+        self.assertIn("ANALYZER_CONTEXT_WINDOW = 4096", command)
+
+    def test_setup_rejects_provider_incompatible_with_local_vllm(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"LOCAL_ANALYZER_PROVIDER": "openrouter"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "must be vLLM/OpenAI-compatible"):
+                duck_kaggle_setup_command()
+
+    def test_setup_rejects_malformed_dataset_references(self) -> None:
+        for dataset_ref in ("", "owner-only", "owner/slug/extra", "/slug", "owner/"):
+            with self.subTest(dataset_ref=dataset_ref):
+                with self.assertRaisesRegex(ValueError, "owner/slug"):
+                    duck_kaggle_setup_command(
+                        DuckKaggleVllmConfig(wheelhouse_dataset_source=dataset_ref)
+                    )
+
+    def test_setup_rejects_non_numeric_context_window(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOCAL_ANALYZER_PROVIDER": "vllm",
+                "LOCAL_ANALYZER_CONTEXT_WINDOW": "many",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(ValueError):
+                duck_kaggle_setup_command()
+
+    def test_setup_rejects_non_numeric_scheduler_values(self) -> None:
+        invalid_configs = (
+            DuckKaggleVllmConfig(gpu_memory_utilization="high"),
+            DuckKaggleVllmConfig(max_num_seqs="many"),
+            DuckKaggleVllmConfig(max_num_batched_tokens="many"),
+        )
+        for config in invalid_configs:
+            with self.subTest(config=config):
+                with self.assertRaises(ValueError):
+                    duck_kaggle_setup_command(config)
 
     def test_setup_detects_server_exit_and_emits_complete_log(self) -> None:
         command = duck_kaggle_setup_command(

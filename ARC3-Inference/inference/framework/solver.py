@@ -53,6 +53,10 @@ from inference.framework.kaggle import (
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
+    DEFAULT_VLLM_GPU_MEMORY_UTILIZATION,
+    DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS,
+    DEFAULT_VLLM_MAX_NUM_SEQS,
+    DEFAULT_VLLM_ENABLE_CHUNKED_PREFILL,
     DEFAULT_VLLM_PORT,
     DEFAULT_VLLM_TENSOR_PARALLEL_SIZE,
     DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE,
@@ -1118,6 +1122,16 @@ class HarnessSolver(Solver):
     kaggle_vllm_tensor_parallel_size: int = field(
         default=DEFAULT_VLLM_TENSOR_PARALLEL_SIZE, repr=False
     )
+    kaggle_vllm_gpu_memory_utilization: float = field(
+        default=DEFAULT_VLLM_GPU_MEMORY_UTILIZATION, repr=False
+    )
+    kaggle_vllm_max_num_seqs: int = field(default=DEFAULT_VLLM_MAX_NUM_SEQS, repr=False)
+    kaggle_vllm_max_num_batched_tokens: int = field(
+        default=DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS, repr=False
+    )
+    kaggle_vllm_enable_chunked_prefill: bool = field(
+        default=DEFAULT_VLLM_ENABLE_CHUNKED_PREFILL, repr=False
+    )
     kaggle_expected_gpu_type: str = field(
         default=DEFAULT_EXPECTED_GPU_TYPE, repr=False
     )
@@ -1232,6 +1246,10 @@ class HarnessSolver(Solver):
             vllm_port=self.kaggle_vllm_port,
             max_model_len=self.kaggle_vllm_max_model_len,
             tensor_parallel_size=self.kaggle_vllm_tensor_parallel_size,
+            gpu_memory_utilization=self.kaggle_vllm_gpu_memory_utilization,
+            max_num_seqs=self.kaggle_vllm_max_num_seqs,
+            max_num_batched_tokens=self.kaggle_vllm_max_num_batched_tokens,
+            enable_chunked_prefill=self.kaggle_vllm_enable_chunked_prefill,
             expected_gpu_type=self.kaggle_expected_gpu_type,
             expected_gpu_count=self.kaggle_expected_gpu_count,
             wheelhouse_stamp_text=self.kaggle_wheelhouse_stamp_text,

@@ -57,12 +57,13 @@ class ToolAgentContextTrimTests(unittest.TestCase):
     def test_incremental_json_length_matches_whole_request_serialization(self) -> None:
         messages = self._messages()
         tools = [{"type": "function", "function": {"name": "python"}}]
+        forced_choice = {"type": "function", "function": {"name": "python"}}
         payload = {
             "messages": messages,
-            "tool_choice": "auto",
+            "tool_choice": forced_choice,
             "tools": tools,
         }
-        empty_payload = {"messages": [], "tool_choice": "auto", "tools": tools}
+        empty_payload = {"messages": [], "tool_choice": forced_choice, "tools": tools}
         incremental_length = (
             _estimated_json_length(empty_payload)
             + sum(_estimated_json_length(message) for message in messages)

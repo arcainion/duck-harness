@@ -13,9 +13,15 @@ DEFAULT_SERVED_MODEL_NAME = "vrfai/Qwen3.6-27B-FP8"
 DEFAULT_VLLM_PORT = 1234
 DEFAULT_VLLM_MAX_MODEL_LEN = 65536
 DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 1
+DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.92
+DEFAULT_VLLM_MAX_NUM_SEQS = 32
+DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS = 16384
+DEFAULT_VLLM_ENABLE_CHUNKED_PREFILL = True
 DEFAULT_EXPECTED_GPU_TYPE = "rtx-pro-6000"
 DEFAULT_EXPECTED_GPU_COUNT = 1
 T4_VLLM_MAX_MODEL_LEN = 8192
+T4_VLLM_MAX_NUM_SEQS = 16
+T4_VLLM_MAX_NUM_BATCHED_TOKENS = 8192
 DEFAULT_WHEELHOUSE_STAMP_TEXT = "vllm==0.19.0 torch==2.10.0 flashinfer==0.6.6\n"
 
 # The 25 official ARC-AGI-3 games. The first 16 are the original Kaggle duck
@@ -59,6 +65,10 @@ class DuckKaggleVllmConfig:
     vllm_port: int = DEFAULT_VLLM_PORT
     max_model_len: int = DEFAULT_VLLM_MAX_MODEL_LEN
     tensor_parallel_size: int = DEFAULT_VLLM_TENSOR_PARALLEL_SIZE
+    gpu_memory_utilization: float = DEFAULT_VLLM_GPU_MEMORY_UTILIZATION
+    max_num_seqs: int = DEFAULT_VLLM_MAX_NUM_SEQS
+    max_num_batched_tokens: int = DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS
+    enable_chunked_prefill: bool = DEFAULT_VLLM_ENABLE_CHUNKED_PREFILL
     expected_gpu_type: str = DEFAULT_EXPECTED_GPU_TYPE
     expected_gpu_count: int = DEFAULT_EXPECTED_GPU_COUNT
     wheelhouse_stamp_text: str = DEFAULT_WHEELHOUSE_STAMP_TEXT
@@ -76,6 +86,8 @@ def duck_kaggle_vllm_config_for_accelerator(
         return DuckKaggleVllmConfig(
             max_model_len=T4_VLLM_MAX_MODEL_LEN,
             tensor_parallel_size=2,
+            max_num_seqs=T4_VLLM_MAX_NUM_SEQS,
+            max_num_batched_tokens=T4_VLLM_MAX_NUM_BATCHED_TOKENS,
             expected_gpu_type="t4",
             expected_gpu_count=2,
         )
@@ -153,6 +165,10 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__MULTIMODAL_CONTEXT__": repr(os.environ.get("MULTIMODAL_CONTEXT", "current_grid")),
         "__MULTIMODAL_UPSCALE__": repr(os.environ.get("MULTIMODAL_UPSCALE", "4")),
         "__VLLM_TENSOR_PARALLEL_SIZE__": repr(int(cfg.tensor_parallel_size)),
+        "__VLLM_GPU_MEMORY_UTILIZATION__": repr(float(cfg.gpu_memory_utilization)),
+        "__VLLM_MAX_NUM_SEQS__": repr(max(1, int(cfg.max_num_seqs))),
+        "__VLLM_MAX_NUM_BATCHED_TOKENS__": repr(max(1, int(cfg.max_num_batched_tokens))),
+        "__VLLM_ENABLE_CHUNKED_PREFILL__": repr(bool(cfg.enable_chunked_prefill)),
         "__EXPECTED_GPU_TYPE__": repr(str(cfg.expected_gpu_type)),
         "__EXPECTED_GPU_COUNT__": repr(int(cfg.expected_gpu_count)),
         "__WHEELHOUSE_STAMP_TEXT__": repr(cfg.wheelhouse_stamp_text),
@@ -196,6 +212,10 @@ VLLM_BASE_URL = f'http://{VLLM_HOST}:{VLLM_PORT}/v1'
 VLLM_MAX_MODEL_LEN = __VLLM_MAX_MODEL_LEN__
 ANALYZER_CONTEXT_WINDOW = __ANALYZER_CONTEXT_WINDOW__
 VLLM_TENSOR_PARALLEL_SIZE = __VLLM_TENSOR_PARALLEL_SIZE__
+VLLM_GPU_MEMORY_UTILIZATION = __VLLM_GPU_MEMORY_UTILIZATION__
+VLLM_MAX_NUM_SEQS = __VLLM_MAX_NUM_SEQS__
+VLLM_MAX_NUM_BATCHED_TOKENS = __VLLM_MAX_NUM_BATCHED_TOKENS__
+VLLM_ENABLE_CHUNKED_PREFILL = __VLLM_ENABLE_CHUNKED_PREFILL__
 EXPECTED_GPU_TYPE = __EXPECTED_GPU_TYPE__
 EXPECTED_GPU_COUNT = __EXPECTED_GPU_COUNT__
 WORKING_DIR = Path(os.environ['TAAF_KAGGLE_WORKING_DIR'])
@@ -380,7 +400,15 @@ def start_vllm_server() -> None:
         'qwen3',
         '--max-model-len',
         str(VLLM_MAX_MODEL_LEN),
+        '--gpu-memory-utilization',
+        str(VLLM_GPU_MEMORY_UTILIZATION),
+        '--max-num-seqs',
+        str(VLLM_MAX_NUM_SEQS),
+        '--max-num-batched-tokens',
+        str(VLLM_MAX_NUM_BATCHED_TOKENS),
     ]
+    if VLLM_ENABLE_CHUNKED_PREFILL:
+        cmd.append('--enable-chunked-prefill')
     print('Starting vLLM OpenAI server:', ' '.join(cmd), flush=True)
     process = subprocess.Popen(cmd, env=vllm_env(), stdout=log_handle, stderr=subprocess.STDOUT, text=True)
     VLLM_SERVER_PID.write_text(str(process.pid), encoding='utf-8')

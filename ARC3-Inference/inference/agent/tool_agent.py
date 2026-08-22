@@ -33,6 +33,7 @@ from inference.agent.prompts import (
 from inference.agent.python_tool_sandbox import (
     SandboxHostActionError,
     _sandbox_exception_diagnostic,
+    prewarm_sandbox,
     run_sandboxed_python,
 )
 from inference.agent.runtime_state import (
@@ -227,6 +228,10 @@ def _get_env_float(name: str, default: float) -> float:
 
 
 _LOCAL_ANALYZER_MAX_OUTPUT = _get_env_int("LOCAL_ANALYZER_MAX_OUTPUT", 0)
+_LOCAL_ANALYZER_INITIAL_MAX_OUTPUT = _get_env_int("LOCAL_ANALYZER_INITIAL_MAX_OUTPUT", 2048)
+_LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT = _get_env_int("LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT", 1024)
+_LOCAL_ANALYZER_REPAIR_MAX_OUTPUT = _get_env_int("LOCAL_ANALYZER_REPAIR_MAX_OUTPUT", 512)
+_LOCAL_ANALYZER_FORCE_PYTHON_TOOL = _get_env_bool("LOCAL_ANALYZER_FORCE_PYTHON_TOOL", True)
 _LOCAL_ANALYZER_CONTEXT_WINDOW = _get_env_int("LOCAL_ANALYZER_CONTEXT_WINDOW", 32768)
 _LOCAL_ANALYZER_TIMEOUT = _get_env_float("LOCAL_ANALYZER_TIMEOUT", 0.0)
 _LOCAL_ANALYZER_TOOL_STEPS = _get_env_int("LOCAL_ANALYZER_TOOL_STEPS", 12)
@@ -250,7 +255,8 @@ _PYTHON_TOOL_DESCRIPTION = (
     "`record_strategy(...)`, bounded `memory`, `remember(key, value)`, `forget(key=None)`, "
     "and `action(actions)` for real environment actions. Frame and transition objects expose the "
     "bounded, mutation-safe analysis/search methods documented in the system prompt; repeated structural "
-    "queries are memoized. Raw numeric colors are unavailable: prefer `.segmentation`, compact summaries, "
+    "queries are memoized. Combine related inspections and scoring in one snippet before acting. "
+    "Raw numeric colors are unavailable: prefer `.segmentation`, compact summaries, "
     "targeted searches, and small `.crop(...)` regions. `history[-1].frame` is current; use "
     "`previous_frame` or `last_transition` for before/after analysis. A final expression is returned "
     "notebook-style; use `print(...)` or assign `result` for compact output."
@@ -400,8 +406,19 @@ def _empty_world_model() -> dict[str, str]:
     }
 
 
-def _request_tool_choice(tools: list[dict[str, Any]] | None) -> str | None:
-    return "auto" if tools else None
+def _request_tool_choice(
+    tools: list[dict[str, Any]] | None,
+    *,
+    force: bool = _LOCAL_ANALYZER_FORCE_PYTHON_TOOL,
+) -> str | dict[str, Any] | None:
+    if not tools:
+        return None
+    if force and len(tools) == 1:
+        function = tools[0].get("function", {}) if isinstance(tools[0], dict) else {}
+        name = str(function.get("name", "")).strip()
+        if name:
+            return {"type": "function", "function": {"name": name}}
+    return "auto"
 
 
 def _trim_log_text(text: str, *, max_chars: int = _RESPONSE_META_MAX_CHARS) -> str:
@@ -464,6 +481,7 @@ class AnalyzerTurnResult:
     retryable_failure: bool = False
     reasoning: str = ""
     yielded_control: bool = False
+    efficiency_metrics: dict[str, float | int] | None = None
 
 
 @dataclass(frozen=True)
@@ -698,6 +716,42 @@ def _append_transcript_section(log_path: Path, label: str, content: str) -> None
         f.write(f"[{label}]\n")
         f.write(rendered_content)
         f.write("\n\n")
+
+
+class _TranscriptBuffer:
+    """Append-only transcript with one file handle and lazy full rendering."""
+
+    def __init__(self, log_path: Path, header: str) -> None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = open(log_path, "a", encoding="utf-8")
+        self._parts = [header]
+        self._rendered: str | None = header
+        self._closed = False
+        self._handle.write(header)
+        self._handle.flush()
+
+    def append(self, label: str, content: str) -> str:
+        section = _render_transcript_section(label, content)
+        if not section:
+            return ""
+        self._parts.append(section)
+        self._rendered = None
+        self._handle.write(section)
+        self._handle.flush()
+        return section
+
+    def render(self) -> str:
+        if self._rendered is None:
+            self._rendered = "".join(self._parts)
+        return self._rendered
+
+    def close(self) -> None:
+        if not self._closed:
+            self._handle.close()
+            self._closed = True
+
+    def __del__(self) -> None:
+        self.close()
 
 
 def _render_transcript_section(label: str, content: str) -> str:
@@ -1055,7 +1109,7 @@ def _append_request_snapshot(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     event: str | None = None,
-    tool_choice: str | None = None,
+    tool_choice: Any = None,
     finish_reason: str | None = None,
     analysis_step: int | None = None,
     action: int | None = None,
@@ -1097,7 +1151,7 @@ def _write_prompt_log_snapshot(
     request_index: int,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
-    tool_choice: str | None,
+    tool_choice: Any,
     transcript: str,
 ) -> None:
     rendered_messages = "\n\n".join(_render_prompt_log_message(message) for message in messages)
@@ -1171,6 +1225,9 @@ class _ChatCompletionResult:
     message: dict[str, Any]
     finish_reason: str = ""
     usage: dict[str, Any] | None = None
+    latency_seconds: float = 0.0
+    request_attempts: int = 1
+    forced_tool_fallback: bool = False
 
 
 class ToolAgent:
@@ -1205,8 +1262,12 @@ class ToolAgent:
         self._python_timeout = min(30, max(1, _LOCAL_ANALYZER_TOOL_TIMEOUT))
         self._yield_seconds = None if _LOCAL_ANALYZER_YIELD_SECONDS <= 0 else float(_LOCAL_ANALYZER_YIELD_SECONDS)
         configured_max_output = _LOCAL_ANALYZER_MAX_OUTPUT
-        self._max_output_tokens = None if configured_max_output <= 0 else max(1, configured_max_output)
-        self._reply_reserve_tokens = self._max_output_tokens or 512
+        self._max_output_tokens = (
+            max(1, configured_max_output)
+            if configured_max_output > 0
+            else max(1, _LOCAL_ANALYZER_INITIAL_MAX_OUTPUT)
+        )
+        self._reply_reserve_tokens = self._max_output_tokens
         self._tool_output_tokens = max(64, _LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS)
         self._tool_output_chars = max(256, self._tool_output_tokens * 4)
         self._save_request_logs = bool(save_request_logs)
@@ -1233,6 +1294,33 @@ class ToolAgent:
         self._frame_payload_cache: _FramePayloadCache | None = None
         self._experience_snapshot_cache: _ExperienceSnapshotCache | None = None
         self._generated_tool_call_count = 0
+        self._http_session = requests.Session()
+        self._forced_tool_choice_supported: bool | None = None
+        self._turn_efficiency_metrics: dict[str, float | int] = {}
+
+    def close(self) -> None:
+        self._http_session.close()
+
+    def __del__(self) -> None:
+        session = getattr(self, "_http_session", None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def _adaptive_output_limit(self, request_index: int, *, repair: bool = False) -> int:
+        if _LOCAL_ANALYZER_MAX_OUTPUT > 0:
+            return self._max_output_tokens
+        if repair:
+            return max(1, min(self._max_output_tokens, _LOCAL_ANALYZER_REPAIR_MAX_OUTPUT))
+        if request_index <= 1:
+            return self._max_output_tokens
+        return max(1, min(self._max_output_tokens, _LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT))
+
+    def _record_efficiency(self, key: str, value: float | int) -> None:
+        existing = self._turn_efficiency_metrics.get(key, 0)
+        self._turn_efficiency_metrics[key] = existing + value
 
     def _headers(self) -> dict[str, str]:
         api_key = (
@@ -1835,29 +1923,47 @@ class ToolAgent:
         *,
         tools: list[dict[str, Any]] | None,
         request_timeout_seconds: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> _ChatCompletionResult:
+        force_tool = self._forced_tool_choice_supported is not False
+        tool_choice = _request_tool_choice(tools, force=force_tool)
         payload = build_chat_payload(
             provider=self._model.provider,
             model=self._model.model_id,
             messages=messages,
-            max_tokens=self._max_output_tokens,
+            max_tokens=max_output_tokens or self._max_output_tokens,
             temperature=_LOCAL_ANALYZER_TEMPERATURE,
             top_p=_LOCAL_ANALYZER_TOP_P,
             top_k=_LOCAL_ANALYZER_TOP_K,
             thinking=bool(_LOCAL_ANALYZER_ENABLE_THINKING),
             tools=tools,
-            tool_choice=_request_tool_choice(tools),
+            tool_choice=tool_choice,
             seed=_LOCAL_ANALYZER_SEED,
         )
         def post_chat(request_payload: dict[str, Any]) -> requests.Response:
-            return requests.post(
+            return self._http_session.post(
                 f"{self._model.base_url.rstrip('/')}/chat/completions",
                 headers=self._headers(),
                 json=request_payload,
                 timeout=request_timeout_seconds if request_timeout_seconds is not None else self._timeout,
             )
 
+        started_at = time.monotonic()
         response = post_chat(payload)
+        request_attempts = 1
+        forced_tool_fallback = False
+        if isinstance(tool_choice, dict) and response.status_code in {400, 404, 422}:
+            detail = response.text.lower()
+            if "tool_choice" in detail or "function" in detail or "tool choice" in detail:
+                fallback_payload = dict(payload)
+                fallback_payload["tool_choice"] = "auto"
+                response.close()
+                response = post_chat(fallback_payload)
+                request_attempts += 1
+                forced_tool_fallback = True
+                self._forced_tool_choice_supported = False
+        elif isinstance(tool_choice, dict):
+            self._forced_tool_choice_supported = True
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
@@ -1881,6 +1987,9 @@ class ToolAgent:
             message=choice.get("message", {}),
             finish_reason=str(choice.get("finish_reason", "") or ""),
             usage=payload.get("usage"),
+            latency_seconds=time.monotonic() - started_at,
+            request_attempts=request_attempts,
+            forced_tool_fallback=forced_tool_fallback,
         )
 
     def _trim_tool_text(self, text: str) -> tuple[str, bool]:
@@ -1923,7 +2032,7 @@ class ToolAgent:
             result["truncation_note"] = (
                 f"Tool output was cut off to stay within the ~{self._tool_output_tokens}-token response budget."
             )
-        return json.dumps(result, indent=2)
+        return json.dumps(result, ensure_ascii=True, separators=(",", ":"))
 
     def _normalize_python_actions(self, value: Any) -> list[dict[str, Any]]:
         if isinstance(value, str):
@@ -2062,7 +2171,9 @@ class ToolAgent:
         self._ensure_session(state_path)
         code = _normalize_generated_python_code(arguments.get("code", ""))
         if not code:
-            return _ToolDispatchResult(json.dumps({"error": "python requires a non-empty `code` string."}, indent=2))
+            return _ToolDispatchResult(json.dumps(
+                {"error": "python requires a non-empty `code` string."}, separators=(",", ":")
+            ))
         try:
             compile(code, "<python_tool>", "exec")
         except SyntaxError as exc:
@@ -2196,16 +2307,44 @@ class ToolAgent:
                 ),
             }
 
+        state_started_at = time.monotonic()
+        initial_state = _serialized_runtime_state(
+            runtime_state=(current_frame, history_entries)
+        )
+        self._record_efficiency(
+            "state_build_seconds",
+            time.monotonic() - state_started_at,
+        )
+        self._record_efficiency(
+            "initial_state_bytes",
+            len(json.dumps(initial_state, ensure_ascii=False, separators=(",", ":"))),
+        )
+        self._record_efficiency("generated_code_chars", len(code))
+        sandbox_started_at = time.monotonic()
         sandbox_result = run_sandboxed_python(
             code=code,
             timeout_seconds=self._python_timeout,
-            initial_state=_serialized_runtime_state(
-                runtime_state=(current_frame, history_entries)
-            ),
+            initial_state=initial_state,
             action_handler=_handle_action,
             strategy_handler=self._record_strategy,
             memory_handler=self._record_python_memory,
         )
+        self._record_efficiency("sandbox_calls", 1)
+        self._record_efficiency(
+            "sandbox_seconds",
+            time.monotonic() - sandbox_started_at,
+        )
+        sandbox_efficiency = sandbox_result.get("efficiency")
+        if isinstance(sandbox_efficiency, dict):
+            if sandbox_efficiency.get("prewarmed"):
+                self._record_efficiency("sandbox_prewarmed_calls", 1)
+            try:
+                self._record_efficiency(
+                    "sandbox_transport_bytes",
+                    int(sandbox_efficiency.get("host_to_sandbox_bytes") or 0),
+                )
+            except (TypeError, ValueError):
+                pass
 
         action_results = [
             item
@@ -2227,7 +2366,9 @@ class ToolAgent:
         self._ensure_session(state_path)
         if name == "python":
             return self._run_python_tool(state_path, arguments)
-        return _ToolDispatchResult(json.dumps({"error": f"Unknown tool: {name}"}, indent=2))
+        return _ToolDispatchResult(json.dumps(
+            {"error": f"Unknown tool: {name}"}, separators=(",", ":")
+        ))
 
     def _estimate_request_input_tokens(
         self,
@@ -2406,6 +2547,7 @@ class ToolAgent:
         self._ensure_session(state_path)
         self._step_env_callback = step_env
         self._current_valid_actions = _normalize_valid_actions(valid_actions)
+        self._turn_efficiency_metrics = {}
 
         analyzer_log = transcript_path or (state_path.parent / f"{state_path.stem}_analyzer.txt")
         prompt_log = _resolve_prompt_log_path(state_path)
@@ -2426,20 +2568,17 @@ class ToolAgent:
         )
         display_action_num = _display_action_number(action_num)
 
-        with open(analyzer_log, "a", encoding="utf-8") as f:
-            step_label = f"analysis_step={analysis_step} | " if analysis_step is not None else ""
-            transcript_header = (
-                f"\n--- {step_label}action={display_action_num} | "
-                f"{time.strftime('%H:%M:%S')} | tool-agent ---\n"
-            )
-            f.write(transcript_header)
-        transcript_parts = [transcript_header]
+        step_label = f"analysis_step={analysis_step} | " if analysis_step is not None else ""
+        transcript_header = (
+            f"\n--- {step_label}action={display_action_num} | "
+            f"{time.strftime('%H:%M:%S')} | tool-agent ---\n"
+        )
+        transcript_buffer = _TranscriptBuffer(analyzer_log, transcript_header)
 
         def append_transcript(label: str, content: str) -> None:
-            _append_transcript_section(analyzer_log, label, content)
-            transcript_parts.append(_render_transcript_section(label, content))
-            if transcript_updated is not None:
-                transcript_updated("".join(transcript_parts))
+            section = transcript_buffer.append(label, content)
+            if section and transcript_updated is not None:
+                transcript_updated(transcript_buffer.render())
 
         append_transcript("SYSTEM PROMPT", self._system_prompt)
         append_transcript("USER PROMPT", user_prompt)
@@ -2447,8 +2586,9 @@ class ToolAgent:
         previous_history_messages = list(self._history_messages)
         preserve_history = True
         tools = self._tools(state_path)
+        prewarm_sandbox()
         tool_choice = _request_tool_choice(tools)
-        request_tools_snapshot = json.loads(json.dumps(tools))
+        request_tools_snapshot = tools
         request_base_chars = _estimated_request_base_length(tools)
         message_length_cache: dict[int, tuple[dict[str, Any], int]] = {}
         messages: list[dict[str, Any]] = self._trim_messages_for_context(
@@ -2462,10 +2602,11 @@ class ToolAgent:
         captured_reasoning = ""
         latest_request_messages: list[dict[str, Any]] | None = None
         latest_request_tools: list[dict[str, Any]] | None = None
-        latest_request_tool_choice: str | None = None
+        latest_request_tool_choice: Any = None
         latest_request_index = 0
         turn_started_at = time.monotonic()
         yielded_control_reason: str | None = None
+        repair_next_request = False
 
         def control_yield_reason() -> str | None:
             if should_stop is not None:
@@ -2491,24 +2632,19 @@ class ToolAgent:
                     request_base_chars=request_base_chars,
                     message_length_cache=message_length_cache,
                 )
-                latest_request_messages = json.loads(json.dumps(messages))
+                latest_request_messages = list(messages)
                 latest_request_tools = request_tools_snapshot
                 latest_request_tool_choice = tool_choice
                 latest_request_index = turn_count
-                _write_prompt_log_snapshot(
-                    prompt_log,
-                    model_id=self._model.model_id,
-                    base_url=self._model.base_url,
-                    display_action_num=display_action_num,
-                    analysis_step=analysis_step,
-                    request_index=turn_count,
-                    messages=latest_request_messages,
-                    tools=latest_request_tools,
-                    tool_choice=tool_choice,
-                    transcript="".join(transcript_parts),
-                )
                 try:
-                    request_kwargs: dict[str, Any] = {"tools": tools}
+                    request_kwargs: dict[str, Any] = {
+                        "tools": tools,
+                        "max_output_tokens": self._adaptive_output_limit(
+                            turn_count,
+                            repair=repair_next_request,
+                        ),
+                    }
+                    repair_next_request = False
                     if request_timeout_seconds is not None:
                         request_kwargs["request_timeout_seconds"] = request_timeout_seconds
                     if self._save_request_logs:
@@ -2523,6 +2659,10 @@ class ToolAgent:
                             request_index_within_turn=latest_request_index,
                         )
                     result = self._chat_completion(messages, **request_kwargs)
+                    self._record_efficiency("model_calls", result.request_attempts)
+                    self._record_efficiency("model_seconds", result.latency_seconds)
+                    if result.forced_tool_fallback:
+                        self._record_efficiency("forced_tool_fallbacks", 1)
                     self._accumulate_usage_tokens(result.usage)
                     if self._save_request_logs:
                         _append_request_snapshot(
@@ -2623,26 +2763,20 @@ class ToolAgent:
                     yielded_control_reason = control_yield_reason()
                     if yielded_control_reason is not None:
                         break
-                    followup_prefix = "You have not acted yet. Investigate first. "
+                    followup_prefix = "No action was executed. "
                     if tool_call_markup_in_text:
                         followup_prefix = (
-                            "You did not call a tool. We detected `<tool_call>` markup inside your reasoning or assistant text, "
-                            "so no parsed tool call was executed. On this retry, do not add a note or explanation first. "
-                            "Emit exactly one `python` tool call directly as your next response. "
-                            "Do not place `<tool_call>` markup inside reasoning, explanation, or notes. "
+                            "Tool markup appeared as text and was not executable. "
                         )
                     followup_prompt = (
                         f"{followup_prefix}"
-                        "Then investigate and revise your working world model of what the level contains, what actions appear to do, what the current goal seems to be, and what plan looks best. "
-                        "If helpful, include short world-model update lines such as `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, or `Cross-level notes:`. "
-                        "Call the `python` tool with code that inspects `current_frame`, `previous_frame`, `last_transition`, `history`, or `valid_actions` -- use `current_frame.segmentation` as the primary view, and `.ascii` only for a small specific region -- "
-                        "compare `previous_frame` to `current_frame` for the most recent change, "
-                        "derives a compact board summary, programs a small search or scorer over candidate actions or short sequences, "
-                        "then call `action(actions)` inside Python with the best valid action or ordered batch that your code selected. "
+                        "Emit exactly one parsed `python` tool call now. Combine useful inspections in one snippet, "
+                        "update the world model if needed, and call `action(actions)` with the selected valid action or batch. "
                         f"{TOOL_CALL_FORMAT_GUIDANCE}"
                     )
                     append_transcript("USER PROMPT", followup_prompt)
                     messages.append({"role": "user", "content": followup_prompt})
+                    repair_next_request = True
                     continue
 
                 if content:
@@ -2669,13 +2803,14 @@ class ToolAgent:
                         rendered_tool_call or (json.dumps(arguments, indent=2) if arguments else "{}"),
                     )
                     if argument_error is not None:
+                        repair_next_request = True
                         dispatch = _ToolDispatchResult(
                             json.dumps(
                                 {
                                     "error": argument_error,
                                     "retryable": True,
                                 },
-                                indent=2,
+                                separators=(",", ":"),
                             )
                         )
                     else:
@@ -2718,10 +2853,16 @@ class ToolAgent:
                     messages=latest_request_messages,
                     tools=latest_request_tools,
                     tool_choice=latest_request_tool_choice,
-                    transcript="".join(transcript_parts),
+                    transcript=transcript_buffer.render(),
                 )
             log.warning("analyzer request failed at action %d: %s", display_action_num, exc)
-            return AnalyzerTurnResult(step_executed=False, retryable_failure=True, reasoning=captured_reasoning)
+            transcript_buffer.close()
+            return AnalyzerTurnResult(
+                step_executed=False,
+                retryable_failure=True,
+                reasoning=captured_reasoning,
+                efficiency_metrics=dict(self._turn_efficiency_metrics),
+            )
         except Exception as exc:
             append_transcript("ANALYZER STATUS", f"error: {exc}")
             preserve_history = False
@@ -2736,9 +2877,10 @@ class ToolAgent:
                     messages=latest_request_messages,
                     tools=latest_request_tools,
                     tool_choice=latest_request_tool_choice,
-                    transcript="".join(transcript_parts),
+                    transcript=transcript_buffer.render(),
                 )
             log.warning("analyzer failed at action %d: %s", display_action_num, exc)
+            transcript_buffer.close()
             return None
         finally:
             if preserve_history:
@@ -2772,6 +2914,7 @@ class ToolAgent:
             f"available_tools: python\n"
             f"python_timeout_seconds: {self._python_timeout}\n"
             f"history_messages: {len(self._history_messages)}\n"
+            f"efficiency_metrics: {json.dumps(self._turn_efficiency_metrics, separators=(',', ':'))}\n"
             f"step_executed: {step_executed}\n"
             f"message: {status_message}"
         )
@@ -2787,10 +2930,12 @@ class ToolAgent:
                 messages=latest_request_messages,
                 tools=latest_request_tools,
                 tool_choice=latest_request_tool_choice,
-                transcript="".join(transcript_parts),
+                transcript=transcript_buffer.render(),
             )
+        transcript_buffer.close()
         return AnalyzerTurnResult(
             step_executed=step_executed,
             reasoning=captured_reasoning,
             yielded_control=yielded_control_reason is not None,
+            efficiency_metrics=dict(self._turn_efficiency_metrics),
         )
