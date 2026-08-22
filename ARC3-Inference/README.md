@@ -66,6 +66,16 @@ The duck can use:
 - `current_frame.ascii` for a compact symbolic grid
 - `current_frame.segmentation` for connected components, object hashes,
   boundaries, containment, and adjacency
+- `current_frame.find(symbol, limit=64)` for a bounded coordinate sample,
+  total count, and bounding box for one letter-coded color
+- `current_frame.cell(row, col)` and `current_frame.neighbors(row, col)` for
+  bounded local color, direction, and coordinate queries
+- `current_frame.shortest_path(start, goal, passable=...)` for bounded BFS over
+  caller-selected letter-coded colors, including the next step and move sequence
+- `current_frame.shortest_path_to_any(start, goals, passable=...)` for selecting
+  and routing to the nearest of up to 64 candidate coordinates in one search
+- `current_frame.crop(top, left, bottom, right)` for a clipped letter-coded
+  region, and `current_frame.diff(other)` for bounded before/after changes
 - `history`, `previous_frame`, `transitions`, and `last_transition` for
   before/after reasoning
 - `valid_actions` for the current action set
@@ -83,8 +93,13 @@ The duck can use:
   contradiction memory within one game run
 
 The raw numeric grid is intentionally hidden from the Python tool. The preferred
-view is `current_frame.segmentation`; `current_frame.ascii` is there for small
-local checks.
+view is `current_frame.segmentation`; use `current_frame.find(...)` to locate a
+color and `current_frame.crop(...)` for small local checks without parsing or
+printing the whole board.
+
+Generated-code failures include bounded structured diagnostics with the error
+type, source line and column, offending source text, and a repair hint so the
+model can correct and retry an ephemeral Python call directly.
 
 The model-facing actions are:
 
@@ -94,7 +109,11 @@ The model-facing actions are:
 
 `MOUSE` uses `row` and `col`. Legacy `x` / `y` mouse fields are rejected.
 
-Every Python tool call starts fresh. It can import a small allowlist of standard
+Every Python tool call starts with fresh executable state. A bounded JSON
+scratchpad remains available as `memory` within one game run: use
+`remember(key, value)` to persist computed data and `forget(key)` or `forget()`
+to remove it. The scratchpad allows 16 keys, 64 characters per key, 2 KiB per
+value, and 8 KiB total. The tool can also import a small allowlist of standard
 library modules, print compact summaries, assign a final value to `result`, and
 call `action(...)` once or many times. The tool call timeout defaults to 30
 seconds. Batched action results include a bounded `steps` list so each action can

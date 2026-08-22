@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+
+from inference.agent.python_tool_sandbox import _SANDBOX_BOOTSTRAP
+from inference.agent.tool_agent import (
+    ToolAgent,
+    _ChatCompletionResult,
+    _normalize_generated_python_code,
+    _normalize_tool_call_arguments,
+    _python_tool_payload,
+    _render_tool_result_display,
+)
+
+
+class ToolAgentCodeGenerationTests(TestCase):
+    @staticmethod
+    def _execute_prepared_code(code: str) -> dict:
+        bootstrap_namespace = {"__name__": "sandbox_bootstrap_test"}
+        exec(compile(_SANDBOX_BOOTSTRAP, "<sandbox-bootstrap>", "exec"), bootstrap_namespace)
+        tree = bootstrap_namespace["_prepare_user_code"](code)
+        runtime: dict = {}
+        exec(compile(tree, "<python_tool>", "exec"), runtime, runtime)
+        return runtime
+
+    def test_normalizes_whole_python_code_fence(self) -> None:
+        code = _normalize_generated_python_code(
+            "```python\nprint('components', 3)\nresult = {'count': 3}\n```"
+        )
+
+        self.assertEqual(
+            code,
+            "print('components', 3)\nresult = {'count': 3}",
+        )
+
+    def test_recovers_python_fence_with_explanatory_markdown(self) -> None:
+        value = "Run this:\n```python\nresult = 3\n```"
+
+        self.assertEqual(_normalize_generated_python_code(value), "result = 3")
+
+    def test_does_not_guess_between_multiple_code_fences(self) -> None:
+        value = (
+            "```python\nresult = 1\n```\n"
+            "```python\nresult = 2\n```"
+        )
+
+        self.assertEqual(_normalize_generated_python_code(value), value)
+
+    def test_does_not_extract_invalid_fenced_python(self) -> None:
+        value = "Try this:\n```python\nfor\n```"
+
+        self.assertEqual(_normalize_generated_python_code(value), value)
+
+    def test_rejects_non_object_tool_arguments(self) -> None:
+        with self.assertRaisesRegex(ValueError, "JSON object"):
+            _normalize_tool_call_arguments('["not", "an", "object"]')
+        with self.assertRaisesRegex(ValueError, "JSON object"):
+            _normalize_tool_call_arguments(["not", "an", "object"])
+
+    def test_preserves_valid_raw_python_containing_backticks(self) -> None:
+        value = 'result = "```python\\nnot executable\\n```"'
+
+        self.assertEqual(_normalize_generated_python_code(value), value)
+
+    def test_preflight_syntax_error_returns_structured_repair_context(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        response = agent._run_python_tool(
+            Path("unused/tool_runtime_state.json"),
+            {"code": "if True print('x')"},
+        )
+        payload = json.loads(response.content)
+
+        self.assertEqual(payload["tool"], "python")
+        self.assertTrue(payload["retryable"])
+        self.assertIn("syntax error", payload["error"].lower())
+        self.assertEqual(payload["diagnostic"]["type"], "SyntaxError")
+        self.assertEqual(payload["diagnostic"]["line"], 1)
+        self.assertEqual(payload["diagnostic"]["source"], "if True print('x')")
+        self.assertIn("retry", payload["diagnostic"]["hint"].lower())
+
+    def test_captures_notebook_style_final_expression(self) -> None:
+        runtime = self._execute_prepared_code("values = [2, 3, 5]\nsum(values)")
+
+        self.assertEqual(runtime["__tool_expression_result"], 10)
+
+    def test_final_expression_executes_only_once(self) -> None:
+        runtime = self._execute_prepared_code(
+            "calls = []\n"
+            "def produce():\n"
+            "    calls.append('called')\n"
+            "    return 7\n"
+            "produce()"
+        )
+
+        self.assertEqual(runtime["calls"], ["called"])
+        self.assertEqual(runtime["__tool_expression_result"], 7)
+
+    def test_explicit_result_remains_authoritative(self) -> None:
+        runtime = self._execute_prepared_code("result = {'answer': 42}\n'ignored expression'")
+
+        selected = runtime.get("result", runtime.get("__tool_expression_result"))
+        self.assertEqual(selected, {"answer": 42})
+
+    def test_multi_action_snippet_keeps_latest_valid_actions(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        responses = iter(
+            [
+                {
+                    "executed": True,
+                    "action_num": 1,
+                    "action_display": "LEFT",
+                    "valid_actions": ["RIGHT"],
+                },
+                {
+                    "executed": True,
+                    "action_num": 2,
+                    "action_display": "RIGHT",
+                },
+            ]
+        )
+
+        def step_env(_request: dict) -> dict:
+            return next(responses)
+
+        agent._step_env_callback = step_env
+        agent._current_valid_actions = ["LEFT"]
+        response = agent._run_python_tool(
+            Path("unused/tool_runtime_state.json"),
+            {
+                "code": (
+                    "action('LEFT')\n"
+                    "after_first = list(valid_actions)\n"
+                    "action('RIGHT')\n"
+                    "{'after_first': after_first, 'after_second': list(valid_actions)}"
+                )
+            },
+        )
+        payload = json.loads(response.content)
+
+        self.assertEqual(payload["result"]["after_first"], ["RIGHT"])
+        self.assertEqual(payload["result"]["after_second"], ["RIGHT"])
+
+    def test_analyze_returns_malformed_arguments_as_retryable_tool_result(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._tool_steps = 1
+        agent._chat_completion = lambda *_args, **_kwargs: _ChatCompletionResult(
+            message={
+                "tool_calls": [
+                    {
+                        "id": "bad-arguments",
+                        "type": "function",
+                        "function": {"name": "python", "arguments": "[]"},
+                    }
+                ]
+            },
+            finish_reason="tool_calls",
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            result = agent.analyze(state_path, action_num=0, valid_actions=["LEFT"])
+            transcript = state_path.with_name("tool_runtime_state_analyzer.txt").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.step_executed)
+        self.assertIn("Provide one JSON object and retry", transcript)
+
+    def test_usage_aliases_are_not_double_counted(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        agent._accumulate_usage_tokens(
+            {
+                "prompt_tokens": 11,
+                "input_tokens": 11,
+                "completion_tokens": 7,
+                "output_tokens": 7,
+            }
+        )
+
+        self.assertEqual(agent.generated_tokens, 7)
+        self.assertEqual(agent.total_tokens, 18)
+
+    def test_generated_only_usage_contributes_to_total(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        agent._accumulate_usage_tokens(
+            {"input_tokens": 5, "generated_tokens": 3}
+        )
+
+        self.assertEqual(agent.generated_tokens, 3)
+        self.assertEqual(agent.total_tokens, 8)
+
+    def test_response_tool_calls_receive_unique_nonempty_ids(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        calls = agent._normalize_response_tool_calls(
+            [
+                None,
+                {"id": "duplicate", "function": {"name": "python"}},
+                {"id": "duplicate", "function": None},
+            ]
+        )
+
+        ids = [call["id"] for call in calls]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(all(ids))
+        self.assertTrue(all(isinstance(call["function"], dict) for call in calls))
+
+    def test_payload_preserves_stdout_and_structured_result(self) -> None:
+        payload = _python_tool_payload(
+            {
+                "stdout": "components: 3\n",
+                "result": {"count": 3, "colors": [2, 4]},
+                "error": "",
+                "action_results": [],
+            }
+        )
+
+        self.assertEqual(payload["stdout"], "components: 3\n")
+        self.assertEqual(payload["result"], {"count": 3, "colors": [2, 4]})
+        rendered = _render_tool_result_display(payload)
+        self.assertIn("components: 3", rendered)
+        self.assertIn("result:", rendered)
+        self.assertIn("count: 3", rendered)
+
+    def test_payload_keeps_action_summary_fallback_without_user_output(self) -> None:
+        payload = _python_tool_payload(
+            {
+                "stdout": "",
+                "result": None,
+                "error": "",
+                "action_results": [
+                    {"executed": True, "action_display": "LEFT"},
+                    {"executed": True, "action_display": "UP"},
+                ],
+            }
+        )
+
+        self.assertEqual(payload["result"]["action_calls"], 2)
+        self.assertEqual(
+            payload["result"]["last_action_result"]["action_display"],
+            "UP",
+        )

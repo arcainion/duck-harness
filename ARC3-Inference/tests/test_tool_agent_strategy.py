@@ -72,9 +72,9 @@ class ToolAgentStrategyTests(TestCase):
         self.assertEqual(saved["confidence"], 1.0)
         self.assertEqual(agent._summarized_knowledge["current_plan"], "press SPACE once")
 
-    def test_prediction_is_bounded_and_checked_without_another_model_call(self) -> None:
+    def test_prediction_is_evaluated_once_then_consumed(self) -> None:
         agent = self._agent()
-        saved = agent._record_strategy(
+        agent._record_strategy(
             {
                 "test_action": "space",
                 "expected_outcome": "level_progress",
@@ -82,22 +82,39 @@ class ToolAgentStrategyTests(TestCase):
                 "contradictions": ["old evidence was ambiguous"] * 10,
             }
         )
+        self.assertEqual(agent._strategy_memory["fallback"], "inspect a different object")
+        self.assertLessEqual(len(agent._strategy_memory["contradictions"]), 3)
 
-        result = agent._evaluate_strategy_prediction(
-            {
-                "executed": True,
-                "action_display": "SPACE",
-                "outcome_class": "level_progress",
-                "level_completed": True,
-                "reward": 0.1,
-            }
-        )
+        action_result = {
+            "executed": True,
+            "action_display": "SPACE",
+            "outcome_class": "level_progress",
+            "level_completed": True,
+            "reward": 0.1,
+        }
+        result = agent._evaluate_strategy_prediction(action_result)
 
-        self.assertEqual(saved["test_action"], "SPACE")
-        self.assertEqual(saved["expected_outcome"], "level_progress")
-        self.assertLessEqual(len(saved["contradictions"]), 3)
         self.assertEqual(result["status"], "supported")
-        self.assertEqual(agent._strategy_memory["prediction_result"], result)
+        self.assertNotIn("test_action", agent._strategy_memory)
+        self.assertNotIn("expected_outcome", agent._strategy_memory)
+        self.assertNotIn("prediction_result", agent._strategy_memory)
+        consumed = agent._strategy_memory["last_evaluated_prediction"]
+        self.assertEqual(consumed["test_action"], "SPACE")
+        self.assertEqual(consumed["expected_outcome"], "level_progress")
+        self.assertEqual(consumed["status"], "supported")
+
+        repeat = agent._evaluate_strategy_prediction(dict(action_result))
+        self.assertIsNone(repeat)
+
+    def test_partial_prediction_update_keeps_declared_outcome(self) -> None:
+        agent = self._agent()
+        agent._record_strategy(
+            {"test_action": "LEFT", "expected_outcome": "new_state"}
+        )
+        agent._record_strategy({"test_action": "RIGHT"})
+
+        self.assertEqual(agent._strategy_memory["test_action"], "RIGHT")
+        self.assertEqual(agent._strategy_memory["expected_outcome"], "new_state")
 
     def test_prompt_contains_bounded_controller_summary_not_raw_grid(self) -> None:
         agent = self._agent()
@@ -154,4 +171,9 @@ class ToolAgentStrategyTests(TestCase):
         self.assertIn("opaque-id", prompt)
         self.assertNotIn("recent_transitions", prompt)
         self.assertNotIn("[[1, 2], [3, 4]]", prompt)
+        self.assertIn("prefer batching it in one call", prompt)
+        self.assertIn(
+            "Before executing new actions you must always give the revised version",
+            prompt,
+        )
         self.assertLess(len(prompt), 10_000)

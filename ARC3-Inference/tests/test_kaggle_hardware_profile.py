@@ -13,9 +13,21 @@ from inference.framework.kaggle import (
     duck_kaggle_setup_command,
     duck_kaggle_vllm_config_for_accelerator,
 )
+from inference.framework.solver import HarnessSolver
 
 
 class KaggleHardwareProfileTests(TestCase):
+    def test_solver_propagates_expected_gpu_shape(self) -> None:
+        solver = HarnessSolver(
+            kaggle_expected_gpu_type="t4",
+            kaggle_expected_gpu_count=2,
+        )
+
+        config = solver._kaggle_vllm_config()
+
+        self.assertEqual(config.expected_gpu_type, "t4")
+        self.assertEqual(config.expected_gpu_count, 2)
+
     def test_t4_profile_matches_kaggle_dual_gpu_shape(self) -> None:
         config = duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
 

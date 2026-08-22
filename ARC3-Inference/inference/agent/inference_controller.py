@@ -500,17 +500,30 @@ def transition_metadata(
     prior_history: list[HistoryEntry],
     action: str,
     config: InferenceControllerConfig,
+    valid_actions: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     before_id = frame_fingerprint(before)
     after_id = frame_fingerprint(after)
     known_states = {frame_fingerprint(entry.frame) for entry in prior_history}
+    action_key = action_family(action)
     before_snapshot = build_experience_snapshot(
-        prior_history, before, [action_family(action)], config
+        prior_history,
+        before,
+        valid_actions if valid_actions is not None else [action_key],
+        config,
     )
     provisional_history = [*prior_history, HistoryEntry(action=action, frame=after)]
     snapshot = build_experience_snapshot(provisional_history, after, [action_family(action)], config)
     transition = snapshot["recent_transitions"][-1]
     ranking = before_snapshot["ranked_actions"]
+    ranked_action = next(
+        (
+            (index, item)
+            for index, item in enumerate(ranking, start=1)
+            if item["action"] == action_key
+        ),
+        None,
+    )
     return {
         "before_state_id": before_id,
         "after_state_id": after_id,
@@ -524,8 +537,8 @@ def transition_metadata(
         "controller_policy": snapshot["policy"],
         "controller_phase": snapshot["phase"],
         "controller_reason_codes": list(snapshot["recovery_reasons"]),
-        "action_rank": 1 if ranking else None,
-        "action_rank_reason": ranking[0]["reason"] if ranking else None,
+        "action_rank": ranked_action[0] if ranked_action is not None else None,
+        "action_rank_reason": ranked_action[1]["reason"] if ranked_action is not None else None,
         "no_op_streak": snapshot["no_op_streak"],
         "behavioral_no_op_streak": snapshot["behavioral_no_op_streak"],
         "stagnation_actions": snapshot["stagnation_actions"],

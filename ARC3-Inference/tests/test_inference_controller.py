@@ -125,6 +125,26 @@ class InferenceControllerTests(TestCase):
         self.assertNotEqual(metadata["before_state_id"], metadata["after_state_id"])
         self.assertEqual(metadata["controller_phase"], "progress")
 
+    def test_transition_metadata_reports_executed_actions_actual_rank(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        state = _frame(1, step=0)
+        history = [
+            HistoryEntry(action="", frame=state),
+            HistoryEntry(action="RIGHT", frame=_frame(1, step=1)),
+        ]
+
+        metadata = transition_metadata(
+            history[-1].frame,
+            _frame(2, step=2),
+            history,
+            "RIGHT",
+            config,
+            ["LEFT", "RIGHT"],
+        )
+
+        self.assertEqual(metadata["action_rank"], 2)
+        self.assertIn("no-op", metadata["action_rank_reason"])
+
     def test_outcome_aware_masks_repeatedly_volatile_cells(self) -> None:
         config = InferenceControllerConfig(
             enabled=True,

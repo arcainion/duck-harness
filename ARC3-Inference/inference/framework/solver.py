@@ -48,6 +48,8 @@ from inference.agent.runtime_state import (
 )
 from inference.agent.tool_agent import ToolAgent
 from inference.framework.kaggle import (
+    DEFAULT_EXPECTED_GPU_COUNT,
+    DEFAULT_EXPECTED_GPU_TYPE,
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
@@ -914,6 +916,8 @@ class _HarnessGameSession:
                 return self._error_payload(f"{type(exc).__name__}: {exc}")
             executed_payloads.append(payload)
             total_reward += float(payload.get("reward", 0.0) or 0.0)
+            if "prediction_result" in payload:
+                strategy_prediction = None
 
             if payload.get("run_complete"):
                 stop_reason = "run_complete"
@@ -923,9 +927,6 @@ class _HarnessGameSession:
                 break
             if payload.get("level_completed"):
                 stop_reason = "level_completed"
-                break
-            if payload.get("loop_detected") and not self.controller_config.outcome_aware:
-                stop_reason = "loop_detected"
                 break
 
         if not executed_payloads:
@@ -1008,6 +1009,7 @@ class _HarnessGameSession:
         previous_grid = _grid_from_state(self.game.current_state)
         previous_frame = self.current_frame()
         prior_history = list(self.history_entries)
+        previous_valid_actions = to_model_actions(_engine_action_names(self.game))
         previous_completed = int(self.game.current_state.levels_completed)
         if generated_tokens is None:
             current_tokens = _analyzer_reported_tokens(self.analyzer)
@@ -1071,6 +1073,7 @@ class _HarnessGameSession:
                     prior_history,
                     action_display,
                     self.controller_config,
+                    previous_valid_actions,
                 )
             )
         prediction_result = _evaluate_strategy_prediction(strategy_prediction, payload)
@@ -1114,6 +1117,12 @@ class HarnessSolver(Solver):
     )
     kaggle_vllm_tensor_parallel_size: int = field(
         default=DEFAULT_VLLM_TENSOR_PARALLEL_SIZE, repr=False
+    )
+    kaggle_expected_gpu_type: str = field(
+        default=DEFAULT_EXPECTED_GPU_TYPE, repr=False
+    )
+    kaggle_expected_gpu_count: int = field(
+        default=DEFAULT_EXPECTED_GPU_COUNT, repr=False
     )
     kaggle_wheelhouse_stamp_text: str = field(
         default=DEFAULT_WHEELHOUSE_STAMP_TEXT, repr=False
@@ -1223,6 +1232,8 @@ class HarnessSolver(Solver):
             vllm_port=self.kaggle_vllm_port,
             max_model_len=self.kaggle_vllm_max_model_len,
             tensor_parallel_size=self.kaggle_vllm_tensor_parallel_size,
+            expected_gpu_type=self.kaggle_expected_gpu_type,
+            expected_gpu_count=self.kaggle_expected_gpu_count,
             wheelhouse_stamp_text=self.kaggle_wheelhouse_stamp_text,
         )
 

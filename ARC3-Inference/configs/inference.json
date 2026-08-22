@@ -60,7 +60,7 @@
     "top_p": 0.95,
     "top_k": 20,
     "timeout": 120,
-    "tool_steps": 8,
+    "tool_steps": 0,
     "tool_timeout": 30,
     "tool_output_tokens": 1024,
     "strategy_enabled": true,

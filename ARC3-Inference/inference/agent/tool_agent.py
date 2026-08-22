@@ -30,7 +30,11 @@ from inference.agent.prompts import (
     TOOL_CALL_FORMAT_GUIDANCE,
     VISUAL_GAME_ADDENDUM,
 )
-from inference.agent.python_tool_sandbox import run_sandboxed_python
+from inference.agent.python_tool_sandbox import (
+    SandboxHostActionError,
+    _sandbox_exception_diagnostic,
+    run_sandboxed_python,
+)
 from inference.agent.runtime_state import (
     RUNTIME_STATE_FILENAME,
     Frame,
@@ -60,6 +64,10 @@ _TOOL_CALL_PARAMETER_RE = re.compile(
     flags=re.DOTALL | re.IGNORECASE,
 )
 _THINK_TAG_RE = re.compile(r"</?think>", flags=re.IGNORECASE)
+_MARKDOWN_CODE_FENCE_RE = re.compile(
+    r"```(?P<language>[A-Za-z0-9_+.-]*)[ \t]*\r?\n(?P<code>.*?)\r?\n```",
+    flags=re.DOTALL,
+)
 
 
 def _get_env_int(name: str, default: int) -> int:
@@ -96,6 +104,35 @@ def _strip_tool_call_markup(text: str) -> str:
         return ""
     stripped = _TOOL_CALL_BLOCK_RE.sub("", text)
     return stripped.strip()
+
+
+def _normalize_generated_python_code(value: Any) -> str:
+    """Recover unambiguous executable Python from common model wrappers.
+
+    Raw Python remains authoritative.  If it does not compile, accept a single
+    Python (or unlabelled) Markdown fence when the fenced body does compile.
+    Multiple fences stay untouched so we never guess which program to run.
+    """
+    code = str(value or "").rstrip()
+    try:
+        compile(code, "<python_tool>", "exec")
+    except (SyntaxError, ValueError, OverflowError):
+        pass
+    else:
+        return code
+
+    matches = list(_MARKDOWN_CODE_FENCE_RE.finditer(code))
+    if len(matches) != 1:
+        return code
+    match = matches[0]
+    if str(match.group("language") or "").lower() not in {"", "py", "python"}:
+        return code
+    candidate = str(match.group("code") or "").rstrip()
+    try:
+        compile(candidate, "<python_tool>", "exec")
+    except (SyntaxError, ValueError, OverflowError):
+        return code
+    return candidate
 
 
 def _recover_tool_calls_from_markup(*chunks: str) -> list[dict[str, Any]]:
@@ -165,13 +202,23 @@ _PYTHON_TOOL_DESCRIPTION = (
     "Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: "
     "`current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, "
     "`valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, "
-    "`record_strategy(...)`, and `action(actions)` for executing one or more real environment actions. "
-    "`current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, and `.level`; "
+    "`record_strategy(...)`, bounded `memory`, `remember(key, value)`, `forget(key=None)`, "
+    "and `action(actions)` for executing one or more real environment actions. "
+    "`current_frame` and each `history[*].frame` expose `.ascii`, `.segmentation`, `.step`, `.level`, and `.shape`; "
+    "frames also expose `.crop(top, left, bottom, right)` for a letter-coded region using half-open bounds, "
+    "`.cell(row, col)` and `.neighbors(row, col, diagonal=False)` for local letter-coded queries, "
+    "`.find(symbol, limit=64)` for bounded color-coordinate searches, "
+    "`.components(symbol, diagonal=False, limit=64, cell_limit=128)` for bounded connected-component geometry, "
+    "`.objects(background=None, diagonal=False, limit=64, cell_limit=128)` for bounded multi-color object geometry, "
+    "`.find_pattern(pattern, wildcard=None, transforms=False, limit=64)` for bounded repeated-pattern searches, "
+    "`.shortest_path(start, goal, passable=...)` for bounded letter-coded BFS, "
+    "`.shortest_path_to_any(start, goals, passable=...)` for nearest-goal BFS, "
+    "`.diff(other, limit=64)`, and transitions expose `.diff(limit=64)` for bounded change summaries; "
     "`history[-1].frame` is the current post-action frame, not the previous frame. "
     "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
     "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
-    "The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. "
-    "Use `print(...)` for compact output or assign final data to `result`."
+    "The raw numeric grid is not available. Use `.segmentation` as the primary view, `.find(...)` to locate colors, `.find_pattern(...)` for templates, `.shortest_path(...)` for navigation, and `.crop(...)` for a small region. "
+    "A final Python expression is returned automatically; use `print(...)` for compact stdout or assign `result` explicitly when needed."
 )
 
 def _normalize_valid_actions(valid_actions: list[str] | None) -> list[str]:
@@ -699,6 +746,87 @@ def _render_tool_result_display(content: Any) -> str:
     return _render_jsonish_text(content)
 
 
+def _python_tool_payload(sandbox_result: dict[str, Any]) -> dict[str, Any]:
+    """Preserve independent stdout and result channels from generated code."""
+    payload: dict[str, Any] = {"tool": "python"}
+    rendered_stdout = str(sandbox_result.get("stdout", "") or "")
+    rendered_error = str(sandbox_result.get("error", "") or "")
+    action_results = [
+        item
+        for item in sandbox_result.get("action_results") or []
+        if isinstance(item, dict)
+    ]
+    if rendered_error:
+        payload["error"] = rendered_error
+        diagnostic = sandbox_result.get("diagnostic")
+        if isinstance(diagnostic, dict):
+            payload["diagnostic"] = dict(diagnostic)
+            payload["retryable"] = True
+        if rendered_stdout:
+            payload["stdout"] = rendered_stdout
+        return payload
+
+    payload["returncode"] = 0
+    if rendered_stdout:
+        payload["stdout"] = rendered_stdout
+    if sandbox_result.get("result") is not None:
+        payload["result"] = sandbox_result.get("result")
+    elif not rendered_stdout and action_results:
+        if len(action_results) == 1:
+            payload["result"] = action_results[-1]
+        else:
+            payload["result"] = {
+                "action_calls": len(action_results),
+                "last_action_result": action_results[-1],
+            }
+    return payload
+
+
+def _bounded_python_memory(
+    update: dict[str, Any],
+    *,
+    max_entries: int = 16,
+    max_key_chars: int = 64,
+    max_value_bytes: int = 2048,
+    max_total_bytes: int = 8192,
+) -> dict[str, Any]:
+    """Validate and normalize the JSON scratchpad persisted between tool calls."""
+    if not isinstance(update, dict):
+        raise TypeError("memory must be a JSON object.")
+    if len(update) > max_entries:
+        raise ValueError(f"memory is limited to {max_entries} keys.")
+
+    normalized: dict[str, Any] = {}
+    for raw_key, value in update.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise ValueError("memory keys must be non-empty strings.")
+        key = raw_key.strip()
+        if len(key) > max_key_chars:
+            raise ValueError(f"memory keys are limited to {max_key_chars} characters.")
+        try:
+            encoded_value = json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("memory values must be finite JSON data.") from exc
+        if len(encoded_value) > max_value_bytes:
+            raise ValueError(f"each memory value is limited to {max_value_bytes} bytes.")
+        normalized[key] = value
+
+    encoded_memory = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded_memory) > max_total_bytes:
+        raise ValueError(f"memory is limited to {max_total_bytes} bytes total.")
+    return json.loads(encoded_memory.decode("utf-8"))
+
+
 def _resolve_run_artifact_location(state_path: Path) -> tuple[Path, str | None]:
     parent = state_path.parent
     if parent.name == "artifacts" and parent.parent != parent:
@@ -967,6 +1095,8 @@ class ToolAgent:
         self._summarized_knowledge = _empty_world_model()
         self._controller_config = InferenceControllerConfig.from_env()
         self._strategy_memory: dict[str, Any] = {}
+        self._python_memory: dict[str, Any] = {}
+        self._generated_tool_call_count = 0
 
     def _headers(self) -> dict[str, str]:
         api_key = (
@@ -985,9 +1115,9 @@ class ToolAgent:
         )
 
     def _ensure_session(self, state_path: Path) -> None:
-        runtime_dir = state_path.parent
-        if self._session_runtime_dir != runtime_dir:
-            self._session_runtime_dir = runtime_dir
+        session_path = state_path.resolve()
+        if self._session_runtime_dir != session_path:
+            self._session_runtime_dir = session_path
             self._history_messages = []
             self._session_total_tokens = 0
             self._session_generated_tokens = 0
@@ -995,6 +1125,36 @@ class ToolAgent:
             self._last_action_result = None
             self._summarized_knowledge = _empty_world_model()
             self._strategy_memory = {}
+            self._python_memory = {}
+            self._generated_tool_call_count = 0
+
+    def _normalize_response_tool_calls(self, value: Any) -> list[dict[str, Any]]:
+        raw_calls = value if isinstance(value, list) else []
+        normalized: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for raw_call in raw_calls:
+            call = dict(raw_call) if isinstance(raw_call, dict) else {}
+            raw_function = call.get("function")
+            call["function"] = (
+                dict(raw_function) if isinstance(raw_function, dict) else {}
+            )
+            call["type"] = str(call.get("type") or "function")
+            call_id = str(call.get("id") or "").strip()
+            if not call_id or call_id in seen_ids:
+                while True:
+                    self._generated_tool_call_count += 1
+                    call_id = f"generated-tool-call-{self._generated_tool_call_count}"
+                    if call_id not in seen_ids:
+                        break
+            call["id"] = call_id
+            seen_ids.add(call_id)
+            normalized.append(call)
+        return normalized
+
+    def _record_python_memory(self, update: dict[str, Any]) -> dict[str, Any]:
+        persisted = _bounded_python_memory(update)
+        self._python_memory = persisted
+        return dict(persisted)
 
     def _record_strategy(self, update: dict[str, Any]) -> dict[str, Any]:
         def short_text(value: Any, max_chars: int = 280) -> str:
@@ -1070,12 +1230,30 @@ class ToolAgent:
             self._summarized_knowledge["current_plan"] = str(persisted["next_test"])
         return dict(self._strategy_memory)
 
+    def _consume_strategy_prediction(self, result: dict[str, Any]) -> dict[str, Any]:
+        consumed = {
+            "test_action": normalize_action_key(
+                self._strategy_memory.get("test_action", "")
+            )
+            or str(result.get("action") or ""),
+            "expected_outcome": (
+                str(self._strategy_memory.get("expected_outcome") or "").strip().lower()
+                or str(result.get("expected") or "")
+            ),
+            "status": result.get("status"),
+            "actual": result.get("actual"),
+        }
+        self._strategy_memory["last_evaluated_prediction"] = consumed
+        for key in ("test_action", "expected_outcome", "prediction_result"):
+            self._strategy_memory.pop(key, None)
+        return dict(consumed)
+
     def _evaluate_strategy_prediction(
         self, action_result: dict[str, Any]
     ) -> dict[str, Any] | None:
         existing = action_result.get("prediction_result")
         if isinstance(existing, dict):
-            self._strategy_memory["prediction_result"] = dict(existing)
+            self._consume_strategy_prediction(dict(existing))
             return dict(existing)
         test_action = normalize_action_key(self._strategy_memory.get("test_action", ""))
         expected = str(self._strategy_memory.get("expected_outcome") or "").strip()
@@ -1122,8 +1300,8 @@ class ToolAgent:
             "expected": expected,
             "actual": actual,
         }
-        self._strategy_memory["prediction_result"] = result
-        return result
+        self._consume_strategy_prediction(result)
+        return dict(result)
 
     @property
     def total_tokens(self) -> int:
@@ -1136,14 +1314,21 @@ class ToolAgent:
     def _accumulate_usage_tokens(self, usage: dict[str, Any] | None) -> None:
         if not isinstance(usage, dict):
             return
-        generated_token_count = 0
-        for key in ("completion_tokens", "output_tokens", "generated_tokens"):
-            raw_value = usage.get(key)
-            try:
-                generated_token_count = max(0, int(raw_value))
-                break
-            except (TypeError, ValueError):
-                continue
+
+        def first_token_count(*keys: str) -> int:
+            for key in keys:
+                raw_value = usage.get(key)
+                try:
+                    return max(0, int(raw_value))
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        generated_token_count = first_token_count(
+            "completion_tokens",
+            "output_tokens",
+            "generated_tokens",
+        )
         self._session_generated_tokens += generated_token_count
 
         total_tokens = usage.get("total_tokens")
@@ -1154,14 +1339,8 @@ class ToolAgent:
         except (TypeError, ValueError):
             pass
 
-        token_count = 0
-        for key in ("prompt_tokens", "completion_tokens", "input_tokens", "output_tokens"):
-            raw_value = usage.get(key)
-            try:
-                token_count += max(0, int(raw_value))
-            except (TypeError, ValueError):
-                continue
-        self._session_total_tokens += token_count
+        input_token_count = first_token_count("prompt_tokens", "input_tokens")
+        self._session_total_tokens += input_token_count + generated_token_count
 
     def _summarize_step_sequence(self, action_results: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not action_results:
@@ -1363,10 +1542,10 @@ class ToolAgent:
             [
                 state_line,
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, `record_strategy(...)`, and `action(actions)`.",
+                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, bounded `memory`, `record_strategy(...)`, `remember(key, value)`, `forget(key=None)`, and `action(actions)`.",
                 "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
-                "Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.",
-                "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one. Inspect `last_action_result['animation']` for bounded temporal evidence that may have disappeared from the final frame.",
+                "Keep tool output compact: use `current_frame.segmentation` as the primary view, `current_frame.find(symbol)` to locate colors, `current_frame.cell(row, col)` / `.neighbors(row, col)` for local checks, `current_frame.shortest_path(start, goal, passable=...)` or `.shortest_path_to_any(start, goals, passable=...)` for bounded navigation, and `current_frame.crop(top, left, bottom, right)` for a small letter-coded region; never print full boards.",
+                "For the most recent change, call `current_frame.diff(previous_frame)` or `last_transition.diff()`; `history[-1].frame` is the current frame, not the previous one. Inspect `last_action_result['animation']` for bounded temporal evidence that may have disappeared from the final frame.",
                 "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
                 "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
                 "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test; optionally include test_action, expected_outcome, fallback, and contradictions so the next result can falsify the plan. This survives fresh Python snippets within this run.",
@@ -1412,6 +1591,9 @@ class ToolAgent:
             "but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`."
         )
         lines.extend(self._summarized_knowledge_lines())
+        lines.append(
+            "Before executing new actions you must always give the revised version of this working world model, updated from the newest evidence."
+        )
         lines.append("end of world model. ")
         if action_num == 0:
             lines.append(
@@ -1423,7 +1605,7 @@ class ToolAgent:
             )
         lines.extend(
             [
-                "When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. Batch only a short sequence supported by observed action effects; use single probes while orienting, exploring, or recovering.",
+                "When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.",
                 "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.",
                 "If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.",
                 TOOL_CALL_FORMAT_GUIDANCE,
@@ -1688,17 +1870,28 @@ class ToolAgent:
 
     def _run_python_tool(self, state_path: Path, arguments: dict[str, Any]) -> _ToolDispatchResult:
         self._ensure_session(state_path)
-        code = str(arguments.get("code", "")).rstrip()
+        code = _normalize_generated_python_code(arguments.get("code", ""))
         if not code:
             return _ToolDispatchResult(json.dumps({"error": "python requires a non-empty `code` string."}, indent=2))
         try:
             compile(code, "<python_tool>", "exec")
         except SyntaxError as exc:
-            return _ToolDispatchResult(json.dumps({"error": f"Python syntax error: {exc}"}, indent=2))
+            payload = _python_tool_payload(
+                {
+                    "error": f"Python syntax error: {exc.msg}",
+                    "diagnostic": _sandbox_exception_diagnostic(exc, code),
+                    "stdout": "",
+                    "action_results": [],
+                }
+            )
+            return _ToolDispatchResult(
+                self._render_tool_payload(
+                    payload,
+                    truncate_fields=("error",),
+                )
+            )
 
         current_frame, history_entries = load_runtime_state(state_path)
-        valid_actions = list(_normalize_valid_actions(self._current_valid_actions))
-
         def _serialized_runtime_state(
             *,
             next_valid_actions: list[str] | None = None,
@@ -1709,7 +1902,7 @@ class ToolAgent:
             if isinstance(next_valid_actions, list):
                 sanitized_actions = [str(item).strip() for item in next_valid_actions if str(item).strip()]
             else:
-                sanitized_actions = list(valid_actions)
+                sanitized_actions = list(self._current_valid_actions)
             persisted_action_result = (
                 last_action_result
                 if isinstance(last_action_result, dict)
@@ -1726,6 +1919,7 @@ class ToolAgent:
                     self._controller_config,
                 ),
                 "strategy": dict(self._strategy_memory),
+                "memory": dict(self._python_memory),
                 "last_action_result": (
                     dict(persisted_action_result)
                     if isinstance(persisted_action_result, dict)
@@ -1739,7 +1933,10 @@ class ToolAgent:
             nonlocal terminal_action_result
             if self._step_env_callback is None:
                 raise RuntimeError("action(actions) is not available in this session.")
-            normalized_actions = self._normalize_python_actions(actions)
+            try:
+                normalized_actions = self._normalize_python_actions(actions)
+            except (TypeError, ValueError) as exc:
+                raise SandboxHostActionError(str(exc)) from exc
             if terminal_action_result is not None:
                 reason = _terminal_action_reason(terminal_action_result) or "terminal_state"
                 compact_payload = {
@@ -1805,6 +2002,7 @@ class ToolAgent:
             initial_state=_serialized_runtime_state(),
             action_handler=_handle_action,
             strategy_handler=self._record_strategy,
+            memory_handler=self._record_python_memory,
         )
 
         action_results = [
@@ -1812,27 +2010,7 @@ class ToolAgent:
             for item in sandbox_result.get("action_results") or []
             if isinstance(item, dict)
         ]
-        payload: dict[str, Any] = {"tool": "python"}
-        rendered_stdout = str(sandbox_result.get("stdout", "") or "")
-        rendered_error = str(sandbox_result.get("error", "") or "")
-        if rendered_error:
-            payload["error"] = rendered_error
-            if rendered_stdout:
-                payload["stdout"] = rendered_stdout
-        else:
-            payload["returncode"] = 0
-            if rendered_stdout:
-                payload["stdout"] = rendered_stdout
-            elif sandbox_result.get("result") is not None:
-                payload["result"] = sandbox_result.get("result")
-            elif action_results:
-                if len(action_results) == 1:
-                    payload["result"] = action_results[-1]
-                else:
-                    payload["result"] = {
-                        "action_calls": len(action_results),
-                        "last_action_result": action_results[-1],
-                    }
+        payload = _python_tool_payload(sandbox_result)
 
         step_executed = any(bool(item.get("executed")) for item in action_results)
         if step_executed:
@@ -2116,11 +2294,15 @@ class ToolAgent:
                     continue
                 raw_reasoning = _extract_reasoning_text(result.message)
                 raw_content = _normalize_message_content(result.message.get("content", ""))
-                tool_calls = json.loads(json.dumps(result.message.get("tool_calls") or []))
+                tool_calls = self._normalize_response_tool_calls(
+                    json.loads(json.dumps(result.message.get("tool_calls") or []))
+                )
                 tool_call_markup_in_text = _contains_tool_call_markup(raw_reasoning, raw_content)
                 recovered_tool_calls_from_markup = False
                 if not tool_calls and tool_call_markup_in_text:
-                    tool_calls = _recover_tool_calls_from_markup(raw_reasoning, raw_content)
+                    tool_calls = self._normalize_response_tool_calls(
+                        _recover_tool_calls_from_markup(raw_reasoning, raw_content)
+                    )
                     recovered_tool_calls_from_markup = bool(tool_calls)
                 reasoning = _strip_tool_call_markup(raw_reasoning) if tool_call_markup_in_text else raw_reasoning
                 content = _strip_tool_call_markup(raw_content) if tool_call_markup_in_text else raw_content
@@ -2129,11 +2311,10 @@ class ToolAgent:
                     function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
                     tool_name = str(function.get("name", "")).strip() or "unknown"
                     raw_arguments = function.get("arguments", "{}")
-                    if isinstance(raw_arguments, str):
-                        try:
-                            json.loads(raw_arguments)
-                        except json.JSONDecodeError as exc:
-                            malformed_argument_errors.append(f"{tool_name}: invalid JSON arguments ({exc})")
+                    try:
+                        _normalize_tool_call_arguments(raw_arguments)
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        malformed_argument_errors.append(f"{tool_name}: invalid arguments ({exc})")
                 response_meta = _format_model_response_meta(
                     finish_reason=result.finish_reason,
                     reasoning=reasoning,
@@ -2201,20 +2382,31 @@ class ToolAgent:
                     tool_name = str(function.get("name", "")).strip()
                     raw_args = function.get("arguments", "{}")
                     try:
-                        if isinstance(raw_args, str):
-                            arguments = json.loads(raw_args)
-                        elif isinstance(raw_args, dict):
-                            arguments = json.loads(json.dumps(raw_args))
-                        else:
-                            arguments = {}
-                    except json.JSONDecodeError:
+                        arguments = _normalize_tool_call_arguments(raw_args)
+                        argument_error = None
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
                         arguments = {}
+                        argument_error = (
+                            f"Invalid arguments for tool {tool_name or 'unknown'}: {exc}. "
+                            "Provide one JSON object and retry."
+                        )
                     rendered_tool_call = _render_tool_call_markup(tool_name, raw_args)
                     append_transcript(
                         f"TOOL CALL: {tool_name}",
                         rendered_tool_call or (json.dumps(arguments, indent=2) if arguments else "{}"),
                     )
-                    dispatch = self._dispatch_tool(state_path, tool_name, arguments)
+                    if argument_error is not None:
+                        dispatch = _ToolDispatchResult(
+                            json.dumps(
+                                {
+                                    "error": argument_error,
+                                    "retryable": True,
+                                },
+                                indent=2,
+                            )
+                        )
+                    else:
+                        dispatch = self._dispatch_tool(state_path, tool_name, arguments)
                     if dispatch.step_executed:
                         step_executed = True
                     append_transcript(f"TOOL RESULT: {tool_name}", _render_tool_result_display(dispatch.content))

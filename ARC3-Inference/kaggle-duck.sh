@@ -28,6 +28,18 @@ KAGGLE_ACCELERATOR="${KAGGLE_ACCELERATOR:-NvidiaRtxPro6000}"
 KAGGLE_DRY_RUN="${KAGGLE_DRY_RUN:-false}"
 DEPLOYMENT_WAIT="${DEPLOYMENT_WAIT:-false}"
 
+KAGGLE_CREDENTIALS_FILE="${HOME}/.kaggle/kaggle.json"
+if [ -f "${KAGGLE_CREDENTIALS_FILE}" ]; then
+    file_kaggle_username="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["username"])' "${KAGGLE_CREDENTIALS_FILE}")"
+    file_kaggle_key="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["key"])' "${KAGGLE_CREDENTIALS_FILE}")"
+    KAGGLE_USERNAME="${KAGGLE_USERNAME:-${file_kaggle_username}}"
+    KAGGLE_KEY="${KAGGLE_KEY:-${file_kaggle_key}}"
+fi
+if [ -n "${KAGGLE_KEY:-}" ]; then
+    KAGGLE_API_TOKEN="${KAGGLE_API_TOKEN:-${KAGGLE_KEY}}"
+fi
+export KAGGLE_USERNAME KAGGLE_KEY KAGGLE_API_TOKEN
+
 if [ -z "${KAGGLE_DATASET_REF}" ] && [ -n "${KAGGLE_USERNAME:-}" ]; then
     KAGGLE_DATASET_REF="${KAGGLE_USERNAME}/taaf-kaggle-source-${RUN_NAME}"
 fi
@@ -49,14 +61,15 @@ if [ "${KAGGLE_DRY_RUN}" = "true" ]; then
 fi
 
 echo
-echo "Notebook: https://www.kaggle.com/code/${KAGGLE_KERNEL_SLUG}"
+if [ -n "${KAGGLE_USERNAME:-}" ]; then
+    echo "Notebook: https://www.kaggle.com/code/${KAGGLE_USERNAME}/${KAGGLE_KERNEL_SLUG}"
+else
+    echo "Notebook slug: ${KAGGLE_KERNEL_SLUG}"
+fi
 if [ -n "${KAGGLE_DATASET_REF}" ]; then
     echo "Source dataset: https://www.kaggle.com/datasets/${KAGGLE_DATASET_REF}"
 fi
 
-if [ -f "${HOME}/.kaggle/kaggle.json" ]; then
-    eval "$(python3 -c "import json; d=json.load(open('${HOME}/.kaggle/kaggle.json')); print('export KAGGLE_USERNAME=%r' % d['username']); print('export KAGGLE_KEY=%r' % d['key']); print('export KAGGLE_API_TOKEN=%r' % d['key'])")"
-fi
-if command -v kaggle >/dev/null 2>&1; then
-    kaggle kernels status "${KAGGLE_KERNEL_SLUG}" || true
+if command -v kaggle >/dev/null 2>&1 && [ -n "${KAGGLE_USERNAME:-}" ]; then
+    kaggle kernels status "${KAGGLE_USERNAME}/${KAGGLE_KERNEL_SLUG}" || true
 fi
