@@ -4,7 +4,12 @@ import json
 import unittest
 from unittest.mock import patch
 
-from inference.agent.tool_agent import ToolAgent, _estimated_json_length
+from inference.agent import tool_agent
+from inference.agent.tool_agent import (
+    ToolAgent,
+    _estimated_json_length,
+    _estimated_request_base_length,
+)
 
 
 class ToolAgentContextTrimTests(unittest.TestCase):
@@ -97,6 +102,48 @@ class ToolAgentContextTrimTests(unittest.TestCase):
                         )
 
                     self.assertEqual(actual, expected)
+
+    def test_turn_local_cache_serializes_each_message_only_once(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._context_budget_tokens = 100_000
+        messages = self._messages()
+        tools = [{"type": "function", "function": {"name": "python"}}]
+        request_base_chars = _estimated_request_base_length(tools)
+        cache: dict[int, tuple[dict, int]] = {}
+
+        with patch.object(
+            tool_agent,
+            "_estimated_json_length",
+            wraps=tool_agent._estimated_json_length,
+        ) as estimate_length:
+            first = agent._trim_messages_for_context(
+                messages,
+                tools=tools,
+                request_base_chars=request_base_chars,
+                message_length_cache=cache,
+            )
+            first_call_count = estimate_length.call_count
+            second = agent._trim_messages_for_context(
+                messages,
+                tools=tools,
+                request_base_chars=request_base_chars,
+                message_length_cache=cache,
+            )
+            second_call_count = estimate_length.call_count
+            extended = [*messages, {"role": "assistant", "content": "new response"}]
+            third = agent._trim_messages_for_context(
+                extended,
+                tools=tools,
+                request_base_chars=request_base_chars,
+                message_length_cache=cache,
+            )
+
+        self.assertEqual(first, messages)
+        self.assertEqual(second, messages)
+        self.assertEqual(third, extended)
+        self.assertEqual(first_call_count, len(messages))
+        self.assertEqual(second_call_count, first_call_count)
+        self.assertEqual(estimate_length.call_count, first_call_count + 1)
 
 
 if __name__ == "__main__":

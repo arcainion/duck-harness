@@ -244,38 +244,16 @@ _PERSISTENT_HISTORY_ASSISTANT_TURNS = 30
 _RESPONSE_META_MAX_CHARS = 4000
 
 _PYTHON_TOOL_DESCRIPTION = (
-    "Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: "
+    "Run one ephemeral Python snippet against preloaded letter-coded game state. Globals: "
     "`current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, "
     "`valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, "
     "`record_strategy(...)`, bounded `memory`, `remember(key, value)`, `forget(key=None)`, "
-    "and `action(actions)` for executing one or more real environment actions. "
-    "Repeated identical structural analyses on the same frame are memoized with mutation-safe results. "
-    "`current_frame` and each `history[*].frame` expose `.ascii`, `.segmentation`, `.step`, `.level`, and `.shape`; "
-    "frames also expose `.crop(top, left, bottom, right)` for a letter-coded region using half-open bounds, "
-    "`.cell(row, col)` and `.neighbors(row, col, diagonal=False)` for local letter-coded queries, "
-    "`.ray(row, col, direction, stop_at=None, include_start=False, limit=64)` for bounded line-of-sight scans, "
-    "`.find(symbol, limit=64)` for bounded color-coordinate searches, `.color_summary(limit=16)` for dominant-first palette and edge statistics, "
-    "`.runs(symbol=None, directions='HV', min_length=2, limit=64)` for maximal same-color lines, "
-    "`.rectangles(symbol=None, kind='any', min_size=2, limit=64)` for filled boxes and closed outlines, "
-    "`.enclosed_regions(symbol=None, diagonal=False, limit=64, cell_limit=128)` for surrounded regions and boundary colors, "
-    "`.components(symbol, diagonal=False, limit=64, cell_limit=128)` for bounded connected-component geometry, "
-    "`.objects(background=None, diagonal=False, limit=64, cell_limit=128)` for bounded multi-color object geometry, "
-    "`.object_relations(background=None, diagonal=False, object_limit=32, relation_limit=64)` for pairwise spatial comparisons, "
-    "`.track_objects(other, background=None, diagonal=False, limit=64)` for object movement, additions, and removals, "
-    "`.transform_relation(other, allow_recolor=True)` for rotations, reflections, and consistent color mappings, "
-    "`.symmetry(sample_limit=8)` for exact and approximate reflection or rotational symmetry, "
-    "`.periodicity(candidate_limit=8, sample_limit=8)` for exact and near row or column repetition, "
-    "`.find_pattern(pattern, wildcard=None, transforms=False, max_mismatches=0, mismatch_limit=8, limit=64)` for exact or approximate repeated-pattern searches, "
-    "`.reachable_region(start, passable=...)` for bounded reachable-space and blocked-frontier analysis, "
-    "`.shortest_path(start, goal_or_symbols, passable=...)` for bounded letter-coded BFS to coordinates or the nearest target color, "
-    "`.shortest_path_to_any(start, goals, passable=...)` for nearest-goal BFS, "
-    "`.diff(other, limit=64)` for bounded change summaries, and `.color_transitions(other, ...)` for aggregate recoloring rules; "
-    "transitions expose both `.diff(...)` and `.color_transitions(...)`; "
-    "`history[-1].frame` is the current post-action frame, not the previous frame. "
-    "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
-    "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
-    "The raw numeric grid is not available. Use `.segmentation` as the primary view, `.find(...)` to locate colors, `.find_pattern(...)` for templates, `.shortest_path(...)` for navigation, and `.crop(...)` for a small region. "
-    "A final Python expression is returned automatically; use `print(...)` for compact stdout or assign `result` explicitly when needed."
+    "and `action(actions)` for real environment actions. Frame and transition objects expose the "
+    "bounded, mutation-safe analysis/search methods documented in the system prompt; repeated structural "
+    "queries are memoized. Raw numeric colors are unavailable: prefer `.segmentation`, compact summaries, "
+    "targeted searches, and small `.crop(...)` regions. `history[-1].frame` is current; use "
+    "`previous_frame` or `last_transition` for before/after analysis. A final expression is returned "
+    "notebook-style; use `print(...)` or assign `result` for compact output."
 )
 
 def _normalize_valid_actions(valid_actions: list[str] | None) -> list[str]:
@@ -650,6 +628,16 @@ def _estimated_json_length(value: Any) -> int:
         return len(json.dumps(value, ensure_ascii=True, sort_keys=True, default=str))
     except TypeError:
         return len(str(value))
+
+
+def _estimated_request_base_length(
+    tools: list[dict[str, Any]] | None,
+) -> int:
+    payload: dict[str, Any] = {"messages": []}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = _request_tool_choice(tools)
+    return _estimated_json_length(payload)
 
 
 def _host_accessible_base_url(base_url: str) -> str:
@@ -1757,13 +1745,8 @@ class ToolAgent:
             [
                 state_line,
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, read-only `experience`, persisted `strategy`, bounded `memory`, `record_strategy(...)`, `remember(key, value)`, `forget(key=None)`, and `action(actions)`.",
-                "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
-                "Keep tool output compact: use `current_frame.segmentation` as the primary view, `current_frame.find(symbol)` to locate colors, `current_frame.cell(row, col)` / `.neighbors(row, col)` for local checks, `current_frame.shortest_path(start, goal_or_symbols, passable=...)` or `.shortest_path_to_any(start, goals, passable=...)` for bounded navigation, and `current_frame.crop(top, left, bottom, right)` for a small letter-coded region; never print full boards.",
-                "For the most recent change, call `current_frame.diff(previous_frame)` or `last_transition.diff()`; `history[-1].frame` is the current frame, not the previous one. Inspect `last_action_result['animation']` for bounded temporal evidence that may have disappeared from the final frame.",
-                "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
-                "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
-                "Use `record_strategy(...)` when evidence changes your goal, hypothesis, confidence, open question, or next test; optionally include test_action, expected_outcome, fallback, and contradictions so the next result can falsify the plan. This survives fresh Python snippets within this run.",
+                "Use the documented `python` state and bounded helpers to inspect current evidence, update the working world model, and select the shortest reliable action or batch.",
+                "Keep output decision-focused; record material strategy changes and stop acting on any terminal result.",
             ]
         )
         if experience_snapshot and experience_snapshot.get("enabled"):
@@ -1798,18 +1781,13 @@ class ToolAgent:
                 [
                     "Deterministic experience controller snapshot:",
                     json.dumps(compact_experience, separators=(",", ":"), sort_keys=True),
-                    "Follow the controller phase, `action_budget`, and ranked action evidence: orient with one compact inspection, explore with a controlled falsifiable probe, continue progress when evidence supports it, and abandon or revise the current hypothesis in recover. Treat `transition_models_here` as a tiny executable world model: verified deterministic entries may be used for short planning, while contradictions mean the state abstraction or hypothesis is incomplete. Never retry a discouraged exact action in the same visible state; semantic cycle warnings remain advisory when backtracking is necessary.",
+                    "Honor the controller phase, action budget, rankings, and deterministic transition evidence; never retry a discouraged exact action, and revise the hypothesis on conflicts.",
                 ]
             )
-        lines.append(
-            "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, "
-            "but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`."
-        )
         lines.extend(self._summarized_knowledge_lines())
         lines.append(
             "Before executing new actions you must always give the revised version of this working world model, updated from the newest evidence."
         )
-        lines.append("end of world model. ")
         if action_num == 0:
             lines.append(
                 "Ground yourself in `current_frame` before acting, but start with a compact structural summary rather than restating the full frame."
@@ -1820,10 +1798,7 @@ class ToolAgent:
             )
         lines.extend(
             [
-                "When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.",
-                "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.",
-                "If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.",
-                TOOL_CALL_FORMAT_GUIDANCE,
+                "Then call `action(actions)` inside `python` with the selected valid action; prefer batching it in one call only when the short sequence is reliable.",
             ]
         )
         if "MOUSE" in _normalize_valid_actions(valid_actions):
@@ -2311,8 +2286,20 @@ class ToolAgent:
             trimmed.pop(0)
         return trimmed
 
-    def _persistent_history_messages(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-        trimmed = self._trim_messages_for_context(messages, tools=tools)
+    def _persistent_history_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        request_base_chars: int | None = None,
+        message_length_cache: dict[int, tuple[dict[str, Any], int]] | None = None,
+    ) -> list[dict[str, Any]]:
+        trimmed = self._trim_messages_for_context(
+            messages,
+            tools=tools,
+            request_base_chars=request_base_chars,
+            message_length_cache=message_length_cache,
+        )
         if not trimmed:
             return []
         trimmed_history = trimmed[1:]
@@ -2337,6 +2324,8 @@ class ToolAgent:
         tools: list[dict[str, Any]] | None = None,
         preserve_recent: int = 1,
         extra_safety_tokens: int = 0,
+        request_base_chars: int | None = None,
+        message_length_cache: dict[int, tuple[dict[str, Any], int]] | None = None,
     ) -> list[dict[str, Any]]:
         if not messages:
             return []
@@ -2344,13 +2333,25 @@ class ToolAgent:
         history = list(messages[1:])
         preserve_recent = max(0, preserve_recent)
         budget_tokens = max(1, self._context_budget_tokens - max(0, extra_safety_tokens))
-        empty_payload: dict[str, Any] = {"messages": []}
-        if tools:
-            empty_payload["tools"] = tools
-            empty_payload["tool_choice"] = _request_tool_choice(tools)
-        request_chars = _estimated_json_length(empty_payload)
-        system_chars = _estimated_json_length(system_message)
-        history_chars = [_estimated_json_length(message) for message in history]
+        request_chars = (
+            _estimated_request_base_length(tools)
+            if request_base_chars is None
+            else request_base_chars
+        )
+
+        def message_chars(message: dict[str, Any]) -> int:
+            if message_length_cache is None:
+                return _estimated_json_length(message)
+            cache_key = id(message)
+            cached = message_length_cache.get(cache_key)
+            if cached is not None and cached[0] is message:
+                return cached[1]
+            length = _estimated_json_length(message)
+            message_length_cache[cache_key] = (message, length)
+            return length
+
+        system_chars = message_chars(system_message)
+        history_chars = [message_chars(message) for message in history]
         history_chars_total = sum(history_chars)
 
         def estimated_tokens() -> int:
@@ -2446,10 +2447,16 @@ class ToolAgent:
         previous_history_messages = list(self._history_messages)
         preserve_history = True
         tools = self._tools(state_path)
+        tool_choice = _request_tool_choice(tools)
+        request_tools_snapshot = json.loads(json.dumps(tools))
+        request_base_chars = _estimated_request_base_length(tools)
+        message_length_cache: dict[int, tuple[dict[str, Any], int]] = {}
         messages: list[dict[str, Any]] = self._trim_messages_for_context(
             [{"role": "system", "content": self._system_prompt}, *self._history_messages, self._build_user_message(user_prompt, current_frame)],
             tools=tools,
             preserve_recent=1,
+            request_base_chars=request_base_chars,
+            message_length_cache=message_length_cache,
         )
         step_executed = False
         captured_reasoning = ""
@@ -2478,10 +2485,14 @@ class ToolAgent:
                 if yielded_control_reason is not None:
                     break
                 turn_count += 1
-                tool_choice = _request_tool_choice(tools)
-                messages = self._trim_messages_for_context(messages, tools=tools)
+                messages = self._trim_messages_for_context(
+                    messages,
+                    tools=tools,
+                    request_base_chars=request_base_chars,
+                    message_length_cache=message_length_cache,
+                )
                 latest_request_messages = json.loads(json.dumps(messages))
-                latest_request_tools = json.loads(json.dumps(tools))
+                latest_request_tools = request_tools_snapshot
                 latest_request_tool_choice = tool_choice
                 latest_request_index = turn_count
                 _write_prompt_log_snapshot(
@@ -2532,6 +2543,8 @@ class ToolAgent:
                         messages,
                         tools=tools,
                         extra_safety_tokens=_CONTEXT_OVERFLOW_RETRY_TRIM_TOKENS,
+                        request_base_chars=request_base_chars,
+                        message_length_cache=message_length_cache,
                     )
                     if trimmed_messages == messages:
                         trimmed_messages = self._force_reduce_messages(messages)
@@ -2729,7 +2742,12 @@ class ToolAgent:
             return None
         finally:
             if preserve_history:
-                self._history_messages = self._persistent_history_messages(messages, tools=tools)
+                self._history_messages = self._persistent_history_messages(
+                    messages,
+                    tools=tools,
+                    request_base_chars=request_base_chars,
+                    message_length_cache=message_length_cache,
+                )
             else:
                 self._history_messages = previous_history_messages
             self._step_env_callback = None

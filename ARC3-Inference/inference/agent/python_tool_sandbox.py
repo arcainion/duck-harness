@@ -461,6 +461,631 @@ def _bounded_frame_color_summary(
     }
 
 
+def _bounded_frame_spatial_operation(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    operation: str,
+    **options: Any,
+) -> dict[str, Any]:
+    """Serve compact, bounded geometry operations for generated programs."""
+    row_count, column_count = shape
+
+    def bounded_limit(name: str, default: int, cap: int = 256) -> int:
+        value = options.get(name, default)
+        if isinstance(value, bool):
+            raise TypeError(f"frame.{operation}(..., {name}=...) expects an integer.")
+        try:
+            return max(0, min(cap, int(value)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"frame.{operation}(..., {name}=...) expects an integer."
+            ) from exc
+
+    def coordinate(value: Any, name: str, *, signed: bool = False) -> tuple[int, int]:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise TypeError(f"frame.{operation}(..., {name}=...) expects [row, col].")
+        row, col = value
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in (row, col)):
+            raise TypeError(
+                f"frame.{operation}(..., {name}=...) expects integer coordinates."
+            )
+        if not signed and not (0 <= row < row_count and 0 <= col < column_count):
+            raise ValueError(f"frame.{operation}(..., {name}=...) is outside the frame.")
+        return row, col
+
+    def coordinates(value: Any, name: str = "cells") -> list[tuple[int, int]]:
+        if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+            raise TypeError(f"frame.{operation}(..., {name}=...) expects coordinates.")
+        if len(value) > 256:
+            raise ValueError(f"frame.{operation}(..., {name}=...) is limited to 256 cells.")
+        return [coordinate(item, f"{name}[{index}]") for index, item in enumerate(value)]
+
+    def symbols(value: Any, name: str = "symbols") -> list[str]:
+        raw = list(value) if isinstance(value, str) else list(value) if isinstance(value, (list, tuple, set)) else []
+        if not raw or any(
+            not isinstance(item, str) or len(item) != 1 or item not in color_chars
+            for item in raw
+        ):
+            raise ValueError(
+                f"frame.{operation}(..., {name}=...) expects symbols from {color_chars!r}."
+            )
+        return list(dict.fromkeys(raw))
+
+    def bounds(value: Any, name: str = "bounds") -> tuple[int, int, int, int]:
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            raise TypeError(
+                f"frame.{operation}(..., {name}=...) expects [top, left, bottom, right]."
+            )
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+            raise TypeError(f"frame.{operation}(..., {name}=...) expects integers.")
+        top, left, bottom, right = value
+        if not (0 <= top < bottom <= row_count and 0 <= left < right <= column_count):
+            raise ValueError(
+                f"frame.{operation}(..., {name}=...) must be a non-empty region inside the frame."
+            )
+        return top, left, bottom, right
+
+    def value_at(row: int, col: int) -> int | None:
+        source_row = grid[row] if row < len(grid) else []
+        value = source_row[col] if col < len(source_row) else None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(color_chars)
+        ):
+            return None
+        return value
+
+    def cell_payload(row: int, col: int) -> dict[str, Any]:
+        value = value_at(row, col)
+        return {
+            "cell": [row, col],
+            "symbol": color_chars[value] if value is not None else None,
+        }
+
+    if operation == "bounds":
+        requested = symbols(options.get("symbols"))
+        requested_values = {color_chars.index(symbol) for symbol in requested}
+        cell_limit = bounded_limit("limit", 64)
+        cells: list[list[int]] = []
+        count = 0
+        row_total = col_total = 0
+        min_row = min_col = None
+        max_row = max_col = None
+        for row in range(row_count):
+            for col in range(column_count):
+                if value_at(row, col) not in requested_values:
+                    continue
+                count += 1
+                row_total += row
+                col_total += col
+                min_row = row if min_row is None else min(min_row, row)
+                min_col = col if min_col is None else min(min_col, col)
+                max_row = row if max_row is None else max(max_row, row)
+                max_col = col if max_col is None else max(max_col, col)
+                if len(cells) < cell_limit:
+                    cells.append([row, col])
+        return {
+            "symbols": requested,
+            "count": count,
+            "bbox": [min_row, min_col, max_row, max_col] if count else None,
+            "centroid": [row_total / count, col_total / count] if count else None,
+            "cells": cells,
+            "truncated_cells": max(0, count - len(cells)),
+        }
+
+    if operation == "region_summary":
+        top, left, bottom, right = bounds(options.get("bounds"))
+        counts: dict[str, int] = {}
+        unknown = 0
+        for row in range(top, bottom):
+            for col in range(left, right):
+                value = value_at(row, col)
+                if value is None:
+                    unknown += 1
+                else:
+                    symbol = color_chars[value]
+                    counts[symbol] = counts.get(symbol, 0) + 1
+        area = (bottom - top) * (right - left)
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], color_chars.index(item[0])))
+        return {
+            "bounds": [top, left, bottom, right],
+            "shape": [bottom - top, right - left],
+            "area": area,
+            "colors": [
+                {"symbol": symbol, "count": count, "fraction": count / area}
+                for symbol, count in ranked
+            ],
+            "unknown_cells": unknown,
+        }
+
+    if operation in {"row_profile", "column_profile"}:
+        requested_raw = options.get("symbol")
+        requested = None if requested_raw is None else symbols(requested_raw, "symbol")
+        axis_length = row_count if operation == "row_profile" else column_count
+        cross_length = column_count if operation == "row_profile" else row_count
+        profile_limit = bounded_limit("limit", 64)
+        profiles = []
+        for axis_index in range(axis_length):
+            counts: dict[str, int] = {}
+            for cross_index in range(cross_length):
+                row, col = (axis_index, cross_index) if operation == "row_profile" else (cross_index, axis_index)
+                value = value_at(row, col)
+                if value is None:
+                    continue
+                symbol = color_chars[value]
+                if requested is None or symbol in requested:
+                    counts[symbol] = counts.get(symbol, 0) + 1
+            profiles.append(
+                {
+                    "index": axis_index,
+                    "counts": {
+                        symbol: counts[symbol]
+                        for symbol in color_chars
+                        if symbol in counts
+                    },
+                    "matched": sum(counts.values()),
+                }
+            )
+        return {
+            "axis": "row" if operation == "row_profile" else "column",
+            "symbol_filter": requested,
+            "count": len(profiles),
+            "profiles": profiles[:profile_limit],
+            "truncated_profiles": max(0, len(profiles) - profile_limit),
+        }
+
+    if operation in {"nearest_cell", "distance"}:
+        start = coordinate(options.get("start"), "start")
+        metric = str(options.get("metric", "manhattan") or "").strip().lower()
+        if metric not in {"manhattan", "chebyshev", "euclidean_squared"}:
+            raise ValueError(
+                f"frame.{operation}(..., metric=...) expects manhattan, chebyshev, or euclidean_squared."
+            )
+
+        def distance_to(cell: tuple[int, int]) -> int:
+            row_delta = abs(cell[0] - start[0])
+            col_delta = abs(cell[1] - start[1])
+            if metric == "manhattan":
+                return row_delta + col_delta
+            if metric == "chebyshev":
+                return max(row_delta, col_delta)
+            return row_delta * row_delta + col_delta * col_delta
+
+        if operation == "distance":
+            end = coordinate(options.get("end"), "end")
+            return {"start": list(start), "end": list(end), "metric": metric, "distance": distance_to(end)}
+        requested = symbols(options.get("symbols"))
+        requested_values = {color_chars.index(symbol) for symbol in requested}
+        result_limit = bounded_limit("limit", 64)
+        ranked = [
+            (distance_to((row, col)), row, col)
+            for row in range(row_count)
+            for col in range(column_count)
+            if value_at(row, col) in requested_values
+        ]
+        ranked.sort()
+        candidates = [
+            {**cell_payload(row, col), "distance": distance}
+            for distance, row, col in ranked[:result_limit]
+        ]
+        return {
+            "start": list(start),
+            "symbols": requested,
+            "metric": metric,
+            "count": len(ranked),
+            "nearest": candidates[0] if candidates else None,
+            "candidates": candidates,
+            "truncated_candidates": max(0, len(ranked) - len(candidates)),
+        }
+
+    if operation == "line_between":
+        start = coordinate(options.get("start"), "start")
+        end = coordinate(options.get("end"), "end")
+        line_limit = bounded_limit("limit", 128, 512)
+        row, col = start
+        end_row, end_col = end
+        delta_col = abs(end_col - col)
+        step_col = 1 if col < end_col else -1
+        delta_row = -abs(end_row - row)
+        step_row = 1 if row < end_row else -1
+        error = delta_col + delta_row
+        line: list[tuple[int, int]] = []
+        while True:
+            line.append((row, col))
+            if (row, col) == end:
+                break
+            doubled = 2 * error
+            if doubled >= delta_row:
+                error += delta_row
+                col += step_col
+            if doubled <= delta_col:
+                error += delta_col
+                row += step_row
+        return {
+            "start": list(start),
+            "end": list(end),
+            "count": len(line),
+            "cells": [cell_payload(row, col) for row, col in line[:line_limit]],
+            "truncated_cells": max(0, len(line) - line_limit),
+        }
+
+    if operation in {"translate_cells", "mirror_cells"}:
+        source = coordinates(options.get("cells"))
+        result_limit = bounded_limit("limit", 128, 256)
+        mapped: list[dict[str, Any]] = []
+        if operation == "translate_cells":
+            row_delta, col_delta = coordinate(options.get("delta"), "delta", signed=True)
+
+            def transform(row: int, col: int) -> tuple[int, int]:
+                return row + row_delta, col + col_delta
+
+            transform_name = "TRANSLATE"
+        else:
+            transform_name = str(options.get("symmetry") or "").strip().upper()
+            transforms = {
+                "HORIZONTAL": lambda row, col: (row_count - 1 - row, col),
+                "VERTICAL": lambda row, col: (row, column_count - 1 - col),
+                "ROTATE_180": lambda row, col: (row_count - 1 - row, column_count - 1 - col),
+                "MAIN_DIAGONAL": lambda row, col: (col, row),
+                "ANTI_DIAGONAL": lambda row, col: (column_count - 1 - col, row_count - 1 - row),
+            }
+            if transform_name not in transforms:
+                raise ValueError(
+                    "frame.mirror_cells(..., symmetry=...) expects HORIZONTAL, VERTICAL, "
+                    "ROTATE_180, MAIN_DIAGONAL, or ANTI_DIAGONAL."
+                )
+            transform = transforms[transform_name]
+        outside = 0
+        for row, col in source:
+            mapped_row, mapped_col = transform(row, col)
+            in_bounds = 0 <= mapped_row < row_count and 0 <= mapped_col < column_count
+            outside += not in_bounds
+            if len(mapped) < result_limit:
+                mapped.append(
+                    {
+                        "source": [row, col],
+                        "target": [mapped_row, mapped_col],
+                        "in_bounds": in_bounds,
+                        "symbol": cell_payload(mapped_row, mapped_col)["symbol"] if in_bounds else None,
+                    }
+                )
+        return {
+            "transform": transform_name,
+            "count": len(source),
+            "mapped": mapped,
+            "outside_frame": outside,
+            "truncated_mappings": max(0, len(source) - len(mapped)),
+        }
+
+    if operation == "compare_regions":
+        first = bounds(options.get("first"), "first")
+        second = bounds(options.get("second"), "second")
+        first_grid = [
+            [value_at(row, col) for col in range(first[1], first[3])]
+            for row in range(first[0], first[2])
+        ]
+        second_grid = [
+            [value_at(row, col) for col in range(second[1], second[3])]
+            for row in range(second[0], second[2])
+        ]
+        relation = _bounded_frame_transform_relation(
+            first_grid,
+            second_grid,
+            before_shape=(first[2] - first[0], first[3] - first[1]),
+            after_shape=(second[2] - second[0], second[3] - second[1]),
+            color_chars=color_chars,
+            allow_recolor=options.get("allow_recolor", True),
+        )
+        return {"first": list(first), "second": list(second), **relation}
+
+    raise ValueError(f"Unknown spatial operation: {operation}")
+
+
+def _bounded_frame_layout_operation(
+    grid: list[list[Any]],
+    *,
+    shape: tuple[int, int],
+    color_chars: str,
+    operation: str,
+    **options: Any,
+) -> dict[str, Any]:
+    """Serve bounded frame-layout and color-topology operations."""
+    row_count, column_count = shape
+
+    def integer(name: str, default: int, cap: int = 256, minimum: int = 0) -> int:
+        value = options.get(name, default)
+        if isinstance(value, bool):
+            raise TypeError(f"frame.{operation}(..., {name}=...) expects an integer.")
+        try:
+            return max(minimum, min(cap, int(value)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"frame.{operation}(..., {name}=...) expects an integer."
+            ) from exc
+
+    def symbol(value: Any, name: str, *, optional: bool = False) -> str | None:
+        if optional and value is None:
+            return None
+        if not isinstance(value, str) or len(value) != 1 or value not in color_chars:
+            raise ValueError(
+                f"frame.{operation}(..., {name}=...) expects a symbol from {color_chars!r}."
+            )
+        return value
+
+    def symbols(value: Any) -> list[str]:
+        raw = list(value) if isinstance(value, (str, list, tuple, set)) else []
+        if not raw or any(
+            not isinstance(item, str) or len(item) != 1 or item not in color_chars
+            for item in raw
+        ):
+            raise ValueError(
+                f"frame.{operation}(..., symbols=...) expects symbols from {color_chars!r}."
+            )
+        return [item for item in color_chars if item in raw]
+
+    def value_at(row: int, col: int) -> int | None:
+        source_row = grid[row] if 0 <= row < len(grid) else []
+        value = source_row[col] if 0 <= col < len(source_row) else None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(color_chars)
+        ):
+            return None
+        return value
+
+    def palette(bounds: tuple[int, int, int, int]) -> dict[str, Any]:
+        top, left, bottom, right = bounds
+        counts: dict[str, int] = {}
+        unknown = 0
+        for row in range(top, bottom):
+            for col in range(left, right):
+                value = value_at(row, col)
+                if value is None:
+                    unknown += 1
+                else:
+                    cell_symbol = color_chars[value]
+                    counts[cell_symbol] = counts.get(cell_symbol, 0) + 1
+        area = max(0, bottom - top) * max(0, right - left)
+        return {
+            "bounds": [top, left, bottom, right],
+            "shape": [max(0, bottom - top), max(0, right - left)],
+            "area": area,
+            "colors": [
+                {"symbol": item, "count": counts[item], "fraction": counts[item] / area if area else 0.0}
+                for item in sorted(counts, key=lambda item: (-counts[item], color_chars.index(item)))
+            ],
+            "unknown_cells": unknown,
+        }
+
+    if operation == "border_summary":
+        thickness = integer("thickness", 1, max(row_count, column_count, 1), 1)
+        row_thickness = min(row_count, thickness)
+        col_thickness = min(column_count, thickness)
+        regions = {
+            "top": (0, 0, row_thickness, column_count),
+            "right": (0, column_count - col_thickness, row_count, column_count),
+            "bottom": (row_count - row_thickness, 0, row_count, column_count),
+            "left": (0, 0, row_count, col_thickness),
+        }
+        return {
+            "thickness": thickness,
+            "sides": {name: palette(bounds) for name, bounds in regions.items()},
+            "corner_cells_counted_on_two_sides": True,
+        }
+
+    if operation == "corner_summary":
+        size = integer("size", 1, max(row_count, column_count, 1), 1)
+        height = min(row_count, size)
+        width = min(column_count, size)
+        regions = {
+            "top_left": (0, 0, height, width),
+            "top_right": (0, column_count - width, height, column_count),
+            "bottom_right": (row_count - height, column_count - width, row_count, column_count),
+            "bottom_left": (row_count - height, 0, row_count, width),
+        }
+        return {"size": size, "corners": {name: palette(bounds) for name, bounds in regions.items()}}
+
+    if operation == "center_summary":
+        radius = integer("radius", 0, max(row_count, column_count, 1))
+        top = max(0, (row_count - 1) // 2 - radius)
+        bottom = min(row_count, row_count // 2 + 1 + radius)
+        left = max(0, (column_count - 1) // 2 - radius)
+        right = min(column_count, column_count // 2 + 1 + radius)
+        return {"radius": radius, **palette((top, left, bottom, right))}
+
+    if operation == "quadrant_summary":
+        row_split = (row_count + 1) // 2
+        col_split = (column_count + 1) // 2
+        regions = {
+            "top_left": (0, 0, row_split, col_split),
+            "top_right": (0, col_split, row_split, column_count),
+            "bottom_right": (row_split, col_split, row_count, column_count),
+            "bottom_left": (row_split, 0, row_count, col_split),
+        }
+        return {
+            "split": [row_split, col_split],
+            "quadrants": {name: palette(bounds) for name, bounds in regions.items()},
+        }
+
+    if operation == "color_adjacency":
+        diagonal = options.get("diagonal", False)
+        if not isinstance(diagonal, bool):
+            raise TypeError("frame.color_adjacency(..., diagonal=...) expects a boolean.")
+        result_limit = integer("limit", 64)
+        offsets = [(0, 1), (1, 0)]
+        if diagonal:
+            offsets.extend([(1, 1), (1, -1)])
+        contacts: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in range(row_count):
+            for col in range(column_count):
+                first_value = value_at(row, col)
+                if first_value is None:
+                    continue
+                for row_delta, col_delta in offsets:
+                    other_row, other_col = row + row_delta, col + col_delta
+                    if not (0 <= other_row < row_count and 0 <= other_col < column_count):
+                        continue
+                    second_value = value_at(other_row, other_col)
+                    if second_value is None or second_value == first_value:
+                        continue
+                    values = sorted((first_value, second_value))
+                    key = color_chars[values[0]], color_chars[values[1]]
+                    item = contacts.setdefault(key, {"colors": list(key), "contacts": 0, "samples": []})
+                    item["contacts"] += 1
+                    if len(item["samples"]) < 8:
+                        item["samples"].append([[row, col], [other_row, other_col]])
+        ranked = sorted(contacts.values(), key=lambda item: (-item["contacts"], item["colors"]))
+        return {
+            "diagonal": diagonal,
+            "count": len(ranked),
+            "pairs": ranked[:result_limit],
+            "truncated_pairs": max(0, len(ranked) - result_limit),
+        }
+
+    if operation == "distance_between_colors":
+        first_symbol = symbol(options.get("first"), "first")
+        second_symbol = symbol(options.get("second"), "second")
+        metric = str(options.get("metric", "manhattan") or "").strip().lower()
+        if metric not in {"manhattan", "chebyshev", "euclidean_squared"}:
+            raise ValueError("frame.distance_between_colors(..., metric=...) received an invalid metric.")
+        first_cells = [
+            (row, col) for row in range(row_count) for col in range(column_count)
+            if value_at(row, col) == color_chars.index(first_symbol)
+        ]
+        second_cells = [
+            (row, col) for row in range(row_count) for col in range(column_count)
+            if value_at(row, col) == color_chars.index(second_symbol)
+        ]
+        best = None
+        for first_cell in first_cells:
+            for second_cell in second_cells:
+                if first_cell == second_cell:
+                    continue
+                row_delta = abs(first_cell[0] - second_cell[0])
+                col_delta = abs(first_cell[1] - second_cell[1])
+                distance = (
+                    row_delta + col_delta if metric == "manhattan"
+                    else max(row_delta, col_delta) if metric == "chebyshev"
+                    else row_delta * row_delta + col_delta * col_delta
+                )
+                candidate = distance, first_cell, second_cell
+                if best is None or candidate < best:
+                    best = candidate
+        return {
+            "first": first_symbol,
+            "second": second_symbol,
+            "metric": metric,
+            "first_count": len(first_cells),
+            "second_count": len(second_cells),
+            "distance": best[0] if best else None,
+            "cells": [list(best[1]), list(best[2])] if best else None,
+        }
+
+    if operation in {"divider_lines", "panels"}:
+        requested = symbol(options.get("symbol"), "symbol", optional=True)
+        divider_rows = []
+        divider_columns = []
+        for row in range(row_count):
+            values = [value_at(row, col) for col in range(column_count)]
+            if values and values[0] is not None and all(value == values[0] for value in values):
+                line_symbol = color_chars[values[0]]
+                if requested is None or line_symbol == requested:
+                    divider_rows.append({"index": row, "symbol": line_symbol})
+        for col in range(column_count):
+            values = [value_at(row, col) for row in range(row_count)]
+            if values and values[0] is not None and all(value == values[0] for value in values):
+                line_symbol = color_chars[values[0]]
+                if requested is None or line_symbol == requested:
+                    divider_columns.append({"index": col, "symbol": line_symbol})
+        if operation == "divider_lines":
+            result_limit = integer("limit", 64)
+            return {
+                "symbol_filter": requested,
+                "row_count": len(divider_rows),
+                "column_count": len(divider_columns),
+                "rows": divider_rows[:result_limit],
+                "columns": divider_columns[:result_limit],
+                "truncated_lines": max(0, len(divider_rows) - result_limit) + max(0, len(divider_columns) - result_limit),
+            }
+
+        def intervals(length: int, separators: list[int]) -> list[tuple[int, int]]:
+            result = []
+            start = 0
+            for separator in separators:
+                if start < separator:
+                    result.append((start, separator))
+                start = separator + 1
+            if start < length:
+                result.append((start, length))
+            return result
+
+        row_intervals = intervals(row_count, [item["index"] for item in divider_rows])
+        col_intervals = intervals(column_count, [item["index"] for item in divider_columns])
+        all_panels = [palette((top, left, bottom, right)) for top, bottom in row_intervals for left, right in col_intervals]
+        panel_limit = integer("limit", 64)
+        return {
+            "symbol_filter": requested,
+            "divider_rows": [item["index"] for item in divider_rows],
+            "divider_columns": [item["index"] for item in divider_columns],
+            "count": len(all_panels),
+            "panels": all_panels[:panel_limit],
+            "truncated_panels": max(0, len(all_panels) - panel_limit),
+        }
+
+    if operation == "tile_summary":
+        tile_height = integer("tile_height", 1, max(row_count, 1), 1)
+        tile_width = integer("tile_width", 1, max(column_count, 1), 1)
+        tile_limit = integer("limit", 64)
+        tiles = []
+        for top in range(0, row_count, tile_height):
+            for left in range(0, column_count, tile_width):
+                bottom = min(row_count, top + tile_height)
+                right = min(column_count, left + tile_width)
+                item = palette((top, left, bottom, right))
+                item["complete"] = bottom - top == tile_height and right - left == tile_width
+                tiles.append(item)
+        return {
+            "tile_shape": [tile_height, tile_width],
+            "grid_shape": [
+                (row_count + tile_height - 1) // tile_height,
+                (column_count + tile_width - 1) // tile_width,
+            ],
+            "count": len(tiles),
+            "tiles": tiles[:tile_limit],
+            "truncated_tiles": max(0, len(tiles) - tile_limit),
+        }
+
+    if operation == "edge_distance":
+        requested = symbols(options.get("symbols"))
+        requested_values = {color_chars.index(item) for item in requested}
+        sample_limit = integer("limit", 64)
+        ranked = []
+        histogram: dict[int, int] = {}
+        for row in range(row_count):
+            for col in range(column_count):
+                if value_at(row, col) not in requested_values:
+                    continue
+                distance = min(row, col, row_count - 1 - row, column_count - 1 - col)
+                histogram[distance] = histogram.get(distance, 0) + 1
+                ranked.append((distance, row, col))
+        ranked.sort()
+        return {
+            "symbols": requested,
+            "count": len(ranked),
+            "minimum": ranked[0][0] if ranked else None,
+            "maximum": max((item[0] for item in ranked), default=None),
+            "histogram": {str(distance): histogram[distance] for distance in sorted(histogram)},
+            "nearest": [[row, col] for _distance, row, col in ranked[:sample_limit]],
+            "truncated_nearest": max(0, len(ranked) - sample_limit),
+        }
+
+    raise ValueError(f"Unknown layout operation: {operation}")
+
+
 def _bounded_frame_runs(
     grid: list[list[Any]],
     *,
@@ -2889,6 +3514,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     __FRAME_RAY_SOURCE__
     __FRAME_FIND_SOURCE__
     __FRAME_COLOR_SUMMARY_SOURCE__
+    __FRAME_SPATIAL_SOURCE__
+    __FRAME_LAYOUT_SOURCE__
     __FRAME_RUNS_SOURCE__
     __FRAME_RECTANGLES_SOURCE__
     __FRAME_ENCLOSED_REGIONS_SOURCE__
@@ -3214,6 +3841,146 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 shape=self.shape,
                 color_chars=COLOR_CHARS,
                 limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def bounds(self, symbols, *, limit=64):
+            return _bounded_frame_spatial_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="bounds", symbols=symbols, limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def region_summary(self, bounds):
+            return _bounded_frame_spatial_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="region_summary", bounds=bounds,
+            )
+
+        @_cached_frame_analysis
+        def row_profile(self, symbol=None, *, limit=64):
+            return _bounded_frame_spatial_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="row_profile", symbol=symbol, limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def column_profile(self, symbol=None, *, limit=64):
+            return _bounded_frame_spatial_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="column_profile", symbol=symbol, limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def nearest_cell(self, start, symbols, *, metric="manhattan", limit=64):
+            return _bounded_frame_spatial_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="nearest_cell", start=start, symbols=symbols,
+                metric=metric, limit=limit,
+            )
+
+        def distance(self, start, end, *, metric="manhattan"):
+            return _bounded_frame_spatial_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="distance", start=start, end=end, metric=metric,
+            )
+
+        def line_between(self, start, end, *, limit=128):
+            return _bounded_frame_spatial_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="line_between", start=start, end=end, limit=limit,
+            )
+
+        def translate_cells(self, cells, delta, *, limit=128):
+            return _bounded_frame_spatial_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="translate_cells", cells=cells, delta=delta, limit=limit,
+            )
+
+        def mirror_cells(self, cells, symmetry, *, limit=128):
+            return _bounded_frame_spatial_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="mirror_cells", cells=cells, symmetry=symmetry, limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def compare_regions(self, first, second, *, allow_recolor=True):
+            return _bounded_frame_spatial_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="compare_regions", first=first, second=second,
+                allow_recolor=allow_recolor,
+            )
+
+        @_cached_frame_analysis
+        def border_summary(self, *, thickness=1):
+            return _bounded_frame_layout_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="border_summary", thickness=thickness,
+            )
+
+        @_cached_frame_analysis
+        def corner_summary(self, *, size=1):
+            return _bounded_frame_layout_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="corner_summary", size=size,
+            )
+
+        @_cached_frame_analysis
+        def center_summary(self, *, radius=0):
+            return _bounded_frame_layout_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="center_summary", radius=radius,
+            )
+
+        @_cached_frame_analysis
+        def quadrant_summary(self):
+            return _bounded_frame_layout_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="quadrant_summary",
+            )
+
+        @_cached_frame_analysis
+        def color_adjacency(self, *, diagonal=False, limit=64):
+            return _bounded_frame_layout_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="color_adjacency", diagonal=diagonal, limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def distance_between_colors(self, first, second, *, metric="manhattan"):
+            return _bounded_frame_layout_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="distance_between_colors", first=first, second=second,
+                metric=metric,
+            )
+
+        @_cached_frame_analysis
+        def divider_lines(self, symbol=None, *, limit=64):
+            return _bounded_frame_layout_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="divider_lines", symbol=symbol, limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def panels(self, symbol=None, *, limit=64):
+            return _bounded_frame_layout_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="panels", symbol=symbol, limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def tile_summary(self, tile_height, tile_width, *, limit=64):
+            return _bounded_frame_layout_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="tile_summary", tile_height=tile_height,
+                tile_width=tile_width, limit=limit,
+            )
+
+        @_cached_frame_analysis
+        def edge_distance(self, symbols, *, limit=64):
+            return _bounded_frame_layout_operation(
+                self._grid, shape=self.shape, color_chars=COLOR_CHARS,
+                operation="edge_distance", symbols=symbols, limit=limit,
             )
 
         @_cached_frame_analysis
@@ -3973,6 +4740,12 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     "__FRAME_COLOR_SUMMARY_SOURCE__\n",
     inspect.getsource(_bounded_frame_color_summary),
 ).replace(
+    "__FRAME_SPATIAL_SOURCE__\n",
+    inspect.getsource(_bounded_frame_spatial_operation),
+).replace(
+    "__FRAME_LAYOUT_SOURCE__\n",
+    inspect.getsource(_bounded_frame_layout_operation),
+).replace(
     "__FRAME_RUNS_SOURCE__\n", inspect.getsource(_bounded_frame_runs)
 ).replace(
     "__FRAME_RECTANGLES_SOURCE__\n", inspect.getsource(_bounded_frame_rectangles)
@@ -4048,7 +4821,9 @@ def _sandbox_env() -> dict[str, str]:
 
 
 def _send_json_line(handle: Any, payload: dict[str, Any]) -> None:
-    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    handle.write(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
     handle.flush()
 
 
