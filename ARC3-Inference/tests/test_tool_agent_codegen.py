@@ -337,6 +337,113 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(payload["result"], 7)
         self.assertEqual(payload["auto_repair"]["repair"], "insert_missing_colon")
 
+    def test_final_top_level_return_is_repaired_as_result(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": {"count": 3},
+            "stdout": "",
+            "action_results": [],
+        }
+        code = "values = [1, 2, 3]\nreturn {'count': len(values)}"
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], {"count": 3})
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "replace_top_level_return"
+        )
+        repaired = sandbox.call_args.kwargs["code"]
+        self.assertIn("result = {'count': len(values)}", repaired)
+        self.assertNotIn("return {'count'", repaired)
+
+    def test_unclosed_delimiters_are_completed_before_execution(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": 3,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = "result = len([1, 2, 3"
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 3)
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "close_unmatched_delimiters"
+        )
+        self.assertEqual(sandbox.call_args.kwargs["code"], f"{code}\n])")
+
+    def test_uniformly_indented_snippet_is_dedented_before_execution(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": 6,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = "    values = [1, 2, 3]\n    result = sum(values)"
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 6)
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "dedent_uniform_block"
+        )
+        self.assertEqual(
+            sandbox.call_args.kwargs["code"],
+            "values = [1, 2, 3]\nresult = sum(values)",
+        )
+
     def test_boolean_operator_repair_preserves_strings_and_comments(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -377,6 +484,136 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertIn("# comment || text", repaired_code)
         self.assertIn("True  and  False", repaired_code)
         self.assertIn(" or  True", repaired_code)
+
+    def test_equality_operator_repair_preserves_strings_and_comments(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": True,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = (
+            'label = "literal === text"  # comment !== text\n'
+            "result = (1 === 1) and (2 !== 3)"
+        )
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertTrue(payload["result"])
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "normalize_equality_operators"
+        )
+        repaired_code = sandbox.call_args.kwargs["code"]
+        self.assertIn('"literal === text"', repaired_code)
+        self.assertIn("# comment !== text", repaired_code)
+        self.assertIn("1 == 1", repaired_code)
+        self.assertIn("2 != 3", repaired_code)
+        self.assertNotIn("1 === 1", repaired_code)
+        self.assertNotIn("2 !== 3", repaired_code)
+
+    def test_negation_operator_repair_preserves_strings_and_comments(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": True,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = (
+            'label = "literal ! text"  # comment ! text\n'
+            "result = !False and !!True"
+        )
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertTrue(payload["result"])
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "normalize_negation_operators"
+        )
+        repaired_code = sandbox.call_args.kwargs["code"]
+        self.assertIn('"literal ! text"', repaired_code)
+        self.assertIn("# comment ! text", repaired_code)
+        self.assertIn("not False", repaired_code)
+        self.assertIn("not  not True", repaired_code)
+
+    def test_variable_declaration_repair_preserves_strings_and_comments(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": 3,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = (
+            'label = "const untouched = true"  # let untouched = false\n'
+            "const values = [1, 2]\n"
+            "let total = sum(values)\n"
+            "result = total"
+        )
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 3)
+        self.assertEqual(
+            payload["auto_repair"]["repair"],
+            "normalize_variable_declarations",
+        )
+        repaired_code = sandbox.call_args.kwargs["code"]
+        self.assertIn('"const untouched = true"', repaired_code)
+        self.assertIn("# let untouched = false", repaired_code)
+        self.assertIn("values = [1, 2]", repaired_code)
+        self.assertIn("total = sum(values)", repaired_code)
+        self.assertNotIn("const values", repaired_code)
+        self.assertNotIn("let total", repaired_code)
 
     def test_semantic_fingerprint_ignores_formatting_and_comments(self) -> None:
         self.assertEqual(
@@ -777,6 +1014,171 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertNotIn("true", final_code)
         self.assertNotIn("null", final_code)
 
+    def test_candidate_verification_rewrites_container_length(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        state_path = Mock()
+        state_path.is_file.return_value = True
+        agent._session_runtime_dir = state_path
+        missing_length = {
+            "error": "AttributeError: length",
+            "diagnostic": {
+                "type": "AttributeError",
+                "attribute": "length",
+                "object_type": "list",
+                "line": 2,
+            },
+            "action_results": [],
+        }
+        successful = {"error": "", "result": 3, "action_results": []}
+        code = "items = [1, 2, 3]\nresult = items.length"
+
+        with (
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(agent, "_cached_frame_payloads", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_length, successful],
+            ) as sandbox,
+        ):
+            verified = agent._verify_python_candidate(code)
+
+        self.assertTrue(verified)
+        self.assertIn("result = len(items)", sandbox.call_args.kwargs["code"])
+
+        shadowed = "len = lambda value: 0\nitems = [1]\nresult = items.length"
+        missing_length["diagnostic"]["line"] = 3
+        with (
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(agent, "_cached_frame_payloads", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=missing_length,
+            ) as sandbox,
+        ):
+            self.assertFalse(agent._verify_python_candidate(shadowed))
+        sandbox.assert_called_once()
+
+    def test_candidate_verification_rewrites_membership_methods(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        state_path = Mock()
+        state_path.is_file.return_value = True
+        agent._session_runtime_dir = state_path
+        missing_includes = {
+            "error": "AttributeError: includes",
+            "diagnostic": {
+                "type": "AttributeError",
+                "attribute": "includes",
+                "object_type": "list",
+                "line": 3,
+            },
+            "action_results": [],
+        }
+        missing_own_property = {
+            "error": "AttributeError: hasOwnProperty",
+            "diagnostic": {
+                "type": "AttributeError",
+                "attribute": "hasOwnProperty",
+                "object_type": "dict",
+                "line": 3,
+            },
+            "action_results": [],
+        }
+        successful = {"error": "", "result": True, "action_results": []}
+        code = (
+            "items = [1, 2, 3]\n"
+            "mapping = {'x': 1}\n"
+            "result = items.includes(2) and mapping.hasOwnProperty('x')"
+        )
+
+        with (
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(agent, "_cached_frame_payloads", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_includes, missing_own_property, successful],
+            ) as sandbox,
+        ):
+            verified = agent._verify_python_candidate(code)
+
+        self.assertTrue(verified)
+        final_code = sandbox.call_args.kwargs["code"]
+        self.assertIn("2 in items", final_code)
+        self.assertIn("'x' in mapping", final_code)
+
+        invalid_arity = "result = [1, 2].includes(2, 0)"
+        missing_includes["diagnostic"]["line"] = 1
+        with (
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(agent, "_cached_frame_payloads", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=missing_includes,
+            ) as sandbox,
+        ):
+            self.assertFalse(agent._verify_python_candidate(invalid_arity))
+        sandbox.assert_called_once()
+
+    def test_candidate_verification_rewrites_standalone_list_push(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        state_path = Mock()
+        state_path.is_file.return_value = True
+        agent._session_runtime_dir = state_path
+        missing_push = {
+            "error": "AttributeError: push",
+            "diagnostic": {
+                "type": "AttributeError",
+                "attribute": "push",
+                "object_type": "list",
+                "line": 2,
+            },
+            "action_results": [],
+        }
+        successful = {"error": "", "result": [1, 2], "action_results": []}
+        code = "items = []\nitems.push(1, 2)\nresult = items"
+
+        with (
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(agent, "_cached_frame_payloads", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_push, successful],
+            ) as sandbox,
+        ):
+            verified = agent._verify_python_candidate(code)
+
+        self.assertTrue(verified)
+        self.assertIn("items.extend([1, 2])", sandbox.call_args.kwargs["code"])
+
+        value_used = "items = []\nresult = items.push(1)"
+        with (
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(agent, "_cached_frame_payloads", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=missing_push,
+            ) as sandbox,
+        ):
+            self.assertFalse(agent._verify_python_candidate(value_used))
+        sandbox.assert_called_once()
+
     def test_candidate_selection_accepts_only_deterministically_repairable_code(self) -> None:
         def choice(code: str) -> dict:
             return {
@@ -800,15 +1202,72 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertTrue(
             _choice_has_executable_tool(choice("result = True && False || True"))
         )
+        self.assertTrue(
+            _choice_has_executable_tool(choice("result = 1 === 1 and 2 !== 3"))
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(choice("result = !(1 === 2)"))
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(
+                choice("const enabled = True && False\nresult = enabled")
+            )
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(choice("value = 3\nreturn value"))
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(
+                choice("def value():\n    return 3\nreturn value()")
+            )
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(
+                choice("result = current_frame.get('objects', [])")
+            )
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(
+                choice("result = last_transition.get('result')")
+            )
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(choice("result = len([1, 2, 3"))
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(choice('result = len(["("'))
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(choice("    value = 3\n    result = value"))
+        )
         self.assertFalse(
             _choice_has_executable_tool(
                 choice("result = current_frame.not_a_real_attribute")
             )
         )
         self.assertFalse(
+            _choice_has_executable_tool(
+                choice("result = current_frame.get('not_documented')")
+            )
+        )
+        self.assertFalse(
+            _choice_has_executable_tool(
+                choice("result = current_frame.get('objects', action('LEFT'))")
+            )
+        )
+        self.assertFalse(_choice_has_executable_tool(choice("result = (")))
+        self.assertFalse(
+            _choice_has_executable_tool(choice("result = ([1, 2)]"))
+        )
+        self.assertFalse(
+            _choice_has_executable_tool(choice("    value = 3\n        result = value"))
+        )
+        self.assertFalse(
+            _choice_has_executable_tool(choice("if True:\n    return 1"))
+        )
+        self.assertFalse(
             _choice_has_executable_tool(choice("result = True & & False"))
         )
-
     def test_candidate_ranking_verifies_repaired_code_with_small_penalty(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -1004,6 +1463,28 @@ class ToolAgentCodeGenerationTests(TestCase):
             )
         )
 
+    def test_deterministic_repair_selects_one_clear_ranked_suggestion(self) -> None:
+        repaired = _deterministic_generated_python_repair(
+            "result = curent_frame.shape",
+            {
+                "type": "NameError",
+                "name": "curent_frame",
+                "suggestions": ["before_frame", "current_frame", "history"],
+            },
+        )
+
+        self.assertEqual(repaired, "result = current_frame.shape")
+        self.assertIsNone(
+            _deterministic_generated_python_repair(
+                "result = fram.shape",
+                {
+                    "type": "NameError",
+                    "name": "fram",
+                    "suggestions": ["frame", "frames"],
+                },
+            )
+        )
+
     def test_deterministic_repair_is_syntax_aware(self) -> None:
         repaired = _deterministic_generated_python_repair(
             'label = "currnt_frame"\nresult = currnt_frame.shape',
@@ -1156,6 +1637,66 @@ class ToolAgentCodeGenerationTests(TestCase):
             "from collections import Counter\nresult = dict(Counter('ABBA'))",
         )
 
+    def test_safe_imports_precede_fuzzy_identifier_repairs(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        missing_mean = {
+            "error": "NameError: mean",
+            "diagnostic": {
+                "type": "NameError",
+                "name": "mean",
+                "line": 1,
+                "suggestions": ["memory"],
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        missing_sqrt = {
+            "error": "NameError: sqrt",
+            "diagnostic": {
+                "type": "NameError",
+                "name": "sqrt",
+                "line": 2,
+                "suggestions": ["str"],
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": 2.5,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = "result = mean([sqrt(4), sqrt(9)])"
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_mean, missing_sqrt, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 2.5)
+        self.assertEqual(
+            payload["auto_repair"]["repairs"],
+            ["insert_safe_import", "insert_safe_import"],
+        )
+        repaired = sandbox.call_args.kwargs["code"]
+        self.assertIn("from statistics import mean", repaired)
+        self.assertIn("from math import sqrt", repaired)
+        self.assertNotIn("memory([", repaired)
+
     def test_run_python_tool_chains_multiple_side_effect_free_repairs(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -1254,6 +1795,423 @@ class ToolAgentCodeGenerationTests(TestCase):
             payload["auto_repair"]["repairs"],
             ["normalize_json_literal", "normalize_json_literal"],
         )
+
+    def test_run_python_tool_rewrites_container_length(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        missing_length = {
+            "error": "AttributeError: length",
+            "diagnostic": {
+                "type": "AttributeError",
+                "attribute": "length",
+                "object_type": "list",
+                "line": 2,
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": 3,
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_length, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "items = [1, 2, 3]\nresult = items.length"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 3)
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "replace_length_with_len"
+        )
+        self.assertIn("result = len(items)", sandbox.call_args.kwargs["code"])
+
+    def test_run_python_tool_rewrites_documented_view_subscription(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        not_subscriptable = {
+            "error": "TypeError: 'FrameView' object is not subscriptable",
+            "diagnostic": {
+                "type": "TypeError",
+                "object_type": "FrameView",
+                "operation": "subscription",
+                "line": 1,
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": 2,
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[not_subscriptable, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "result = len(current_frame['objects'])"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 2)
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "replace_view_subscription"
+        )
+        self.assertIn(
+            "result = len(current_frame.objects)", sandbox.call_args.kwargs["code"]
+        )
+
+    def test_view_subscription_repair_rejects_undocumented_keys(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        not_subscriptable = {
+            "error": "TypeError: 'FrameView' object is not subscriptable",
+            "diagnostic": {
+                "type": "TypeError",
+                "object_type": "FrameView",
+                "operation": "subscription",
+                "line": 1,
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=not_subscriptable,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "result = current_frame['not_documented']"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertIn("not subscriptable", payload["error"])
+        self.assertNotIn("auto_repair", payload)
+        sandbox.assert_called_once()
+
+    def test_run_python_tool_rewrites_documented_view_get(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": 2,
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "result = len(current_frame.get('objects', []))"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 2)
+        self.assertEqual(payload["auto_repair"]["repair"], "replace_view_get")
+        self.assertIn(
+            "result = len(current_frame.objects)", sandbox.call_args.kwargs["code"]
+        )
+
+    def test_run_python_tool_rewrites_exact_mapping_attribute(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        missing_attribute = {
+            "error": "AttributeError: 'dict' object has no attribute 'score'",
+            "diagnostic": {
+                "type": "AttributeError",
+                "attribute": "score",
+                "object_type": "dict",
+                "mapping_keys": ["score", "reward"],
+                "line": 2,
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": 7,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = "payload = {'score': 7}\nresult = payload.score"
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_attribute, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 7)
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "replace_mapping_attribute"
+        )
+        self.assertIn("result = payload['score']", sandbox.call_args.kwargs["code"])
+
+    def test_mapping_attribute_repair_requires_an_exact_runtime_key(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        missing_attribute = {
+            "error": "AttributeError: 'dict' object has no attribute 'score'",
+            "diagnostic": {
+                "type": "AttributeError",
+                "attribute": "score",
+                "object_type": "dict",
+                "mapping_keys": ["reward"],
+                "line": 2,
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=missing_attribute,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "payload = {'reward': 1}\nresult = payload.score"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertIn("has no attribute", payload["error"])
+        self.assertNotIn("auto_repair", payload)
+        sandbox.assert_called_once()
+
+    def test_run_python_tool_corrects_safe_builtin_keyword_typo(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        unexpected_keyword = {
+            "error": "TypeError: 'revers' is an invalid keyword argument for sort()",
+            "diagnostic": {
+                "type": "TypeError",
+                "operation": "unexpected_keyword",
+                "keyword": "revers",
+                "line": 1,
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": [3, 2, 1],
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[unexpected_keyword, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "result = sorted([1, 3, 2], revers=True)"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], [3, 2, 1])
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "correct_builtin_keyword"
+        )
+        self.assertIn("reverse=True", sandbox.call_args.kwargs["code"])
+
+    def test_builtin_keyword_repair_rejects_shadowed_builtin(self) -> None:
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "keyword": "revers",
+            "line": 3,
+        }
+        code = (
+            "def sorted(values, **kwargs):\n"
+            "    return values\n"
+            "result = sorted([2, 1], revers=True)"
+        )
+
+        repaired = tool_agent_module._deterministic_builtin_keyword_repair(
+            code, diagnostic
+        )
+
+        self.assertIsNone(repaired)
+
+    def test_run_python_tool_chains_membership_method_repairs(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        missing_includes = {
+            "error": "AttributeError: includes",
+            "diagnostic": {
+                "type": "AttributeError",
+                "attribute": "includes",
+                "object_type": "list",
+                "line": 3,
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        missing_own_property = {
+            "error": "AttributeError: hasOwnProperty",
+            "diagnostic": {
+                "type": "AttributeError",
+                "attribute": "hasOwnProperty",
+                "object_type": "dict",
+                "line": 3,
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": True,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = (
+            "items = [1, 2, 3]\n"
+            "mapping = {'x': 1}\n"
+            "result = items.includes(2) and mapping.hasOwnProperty('x')"
+        )
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_includes, missing_own_property, successful],
+            ),
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertTrue(payload["result"])
+        self.assertEqual(payload["auto_repair"]["repair_count"], 2)
+        self.assertEqual(
+            payload["auto_repair"]["repairs"],
+            ["replace_membership_method", "replace_membership_method"],
+        )
+
+    def test_run_python_tool_rewrites_standalone_list_push(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        missing_push = {
+            "error": "AttributeError: push",
+            "diagnostic": {
+                "type": "AttributeError",
+                "attribute": "push",
+                "object_type": "list",
+                "line": 2,
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": [1],
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_push, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "items = []\nitems.push(1)\nresult = items"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], [1])
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "replace_list_push"
+        )
+        self.assertIn("items.append(1)", sandbox.call_args.kwargs["code"])
 
     def test_captures_notebook_style_final_expression(self) -> None:
         runtime = self._execute_prepared_code("values = [2, 3, 5]\nsum(values)")

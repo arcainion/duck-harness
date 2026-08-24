@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import textwrap
 import time
 import tokenize
 import xml.etree.ElementTree as ET
@@ -157,21 +158,48 @@ _SANDBOX_SAFE_MODULES = frozenset(
     }
 )
 _SAFE_GENERATED_PYTHON_IMPORTS = {
+    "accumulate": "from itertools import accumulate",
+    "bisect_left": "from bisect import bisect_left",
+    "bisect_right": "from bisect import bisect_right",
     "Counter": "from collections import Counter",
+    "ceil": "from math import ceil",
+    "deepcopy": "from copy import deepcopy",
     "Fraction": "from fractions import Fraction",
     "chain": "from itertools import chain",
     "combinations": "from itertools import combinations",
     "defaultdict": "from collections import defaultdict",
     "deque": "from collections import deque",
+    "floor": "from math import floor",
+    "gcd": "from math import gcd",
+    "groupby": "from itertools import groupby",
     "heapify": "from heapq import heapify",
     "heappop": "from heapq import heappop",
     "heappush": "from heapq import heappush",
+    "insort": "from bisect import insort",
+    "islice": "from itertools import islice",
+    "itemgetter": "from operator import itemgetter",
     "lru_cache": "from functools import lru_cache",
+    "mean": "from statistics import mean",
+    "median": "from statistics import median",
+    "mode": "from statistics import mode",
     "permutations": "from itertools import permutations",
     "product": "from itertools import product",
+    "reduce": "from functools import reduce",
+    "sqrt": "from math import sqrt",
     **{module: f"import {module}" for module in _SANDBOX_SAFE_MODULES},
 }
 _MAX_DETERMINISTIC_RUNTIME_REPAIRS = 4
+_SAFE_BUILTIN_KEYWORDS = {
+    "enumerate": frozenset({"start"}),
+    "max": frozenset({"default", "key"}),
+    "min": frozenset({"default", "key"}),
+    "pow": frozenset({"mod"}),
+    "print": frozenset({"end", "file", "flush", "sep"}),
+    "round": frozenset({"ndigits"}),
+    "sorted": frozenset({"key", "reverse"}),
+    "sum": frozenset({"start"}),
+    "zip": frozenset({"strict"}),
+}
 _JSON_LITERAL_REPLACEMENTS: dict[str, Any] = {
     "false": False,
     "null": None,
@@ -455,13 +483,23 @@ def _generated_python_semantic_fingerprint(code: str) -> str:
 
 
 def _deterministic_boolean_operator_repair(code: str) -> str | None:
-    """Replace adjacent JS boolean operator tokens outside strings/comments."""
+    """Normalize deterministic JS syntax tokens outside strings/comments."""
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
     except (IndentationError, tokenize.TokenError):
         return None
     replacements: list[tuple[int, int, int, str]] = []
-    for first, second in zip(tokens, tokens[1:]):
+    lines = code.splitlines(keepends=True)
+    for index, (first, second) in enumerate(zip(tokens, tokens[1:])):
+        if first.type == tokenize.OP and first.string == "!":
+            replacements.append(
+                (
+                    first.start[0] - 1,
+                    first.start[1],
+                    first.end[1],
+                    " not ",
+                )
+            )
         if (
             first.type == tokenize.OP
             and second.type == tokenize.OP
@@ -478,9 +516,43 @@ def _deterministic_boolean_operator_repair(code: str) -> str | None:
                     " and " if first.string == "&" else " or ",
                 )
             )
+        if (
+            first.type == tokenize.OP
+            and first.string in {"==", "!="}
+            and second.type == tokenize.OP
+            and second.string == "="
+            and first.end == second.start
+            and first.start[0] == second.end[0]
+        ):
+            replacements.append(
+                (
+                    first.start[0] - 1,
+                    first.start[1],
+                    second.end[1],
+                    first.string,
+                )
+            )
+        if (
+            first.type == tokenize.NAME
+            and first.string in {"const", "let"}
+            and 0 <= first.start[0] - 1 < len(lines)
+            and not lines[first.start[0] - 1][: first.start[1]].strip()
+            and index + 2 < len(tokens)
+            and second.type == tokenize.NAME
+            and tokens[index + 2].type == tokenize.OP
+            and tokens[index + 2].string == "="
+            and first.start[0] == second.start[0] == tokens[index + 2].start[0]
+        ):
+            replacements.append(
+                (
+                    first.start[0] - 1,
+                    first.start[1],
+                    second.start[1],
+                    "",
+                )
+            )
     if not replacements:
         return None
-    lines = code.splitlines(keepends=True)
     for line_index, start, end, replacement in sorted(
         replacements, reverse=True
     ):
@@ -500,7 +572,14 @@ def _deterministic_boolean_operator_repair(code: str) -> str | None:
 
 def _deterministic_syntax_repair(code: str, error: SyntaxError) -> str | None:
     """Repair one deterministic syntax artifact and revalidate the result."""
+    if "return" in str(error.msg) and "outside function" in str(error.msg):
+        return _deterministic_top_level_return_repair(code)
+    if "unexpected indent" in str(error.msg).lower():
+        return _deterministic_uniform_dedent_repair(code)
     if "expected ':'" not in str(error.msg):
+        delimiter_repair = _deterministic_unclosed_delimiter_repair(code, error)
+        if delimiter_repair is not None:
+            return delimiter_repair
         return _deterministic_boolean_operator_repair(code)
     if not isinstance(error.lineno, int):
         return None
@@ -535,6 +614,125 @@ def _deterministic_syntax_repair(code: str, error: SyntaxError) -> str | None:
     except (SyntaxError, TypeError, ValueError, OverflowError):
         return None
     return repaired
+
+
+def _deterministic_uniform_dedent_repair(code: str) -> str | None:
+    """Remove one common outer margin from an otherwise valid Python block."""
+    nonblank_lines = [line for line in code.splitlines() if line.strip()]
+    if not nonblank_lines or any(not line[:1].isspace() for line in nonblank_lines):
+        return None
+    repaired = textwrap.dedent(code)
+    if repaired == code:
+        return None
+    try:
+        tree = _parse_bounded_generated_python(repaired)
+        compile(tree, "<python_tool_uniform_dedent_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(tree):
+        return None
+    return repaired
+
+
+def _deterministic_unclosed_delimiter_repair(
+    code: str, error: SyntaxError
+) -> str | None:
+    """Close a bounded, well-nested delimiter stack at end of generated code."""
+    message = str(error.msg).lower()
+    if "was never closed" not in message and "unexpected eof" not in message:
+        return None
+    tokens: list[tokenize.TokenInfo] = []
+    try:
+        generator = tokenize.generate_tokens(io.StringIO(code).readline)
+        while True:
+            tokens.append(next(generator))
+    except StopIteration:
+        pass
+    except tokenize.TokenError as exc:
+        if "eof in multi-line statement" not in str(exc).lower():
+            return None
+    except IndentationError:
+        return None
+
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    closing = {value: key for key, value in pairs.items()}
+    stack: list[tuple[str, int]] = []
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.OP:
+            continue
+        if token.string in pairs:
+            stack.append((token.string, index))
+        elif token.string in closing:
+            if not stack or stack[-1][0] != closing[token.string]:
+                return None
+            stack.pop()
+    if not 1 <= len(stack) <= 4:
+        return None
+    insignificant = {
+        tokenize.COMMENT,
+        tokenize.DEDENT,
+        tokenize.ENDMARKER,
+        tokenize.INDENT,
+        tokenize.NEWLINE,
+        tokenize.NL,
+    }
+    for _opener, opener_index in stack:
+        if not any(
+            token.type not in insignificant
+            for token in tokens[opener_index + 1 :]
+        ):
+            return None
+    suffix = "".join(pairs[opener] for opener, _index in reversed(stack))
+    separator = "" if code.endswith(("\n", "\r")) else "\n"
+    repaired = f"{code}{separator}{suffix}"
+    try:
+        tree = _parse_bounded_generated_python(repaired)
+        compile(tree, "<python_tool_delimiter_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(tree):
+        return None
+    return repaired
+
+
+def _deterministic_top_level_return_repair(code: str) -> str | None:
+    """Turn a final direct module-level return into the Python tool result."""
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if not tree.body or not isinstance(tree.body[-1], ast.Return):
+        return None
+    target = tree.body[-1]
+    replacement = ast.copy_location(
+        ast.Assign(
+            targets=[ast.Name(id="result", ctx=ast.Store())],
+            value=target.value if target.value is not None else ast.Constant(None),
+        ),
+        target,
+    )
+    tree.body[-1] = replacement
+    ast.fix_missing_locations(tree)
+    try:
+        compile(tree, "<python_tool_top_level_return_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(tree):
+        return None
+    return ast.unparse(tree)
+
+
+def _javascript_syntax_repair_kind(code: str) -> str:
+    kinds: list[str] = []
+    if re.search(r"(?m)^[ \t]*(?:const|let)\s+[A-Za-z_]\w*\s*=", code):
+        kinds.append("normalize_variable_declarations")
+    if "&&" in code or "||" in code:
+        kinds.append("normalize_boolean_operators")
+    if "===" in code or "!==" in code:
+        kinds.append("normalize_equality_operators")
+    if re.search(r"!(?!=)", code):
+        kinds.append("normalize_negation_operators")
+    return kinds[0] if len(kinds) == 1 else "normalize_javascript_syntax"
 
 
 def _unique_documented_attribute_suggestion(
@@ -683,6 +881,8 @@ def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
                     "type": "AttributeError",
                     "line": getattr(node, "lineno", None),
                     "attribute": node.attr,
+                    "object_type": "FrameView",
+                    "operation": "mapping_get" if node.attr == "get" else None,
                     "suggestions": suggestions,
                     "message": (
                         f"{ast.unparse(node.value)[:80]} has no documented attribute '{node.attr}'."
@@ -703,6 +903,8 @@ def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
                     "type": "AttributeError",
                     "line": getattr(node, "lineno", None),
                     "attribute": node.attr,
+                    "object_type": "TransitionView",
+                    "operation": "mapping_get" if node.attr == "get" else None,
                     "suggestions": suggestions,
                     "message": (
                         f"{ast.unparse(node.value)[:80]} has no documented transition attribute '{node.attr}'."
@@ -769,14 +971,13 @@ def _deterministic_generated_python_repair(
     require_clean_preflight: bool = True,
 ) -> str | None:
     """Apply one conservative identifier repair from a structured diagnostic."""
-    suggestions = [
-        str(item)
-        for item in diagnostic.get("suggestions") or []
-        if isinstance(item, str) and item.isidentifier()
-    ]
-    if len(suggestions) != 1:
-        return None
-    replacement = suggestions[0]
+    suggestions = list(
+        dict.fromkeys(
+            str(item)
+            for item in diagnostic.get("suggestions") or []
+            if isinstance(item, str) and item.isidentifier()
+        )
+    )
     error_type = str(diagnostic.get("type") or "")
     target = ""
     nodes: list[ast.AST] = []
@@ -804,6 +1005,23 @@ def _deterministic_generated_python_repair(
     else:
         return None
     if not target.isidentifier():
+        return None
+    if len(suggestions) == 1:
+        replacement = suggestions[0]
+    elif len(suggestions) > 1:
+        ranked = sorted(
+            (
+                (difflib.SequenceMatcher(None, target, candidate).ratio(), candidate)
+                for candidate in suggestions
+            ),
+            reverse=True,
+        )
+        if ranked[0][0] < 0.8 or ranked[0][0] - ranked[1][0] < 0.15:
+            return None
+        replacement = ranked[0][1]
+    else:
+        return None
+    if replacement == target:
         return None
     if isinstance(diagnostic_line, int):
         line_nodes = [node for node in nodes if getattr(node, "lineno", None) == diagnostic_line]
@@ -953,18 +1171,541 @@ def _deterministic_json_literal_repair(
     return repaired
 
 
+def _deterministic_length_attribute_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Rewrite one JS-style container `.length` using runtime type evidence."""
+    if (
+        str(diagnostic.get("type") or "") != "AttributeError"
+        or str(diagnostic.get("attribute") or "") != "length"
+        or str(diagnostic.get("object_type") or "")
+        not in {
+            "bytearray",
+            "bytes",
+            "dict",
+            "frozenset",
+            "list",
+            "range",
+            "set",
+            "str",
+            "tuple",
+        }
+    ):
+        return None
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if any(
+        (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "len")
+        or (isinstance(node, ast.arg) and node.arg == "len")
+        for node in ast.walk(tree)
+    ):
+        return None
+    parent = {
+        id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    diagnostic_line = diagnostic.get("line")
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "length"
+        and (
+            not isinstance(diagnostic_line, int)
+            or getattr(node, "lineno", None) == diagnostic_line
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+    attribute = candidates[0]
+    attribute_parent = parent.get(id(attribute))
+    if isinstance(attribute_parent, ast.Call) and attribute_parent.func is attribute:
+        if attribute_parent.args or attribute_parent.keywords:
+            return None
+        target: ast.AST = attribute_parent
+    else:
+        target = attribute
+    replacement = ast.copy_location(
+        ast.Call(
+            func=ast.Name(id="len", ctx=ast.Load()),
+            args=[attribute.value],
+            keywords=[],
+        ),
+        target,
+    )
+
+    class ReplaceLength(ast.NodeTransformer):
+        def generic_visit(self, node: ast.AST) -> ast.AST:
+            if node is target:
+                return replacement
+            return super().generic_visit(node)
+
+    repaired_tree = ReplaceLength().visit(tree)
+    ast.fix_missing_locations(repaired_tree)
+    repaired = ast.unparse(repaired_tree)
+    try:
+        compile(repaired_tree, "<python_tool_length_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(repaired_tree):
+        return None
+    return repaired
+
+
+def _deterministic_view_subscription_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Rewrite one proven view subscription to its documented attribute."""
+    if (
+        str(diagnostic.get("type") or "") != "TypeError"
+        or str(diagnostic.get("operation") or "") != "subscription"
+    ):
+        return None
+    object_type = str(diagnostic.get("object_type") or "")
+    documented = {
+        "FrameView": _FRAME_VIEW_ATTRIBUTES,
+        "TransitionView": _TRANSITION_VIEW_ATTRIBUTES,
+    }.get(object_type)
+    if documented is None:
+        return None
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    diagnostic_line = diagnostic.get("line")
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.ctx, ast.Load)
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+        and node.slice.value in documented
+        and (
+            not isinstance(diagnostic_line, int)
+            or getattr(node, "lineno", None) == diagnostic_line
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+    target = candidates[0]
+    replacement = ast.copy_location(
+        ast.Attribute(
+            value=target.value,
+            attr=str(target.slice.value),
+            ctx=ast.Load(),
+        ),
+        target,
+    )
+
+    class ReplaceViewSubscription(ast.NodeTransformer):
+        def generic_visit(self, node: ast.AST) -> ast.AST:
+            if node is target:
+                return replacement
+            return super().generic_visit(node)
+
+    repaired_tree = ReplaceViewSubscription().visit(tree)
+    ast.fix_missing_locations(repaired_tree)
+    try:
+        compile(repaired_tree, "<python_tool_view_subscription_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(repaired_tree):
+        return None
+    return ast.unparse(repaired_tree)
+
+
+def _deterministic_view_get_repair(
+    code: str,
+    diagnostic: dict[str, Any],
+    *,
+    require_clean_preflight: bool = True,
+) -> str | None:
+    """Rewrite one mapping-style view get to a documented attribute."""
+    if (
+        str(diagnostic.get("type") or "") != "AttributeError"
+        or str(diagnostic.get("attribute") or "") != "get"
+    ):
+        return None
+    object_type = str(diagnostic.get("object_type") or "")
+    documented = {
+        "FrameView": _FRAME_VIEW_ATTRIBUTES,
+        "TransitionView": _TRANSITION_VIEW_ATTRIBUTES,
+    }.get(object_type)
+    if documented is None:
+        return None
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    diagnostic_line = diagnostic.get("line")
+
+    def has_safe_default(node: ast.Call) -> bool:
+        if len(node.args) == 1:
+            return True
+        if len(node.args) != 2:
+            return False
+        try:
+            ast.literal_eval(node.args[1])
+        except (TypeError, ValueError, SyntaxError, MemoryError, RecursionError):
+            return False
+        return True
+
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and not node.keywords
+        and has_safe_default(node)
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and node.args[0].value in documented
+        and (
+            not isinstance(diagnostic_line, int)
+            or getattr(node, "lineno", None) == diagnostic_line
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+    target = candidates[0]
+    replacement = ast.copy_location(
+        ast.Attribute(
+            value=target.func.value,
+            attr=str(target.args[0].value),
+            ctx=ast.Load(),
+        ),
+        target,
+    )
+
+    class ReplaceViewGet(ast.NodeTransformer):
+        def generic_visit(self, node: ast.AST) -> ast.AST:
+            if node is target:
+                return replacement
+            return super().generic_visit(node)
+
+    repaired_tree = ReplaceViewGet().visit(tree)
+    ast.fix_missing_locations(repaired_tree)
+    try:
+        compile(repaired_tree, "<python_tool_view_get_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if require_clean_preflight and _generated_python_preflight_issues(repaired_tree):
+        return None
+    return ast.unparse(repaired_tree)
+
+
+def _deterministic_mapping_attribute_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Rewrite one failed dict attribute load to an exact known string key."""
+    if (
+        str(diagnostic.get("type") or "") != "AttributeError"
+        or str(diagnostic.get("object_type") or "") != "dict"
+    ):
+        return None
+    attribute = str(diagnostic.get("attribute") or "")
+    mapping_keys = {
+        str(key)
+        for key in diagnostic.get("mapping_keys") or []
+        if isinstance(key, str) and key.isidentifier()
+    }
+    if not attribute.isidentifier() or attribute not in mapping_keys:
+        return None
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    diagnostic_line = diagnostic.get("line")
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.ctx, ast.Load)
+        and node.attr == attribute
+        and (
+            not isinstance(diagnostic_line, int)
+            or getattr(node, "lineno", None) == diagnostic_line
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+    target = candidates[0]
+    replacement = ast.copy_location(
+        ast.Subscript(
+            value=target.value,
+            slice=ast.Constant(attribute),
+            ctx=ast.Load(),
+        ),
+        target,
+    )
+
+    class ReplaceMappingAttribute(ast.NodeTransformer):
+        def generic_visit(self, node: ast.AST) -> ast.AST:
+            if node is target:
+                return replacement
+            return super().generic_visit(node)
+
+    repaired_tree = ReplaceMappingAttribute().visit(tree)
+    ast.fix_missing_locations(repaired_tree)
+    try:
+        compile(repaired_tree, "<python_tool_mapping_attribute_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(repaired_tree):
+        return None
+    return ast.unparse(repaired_tree)
+
+
+def _deterministic_builtin_keyword_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Correct one high-confidence keyword typo on an unshadowed safe builtin."""
+    if (
+        str(diagnostic.get("type") or "") != "TypeError"
+        or str(diagnostic.get("operation") or "") != "unexpected_keyword"
+    ):
+        return None
+    keyword_name = str(diagnostic.get("keyword") or "")
+    if not keyword_name.isidentifier():
+        return None
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    diagnostic_line = diagnostic.get("line")
+    candidates: list[tuple[ast.Call, ast.keyword, str, str]] = []
+    for node in ast.walk(tree):
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Name)
+            or node.func.id not in _SAFE_BUILTIN_KEYWORDS
+            or (
+                isinstance(diagnostic_line, int)
+                and getattr(node, "lineno", None) != diagnostic_line
+            )
+        ):
+            continue
+        target_keywords = [item for item in node.keywords if item.arg == keyword_name]
+        if len(target_keywords) != 1:
+            continue
+        replacement = _unique_documented_attribute_suggestion(
+            keyword_name, _SAFE_BUILTIN_KEYWORDS[node.func.id]
+        )
+        if len(replacement) != 1 or any(
+            item.arg == replacement[0] for item in node.keywords
+        ):
+            continue
+        candidates.append((node, target_keywords[0], node.func.id, replacement[0]))
+    if len(candidates) != 1:
+        return None
+    _call, target_keyword, builtin_name, replacement = candidates[0]
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Store)
+            and node.id == builtin_name
+        ) or (isinstance(node, ast.arg) and node.arg == builtin_name):
+            return None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == builtin_name:
+                return None
+        if isinstance(node, ast.ExceptHandler) and node.name == builtin_name:
+            return None
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            (alias.asname or alias.name.split(".", 1)[0]) == builtin_name
+            for alias in node.names
+        ):
+            return None
+    target_keyword.arg = replacement
+    ast.fix_missing_locations(tree)
+    try:
+        compile(tree, "<python_tool_builtin_keyword_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(tree):
+        return None
+    return ast.unparse(tree)
+
+
+def _deterministic_membership_method_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Rewrite one JS-style membership method using runtime type evidence."""
+    if str(diagnostic.get("type") or "") != "AttributeError":
+        return None
+    attribute_name = str(diagnostic.get("attribute") or "")
+    object_type = str(diagnostic.get("object_type") or "")
+    compatible_types = {
+        "includes": {
+            "bytearray",
+            "bytes",
+            "frozenset",
+            "list",
+            "range",
+            "set",
+            "str",
+            "tuple",
+        },
+        "hasOwnProperty": {"dict"},
+    }
+    if object_type not in compatible_types.get(attribute_name, set()):
+        return None
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    diagnostic_line = diagnostic.get("line")
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attribute_name
+        and len(node.args) == 1
+        and not node.keywords
+        and (
+            not isinstance(diagnostic_line, int)
+            or getattr(node, "lineno", None) == diagnostic_line
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+    target = candidates[0]
+    replacement = ast.copy_location(
+        ast.Compare(
+            left=target.args[0],
+            ops=[ast.In()],
+            comparators=[target.func.value],
+        ),
+        target,
+    )
+
+    class ReplaceMembership(ast.NodeTransformer):
+        def generic_visit(self, node: ast.AST) -> ast.AST:
+            if node is target:
+                return replacement
+            return super().generic_visit(node)
+
+    repaired_tree = ReplaceMembership().visit(tree)
+    ast.fix_missing_locations(repaired_tree)
+    repaired = ast.unparse(repaired_tree)
+    try:
+        compile(repaired_tree, "<python_tool_membership_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(repaired_tree):
+        return None
+    return repaired
+
+
+def _deterministic_list_push_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Rewrite a standalone JS list push while preserving ignored-return semantics."""
+    if (
+        str(diagnostic.get("type") or "") != "AttributeError"
+        or str(diagnostic.get("attribute") or "") != "push"
+        or str(diagnostic.get("object_type") or "") != "list"
+    ):
+        return None
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    parent = {
+        id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    diagnostic_line = diagnostic.get("line")
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "push"
+        and 1 <= len(node.args) <= 16
+        and not node.keywords
+        and isinstance(parent.get(id(node)), ast.Expr)
+        and (
+            not isinstance(diagnostic_line, int)
+            or getattr(node, "lineno", None) == diagnostic_line
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+    target = candidates[0]
+    if len(target.args) == 1:
+        method = "append"
+        arguments = list(target.args)
+    else:
+        method = "extend"
+        arguments = [ast.List(elts=list(target.args), ctx=ast.Load())]
+    replacement = ast.copy_location(
+        ast.Call(
+            func=ast.Attribute(
+                value=target.func.value,
+                attr=method,
+                ctx=ast.Load(),
+            ),
+            args=arguments,
+            keywords=[],
+        ),
+        target,
+    )
+
+    class ReplacePush(ast.NodeTransformer):
+        def generic_visit(self, node: ast.AST) -> ast.AST:
+            if node is target:
+                return replacement
+            return super().generic_visit(node)
+
+    repaired_tree = ReplacePush().visit(tree)
+    ast.fix_missing_locations(repaired_tree)
+    repaired = ast.unparse(repaired_tree)
+    try:
+        compile(repaired_tree, "<python_tool_list_push_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(repaired_tree):
+        return None
+    return repaired
+
+
 def _deterministic_runtime_python_repair(
     code: str, diagnostic: dict[str, Any]
 ) -> tuple[str, str] | None:
     repaired = _deterministic_json_literal_repair(code, diagnostic)
     if repaired is not None:
         return repaired, "normalize_json_literal"
-    repaired = _deterministic_generated_python_repair(code, diagnostic)
+    repaired = _deterministic_length_attribute_repair(code, diagnostic)
     if repaired is not None:
-        return repaired, "correct_identifier"
+        return repaired, "replace_length_with_len"
+    repaired = _deterministic_view_subscription_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "replace_view_subscription"
+    repaired = _deterministic_view_get_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "replace_view_get"
+    repaired = _deterministic_mapping_attribute_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "replace_mapping_attribute"
+    repaired = _deterministic_builtin_keyword_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "correct_builtin_keyword"
+    repaired = _deterministic_membership_method_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "replace_membership_method"
+    repaired = _deterministic_list_push_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "replace_list_push"
     repaired = _deterministic_safe_import_repair(code, diagnostic)
     if repaired is not None:
         return repaired, "insert_safe_import"
+    repaired = _deterministic_generated_python_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "correct_identifier"
     return None
 
 
@@ -977,11 +1718,15 @@ def _deterministic_preflight_python_repair(
     repaired = code
     repair_count = 0
     for issue in issues:
-        candidate = _deterministic_generated_python_repair(
-            repaired,
-            issue,
-            require_clean_preflight=False,
+        candidate = _deterministic_view_get_repair(
+            repaired, issue, require_clean_preflight=False
         )
+        if candidate is None:
+            candidate = _deterministic_generated_python_repair(
+                repaired,
+                issue,
+                require_clean_preflight=False,
+            )
         if candidate is None or candidate == repaired:
             return None
         repaired = candidate
@@ -4995,7 +5740,11 @@ class ToolAgent:
                         "applied": True,
                         "original_diagnostic_type": "GeneratedCodePreflightError",
                         "original_source": first_issue.get("message"),
-                        "repair": "correct_documented_attribute",
+                        "repair": (
+                            "replace_view_get"
+                            if first_issue.get("operation") == "mapping_get"
+                            else "correct_documented_attribute"
+                        ),
                         "repair_count": repair_count,
                         "repaired_code_fingerprint": (
                             _generated_python_semantic_fingerprint(repaired)
@@ -5074,9 +5823,23 @@ class ToolAgent:
                     "original_diagnostic_type": "SyntaxError",
                     "original_source": exc.text.strip() if exc.text else None,
                     "repair": (
-                        "insert_missing_colon"
-                        if "expected ':'" in str(exc.msg)
-                        else "normalize_boolean_operators"
+                        "replace_top_level_return"
+                        if "return" in str(exc.msg)
+                        and "outside function" in str(exc.msg)
+                        else (
+                            "close_unmatched_delimiters"
+                            if "was never closed" in str(exc.msg).lower()
+                            or "unexpected eof" in str(exc.msg).lower()
+                            else (
+                                "dedent_uniform_block"
+                                if "unexpected indent" in str(exc.msg).lower()
+                                else (
+                                    "insert_missing_colon"
+                                    if "expected ':'" in str(exc.msg)
+                                    else _javascript_syntax_repair_kind(code)
+                                )
+                            )
+                        )
                     ),
                     "repaired_code_fingerprint": _generated_python_semantic_fingerprint(
                         repaired

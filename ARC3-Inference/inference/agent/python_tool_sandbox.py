@@ -10,6 +10,7 @@ import json
 import marshal
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -3407,11 +3408,20 @@ def _sandbox_exception_diagnostic(
         hint = f"Use only approved modules: {modules}." if modules else "Use an approved module."
     elif isinstance(exc, AttributeError):
         attribute = str(getattr(exc, "name", "") or "")[:120]
-        object_type = type(getattr(exc, "obj", None)).__name__[:80]
+        error_object = getattr(exc, "obj", None)
+        object_type = type(error_object).__name__[:80]
         if attribute:
             details["attribute"] = attribute
         if object_type:
             details["object_type"] = object_type
+        if isinstance(error_object, dict):
+            mapping_keys: list[str] = []
+            for key in error_object:
+                if isinstance(key, str) and key.isidentifier():
+                    mapping_keys.append(key[:120])
+                    if len(mapping_keys) >= 32:
+                        break
+            details["mapping_keys"] = sorted(mapping_keys)
         documented_attributes = {
             "FrameView": [
                 "analyze",
@@ -3479,11 +3489,14 @@ def _sandbox_exception_diagnostic(
             n=3,
             cutoff=0.45,
         )
-        hint = (
-            "Use the closest documented sandbox attribute and retry."
-            if suggestions
-            else "Check the documented sandbox object attributes and method names."
-        )
+        if object_type == "dict" and attribute in details.get("mapping_keys", []):
+            hint = f"Use mapping access for this key: [{attribute!r}]."
+        else:
+            hint = (
+                "Use the closest documented sandbox attribute and retry."
+                if suggestions
+                else "Check the documented sandbox object attributes and method names."
+            )
     elif isinstance(exc, KeyError):
         if exc.args and isinstance(exc.args[0], (str, int, float, bool, type(None))):
             details["key"] = exc.args[0]
@@ -3491,7 +3504,31 @@ def _sandbox_exception_diagnostic(
     elif isinstance(exc, IndexError):
         hint = "Check frame shape and sequence bounds before indexing."
     elif isinstance(exc, TypeError):
-        hint = "Check argument types, method signatures, and keyword-only parameters."
+        subscription_match = re.fullmatch(
+            r"'([^']+)' object is not subscriptable", str(exc)
+        )
+        keyword_match = re.search(
+            r"(?:unexpected keyword argument|invalid keyword argument(?: for \w+\(\))?:?)\s*['\"]([^'\"]+)['\"]",
+            str(exc),
+        )
+        if keyword_match is None:
+            keyword_match = re.search(
+                r"['\"]([^'\"]+)['\"] is an invalid keyword argument",
+                str(exc),
+            )
+        if subscription_match:
+            details["object_type"] = subscription_match.group(1)[:80]
+            details["operation"] = "subscription"
+            hint = (
+                "Use a documented attribute instead of mapping subscription for "
+                "sandbox view objects."
+            )
+        elif keyword_match and keyword_match.group(1).isidentifier():
+            details["keyword"] = keyword_match.group(1)[:120]
+            details["operation"] = "unexpected_keyword"
+            hint = "Check the callable's documented keyword argument names."
+        else:
+            hint = "Check argument types, method signatures, and keyword-only parameters."
     elif isinstance(exc, ValueError):
         hint = "Check the reported API constraint and retry with a valid value."
     else:
@@ -3522,6 +3559,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     import io
     import json
     import os
+    import re
     import sys
     import traceback
     import types

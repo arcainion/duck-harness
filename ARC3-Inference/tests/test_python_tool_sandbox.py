@@ -56,6 +56,45 @@ def _run_with_frame(code: str) -> dict:
 
 
 class PythonToolSandboxTests(TestCase):
+    def test_type_error_diagnostic_extracts_unexpected_keyword(self) -> None:
+        try:
+            sorted([2, 1], revers=True)
+        except TypeError as exc:
+            diagnostic = sandbox_module._sandbox_exception_diagnostic(
+                exc, "result = sorted([2, 1], revers=True)"
+            )
+
+        self.assertEqual(diagnostic["operation"], "unexpected_keyword")
+        self.assertEqual(diagnostic["keyword"], "revers")
+        self.assertIn("keyword argument", diagnostic["hint"])
+
+    def test_attribute_error_diagnostic_reports_bounded_mapping_keys(self) -> None:
+        mapping = {"score": 7, "not-a-python-attribute": 8, 3: "ignored"}
+        try:
+            mapping.score
+        except AttributeError as exc:
+            diagnostic = sandbox_module._sandbox_exception_diagnostic(
+                exc, "result = mapping.score"
+            )
+
+        self.assertEqual(diagnostic["object_type"], "dict")
+        self.assertEqual(diagnostic["attribute"], "score")
+        self.assertEqual(diagnostic["mapping_keys"], ["score"])
+        self.assertIn("mapping access", diagnostic["hint"])
+
+    def test_type_error_diagnostic_identifies_view_subscription(self) -> None:
+        try:
+            raise TypeError("'FrameView' object is not subscriptable")
+        except TypeError as exc:
+            diagnostic = sandbox_module._sandbox_exception_diagnostic(
+                exc, "result = current_frame['objects']"
+            )
+
+        self.assertEqual(diagnostic["type"], "TypeError")
+        self.assertEqual(diagnostic["object_type"], "FrameView")
+        self.assertEqual(diagnostic["operation"], "subscription")
+        self.assertIn("documented attribute", diagnostic["hint"])
+
     def test_required_os_isolation_fails_closed_without_bubblewrap(self) -> None:
         with (
             mock.patch.object(sandbox_module, "_SANDBOX_REQUIRE_OS_ISOLATION", True),
