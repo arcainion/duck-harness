@@ -3415,9 +3415,18 @@ def _sandbox_exception_diagnostic(
         if object_type:
             details["object_type"] = object_type
         if isinstance(error_object, dict):
+            details["mapping_type"] = True
             mapping_keys: list[str] = []
-            for key in error_object:
-                if isinstance(key, str) and key.isidentifier():
+            if attribute.isidentifier() and dict.__contains__(error_object, attribute):
+                mapping_keys.append(attribute[:120])
+            for inspected, key in enumerate(dict.__iter__(error_object)):
+                if inspected >= 64:
+                    break
+                if (
+                    type(key) is str
+                    and key.isidentifier()
+                    and key != attribute
+                ):
                     mapping_keys.append(key[:120])
                     if len(mapping_keys) >= 32:
                         break
@@ -3489,7 +3498,7 @@ def _sandbox_exception_diagnostic(
             n=3,
             cutoff=0.45,
         )
-        if object_type == "dict" and attribute in details.get("mapping_keys", []):
+        if details.get("mapping_type") is True and attribute in details.get("mapping_keys", []):
             hint = f"Use mapping access for this key: [{attribute!r}]."
         else:
             hint = (
@@ -3526,6 +3535,9 @@ def _sandbox_exception_diagnostic(
         elif keyword_match and keyword_match.group(1).isidentifier():
             details["keyword"] = keyword_match.group(1)[:120]
             details["operation"] = "unexpected_keyword"
+            callable_match = re.search(r"for ([A-Za-z_]\w*)\(\)", str(exc))
+            if callable_match:
+                details["callable"] = callable_match.group(1)[:120]
             hint = "Check the callable's documented keyword argument names."
         else:
             hint = "Check argument types, method signatures, and keyword-only parameters."

@@ -66,10 +66,12 @@ class PythonToolSandboxTests(TestCase):
 
         self.assertEqual(diagnostic["operation"], "unexpected_keyword")
         self.assertEqual(diagnostic["keyword"], "revers")
+        self.assertEqual(diagnostic["callable"], "sort")
         self.assertIn("keyword argument", diagnostic["hint"])
 
     def test_attribute_error_diagnostic_reports_bounded_mapping_keys(self) -> None:
-        mapping = {"score": 7, "not-a-python-attribute": 8, 3: "ignored"}
+        mapping = {f"key_{index}": index for index in range(40)}
+        mapping.update({"not-a-python-attribute": 8, 3: "ignored", "score": 7})
         try:
             mapping.score
         except AttributeError as exc:
@@ -78,8 +80,31 @@ class PythonToolSandboxTests(TestCase):
             )
 
         self.assertEqual(diagnostic["object_type"], "dict")
+        self.assertIs(diagnostic["mapping_type"], True)
         self.assertEqual(diagnostic["attribute"], "score")
+        self.assertIn("score", diagnostic["mapping_keys"])
+        self.assertEqual(len(diagnostic["mapping_keys"]), 32)
+        self.assertIn("mapping access", diagnostic["hint"])
+
+    def test_mapping_diagnostic_bypasses_dict_subclass_overrides(self) -> None:
+        class HostileDict(dict):
+            def __contains__(self, _key: object) -> bool:
+                raise AssertionError("override must not run")
+
+            def __iter__(self):
+                raise AssertionError("override must not run")
+
+        mapping = HostileDict(score=7)
+        try:
+            mapping.score
+        except AttributeError as exc:
+            diagnostic = sandbox_module._sandbox_exception_diagnostic(
+                exc, "result = mapping.score"
+            )
+
         self.assertEqual(diagnostic["mapping_keys"], ["score"])
+        self.assertEqual(diagnostic["object_type"], "HostileDict")
+        self.assertIs(diagnostic["mapping_type"], True)
         self.assertIn("mapping access", diagnostic["hint"])
 
     def test_type_error_diagnostic_identifies_view_subscription(self) -> None:

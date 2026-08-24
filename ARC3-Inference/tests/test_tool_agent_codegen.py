@@ -60,6 +60,13 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertEqual(_normalize_generated_python_code(value), "result = 5")
 
+    def test_recovers_six_bounded_structured_wrapper_levels(self) -> None:
+        value: object = "result = 6"
+        for _ in range(6):
+            value = {"code": value}
+
+        self.assertEqual(_normalize_generated_python_code(value), "result = 6")
+
     def test_recovers_json_encoded_code_mapping(self) -> None:
         value = json.dumps({"code": "result = 8"})
 
@@ -77,6 +84,24 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(
             _normalize_generated_python_code(value),
             "values = [2, 3, 5]\nresult = sum(values)",
+        )
+
+    def test_recovers_long_code_line_array_within_parser_limits(self) -> None:
+        lines = [f"value_{index} = {index}" for index in range(130)]
+        lines.append("result = value_129")
+
+        self.assertEqual(
+            _normalize_generated_python_code({"code": lines}),
+            "\n".join(lines),
+        )
+
+    def test_recovers_structured_line_array_beyond_legacy_cap(self) -> None:
+        lines = [f"# planning note {index}" for index in range(1500)]
+        lines.append("result = 7")
+
+        self.assertEqual(
+            _normalize_generated_python_code({"code": lines}),
+            "\n".join(lines),
         )
 
     def test_recovers_exact_nested_code_content_wrapper(self) -> None:
@@ -177,6 +202,22 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(_normalize_generated_python_code(wrapped), "result = current_frame.shape")
         self.assertEqual(_normalize_generated_python_code(metadata), "result = 42")
 
+    def test_recovers_provider_parts_with_benign_transport_metadata(self) -> None:
+        wrapped = {
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "result = 17",
+                    "id": "part-1",
+                    "index": 0,
+                    "role": "assistant",
+                    "status": "completed",
+                }
+            ]
+        }
+
+        self.assertEqual(_normalize_generated_python_code(wrapped), "result = 17")
+
     def test_does_not_guess_between_competing_content_parts(self) -> None:
         wrapped = {"content": [{"type": "text", "text": "result = 1"}, {"type": "text", "text": "result = 2"}]}
 
@@ -203,6 +244,104 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertIn(
             _normalize_generated_python_code(line_split),
             {"if True:    result = 7", "if True:\n    result = 7"},
+        )
+
+    def test_recovers_program_split_across_more_than_sixteen_parts(self) -> None:
+        fragments = ["result = ("] + ["1 +"] * 18 + ["1)"]
+        wrapped = {
+            "content": [
+                {"type": "output_text", "text": fragment}
+                for fragment in fragments
+            ]
+        }
+
+        self.assertEqual(
+            _normalize_generated_python_code(wrapped),
+            "".join(fragments),
+        )
+
+    def test_reassembles_compiling_parts_with_cross_fragment_dependency(self) -> None:
+        wrapped = {
+            "content": [
+                {"type": "text", "text": "values = [2, 3, 5]"},
+                {"type": "text", "text": "result = sum(values)"},
+            ]
+        }
+
+        self.assertEqual(
+            _normalize_generated_python_code(wrapped),
+            "values = [2, 3, 5]\nresult = sum(values)",
+        )
+
+    def test_comprehension_target_does_not_create_fragment_dependency(self) -> None:
+        wrapped = {
+            "content": [
+                {"type": "text", "text": "result = [x for x in [1]]"},
+                {"type": "text", "text": "result = x"},
+            ]
+        }
+
+        self.assertEqual(_normalize_generated_python_code(wrapped), str(wrapped))
+
+    def test_match_pattern_binding_creates_fragment_dependency(self) -> None:
+        first = "match {'score': 7}:\n    case {'score': score}:\n        pass\n"
+        second = "result = score"
+        wrapped = {
+            "content": [
+                {"type": "text", "text": first},
+                {"type": "text", "text": second},
+            ]
+        }
+
+        self.assertEqual(
+            _normalize_generated_python_code(wrapped),
+            f"{first}{second}",
+        )
+
+    def test_walrus_binding_creates_fragment_dependency(self) -> None:
+        first = "(score := 7)\n"
+        second = "result = score"
+        wrapped = {
+            "content": [
+                {"type": "text", "text": first},
+                {"type": "text", "text": second},
+            ]
+        }
+
+        self.assertEqual(
+            _normalize_generated_python_code(wrapped), f"{first}{second}"
+        )
+
+    def test_try_star_body_binding_creates_fragment_dependency(self) -> None:
+        first = (
+            "try:\n"
+            "    score = 7\n"
+            "except* ValueError:\n"
+            "    score = 0\n"
+        )
+        second = "result = score"
+        wrapped = {
+            "content": [
+                {"type": "text", "text": first},
+                {"type": "text", "text": second},
+            ]
+        }
+
+        self.assertEqual(
+            _normalize_generated_python_code(wrapped), f"{first}{second}"
+        )
+
+    def test_reassembles_provider_split_helper_definition(self) -> None:
+        wrapped = {
+            "content": [
+                {"type": "text", "text": "def compute():\n    return 7"},
+                {"type": "text", "text": "result = compute()"},
+            ]
+        }
+
+        self.assertEqual(
+            _normalize_generated_python_code(wrapped),
+            "def compute():\n    return 7\nresult = compute()",
         )
 
     def test_deduplicates_semantically_identical_wrapped_programs(self) -> None:
@@ -337,6 +476,34 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(payload["result"], 7)
         self.assertEqual(payload["auto_repair"]["repair"], "insert_missing_colon")
 
+    def test_missing_colon_repair_supports_async_function_headers(self) -> None:
+        code = "async def compute()\n    return 7\nresult = 1"
+        try:
+            compile(code, "<test>", "exec")
+        except SyntaxError as exc:
+            repaired = tool_agent_module._deterministic_syntax_repair(code, exc)
+        else:
+            self.fail("expected the async function header to require a colon")
+
+        self.assertEqual(
+            repaired,
+            "async def compute():\n    return 7\nresult = 1",
+        )
+
+    def test_missing_colon_repair_supports_multiline_headers(self) -> None:
+        code = "def compute(\n    value\n)\n    return value\nresult = compute(7)"
+        try:
+            compile(code, "<test>", "exec")
+        except SyntaxError as exc:
+            repaired = tool_agent_module._deterministic_syntax_repair(code, exc)
+        else:
+            self.fail("expected the multiline function header to require a colon")
+
+        self.assertEqual(
+            repaired,
+            "def compute(\n    value\n):\n    return value\nresult = compute(7)",
+        )
+
     def test_final_top_level_return_is_repaired_as_result(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -407,6 +574,16 @@ class ToolAgentCodeGenerationTests(TestCase):
         )
         self.assertEqual(sandbox.call_args.kwargs["code"], f"{code}\n])")
 
+    def test_deeper_bounded_unclosed_delimiters_are_completed(self) -> None:
+        code = "result = ((((([1, 2, 3]"
+        error = SyntaxError("'(' was never closed")
+
+        repaired = tool_agent_module._deterministic_unclosed_delimiter_repair(
+            code, error
+        )
+
+        self.assertEqual(repaired, f"{code}\n)))))")
+
     def test_uniformly_indented_snippet_is_dedented_before_execution(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -443,6 +620,56 @@ class ToolAgentCodeGenerationTests(TestCase):
             sandbox.call_args.kwargs["code"],
             "values = [1, 2, 3]\nresult = sum(values)",
         )
+
+    def test_uniform_dedent_ignores_unindented_comment_lines(self) -> None:
+        code = "# generated analysis\n    result = sum([1, 2, 3])"
+        try:
+            compile(code, "<test>", "exec")
+        except SyntaxError as exc:
+            repaired = tool_agent_module._deterministic_syntax_repair(code, exc)
+        else:
+            self.fail("expected the uniformly indented snippet to be invalid")
+
+        self.assertEqual(
+            repaired,
+            "# generated analysis\nresult = sum([1, 2, 3])",
+        )
+
+    def test_recursive_repairs_preserve_ordered_metadata(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": [],
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "    result = current_frame.objcts()"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["auto_repair"]["repair"], "repair_chain")
+        self.assertEqual(payload["auto_repair"]["repair_count"], 2)
+        self.assertEqual(
+            payload["auto_repair"]["repairs"],
+            ["dedent_uniform_block", "correct_documented_attribute"],
+        )
+        self.assertIn("current_frame.objects()", sandbox.call_args.kwargs["code"])
 
     def test_boolean_operator_repair_preserves_strings_and_comments(self) -> None:
         agent = ToolAgent(
@@ -637,6 +864,100 @@ class ToolAgentCodeGenerationTests(TestCase):
         issues = _generated_python_preflight_issues(over_limit)
         self.assertIn("1000001 iterations", issues[0]["message"])
 
+    def test_preflight_handles_shifted_ranges_but_not_keyworded_range(self) -> None:
+        shifted = _parse_bounded_generated_python("result = range(1 << 20)")
+        keyworded = _parse_bounded_generated_python(
+            "result = range(stop=1000001)"
+        )
+
+        shifted_issues = _generated_python_preflight_issues(shifted)
+        self.assertIn("1048576 iterations", shifted_issues[0]["message"])
+        self.assertFalse(
+            any(
+                "Constant range expands" in issue["message"]
+                for issue in _generated_python_preflight_issues(keyworded)
+            )
+        )
+
+    def test_preflight_skips_large_range_guard_after_range_rebinding(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "range = lambda stop: [stop]\nresult = range(2000000)"
+        )
+
+        self.assertFalse(
+            any(
+                "Constant range expands" in issue["message"]
+                for issue in _generated_python_preflight_issues(tree)
+            )
+        )
+
+    def test_preflight_skips_range_parameter_inside_reachable_helper(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "def build(range):\n"
+            "    return range(2000000)\n"
+            "result = build(lambda stop: [stop])"
+        )
+
+        self.assertFalse(
+            any(
+                "Constant range expands" in issue["message"]
+                for issue in _generated_python_preflight_issues(tree)
+            )
+        )
+
+    def test_preflight_skips_function_local_range_binding(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "def build():\n"
+            "    range = lambda stop: [stop]\n"
+            "    return range(2000000)\n"
+            "result = build()"
+        )
+
+        self.assertFalse(
+            any(
+                "Constant range expands" in issue["message"]
+                for issue in _generated_python_preflight_issues(tree)
+            )
+        )
+
+    def test_preflight_propagates_module_range_binding_into_helper(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "range = lambda stop: [stop]\n"
+            "def build():\n"
+            "    return range(2000000)\n"
+            "result = build()"
+        )
+
+        self.assertFalse(
+            any(
+                "Constant range expands" in issue["message"]
+                for issue in _generated_python_preflight_issues(tree)
+            )
+        )
+
+    def test_preflight_rejects_enormous_constant_range_expression(self) -> None:
+        tree = _parse_bounded_generated_python("result = range(10 ** 20)")
+
+        issues = _generated_python_preflight_issues(tree)
+
+        self.assertIn("100000000000000000000 iterations", issues[0]["message"])
+
+    def test_preflight_rejects_huge_two_argument_range(self) -> None:
+        tree = _parse_bounded_generated_python("result = range(0, 10 ** 20)")
+
+        issues = _generated_python_preflight_issues(tree)
+
+        self.assertIn("100000000000000000000 iterations", issues[0]["message"])
+
+    def test_preflight_rejects_huge_negative_step_range(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "result = range(10 ** 20, 0, -1)"
+        )
+
+        issues = _generated_python_preflight_issues(tree)
+
+        self.assertIn("100000000000000000000 iterations", issues[0]["message"])
+
     def test_preflight_ignores_invalid_operations_in_uncalled_helpers(self) -> None:
         tree = _parse_bounded_generated_python(
             "def dormant():\n"
@@ -653,6 +974,45 @@ class ToolAgentCodeGenerationTests(TestCase):
         issues = _generated_python_preflight_issues(tree)
 
         self.assertIn("has no break path", issues[0]["message"])
+
+    def test_preflight_excludes_while_false_body(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "while False:\n"
+            "    import pathlib\n"
+            "result = 1"
+        )
+
+        self.assertEqual(_generated_python_preflight_issues(tree), [])
+
+    def test_preflight_includes_while_false_else_suite(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "while False:\n"
+            "    pass\n"
+            "else:\n"
+            "    result = current_frame.objcts"
+        )
+
+        issues = _generated_python_preflight_issues(tree)
+        self.assertEqual(issues[0]["suggestions"], ["objects"])
+
+    def test_preflight_excludes_definitely_empty_for_body(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "for item in []:\n"
+            "    import pathlib\n"
+            "result = 1"
+        )
+
+        self.assertEqual(_generated_python_preflight_issues(tree), [])
+
+    def test_preflight_includes_function_annotations(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "def helper(value: current_frame.objcts):\n"
+            "    return value\n"
+            "result = 1"
+        )
+
+        issues = _generated_python_preflight_issues(tree)
+        self.assertEqual(issues[0]["suggestions"], ["objects"])
 
     def test_structured_inspect_tool_executes_without_custom_code(self) -> None:
         agent = ToolAgent(
@@ -927,11 +1287,11 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertTrue(verified)
         self.assertEqual(sandbox.call_count, 2)
+        self.assertEqual(agent._candidate_verification_repair_count, 1)
         self.assertEqual(
             sandbox.call_args_list[1].kwargs["code"],
             "from collections import Counter\nresult = dict(Counter('ABBA'))",
         )
-
     def test_candidate_verification_chains_multiple_safe_imports(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -970,6 +1330,7 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertTrue(verified)
         self.assertEqual(sandbox.call_count, 3)
+        self.assertEqual(agent._candidate_verification_repair_count, 2)
         final_code = sandbox.call_args_list[2].kwargs["code"]
         self.assertIn("from collections import Counter", final_code)
         self.assertIn("from itertools import product", final_code)
@@ -1240,6 +1601,20 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertTrue(
             _choice_has_executable_tool(choice("    value = 3\n    result = value"))
         )
+        self.assertTrue(
+            _choice_has_executable_tool(
+                choice("    result = current_frame.objcts()")
+            )
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(
+                choice(
+                    "items = transitions\n"
+                    "transition = items[0]\n"
+                    "result = transition.aftr_frame"
+                )
+            )
+        )
         self.assertFalse(
             _choice_has_executable_tool(
                 choice("result = current_frame.not_a_real_attribute")
@@ -1253,6 +1628,12 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertFalse(
             _choice_has_executable_tool(
                 choice("result = current_frame.get('objects', action('LEFT'))")
+            )
+        )
+        large_default = ", ".join(str(index) for index in range(130))
+        self.assertFalse(
+            _choice_has_executable_tool(
+                choice(f"result = current_frame.get('objects', [{large_default}])")
             )
         )
         self.assertFalse(_choice_has_executable_tool(choice("result = (")))
@@ -1307,6 +1688,43 @@ class ToolAgentCodeGenerationTests(TestCase):
             "result = current_frame.objects()",
         )
 
+    def test_candidate_ranking_penalizes_runtime_repairs(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        def choice(code: str) -> dict:
+            return {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "python",
+                                "arguments": json.dumps({"code": code}),
+                            }
+                        }
+                    ]
+                }
+            }
+
+        def verify(code: str) -> bool:
+            agent._candidate_verification_repair_count = int("Counter" in code)
+            return True
+
+        with patch.object(agent, "_verify_python_candidate", side_effect=verify):
+            repaired_score, repaired_valid = agent._score_candidate_choice(
+                choice("result = Counter('A')")
+            )
+            native_score, native_valid = agent._score_candidate_choice(
+                choice("result = {'A': 1}")
+            )
+
+        self.assertTrue(repaired_valid)
+        self.assertTrue(native_valid)
+        self.assertEqual(native_score - repaired_score, 5)
+
     def test_semantic_preflight_blocks_definite_failures_before_sandbox(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -1334,12 +1752,30 @@ class ToolAgentCodeGenerationTests(TestCase):
                 "Direct recursion",
             ),
             (
+                "def recurse():\n"
+                "    alias = recurse\n"
+                "    return alias()\n"
+                "result = recurse()",
+                "Direct recursion",
+            ),
+            (
+                "def recurse():\n"
+                "    alias: object = recurse\n"
+                "    return alias()\n"
+                "result = recurse()",
+                "Direct recursion",
+            ),
+            (
                 "def first():\n    return second()\n"
                 "def second():\n    return first()\n"
                 "result = first()",
                 "Mutual recursion",
             ),
             ("result = list(range(1000001))", "expands to 1000001 iterations"),
+            (
+                "result = list(range(500001 * 2))",
+                "expands to 1000002 iterations",
+            ),
         )
         for code, expected in cases:
             with (
@@ -1441,6 +1877,40 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertEqual(_generated_python_preflight_issues(tree), [])
 
+    def test_preflight_discards_rebound_recursion_alias(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "def compute():\n"
+            "    alias = compute\n"
+            "    alias = lambda: 7\n"
+            "    return alias()\n"
+            "result = compute()"
+        )
+
+        self.assertEqual(_generated_python_preflight_issues(tree), [])
+
+    def test_preflight_preserves_recursion_in_assignment_rhs(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "def compute():\n"
+            "    alias = compute\n"
+            "    alias = alias()\n"
+            "    return 7\n"
+            "result = compute()"
+        )
+
+        issues = _generated_python_preflight_issues(tree)
+        self.assertIn("Direct recursion", issues[0]["message"])
+
+    def test_preflight_discards_deleted_recursion_alias(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "def compute():\n"
+            "    alias = compute\n"
+            "    del alias\n"
+            "    return alias()\n"
+            "result = compute()"
+        )
+
+        self.assertEqual(_generated_python_preflight_issues(tree), [])
+
     def test_deterministic_repair_applies_one_unambiguous_name_fix(self) -> None:
         repaired = _deterministic_generated_python_repair(
             "result = currnt_frame.shape",
@@ -1510,6 +1980,47 @@ class ToolAgentCodeGenerationTests(TestCase):
                 },
             )
         )
+
+    def test_preflight_invalidates_rebound_view_aliases(self) -> None:
+        for code in (
+            "frame = current_frame\ndel frame\nresult = frame.objcts",
+            "frame = current_frame\nframe += 1\nresult = frame.objcts",
+            "frame = current_frame\ndef frame():\n    return 1\nresult = frame.objcts",
+            "frame = current_frame\nfor frame in [1]:\n    pass\nresult = frame.objcts",
+            "frame = current_frame\nwith manager as frame:\n    pass\nresult = frame.objcts",
+        ):
+            with self.subTest(code=code):
+                tree = _parse_bounded_generated_python(code)
+                self.assertEqual(_generated_python_preflight_issues(tree), [])
+
+    def test_preflight_tracks_top_level_assignment_expression_aliases(self) -> None:
+        inferred = _parse_bounded_generated_python(
+            "(frame := current_frame)\nresult = frame.objcts()"
+        )
+        invalidated = _parse_bounded_generated_python(
+            "frame = current_frame\n(frame := 1)\nresult = frame.objcts"
+        )
+
+        inferred_issues = _generated_python_preflight_issues(inferred)
+        self.assertEqual(len(inferred_issues), 1)
+        self.assertEqual(inferred_issues[0]["suggestions"], ["objects"])
+        self.assertEqual(_generated_python_preflight_issues(invalidated), [])
+
+    def test_preflight_uses_view_provenance_at_source_position(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "result = current_frame.objcts\ncurrent_frame = object()"
+        )
+
+        issues = _generated_python_preflight_issues(tree)
+        self.assertEqual(issues[0]["suggestions"], ["objects"])
+
+    def test_preflight_tracks_view_aliases_through_constant_branch(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "if True:\n    frame = current_frame\nresult = frame.objcts"
+        )
+
+        issues = _generated_python_preflight_issues(tree)
+        self.assertEqual(issues[0]["suggestions"], ["objects"])
 
     def test_static_action_analysis_skips_dead_and_uncalled_code(self) -> None:
         agent = ToolAgent(
@@ -1636,6 +2147,12 @@ class ToolAgentCodeGenerationTests(TestCase):
             sandbox.call_args_list[1].kwargs["code"],
             "from collections import Counter\nresult = dict(Counter('ABBA'))",
         )
+        self.assertEqual(
+            payload["auto_repair"]["repaired_code_fingerprint"],
+            _generated_python_semantic_fingerprint(
+                sandbox.call_args_list[1].kwargs["code"]
+            ),
+        )
 
     def test_safe_imports_precede_fuzzy_identifier_repairs(self) -> None:
         agent = ToolAgent(
@@ -1697,6 +2214,88 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertIn("from math import sqrt", repaired)
         self.assertNotIn("memory([", repaired)
 
+    def test_safe_import_completion_supports_sequence_analysis_helpers(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        missing_prod = {
+            "error": "NameError: prod",
+            "diagnostic": {"type": "NameError", "name": "prod", "line": 1},
+            "stdout": "",
+            "action_results": [],
+        }
+        missing_pairwise = {
+            "error": "NameError: pairwise",
+            "diagnostic": {"type": "NameError", "name": "pairwise", "line": 2},
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": 6,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = "result = prod(b - a for a, b in pairwise([1, 3, 6]))"
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_prod, missing_pairwise, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 6)
+        self.assertEqual(payload["auto_repair"]["repair_count"], 2)
+        repaired = sandbox.call_args.kwargs["code"]
+        self.assertIn("from math import prod", repaired)
+        self.assertIn("from itertools import pairwise", repaired)
+
+    def test_safe_import_completion_supports_integer_grid_helpers(self) -> None:
+        isqrt_repair = tool_agent_module._deterministic_safe_import_repair(
+            "result = isqrt(81)",
+            {"type": "NameError", "name": "isqrt", "line": 1},
+        )
+        namedtuple_repair = tool_agent_module._deterministic_safe_import_repair(
+            "Point = namedtuple('Point', 'row col')\nresult = Point(1, 2)",
+            {"type": "NameError", "name": "namedtuple", "line": 1},
+        )
+
+        self.assertEqual(isqrt_repair, "from math import isqrt\nresult = isqrt(81)")
+        self.assertIn("from collections import namedtuple", namedtuple_repair)
+        self.assertEqual(
+            tool_agent_module._deterministic_safe_import_repair(
+                "result = lcm(6, 8)",
+                {"type": "NameError", "name": "lcm", "line": 1},
+            ),
+            "from math import lcm\nresult = lcm(6, 8)",
+        )
+
+    def test_safe_import_completion_supports_geometry_and_operator_helpers(self) -> None:
+        expected = {
+            "degrees": "from math import degrees",
+            "radians": "from math import radians",
+            "hypot": "from math import hypot",
+            "attrgetter": "from operator import attrgetter",
+            "methodcaller": "from operator import methodcaller",
+        }
+        for name, import_line in expected.items():
+            with self.subTest(name=name):
+                repaired = tool_agent_module._deterministic_safe_import_repair(
+                    f"result = {name}(value)",
+                    {"type": "NameError", "name": name, "line": 1},
+                )
+                self.assertTrue(repaired.startswith(f"{import_line}\n"))
+
     def test_run_python_tool_chains_multiple_side_effect_free_repairs(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -1749,6 +2348,217 @@ class ToolAgentCodeGenerationTests(TestCase):
         )
         self.assertEqual(sandbox.call_count, 3)
 
+    def test_run_python_tool_supports_more_than_four_safe_repairs(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        names = ["Counter", "product", "sqrt", "mean", "pairwise"]
+        failures = [
+            {
+                "error": f"NameError: {name}",
+                "diagnostic": {
+                    "type": "NameError",
+                    "name": name,
+                    "line": 2 * index + 1,
+                },
+                "stdout": "",
+                "action_results": [],
+            }
+            for index, name in enumerate(names)
+        ]
+        successful = {
+            "error": "",
+            "result": 1,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = "\n".join(
+            [
+                "counts = Counter('AA')",
+                "pairs = list(product([1], repeat=2))",
+                "root = sqrt(4)",
+                "average = mean([root])",
+                "steps = list(pairwise([1, 2]))",
+                "result = len(counts) + len(pairs) + len(steps) - int(average)",
+            ]
+        )
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[*failures, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 1)
+        self.assertEqual(payload["auto_repair"]["repair_count"], 5)
+        self.assertEqual(sandbox.call_count, 6)
+
+    def test_effectful_call_detection_ignores_strings_and_comments(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        missing_counter = {
+            "error": "NameError: Counter",
+            "diagnostic": {
+                "type": "NameError",
+                "name": "Counter",
+                "line": 7,
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": {"A": 1},
+            "stdout": "",
+            "action_results": [],
+        }
+        code = (
+            'label = "remember("\n'
+            "# forget(\n"
+            "if False:\n"
+            '    remember("dead", 1)\n'
+            "def unused():\n"
+            '    forget("also_dead")\n'
+            'result = dict(Counter("A"))'
+        )
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_counter, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], {"A": 1})
+        self.assertEqual(payload["auto_repair"]["repair"], "insert_safe_import")
+        self.assertEqual(sandbox.call_count, 2)
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=missing_counter,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": 'remember("key", 1)\nresult = dict(Counter("A"))'},
+            )
+
+        self.assertIn("NameError", json.loads(response.content)["error"])
+        sandbox.assert_called_once()
+
+    def test_effectful_call_detection_follows_called_function_alias(self) -> None:
+        code = (
+            "def mutate():\n"
+            "    remember('key', 1)\n"
+            "alias = mutate\n"
+            "alias()\n"
+            "result = Counter('A')"
+        )
+
+        self.assertTrue(
+            tool_agent_module._generated_python_calls_any(
+                code, frozenset({"remember", "forget", "record_strategy"})
+            )
+        )
+        branch_alias = code.replace("alias = mutate", "if True:\n    alias = mutate")
+        self.assertTrue(
+            tool_agent_module._generated_python_calls_any(
+                branch_alias, frozenset({"remember", "forget", "record_strategy"})
+            )
+        )
+
+    def test_effectful_call_detection_respects_alias_rebinding_order(self) -> None:
+        prefix = "def mutate():\n    remember('key', 1)\nalias = mutate\n"
+        names = frozenset({"remember", "forget", "record_strategy"})
+
+        self.assertFalse(
+            tool_agent_module._generated_python_calls_any(
+                prefix + "alias = lambda: None\nalias()", names
+            )
+        )
+        self.assertTrue(
+            tool_agent_module._generated_python_calls_any(
+                prefix + "alias()\nalias = lambda: None", names
+            )
+        )
+
+    def test_effectful_call_detection_preserves_assignment_rhs_call(self) -> None:
+        code = (
+            "def mutate():\n"
+            "    remember('key', 1)\n"
+            "alias = mutate\n"
+            "alias = alias()"
+        )
+
+        self.assertTrue(
+            tool_agent_module._generated_python_calls_any(
+                code, frozenset({"remember", "forget", "record_strategy"})
+            )
+        )
+
+    def test_effectful_call_detection_follows_transitive_helper_alias(self) -> None:
+        code = (
+            "def mutate():\n"
+            "    remember('key', 1)\n"
+            "def wrapper():\n"
+            "    alias = mutate\n"
+            "    alias()\n"
+            "wrapper()"
+        )
+
+        self.assertTrue(
+            tool_agent_module._generated_python_calls_any(
+                code, frozenset({"remember", "forget", "record_strategy"})
+            )
+        )
+
+    def test_effectful_call_detection_ignores_unrelated_object_method(self) -> None:
+        self.assertFalse(
+            tool_agent_module._generated_python_calls_any(
+                "logger.remember('message')\nresult = 1",
+                frozenset({"remember", "forget", "record_strategy"}),
+            )
+        )
+
+    def test_effectful_call_detection_discards_deleted_alias(self) -> None:
+        code = (
+            "def mutate():\n"
+            "    remember('key', 1)\n"
+            "alias = mutate\n"
+            "del alias\n"
+            "alias()"
+        )
+
+        self.assertFalse(
+            tool_agent_module._generated_python_calls_any(
+                code, frozenset({"remember", "forget", "record_strategy"})
+            )
+        )
+
     def test_run_python_tool_reports_json_literal_repair_chain(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -1795,6 +2605,46 @@ class ToolAgentCodeGenerationTests(TestCase):
             payload["auto_repair"]["repairs"],
             ["normalize_json_literal", "normalize_json_literal"],
         )
+
+    def test_length_repair_accepts_mapping_subclass_diagnostic(self) -> None:
+        repaired = tool_agent_module._deterministic_length_attribute_repair(
+            "result = payload.length",
+            {
+                "type": "AttributeError",
+                "attribute": "length",
+                "object_type": "ScoreMap",
+                "mapping_type": True,
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = len(payload)")
+
+    def test_length_repair_accepts_size_property(self) -> None:
+        repaired = tool_agent_module._deterministic_length_attribute_repair(
+            "result = values.size",
+            {
+                "type": "AttributeError",
+                "attribute": "size",
+                "object_type": "set",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = len(values)")
+
+    def test_length_repair_accepts_dictionary_view(self) -> None:
+        repaired = tool_agent_module._deterministic_length_attribute_repair(
+            "result = keys.length",
+            {
+                "type": "AttributeError",
+                "attribute": "length",
+                "object_type": "dict_keys",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = len(keys)")
 
     def test_run_python_tool_rewrites_container_length(self) -> None:
         agent = ToolAgent(
@@ -2043,6 +2893,43 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertNotIn("auto_repair", payload)
         sandbox.assert_called_once()
 
+    def test_mapping_attribute_repair_accepts_one_clear_key_typo(self) -> None:
+        diagnostic = {
+            "type": "AttributeError",
+            "attribute": "scroe",
+            "object_type": "dict",
+            "mapping_keys": ["reward", "score"],
+            "line": 2,
+        }
+        code = "payload = {'score': 7}\nresult = payload.scroe"
+
+        repaired = tool_agent_module._deterministic_mapping_attribute_repair(
+            code, diagnostic
+        )
+
+        self.assertEqual(repaired, "payload = {'score': 7}\nresult = payload['score']")
+        ambiguous = dict(diagnostic, attribute="fram", mapping_keys=["frame", "frames"])
+        self.assertIsNone(
+            tool_agent_module._deterministic_mapping_attribute_repair(
+                "payload = {}\nresult = payload.fram", ambiguous
+            )
+        )
+
+    def test_mapping_attribute_repair_accepts_dict_subclass_diagnostic(self) -> None:
+        repaired = tool_agent_module._deterministic_mapping_attribute_repair(
+            "result = payload.score",
+            {
+                "type": "AttributeError",
+                "object_type": "ScoreMap",
+                "mapping_type": True,
+                "attribute": "score",
+                "mapping_keys": ["score"],
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = payload['score']")
+
     def test_run_python_tool_corrects_safe_builtin_keyword_typo(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -2106,6 +2993,147 @@ class ToolAgentCodeGenerationTests(TestCase):
         )
 
         self.assertIsNone(repaired)
+
+    def test_list_sort_keyword_repair_requires_static_list_receiver(self) -> None:
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "callable": "sort",
+            "keyword": "revers",
+            "line": 2,
+        }
+        code = "items = [3, 1, 2]\nitems.sort(revers=True)\nresult = items"
+
+        repaired = tool_agent_module._deterministic_list_sort_keyword_repair(
+            code, diagnostic
+        )
+
+        self.assertIn("items.sort(reverse=True)", repaired)
+        self.assertIsNone(
+            tool_agent_module._deterministic_list_sort_keyword_repair(
+                "items = source\nitems.sort(revers=True)", diagnostic
+            )
+        )
+
+    def test_list_sort_keyword_repair_respects_receiver_rebinding(self) -> None:
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "callable": "sort",
+            "keyword": "revers",
+            "line": 3,
+        }
+
+        self.assertIsNone(
+            tool_agent_module._deterministic_list_sort_keyword_repair(
+                "items = []\nitems = source\nitems.sort(revers=True)",
+                diagnostic,
+            )
+        )
+
+    def test_list_sort_keyword_repair_tracks_alias_and_constant_branch(self) -> None:
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "callable": "sort",
+            "keyword": "revers",
+            "line": 4,
+        }
+        code = (
+            "if True:\n"
+            "    items = [3, 1, 2]\n"
+            "ordered = items\n"
+            "ordered.sort(revers=True)"
+        )
+
+        repaired = tool_agent_module._deterministic_list_sort_keyword_repair(
+            code, diagnostic
+        )
+
+        self.assertIn("ordered.sort(reverse=True)", repaired)
+
+    def test_list_sort_keyword_repair_tracks_function_local_list(self) -> None:
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "callable": "sort",
+            "keyword": "revers",
+            "line": 3,
+        }
+        code = (
+            "def order():\n"
+            "    items = [3, 1, 2]\n"
+            "    items.sort(revers=True)\n"
+            "    return items\n"
+            "result = order()"
+        )
+
+        repaired = tool_agent_module._deterministic_list_sort_keyword_repair(
+            code, diagnostic
+        )
+
+        self.assertIn("items.sort(reverse=True)", repaired)
+
+    def test_list_sort_keyword_repair_invalidates_loop_target(self) -> None:
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "callable": "sort",
+            "keyword": "revers",
+            "line": 4,
+        }
+        code = (
+            "items = []\n"
+            "for items in sources:\n"
+            "    pass\n"
+            "items.sort(revers=True)"
+        )
+
+        self.assertIsNone(
+            tool_agent_module._deterministic_list_sort_keyword_repair(
+                code, diagnostic
+            )
+        )
+
+    def test_membership_repair_accepts_mapping_subclass_diagnostic(self) -> None:
+        repaired = tool_agent_module._deterministic_membership_method_repair(
+            "result = payload.hasOwnProperty('score')",
+            {
+                "type": "AttributeError",
+                "attribute": "hasOwnProperty",
+                "object_type": "ScoreMap",
+                "mapping_type": True,
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = 'score' in payload")
+
+    def test_string_method_repair_accepts_starts_with(self) -> None:
+        repaired = tool_agent_module._deterministic_string_method_repair(
+            "result = label.startsWith('arc', 1)",
+            {
+                "type": "AttributeError",
+                "attribute": "startsWith",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = label.startswith('arc', 1)")
+
+    def test_string_method_repair_accepts_ends_with(self) -> None:
+        repaired = tool_agent_module._deterministic_string_method_repair(
+            "result = label.endsWith('arc')",
+            {
+                "type": "AttributeError",
+                "attribute": "endsWith",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = label.endswith('arc')")
 
     def test_run_python_tool_chains_membership_method_repairs(self) -> None:
         agent = ToolAgent(
@@ -2510,6 +3538,59 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertEqual(sandbox.call_count, 1)
         self.assertIn("Duplicate failed program suppressed", transcript)
+
+    def test_static_action_analysis_inspects_function_default(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "def helper(moves=action([{'action': 'LEFT'}])):\n"
+            "    return moves"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_inspects_lambda_default(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "helper = lambda moves=action([{'action': 'LEFT'}]): moves"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_tracks_direct_walrus_binding(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "(moves := [{'action': 'LEFT'}])\naction(moves)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_excludes_empty_for_body(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "for item in []:\n"
+            "    action([{'action': 'LEFT'}])\n"
+            "result = 1"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
+    def test_static_action_analysis_inspects_function_annotation(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "def helper(value: action([{'action': 'LEFT'}])):\n"
+            "    return value"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}]],
+        )
 
     def test_repeated_failure_triggers_quality_model_failover(self) -> None:
         agent = ToolAgent(
