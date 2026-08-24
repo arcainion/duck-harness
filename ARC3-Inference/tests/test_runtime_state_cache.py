@@ -23,7 +23,13 @@ class RuntimeStateCacheTests(unittest.TestCase):
             write_runtime_state(
                 path,
                 current_frame=frame,
-                history=[HistoryEntry(action="RIGHT", frame=frame)],
+                history=[
+                    HistoryEntry(
+                        action="RIGHT",
+                        frame=frame,
+                        animation={"transient_changed_cells": 2},
+                    )
+                ],
             )
             first = load_runtime_state(path)
 
@@ -36,6 +42,7 @@ class RuntimeStateCacheTests(unittest.TestCase):
 
         self.assertEqual(second, first)
         self.assertIsNot(second[1], first[1])
+        self.assertEqual(second[1][0].animation["transient_changed_cells"], 2)
 
     def test_write_invalidates_cached_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

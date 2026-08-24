@@ -128,7 +128,11 @@ def _resolve_game_ids(args: argparse.Namespace) -> list[str]:
     # Local dataset/generator game enumeration is not available in this build, so
     # the only built-in game set is the official one (``--include-tags official``).
     # The live competition supplies its own game list at runtime.
-    if dataset_specs or exclude_tags or any(tag.lower() != "official" for tag in include_tags):
+    if (
+        dataset_specs
+        or exclude_tags
+        or any(tag.lower() != "official" for tag in include_tags)
+    ):
         raise ValueError(
             "Dataset/tag-based game selection beyond '--include-tags official' is not "
             "available in this build. Use --game with explicit ids, --include-tags "
@@ -768,6 +772,13 @@ def _positive_env_int(name: str, default: int) -> int:
         return default
 
 
+def _nonnegative_env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default)) or default))
+    except ValueError:
+        return default
+
+
 def _write_run_config(
     args: argparse.Namespace,
     *,
@@ -822,11 +833,62 @@ def _write_run_config(
         "inference_capabilities": {
             "controller_policy": os.environ.get(
                 "LOCAL_ANALYZER_STRATEGY_POLICY", "outcome_aware"
-            ).strip().lower().replace("-", "_"),
+            )
+            .strip()
+            .lower()
+            .replace("-", "_"),
             "candidate_count": _positive_env_int("LOCAL_ANALYZER_CANDIDATES", 2),
+            "game_token_budget": _nonnegative_env_int(
+                "LOCAL_ANALYZER_GAME_TOKEN_BUDGET", 250000
+            ),
             "plan_min_support": _positive_env_int("LOCAL_ANALYZER_PLAN_MIN_SUPPORT", 2),
             "durable_cross_trial_knowledge": True,
             "structured_causal_model": True,
+            "causal_model_grounded": True,
+            "reward_and_terminal_aware": True,
+            "information_gain_exploration": True,
+            "contextual_plan_validation": True,
+            "temporal_motion_evidence": True,
+            "independent_evidence_support": True,
+            "process_safe_knowledge_store": True,
+            "adaptive_inference_budget": True,
+            "terminal_game_token_budget": True,
+            "complete_inference_trace_contract": True,
+            "provider_usage_fallback": True,
+            "pareto_utility_planning": True,
+            "simple_path_planning": True,
+            "state_conditioned_causal_model": True,
+            "causal_cache_coherence": True,
+            "bounded_causal_eviction": True,
+            "full_batch_harm_guard": True,
+            "dynamic_host_harm_guard": True,
+            "partial_batch_diagnostics": True,
+            "guard_metric_taxonomy": True,
+            "reset_scoped_volatility": True,
+            "repeatable_exact_effect_recovery": True,
+            "state_dependent_batch_actions": True,
+            "declining_request_deadline": True,
+            "lossless_bounded_knowledge_merge": True,
+            "confidence_aware_harm_evidence": True,
+            "coordinate_scoped_parameterized_evidence": True,
+            "joint_transition_calibration": True,
+            "provenance_weighted_action_models": True,
+            "observable_decision_state": True,
+            "behavior_backed_regression_gates": True,
+            "contingent_observation_planning": True,
+            "delayed_credit_assignment": True,
+            "object_centric_temporal_state": True,
+            "hypothesis_directed_exploration": True,
+            "adaptive_recovery_portfolio": True,
+            "nonstationary_dynamics_detection": True,
+            "state_context_continuity": True,
+            "animation_aware_outcomes": True,
+            "executable_branch_policy": True,
+            "regime_aware_recency": True,
+            "object_abstract_planning": True,
+            "causal_credit_continuity": True,
+            "deterministic_budget_fallback": True,
+            "versioned_state_memory": True,
         },
         "wave_count": wave_count,
         "max_actions": args.max_actions,
@@ -1238,9 +1300,7 @@ def main() -> None:
     parser.add_argument("--dataset", "--datasets", dest="dataset", default="")
     parser.add_argument("--include-tags", dest="include_tags", default="")
     parser.add_argument("--exclude-tags", dest="exclude_tags", default="")
-    parser.add_argument(
-        "--environments-dir", dest="environments_dir", default=None
-    )
+    parser.add_argument("--environments-dir", dest="environments_dir", default=None)
     parser.add_argument("--datasets-dir", dest="datasets_dir", default=None)
     parser.add_argument(
         "--list-games",

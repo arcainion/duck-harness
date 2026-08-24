@@ -400,6 +400,32 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
         request_payload = agent._http_session.post.call_args.kwargs["json"]
         self.assertEqual(request_payload["n"], 2)
 
+    def test_chat_completion_estimates_generated_tokens_when_usage_is_missing(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        response = _Response(
+            200,
+            "",
+            {
+                "choices": [
+                    {
+                        "message": {"content": "A sufficiently long generated response."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+        agent._http_session.post = Mock(return_value=response)
+
+        result = agent._chat_completion(
+            [{"role": "user", "content": "go"}], tools=None
+        )
+        agent._accumulate_usage_tokens(result.usage)
+
+        self.assertGreater(result.usage["generated_tokens"], 0)
+        self.assertEqual(
+            agent._session_generated_tokens, result.usage["generated_tokens"]
+        )
+
     def test_agent_activates_configured_fallback_model(self) -> None:
         agent = ToolAgent(model="unit-test-model")
         config_type = type(agent._model)

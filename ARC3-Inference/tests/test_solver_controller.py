@@ -21,6 +21,7 @@ from inference.agent.inference_controller import (
     InferenceControllerConfig,
 )
 from inference.agent.runtime_state import Frame, HistoryEntry
+from inference.agent.trial_knowledge import TrialKnowledgeStore
 from inference.framework.solver import (
     _HarnessGameSession,
     _evaluate_strategy_prediction,
@@ -29,7 +30,183 @@ from inference.framework.solver import (
 
 
 class SolverControllerTests(TestCase):
-    def test_analyzer_retry_circuit_breaker_stops_repeated_transport_failures(self) -> None:
+    def test_host_cross_trial_harm_check_uses_the_current_state(self) -> None:
+        store = TrialKnowledgeStore()
+        frame = Frame(grid=((2,),), step=1, level=1)
+        state_id = solver_module.frame_fingerprint(frame)
+        store.observe(
+            "game-a",
+            {
+                "executed": True,
+                "before_state_id": state_id,
+                "after_state_id": "terminal",
+                "action_display": "RIGHT",
+                "outcome_class": "terminal_failure",
+            },
+            evidence_id="run-a:pass=0",
+        )
+        session = object.__new__(_HarnessGameSession)
+        session.solver = SimpleNamespace(_knowledge_store=store)
+        session.game = SimpleNamespace(game_run=SimpleNamespace(game_id="game-a"))
+        session.controller_config = InferenceControllerConfig(
+            enabled=True, policy=OUTCOME_AWARE_POLICY
+        )
+        session.current_frame = lambda: frame
+
+        reason = session._cross_trial_harm_reason("RIGHT")
+
+        self.assertIn("1 of 1 independent cross-trial", reason)
+        self.assertIsNone(session._cross_trial_harm_reason("LEFT"))
+
+        store.observe(
+            "game-a",
+            {
+                "executed": True,
+                "before_state_id": state_id,
+                "after_state_id": "progress",
+                "action_display": "RIGHT",
+                "outcome_class": "level_progress",
+            },
+            evidence_id="run-b:pass=0",
+        )
+        self.assertIsNone(session._cross_trial_harm_reason("RIGHT"))
+
+    def test_game_token_budget_yield_finishes_instead_of_retrying_forever(self) -> None:
+        run = SimpleNamespace(
+            state="playing",
+            history=[],
+            final_score=None,
+            solver_note=None,
+            solver_analysis_html=None,
+        )
+        state = SimpleNamespace(
+            raw=SimpleNamespace(state=arcengine.GameState.NOT_FINISHED),
+            available_actions={arcengine.GameAction.ACTION1.value},
+        )
+        calls = 0
+
+        def analyze(*_args, **_kwargs) -> AnalyzerTurnResult:
+            nonlocal calls
+            calls += 1
+            return AnalyzerTurnResult(
+                step_executed=False,
+                yielded_control=True,
+                yield_reason="game_token_budget",
+            )
+
+        def finish_game() -> None:
+            run.final_score = 0
+
+        game = SimpleNamespace(
+            current_state=state,
+            game_run=run,
+            finish_game=finish_game,
+        )
+        solver = SimpleNamespace(
+            max_runtime_s_per_game=None,
+            max_actions_per_game=None,
+            soft_time_remaining_seconds=lambda: None,
+        )
+        analyzer = SimpleNamespace(total_tokens=100, analyze=analyze)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = _HarnessGameSession(
+                solver=solver,
+                game=game,
+                analyzer=analyzer,
+                game_index=0,
+                pass_index=0,
+                state_path=root / "state.json",
+                transcript_path=root / "transcript.txt",
+                analysis_html_relpath="analysis.html",
+                stop_event=threading.Event(),
+                viewer_data_path=root / "viewer.json",
+                controller_config=InferenceControllerConfig(enabled=False),
+            )
+            for method_name in (
+                "seed_initial_history",
+                "write_runtime_state",
+                "_append_initial_viewer_event",
+                "write_viewer_payload",
+                "_write_analysis_html",
+            ):
+                setattr(session, method_name, lambda: None)
+            session._read_transcript_bytes = lambda: b""
+            session._transcript_delta_since = lambda _content: ""
+
+            session.play()
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(run.final_score, 0)
+        self.assertIn("game_token_budget", run.solver_note)
+
+    def test_game_token_budget_fallback_executes_safe_ranked_action(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.controller_config = InferenceControllerConfig(
+            enabled=True, policy=OUTCOME_AWARE_POLICY
+        )
+        session.history_entries = []
+        session.should_stop = lambda: False
+        session.current_frame = lambda: Frame(grid=((0,),), step=0, level=1)
+        session.game = SimpleNamespace()
+        captured: list[dict] = []
+
+        def step_env(arguments: dict) -> dict:
+            captured.append(arguments)
+            return {"executed": True}
+
+        session.step_env = step_env
+        with (
+            mock.patch.object(
+                solver_module, "_engine_action_names", return_value=["ACTION4"]
+            ),
+            mock.patch.object(
+                solver_module,
+                "build_experience_snapshot",
+                return_value={
+                    "ranked_actions": [
+                        {"action": "RIGHT", "harm_decisive": False},
+                    ],
+                    "mouse_search": {},
+                },
+            ),
+        ):
+            executed = session._execute_controller_fallback("game_token_budget")
+
+        self.assertTrue(executed)
+        self.assertEqual(captured[0]["actions"], [{"action": "RIGHT"}])
+        self.assertEqual(captured[0]["controller_fallback_reason"], "game_token_budget")
+
+    def test_action_viewer_event_preserves_inference_metric_fields(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.viewer_events = []
+        session.analysis_step = 3
+        session._base_viewer_event = lambda _frame: {}
+        animation = {"intermediate_frame_count": 2, "transient_changed_cells": 1}
+
+        session._append_action_viewer_event(
+            {
+                "action_num": 7,
+                "action_display": "RIGHT",
+                "animation": animation,
+                "recommended_plan_action": "RIGHT",
+                "followed_recommended_plan": True,
+                "recommended_plan_confidence": 0.8,
+                "recommended_plan_expected_utility": 1.25,
+            },
+            Frame(grid=((1,),), step=7, level=1),
+        )
+
+        event = session.viewer_events[-1]
+        self.assertEqual(event["animation"], animation)
+        self.assertEqual(event["recommended_plan_action"], "RIGHT")
+        self.assertTrue(event["followed_recommended_plan"])
+        self.assertEqual(event["recommended_plan_confidence"], 0.8)
+        self.assertEqual(event["recommended_plan_expected_utility"], 1.25)
+
+    def test_analyzer_retry_circuit_breaker_stops_repeated_transport_failures(
+        self,
+    ) -> None:
         run = SimpleNamespace(
             state="playing",
             history=[],
@@ -91,7 +268,9 @@ class SolverControllerTests(TestCase):
             session._transcript_delta_since = lambda _offset: ""
 
             with (
-                mock.patch.object(solver_module, "ANALYZER_MAX_CONSECUTIVE_FAILURES", 2),
+                mock.patch.object(
+                    solver_module, "ANALYZER_MAX_CONSECUTIVE_FAILURES", 2
+                ),
                 mock.patch.object(solver_module.time, "sleep"),
             ):
                 session.play()
@@ -116,7 +295,9 @@ class SolverControllerTests(TestCase):
         session = object.__new__(_HarnessGameSession)
         frame = Frame(grid=((1,),), step=0, level=1)
         action = SimpleNamespace(
-            id=SimpleNamespace(value=arcengine.GameAction.ACTION1.value, name="ACTION1"),
+            id=SimpleNamespace(
+                value=arcengine.GameAction.ACTION1.value, name="ACTION1"
+            ),
             data={},
         )
         session.controller_config = InferenceControllerConfig(
@@ -162,6 +343,9 @@ class SolverControllerTests(TestCase):
         self.assertEqual(summary["final_changed_cells"], 0)
         self.assertEqual(summary["transient_changed_cells"], 1)
         self.assertEqual(summary["motion_bbox"], [0, 1, 0, 1])
+        self.assertEqual(summary["per_frame_changed_cells"], [1, 1])
+        self.assertEqual(summary["motion_direction"], "stationary")
+        self.assertTrue(summary["temporally_reversible"])
         self.assertEqual(
             summary["dominant_color_transitions"],
             [
@@ -257,6 +441,76 @@ class SolverControllerTests(TestCase):
         self.assertEqual(result["steps"][0]["before_state_id"], "a")
         self.assertEqual(result["steps"][0]["after_state_id"], "b")
 
+    def test_partial_batch_failure_preserves_bounded_stop_detail(self) -> None:
+        state = SimpleNamespace(
+            available_actions={arcengine.GameAction.ACTION1.value},
+            raw=SimpleNamespace(state=arcengine.GameState.NOT_FINISHED),
+            levels_completed=0,
+            won=False,
+            frame=SimpleNamespace(data=[[0]]),
+        )
+        game = SimpleNamespace(
+            current_state=state,
+            game_run=SimpleNamespace(state="playing", history=[]),
+            number_of_levels=2,
+        )
+        solver = SimpleNamespace(
+            max_runtime_s_per_game=None,
+            max_actions_per_game=None,
+            soft_time_remaining_seconds=lambda: None,
+            job_dir=None,
+        )
+        action = SimpleNamespace(
+            id=SimpleNamespace(
+                value=arcengine.GameAction.ACTION1.value,
+                name="ACTION1",
+            ),
+            data={},
+        )
+        calls = 0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = _HarnessGameSession(
+                solver=solver,
+                game=game,
+                analyzer=SimpleNamespace(),
+                game_index=0,
+                pass_index=0,
+                state_path=root / "state.json",
+                transcript_path=root / "transcript.txt",
+                analysis_html_relpath="analysis.html",
+                stop_event=threading.Event(),
+                viewer_data_path=root / "viewer.json",
+                controller_config=InferenceControllerConfig(enabled=False),
+            )
+            session._normalize_actions = lambda arguments: ([action, action], None)
+
+            def execute(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("engine rejected transition")
+                return {
+                    "executed": True,
+                    "action_num": 1,
+                    "reward": 0,
+                    "board_changed": True,
+                    "level_completed": False,
+                    "game_over": False,
+                    "run_complete": False,
+                    "action_display": "UP",
+                }
+
+            session._execute_action = execute
+            result = session.step_env({"actions": ["UP", "UP"]})
+
+        self.assertEqual(result["executed_count"], 1)
+        self.assertEqual(result["stop_reason"], "action_error")
+        self.assertEqual(
+            result["stop_detail"], "RuntimeError: engine rejected transition"
+        )
+
     def test_prediction_result_is_structured(self) -> None:
         result = _evaluate_strategy_prediction(
             {"test_action": "SPACE", "expected_outcome": "new_state"},
@@ -291,7 +545,9 @@ class SolverControllerTests(TestCase):
             job_dir=None,
         )
         action = SimpleNamespace(
-            id=SimpleNamespace(value=arcengine.GameAction.ACTION1.value, name="ACTION1"),
+            id=SimpleNamespace(
+                value=arcengine.GameAction.ACTION1.value, name="ACTION1"
+            ),
             data={},
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -357,7 +613,9 @@ class SolverControllerTests(TestCase):
             job_dir=None,
         )
         action = SimpleNamespace(
-            id=SimpleNamespace(value=arcengine.GameAction.ACTION1.value, name="ACTION1"),
+            id=SimpleNamespace(
+                value=arcengine.GameAction.ACTION1.value, name="ACTION1"
+            ),
             data={},
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -421,7 +679,9 @@ class SolverControllerTests(TestCase):
             job_dir=None,
         )
         action = SimpleNamespace(
-            id=SimpleNamespace(value=arcengine.GameAction.ACTION1.value, name="ACTION1"),
+            id=SimpleNamespace(
+                value=arcengine.GameAction.ACTION1.value, name="ACTION1"
+            ),
             data={},
         )
 

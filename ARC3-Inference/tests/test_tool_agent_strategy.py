@@ -1,17 +1,23 @@
 from __future__ import annotations
 
-from unittest import TestCase
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import TestCase, mock
 
 from inference.agent.action_names import MAX_ACTION_BATCH
 from inference.agent.inference_controller import InferenceControllerConfig
 from inference.agent.runtime_state import Frame, HistoryEntry
-from inference.agent.tool_agent import ToolAgent
+from inference.agent.tool_agent import ToolAgent, _remaining_deadline_seconds
 from inference.agent.trial_knowledge import TrialKnowledgeStore
 
 
 class ToolAgentStrategyTests(TestCase):
+    def test_request_deadline_declines_and_never_becomes_negative(self) -> None:
+        self.assertIsNone(_remaining_deadline_seconds(None, now=50.0))
+        self.assertEqual(_remaining_deadline_seconds(60.0, now=52.5), 7.5)
+        self.assertEqual(_remaining_deadline_seconds(60.0, now=61.0), 0.0)
+
     def _agent(self) -> ToolAgent:
         agent = ToolAgent(
             model="unit-test-model",
@@ -73,23 +79,70 @@ class ToolAgentStrategyTests(TestCase):
                 "plan_steps": [f"step {index}" for index in range(12)],
                 "success_criteria": "the score increases",
                 "causal_model": {
-                    "entities": [{"id": "selector", "kind": "cursor", "confidence": 0.8}],
-                    "relations": [{"cause": "SPACE", "effect": "selector advances", "support": 2, "confidence": 0.9}],
-                    "subgoals": [{"id": "align", "description": "align selector", "status": "active"}],
-                    "predictions": [{"action": "SPACE", "expected_changes": "selector advances"}],
+                    "entities": [
+                        {"id": "selector", "kind": "cursor", "confidence": 0.8}
+                    ],
+                    "relations": [
+                        {
+                            "cause": "SPACE",
+                            "effect": "selector advances",
+                            "support": 2,
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "subgoals": [
+                        {
+                            "id": "align",
+                            "description": "align selector",
+                            "status": "active",
+                        }
+                    ],
+                    "predictions": [
+                        {"action": "SPACE", "expected_changes": "selector advances"}
+                    ],
                 },
             }
         )
 
         self.assertLessEqual(len(saved["goal"]), 280)
         self.assertEqual(saved["confidence"], 1.0)
-        self.assertEqual(agent._summarized_knowledge["current_plan"], "press SPACE once")
+        self.assertEqual(
+            agent._summarized_knowledge["current_plan"], "press SPACE once"
+        )
         self.assertEqual(len(saved["subgoals"]), 6)
         self.assertEqual(len(saved["plan_steps"]), 8)
         self.assertEqual(saved["current_subgoal"], "align the selector")
         self.assertEqual(saved["causal_model"]["relations"][0]["support"], 2)
 
-    def test_cross_trial_store_exposes_verified_progress_without_raw_frames(self) -> None:
+    def test_recording_causal_model_refreshes_live_experience_and_cache(self) -> None:
+        agent = self._agent()
+        agent._current_experience_snapshot = {"state_id": "state-a"}
+        agent._experience_snapshot_cache = object()
+
+        saved = agent._record_strategy(
+            {
+                "causal_model": {
+                    "relations": [
+                        {
+                            "cause": "RIGHT",
+                            "effect": "outcome:novel",
+                            "conditions": "state:state-a",
+                            "confidence": 0.7,
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertEqual(
+            agent._current_experience_snapshot["causal_model"],
+            saved["causal_model"],
+        )
+        self.assertIsNone(agent._experience_snapshot_cache)
+
+    def test_cross_trial_store_exposes_verified_progress_without_raw_frames(
+        self,
+    ) -> None:
         store = TrialKnowledgeStore()
         store.observe(
             "game",
@@ -134,24 +187,159 @@ class ToolAgentStrategyTests(TestCase):
             self.assertEqual(resumed["observations"], 1)
             self.assertEqual(resumed["transition_records"][0]["pass_index"], 2)
 
-    def test_semantic_candidate_score_prefers_plan_and_avoids_known_mouse_noop(self) -> None:
+    def test_cross_trial_store_merges_stale_process_views_and_recovers_backup(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "knowledge.json"
+            first = TrialKnowledgeStore(persistence_path=path)
+            second = TrialKnowledgeStore(persistence_path=path)
+            base = {
+                "executed": True,
+                "before_state_id": "state-a",
+                "after_state_id": "state-b",
+                "action_display": "RIGHT",
+                "outcome_class": "novel",
+            }
+            first.observe("game", base, evidence_id="run:pass=0")
+            second.observe(
+                "game",
+                {**base, "action_display": "LEFT"},
+                evidence_id="run:pass=1",
+            )
+
+            merged = TrialKnowledgeStore(persistence_path=path).snapshot("game")
+            self.assertEqual(merged["observations"], 2)
+            self.assertEqual(merged["independent_evidence"], 2)
+
+            path.write_text("{corrupt", encoding="utf-8")
+            recovered = TrialKnowledgeStore(persistence_path=path).snapshot("game")
+            self.assertGreaterEqual(recovered["observations"], 1)
+
+    def test_full_stale_store_merge_retains_new_local_observation(self) -> None:
+        store = TrialKnowledgeStore(transition_limit=32)
+        store.observe(
+            "game",
+            {
+                "executed": True,
+                "before_state_id": "fresh-before",
+                "after_state_id": "fresh-after",
+                "action_display": "SPACE",
+                "outcome_class": "novel",
+            },
+            evidence_id="fresh-process",
+        )
+        disk_records = [
+            {
+                "before_state_id": f"old-{index}",
+                "after_state_id": f"old-{index + 1}",
+                "action_display": "LEFT",
+                "outcome_class": "revisit",
+                "evidence_id": f"old-process-{index}",
+                "observed_at": f"2025-01-01T00:00:{index:02d}Z",
+            }
+            for index in range(32)
+        ]
+        path = mock.Mock(spec=Path)
+        path.exists.return_value = True
+        path.read_text.return_value = json.dumps(
+            {"games": {"game": {"transitions": disk_records, "lessons": []}}}
+        )
+
+        store._merge_disk_locked(path)
+
+        merged = store.snapshot("game")
+        self.assertEqual(merged["observations"], 32)
+        self.assertIn(
+            "fresh-process",
+            {item["evidence_id"] for item in merged["transition_records"]},
+        )
+
+    def test_cross_trial_action_evidence_weights_independent_sources(self) -> None:
+        store = TrialKnowledgeStore()
+        base = {
+            "executed": True,
+            "before_state_id": "state-a",
+            "after_state_id": "state-b",
+            "action_display": "RIGHT",
+        }
+        for _ in range(6):
+            store.observe(
+                "game",
+                {**base, "outcome_class": "exact_noop"},
+                evidence_id="run-a:pass=0",
+            )
+        for pass_index in (1, 2, 3):
+            store.observe(
+                "game",
+                {**base, "outcome_class": "novel"},
+                evidence_id=f"run-a:pass={pass_index}",
+            )
+
+        evidence = store.snapshot("game", state_id="state-a")["state_action_evidence"][
+            0
+        ]
+
+        self.assertEqual(evidence["outcomes"], {"exact_noop": 1, "novel": 3})
+        self.assertEqual(evidence["trials"], 4)
+        self.assertEqual(evidence["raw_observations"], 9)
+
+    def test_adaptive_inference_budget_reduces_candidates_near_exhaustion(self) -> None:
+        agent = self._agent()
+        agent._candidate_count = 3
+        agent._current_experience_snapshot = {
+            "phase": "recover",
+            "ranked_actions": [{"uncertainty": 1.0}],
+        }
+        with mock.patch(
+            "inference.agent.tool_agent._LOCAL_ANALYZER_GAME_TOKEN_BUDGET", 100
+        ):
+            agent._session_generated_tokens = 10
+            self.assertEqual(agent._adaptive_candidate_count(20), 3)
+            agent._session_generated_tokens = 70
+            self.assertEqual(agent._adaptive_candidate_count(20), 1)
+            self.assertEqual(agent._adaptive_output_limit(1), 30)
+
+    def test_semantic_candidate_score_prefers_plan_and_avoids_known_mouse_noop(
+        self,
+    ) -> None:
         agent = self._agent()
         agent._current_valid_actions = ["RIGHT", "MOUSE"]
         agent._current_experience_snapshot = {
             "action_budget": 1,
             "ranked_actions": [{"action": "RIGHT", "priority": 0}],
             "discouraged_actions": ["MOUSE(row=1, col=1)"],
-            "mouse_search": {
-                "recent": [{"row": 1, "col": 1, "outcome": "exact_noop"}]
-            },
+            "mouse_search": {"recent": [{"row": 1, "col": 1, "outcome": "exact_noop"}]},
             "recommended_plan": {"actions": ["RIGHT"]},
         }
 
         planned = agent._score_candidate_choice(
-            {"message": {"tool_calls": [{"function": {"name": "python", "arguments": '{"code":"action([\\"RIGHT\\"])"}'}}]}}
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "python",
+                                "arguments": '{"code":"action([\\"RIGHT\\"])"}',
+                            }
+                        }
+                    ]
+                }
+            }
         )[0]
         noop = agent._score_candidate_choice(
-            {"message": {"tool_calls": [{"function": {"name": "python", "arguments": '{"code":"action([{\\"action\\":\\"MOUSE\\",\\"row\\":1,\\"col\\":1}])"}'}}]}}
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "python",
+                                "arguments": '{"code":"action([{\\"action\\":\\"MOUSE\\",\\"row\\":1,\\"col\\":1}])"}',
+                            }
+                        }
+                    ]
+                }
+            }
         )[0]
 
         self.assertGreater(planned, noop)
@@ -161,8 +349,18 @@ class ToolAgentStrategyTests(TestCase):
         agent._current_experience_snapshot = {
             "action_budget": 1,
             "transition_models_here": [
-                {"action": "RIGHT", "predicted_outcome": "level_progress", "confidence": 1.0, "contradictions": 0},
-                {"action": "LEFT", "predicted_outcome": "exact_noop", "confidence": 1.0, "contradictions": 0},
+                {
+                    "action": "RIGHT",
+                    "predicted_outcome": "level_progress",
+                    "confidence": 1.0,
+                    "contradictions": 0,
+                },
+                {
+                    "action": "LEFT",
+                    "predicted_outcome": "exact_noop",
+                    "confidence": 1.0,
+                    "contradictions": 0,
+                },
             ],
         }
 
@@ -170,6 +368,249 @@ class ToolAgentStrategyTests(TestCase):
             agent._semantic_action_score([[{"action": "RIGHT"}]]),
             agent._semantic_action_score([[{"action": "LEFT"}]]),
         )
+
+    def test_candidate_scoring_resolves_literal_action_variables(self) -> None:
+        agent = self._agent()
+        agent._current_valid_actions = ["RIGHT"]
+        agent._current_experience_snapshot = {
+            "action_budget": 1,
+            "outcome_utilities": {"level_progress": 1.0},
+            "transition_models_here": [
+                {
+                    "action": "RIGHT",
+                    "predicted_outcome": "level_progress",
+                    "confidence": 1.0,
+                    "contradictions": 0,
+                }
+            ],
+        }
+
+        score, valid = agent._score_candidate_choice(
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "python",
+                                "arguments": '{"code":"moves = [\\"RIGHT\\"]\\naction(moves)"}',
+                            }
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertTrue(valid)
+        self.assertGreater(score, 200)
+
+    def test_known_terminal_first_action_is_blocked_before_dispatch(self) -> None:
+        agent = self._agent()
+        agent._current_valid_actions = ["RIGHT", "LEFT"]
+        agent._current_experience_snapshot = {
+            "transition_models_here": [{"action": "RIGHT", "terminal_failures": 1}]
+        }
+
+        with self.assertRaisesRegex(ValueError, "terminal-failure"):
+            agent._normalize_python_actions(["RIGHT"])
+        self.assertEqual(
+            agent._normalize_python_actions(["LEFT"]), [{"action": "LEFT"}]
+        )
+
+        self.assertEqual(
+            agent._normalize_python_actions(["LEFT", "RIGHT"]),
+            [{"action": "LEFT"}, {"action": "RIGHT"}],
+        )
+
+    def test_conflicting_harm_evidence_allows_cautious_revalidation(self) -> None:
+        agent = self._agent()
+        agent._current_valid_actions = ["RIGHT"]
+        agent._current_experience_snapshot = {
+            "transition_models_here": [
+                {"action": "RIGHT", "terminal_failures": 1, "trials": 2}
+            ]
+        }
+
+        self.assertEqual(
+            agent._normalize_python_actions(["RIGHT"]), [{"action": "RIGHT"}]
+        )
+
+    def test_executed_actions_ground_causal_relations_and_predictions(self) -> None:
+        agent = self._agent()
+        agent._record_strategy(
+            {
+                "causal_model": {
+                    "predictions": [
+                        {
+                            "action": "RIGHT",
+                            "expected_changes": "reach a new state",
+                            "expected_outcome": "novel",
+                            "confidence": 0.7,
+                        }
+                    ]
+                }
+            }
+        )
+
+        agent._update_causal_model_from_actions(
+            [
+                {
+                    "executed": True,
+                    "action_display": "RIGHT",
+                    "outcome_class": "novel",
+                    "before_state_id": "state-a",
+                }
+            ]
+        )
+
+        causal = agent._strategy_memory["causal_model"]
+        self.assertEqual(causal["predictions"][0]["status"], "supported")
+        self.assertEqual(causal["relations"][0]["effect"], "outcome:novel")
+        self.assertEqual(causal["relations"][0]["support"], 1)
+
+    def test_grounded_causal_relations_are_conditioned_by_state(self) -> None:
+        agent = self._agent()
+
+        agent._update_causal_model_from_actions(
+            [
+                {
+                    "executed": True,
+                    "action_display": "RIGHT",
+                    "outcome_class": "novel",
+                    "before_state_id": "state-a",
+                },
+                {
+                    "executed": True,
+                    "action_display": "RIGHT",
+                    "outcome_class": "exact_noop",
+                    "before_state_id": "state-b",
+                },
+            ]
+        )
+
+        relations = agent._strategy_memory["causal_model"]["relations"]
+        self.assertEqual(len(relations), 2)
+        self.assertEqual(
+            {relation["conditions"] for relation in relations},
+            {"state:state-a", "state:state-b"},
+        )
+        self.assertTrue(all(relation["contradictions"] == 0 for relation in relations))
+
+    def test_causal_prediction_is_only_resolved_in_its_recorded_state(self) -> None:
+        agent = self._agent()
+        agent._current_experience_snapshot = {
+            "state_id": "exact-a",
+            "behavioral_state_id": "stable-a",
+        }
+        agent._record_strategy(
+            {
+                "causal_model": {
+                    "predictions": [
+                        {
+                            "action": "RIGHT",
+                            "expected_outcome": "novel",
+                            "confidence": 0.7,
+                        }
+                    ]
+                }
+            }
+        )
+
+        agent._update_causal_model_from_actions(
+            [
+                {
+                    "executed": True,
+                    "action_display": "RIGHT",
+                    "outcome_class": "novel",
+                    "behavioral_before_state_id": "stable-b",
+                }
+            ]
+        )
+        prediction = agent._strategy_memory["causal_model"]["predictions"][0]
+        self.assertEqual(prediction["status"], "untested")
+        self.assertEqual(prediction["conditions"], "state:stable-a")
+
+        agent._update_causal_model_from_actions(
+            [
+                {
+                    "executed": True,
+                    "action_display": "RIGHT",
+                    "outcome_class": "novel",
+                    "behavioral_before_state_id": "stable-a",
+                }
+            ]
+        )
+
+        self.assertEqual(
+            agent._strategy_memory["causal_model"]["predictions"][0]["status"],
+            "supported",
+        )
+
+    def test_new_grounded_relation_evicts_weak_stale_automatic_relation(self) -> None:
+        agent = self._agent()
+        agent._strategy_memory["causal_model"] = {
+            "relations": [
+                {
+                    "cause": "RIGHT",
+                    "effect": "outcome:novel",
+                    "conditions": f"state:old-{index}",
+                    "evidence": "automatically grounded from executed transition",
+                    "confidence": index / 100,
+                    "support": index + 1,
+                    "last_observed_action": index,
+                }
+                for index in range(24)
+            ]
+        }
+
+        agent._update_causal_model_from_actions(
+            [
+                {
+                    "executed": True,
+                    "action_display": "SPACE",
+                    "outcome_class": "level_progress",
+                    "before_state_id": "new-state",
+                    "action_num": 99,
+                }
+            ]
+        )
+
+        relations = agent._strategy_memory["causal_model"]["relations"]
+        self.assertEqual(len(relations), 24)
+        self.assertNotIn("state:old-0", {item["conditions"] for item in relations})
+        new_relation = next(
+            item for item in relations if item["conditions"] == "state:new-state"
+        )
+        self.assertEqual(new_relation["last_observed_action"], 99)
+
+    def test_candidate_scoring_ignores_causal_relations_from_other_states(self) -> None:
+        agent = self._agent()
+        relations = [
+            {
+                "cause": "RIGHT",
+                "effect": "outcome:level_progress",
+                "conditions": "state:state-a",
+                "confidence": 1.0,
+            },
+            {
+                "cause": "RIGHT",
+                "effect": "outcome:exact_noop",
+                "conditions": "state:state-b",
+                "confidence": 1.0,
+            },
+        ]
+        agent._current_experience_snapshot = {
+            "state_id": "state-b",
+            "behavioral_state_id": "stable-b",
+            "action_budget": 1,
+            "causal_model": {"relations": relations},
+        }
+
+        state_b_score = agent._semantic_action_score([[{"action": "RIGHT"}]])
+        agent._current_experience_snapshot["state_id"] = "state-a"
+        state_a_score = agent._semantic_action_score([[{"action": "RIGHT"}]])
+
+        self.assertLess(state_b_score, 0)
+        self.assertGreater(state_a_score, 0)
 
     def test_prediction_is_evaluated_once_then_consumed(self) -> None:
         agent = self._agent()
@@ -181,7 +622,9 @@ class ToolAgentStrategyTests(TestCase):
                 "contradictions": ["old evidence was ambiguous"] * 10,
             }
         )
-        self.assertEqual(agent._strategy_memory["fallback"], "inspect a different object")
+        self.assertEqual(
+            agent._strategy_memory["fallback"], "inspect a different object"
+        )
         self.assertLessEqual(len(agent._strategy_memory["contradictions"]), 3)
 
         action_result = {
@@ -207,9 +650,7 @@ class ToolAgentStrategyTests(TestCase):
 
     def test_partial_prediction_update_keeps_declared_outcome(self) -> None:
         agent = self._agent()
-        agent._record_strategy(
-            {"test_action": "LEFT", "expected_outcome": "new_state"}
-        )
+        agent._record_strategy({"test_action": "LEFT", "expected_outcome": "new_state"})
         agent._record_strategy({"test_action": "RIGHT"})
 
         self.assertEqual(agent._strategy_memory["test_action"], "RIGHT")
@@ -277,7 +718,29 @@ class ToolAgentStrategyTests(TestCase):
         )
         self.assertLess(len(prompt), 10_000)
 
-    def test_python_actions_are_canonicalized_and_checked_against_current_actions(self) -> None:
+    def test_multimodal_message_includes_previous_and_current_changed_frames(
+        self,
+    ) -> None:
+        agent = self._agent()
+        previous = Frame(grid=((1,),), step=0, level=1)
+        current = Frame(grid=((2,),), step=1, level=1)
+        with mock.patch(
+            "inference.agent.tool_agent.current_grid_image_part",
+            side_effect=[
+                {"type": "image_url", "image_url": {"url": "current"}},
+                {"type": "image_url", "image_url": {"url": "previous"}},
+            ],
+        ):
+            message = agent._build_user_message("prompt", current, previous)
+
+        content = message["content"]
+        self.assertEqual(content[0]["text"], "prompt")
+        self.assertEqual(content[1]["text"], "Previous grid image:")
+        self.assertEqual(content[3]["text"], "Current grid image:")
+
+    def test_python_actions_are_canonicalized_and_checked_against_current_actions(
+        self,
+    ) -> None:
         agent = self._agent()
         agent._current_valid_actions = ["LEFT", "MOUSE"]
 
@@ -287,6 +750,20 @@ class ToolAgentStrategyTests(TestCase):
         )
         with self.assertRaisesRegex(ValueError, "RIGHT.*not currently valid"):
             agent._normalize_python_actions(["RIGHT"])
+
+        self.assertEqual(
+            agent._normalize_python_actions(["LEFT", "RIGHT"]),
+            [{"action": "LEFT"}, {"action": "RIGHT"}],
+        )
+
+    def test_unknown_python_action_is_rejected_without_a_current_action_list(
+        self,
+    ) -> None:
+        agent = self._agent()
+        agent._current_valid_actions = []
+
+        with self.assertRaisesRegex(ValueError, "NOT_REAL.*unknown"):
+            agent._normalize_python_actions(["NOT_REAL"])
 
     def test_mouse_actions_require_integer_row_and_col(self) -> None:
         agent = self._agent()
@@ -298,7 +775,10 @@ class ToolAgentStrategyTests(TestCase):
             {"action": "MOUSE", "row": True, "col": 2},
             {"action": "MOUSE", "row": 1, "col": 2.5},
         ):
-            with self.subTest(action=action), self.assertRaisesRegex(
-                ValueError, "requires integer|must be an integer"
+            with (
+                self.subTest(action=action),
+                self.assertRaisesRegex(
+                    ValueError, "requires integer|must be an integer"
+                ),
             ):
                 agent._normalize_python_actions([action])

@@ -185,7 +185,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(content.body)))
         self.end_headers()
-        self.wfile.write(content.body)
+        self._write_response_body(content.body)
 
     def _send_json(self, payload: dict, *, status: HTTPStatus = HTTPStatus.OK) -> None:
         content = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -198,7 +198,13 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(content.body)))
         self.end_headers()
-        self.wfile.write(content.body)
+        self._write_response_body(content.body)
+
+    def _write_response_body(self, body: bytes) -> None:
+        try:
+            self.wfile.write(body)
+        except ConnectionError:
+            log.debug("viewer client disconnected before response completed")
 
     def _maybe_gzip(self, content: bytes) -> "_ResponseBody":
         accept_encoding = self.headers.get("Accept-Encoding", "")

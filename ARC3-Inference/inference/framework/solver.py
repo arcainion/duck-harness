@@ -37,6 +37,7 @@ from inference.agent.inference_controller import (
     action_guard_reason_code,
     build_experience_snapshot,
     frame_fingerprint,
+    harmful_evidence_is_decisive,
     normalize_action_key,
     transition_metadata,
 )
@@ -162,6 +163,8 @@ def _summarize_animation(
     peak_changed_cells = 0
     changed_coordinates: set[tuple[int, int]] = set()
     transition_counts: dict[tuple[int | None, int | None], int] = {}
+    per_frame_changes: list[int] = []
+    motion_centroids: list[tuple[float, float]] = []
 
     previous = before_grid
     for current in frames:
@@ -171,13 +174,23 @@ def _summarize_animation(
             max((len(row) for row in current), default=0),
         )
         step_changes = 0
+        step_coordinates: list[tuple[int, int]] = []
         for row in range(rows):
             for col in range(cols):
-                old = previous[row][col] if row < len(previous) and col < len(previous[row]) else None
-                new = current[row][col] if row < len(current) and col < len(current[row]) else None
+                old = (
+                    previous[row][col]
+                    if row < len(previous) and col < len(previous[row])
+                    else None
+                )
+                new = (
+                    current[row][col]
+                    if row < len(current) and col < len(current[row])
+                    else None
+                )
                 if old == new:
                     continue
                 step_changes += 1
+                step_coordinates.append((row, col))
                 changed_coordinates.add((row, col))
                 pair = (old, new)
                 transition_counts[pair] = transition_counts.get(pair, 0) + 1
@@ -185,6 +198,13 @@ def _summarize_animation(
             changed_frame_count += 1
             total_changed_cells += step_changes
             peak_changed_cells = max(peak_changed_cells, step_changes)
+            motion_centroids.append(
+                (
+                    sum(row for row, _ in step_coordinates) / step_changes,
+                    sum(col for _, col in step_coordinates) / step_changes,
+                )
+            )
+        per_frame_changes.append(step_changes)
         previous = current
 
     final_grid = frames[-1]
@@ -196,8 +216,16 @@ def _summarize_animation(
     )
     for row in range(rows):
         for col in range(cols):
-            old = before_grid[row][col] if row < len(before_grid) and col < len(before_grid[row]) else None
-            new = final_grid[row][col] if row < len(final_grid) and col < len(final_grid[row]) else None
+            old = (
+                before_grid[row][col]
+                if row < len(before_grid) and col < len(before_grid[row])
+                else None
+            )
+            new = (
+                final_grid[row][col]
+                if row < len(final_grid) and col < len(final_grid[row])
+                else None
+            )
             if old != new:
                 final_changed_coordinates.add((row, col))
 
@@ -223,6 +251,20 @@ def _summarize_animation(
             max(changed_cols),
         ]
 
+    motion_vector = None
+    motion_direction = None
+    if len(motion_centroids) >= 2:
+        delta_row = motion_centroids[-1][0] - motion_centroids[0][0]
+        delta_col = motion_centroids[-1][1] - motion_centroids[0][1]
+        motion_vector = [round(delta_row, 2), round(delta_col, 2)]
+        vertical = "down" if delta_row > 0.25 else "up" if delta_row < -0.25 else ""
+        horizontal = (
+            "right" if delta_col > 0.25 else "left" if delta_col < -0.25 else ""
+        )
+        motion_direction = (
+            "-".join(item for item in (vertical, horizontal) if item) or "stationary"
+        )
+
     return {
         "frame_count": len(frames),
         "intermediate_frame_count": max(0, len(frames) - 1),
@@ -233,6 +275,12 @@ def _summarize_animation(
         "transient_changed_cells": len(changed_coordinates - final_changed_coordinates),
         "motion_bbox": motion_bbox,
         "dominant_color_transitions": dominant_transitions,
+        "per_frame_changed_cells": per_frame_changes[:16],
+        "motion_vector": motion_vector,
+        "motion_direction": motion_direction,
+        "temporally_reversible": bool(
+            changed_coordinates and not final_changed_coordinates
+        ),
     }
 
 
@@ -242,6 +290,20 @@ def _level_number(game: taaf.game.Game) -> int:
     if state.won:
         return max(1, int(game.number_of_levels))
     return max(1, min(int(game.number_of_levels), completed + 1))
+
+
+def _decision_frame(
+    game: taaf.game.Game, state: taaf.game.GameState, *, step: int
+) -> Frame:
+    """Build the canonical observable state used by history and live control."""
+    return Frame(
+        grid=_grid_from_state(state),
+        step=step,
+        level=_level_number(game),
+        valid_actions=tuple(_engine_action_names(game)),
+        engine_state=state.raw.state.name,
+        score=int(state.levels_completed),
+    )
 
 
 def _engine_action_names(game: taaf.game.Game) -> list[str]:
@@ -282,9 +344,13 @@ def _evaluate_strategy_prediction(
     test_action = normalize_action_key(prediction.get("test_action", ""))
     expected = str(prediction.get("expected_outcome") or "").strip().lower()
     actual_action = normalize_action_key(payload.get("action_display", ""))
-    if not test_action or not expected or not (
-        actual_action == test_action
-        or (test_action == "MOUSE" and action_family(actual_action) == "MOUSE")
+    if (
+        not test_action
+        or not expected
+        or not (
+            actual_action == test_action
+            or (test_action == "MOUSE" and action_family(actual_action) == "MOUSE")
+        )
     ):
         return None
     if not payload.get("executed") or expected == "unknown":
@@ -361,10 +427,8 @@ class _HarnessGameSession:
     _viewer_events_flushed: int = field(default=0, init=False, repr=False)
 
     def current_frame(self) -> Frame:
-        return Frame(
-            grid=_grid_from_state(self.game.current_state),
-            step=self.action_count,
-            level=_level_number(self.game),
+        return _decision_frame(
+            self.game, self.game.current_state, step=self.action_count
         )
 
     def write_runtime_state(self) -> None:
@@ -522,6 +586,14 @@ class _HarnessGameSession:
                     continue
                 consecutive_failures = 0
                 if getattr(result, "yielded_control", False):
+                    if getattr(result, "yield_reason", None) == "game_token_budget":
+                        if self._execute_controller_fallback("game_token_budget"):
+                            continue
+                        run.solver_note = (
+                            "stopped: game_token_budget; "
+                            f"tokens={_analyzer_reported_tokens(self.analyzer)}"
+                        )
+                        break
                     retry_analysis_step = analysis_step
                     continue
                 if not result.step_executed:
@@ -540,6 +612,48 @@ class _HarnessGameSession:
             self.state_path.unlink(missing_ok=True)
             self._write_analysis_html()
             self.write_viewer_payload()
+
+    def _execute_controller_fallback(self, reason: str) -> bool:
+        """Execute one empirically safe action when model control is unavailable."""
+        if not self.controller_config.outcome_aware or self.should_stop():
+            return False
+        snapshot = build_experience_snapshot(
+            self.history_entries,
+            self.current_frame(),
+            _engine_action_names(self.game),
+            self.controller_config,
+        )
+        candidates: list[dict[str, Any]] = []
+        mouse_coordinates = list(
+            (snapshot.get("mouse_search") or {}).get("recommended_coordinates") or ()
+        )
+        for ranked in snapshot.get("ranked_actions") or ():
+            if not isinstance(ranked, dict) or ranked.get("harm_decisive"):
+                continue
+            action_name = str(ranked.get("action") or "")
+            if action_name == "MOUSE":
+                if not mouse_coordinates:
+                    continue
+                coordinate = mouse_coordinates.pop(0)
+                candidates.append(
+                    {
+                        "action": "MOUSE",
+                        "row": int(coordinate["row"]),
+                        "col": int(coordinate["col"]),
+                    }
+                )
+            elif action_name:
+                candidates.append({"action": action_name})
+        for candidate in candidates:
+            payload = self.step_env(
+                {
+                    "actions": [candidate],
+                    "controller_fallback_reason": str(reason),
+                }
+            )
+            if payload.get("executed"):
+                return True
+        return False
 
     def _finish_if_needed(self) -> None:
         run = self.game.game_run
@@ -643,6 +757,7 @@ class _HarnessGameSession:
                 "batch_size": payload.get("batch_size"),
                 "before_state_id": payload.get("before_state_id"),
                 "after_state_id": payload.get("after_state_id"),
+                "state_context_version": payload.get("state_context_version"),
                 "behavioral_before_state_id": payload.get("behavioral_before_state_id"),
                 "behavioral_after_state_id": payload.get("behavioral_after_state_id"),
                 "novel_state": payload.get("novel_state"),
@@ -655,7 +770,24 @@ class _HarnessGameSession:
                 "controller_reason_codes": payload.get("controller_reason_codes"),
                 "action_rank": payload.get("action_rank"),
                 "action_rank_reason": payload.get("action_rank_reason"),
+                "action_regime_adapted": payload.get("action_regime_adapted"),
                 "prediction_result": payload.get("prediction_result"),
+                "animation": payload.get("animation"),
+                "recommended_plan_action": payload.get("recommended_plan_action"),
+                "followed_recommended_plan": payload.get("followed_recommended_plan"),
+                "recommended_plan_confidence": payload.get(
+                    "recommended_plan_confidence"
+                ),
+                "recommended_plan_expected_utility": payload.get(
+                    "recommended_plan_expected_utility"
+                ),
+                "recommended_plan_branch_count": payload.get(
+                    "recommended_plan_branch_count"
+                ),
+                "recommended_plan_policy_ready": payload.get(
+                    "recommended_plan_policy_ready"
+                ),
+                "controller_fallback_reason": payload.get("controller_fallback_reason"),
                 "no_op_streak": payload.get("no_op_streak"),
                 "behavioral_no_op_streak": payload.get("behavioral_no_op_streak"),
                 "stagnation_actions": payload.get("stagnation_actions"),
@@ -846,6 +978,7 @@ class _HarnessGameSession:
         executed_payloads: list[dict[str, Any]] = []
         total_reward = 0.0
         stop_reason: str | None = None
+        stop_detail: str | None = None
         batch_size = len(requested_actions)
         requested_displays = [
             _format_action_display(action.id.name, dict(action.data))
@@ -854,6 +987,9 @@ class _HarnessGameSession:
         strategy_prediction = arguments.get("strategy_prediction")
         if not isinstance(strategy_prediction, dict):
             strategy_prediction = None
+        controller_fallback_reason = str(
+            arguments.get("controller_fallback_reason") or ""
+        )
 
         for batch_index, action in enumerate(requested_actions, start=1):
             if batch_index > 1 and self.controller_config.outcome_aware:
@@ -863,11 +999,13 @@ class _HarnessGameSession:
                     _engine_action_names(self.game),
                     self.controller_config,
                 )
-                current_budget = max(
-                    1, int(current_snapshot.get("action_budget") or 1)
-                )
+                current_budget = max(1, int(current_snapshot.get("action_budget") or 1))
                 if batch_index > current_budget:
                     stop_reason = "phase_action_budget"
+                    stop_detail = (
+                        "The controller phase changed and no longer supports the "
+                        "remaining queued actions."
+                    )
                     break
             if self.should_stop():
                 stop_reason = "stopped"
@@ -876,6 +1014,7 @@ class _HarnessGameSession:
                 message = f"{_format_action_display(action.id.name, dict(action.data))} is not valid right now."
                 if executed_payloads:
                     stop_reason = "invalid_action"
+                    stop_detail = message
                     break
                 return self._error_payload(message)
 
@@ -886,29 +1025,38 @@ class _HarnessGameSession:
                 action_display,
                 self.controller_config,
             )
+            guard_reason_code = action_guard_reason_code(
+                self.history_entries,
+                self.current_frame(),
+                action_display,
+                self.controller_config,
+            )
+            if guard_reason is None:
+                cross_trial_harm = self._cross_trial_harm_reason(action_display)
+                if cross_trial_harm is not None:
+                    guard_reason = cross_trial_harm
+                    guard_reason_code = "known_harmful_cross_trial"
             if guard_reason is not None:
-                guard_reason_code = action_guard_reason_code(
-                    self.history_entries,
-                    self.current_frame(),
-                    action_display,
-                    self.controller_config,
-                )
-                stop_reason = "loop_guard"
+                loop_guard = guard_reason_code != "known_harmful_cross_trial"
+                stop_reason = "loop_guard" if loop_guard else "harm_guard"
+                stop_detail = guard_reason
                 current = self.current_frame()
                 self.viewer_events.append(
                     {
                         **self._base_viewer_event(current),
                         "type": "controller",
-                        "title": "Loop Guard",
+                        "title": "Loop Guard" if loop_guard else "Harm Guard",
                         "action_num": self.action_count,
                         "analysis_step": self.analysis_step,
                         "action_display": action_display,
                         "guarded": True,
                         "guard_reason_code": guard_reason_code,
-                        "loop_detected": True,
+                        "loop_detected": loop_guard,
                         "controller_policy": self.controller_config.policy,
                         "controller_phase": "recover",
-                        "controller_reason_codes": [guard_reason_code] if guard_reason_code else [],
+                        "controller_reason_codes": [guard_reason_code]
+                        if guard_reason_code
+                        else [],
                         "stop_reason": stop_reason,
                         "stop_detail": guard_reason,
                     }
@@ -931,10 +1079,12 @@ class _HarnessGameSession:
                     "run_complete": False,
                     "guarded": True,
                     "guard_reason_code": guard_reason_code,
-                    "loop_detected": True,
+                    "loop_detected": loop_guard,
                     "controller_policy": self.controller_config.policy,
                     "controller_phase": "recover",
-                    "controller_reason_codes": [guard_reason_code] if guard_reason_code else [],
+                    "controller_reason_codes": [guard_reason_code]
+                    if guard_reason_code
+                    else [],
                     "requested_count": batch_size,
                     "executed_count": 0,
                     "stopped_early": True,
@@ -953,11 +1103,13 @@ class _HarnessGameSession:
                     batch_index=batch_index,
                     batch_size=batch_size,
                     strategy_prediction=strategy_prediction,
+                    controller_fallback_reason=controller_fallback_reason,
                     flush_viewer_payload=False,
                 )
             except Exception as exc:
                 if executed_payloads:
                     stop_reason = "action_error"
+                    stop_detail = f"{type(exc).__name__}: {exc}"
                     break
                 return self._error_payload(f"{type(exc).__name__}: {exc}")
             executed_payloads.append(payload)
@@ -999,6 +1151,8 @@ class _HarnessGameSession:
                     "after_state_id",
                     "behavioral_before_state_id",
                     "behavioral_after_state_id",
+                    "object_before_state_id",
+                    "object_after_state_id",
                     "board_changed",
                     "novel_state",
                     "outcome_class",
@@ -1030,13 +1184,44 @@ class _HarnessGameSession:
         final_payload["stopped_early"] = len(executed_payloads) < batch_size
         if stop_reason is not None:
             final_payload["stop_reason"] = stop_reason
-            if stop_reason == "phase_action_budget":
-                final_payload["stop_detail"] = (
-                    "The controller phase changed and no longer supports the "
-                    "remaining queued actions."
-                )
+            if stop_detail:
+                final_payload["stop_detail"] = stop_detail
         self.write_viewer_payload()
         return final_payload
+
+    def _cross_trial_harm_reason(self, action_display: str) -> str | None:
+        if not self.controller_config.outcome_aware:
+            return None
+        store = getattr(self.solver, "_knowledge_store", None)
+        run = self.game.game_run
+        game_id = str(getattr(run, "game_id", "") or "")
+        if store is None or not game_id:
+            return None
+        snapshot = store.snapshot(
+            game_id, state_id=frame_fingerprint(self.current_frame())
+        )
+        action_key = normalize_action_key(action_display)
+        for evidence in snapshot.get("state_action_evidence") or []:
+            if not isinstance(evidence, dict):
+                continue
+            if normalize_action_key(evidence.get("action") or "") != action_key:
+                continue
+            outcomes = evidence.get("outcomes") or {}
+            harmful_trials = int(outcomes.get("terminal_failure") or 0) + int(
+                outcomes.get("negative_reward") or 0
+            )
+            total_trials = max(
+                harmful_trials,
+                int(evidence.get("trials") or 0),
+                sum(int(count or 0) for count in outcomes.values()),
+            )
+            if harmful_evidence_is_decisive(harmful_trials, total_trials):
+                return (
+                    f"{action_key} has decisive harm evidence ({harmful_trials} of "
+                    f"{total_trials} independent cross-trial observations): "
+                    "terminal-failure or negative-reward observations in this state"
+                )
+        return None
 
     def _execute_auto_reset(self) -> None:
         action = arcengine.ActionInput(id=arcengine.GameAction.RESET, data={})
@@ -1049,6 +1234,7 @@ class _HarnessGameSession:
         batch_index: int,
         batch_size: int,
         strategy_prediction: dict[str, Any] | None = None,
+        controller_fallback_reason: str = "",
         generated_tokens: int | None = None,
         flush_viewer_payload: bool = True,
     ) -> dict[str, Any]:
@@ -1067,21 +1253,27 @@ class _HarnessGameSession:
         )
         self.last_engine_action = action.id.name
         action_display = _format_action_display(action.id.name, dict(action.data))
-        current_frame = Frame(
-            grid=_grid_from_state(new_state),
-            step=self.action_count,
-            level=_level_number(self.game),
-        )
+        completed = int(new_state.levels_completed)
+        raw_state = new_state.raw.state
+        animation = _summarize_animation(previous_grid, new_state)
+        current_frame = _decision_frame(self.game, new_state, step=self.action_count)
         self.history_entries.append(
-            HistoryEntry(action=action_display, frame=current_frame)
+            HistoryEntry(
+                action=action_display,
+                frame=current_frame,
+                animation=animation,
+                outcome_class_override=(
+                    "terminal_failure"
+                    if raw_state == arcengine.GameState.GAME_OVER
+                    else ""
+                ),
+            )
         )
         self.write_runtime_state()
 
-        completed = int(new_state.levels_completed)
         reward = float(completed - previous_completed) / max(
             1.0, float(self.game.number_of_levels)
         )
-        raw_state = new_state.raw.state
         board_changed = previous_grid != _grid_from_state(new_state)
         level_completed = bool(
             new_state.just_won_level and raw_state != arcengine.GameState.WIN
@@ -1108,7 +1300,8 @@ class _HarnessGameSession:
             "action_display": action_display,
             "batch_index": batch_index,
             "batch_size": batch_size,
-            "animation": _summarize_animation(previous_grid, new_state),
+            "controller_fallback_reason": controller_fallback_reason or None,
+            "animation": animation,
             **self.timing_payload(),
         }
         if self.controller_config.enabled:
@@ -1120,6 +1313,13 @@ class _HarnessGameSession:
                     action_display,
                     self.controller_config,
                     previous_valid_actions,
+                    reward=reward,
+                    game_over=raw_state == arcengine.GameState.GAME_OVER,
+                    run_complete=raw_state == arcengine.GameState.WIN,
+                    next_valid_actions=to_model_actions(
+                        _engine_action_names(self.game)
+                    ),
+                    animation=animation,
                 )
             )
         prediction_result = _evaluate_strategy_prediction(strategy_prediction, payload)
@@ -1174,9 +1374,7 @@ class HarnessSolver(Solver):
     kaggle_vllm_enable_chunked_prefill: bool = field(
         default=DEFAULT_VLLM_ENABLE_CHUNKED_PREFILL, repr=False
     )
-    kaggle_expected_gpu_type: str = field(
-        default=DEFAULT_EXPECTED_GPU_TYPE, repr=False
-    )
+    kaggle_expected_gpu_type: str = field(default=DEFAULT_EXPECTED_GPU_TYPE, repr=False)
     kaggle_expected_gpu_count: int = field(
         default=DEFAULT_EXPECTED_GPU_COUNT, repr=False
     )
@@ -1215,10 +1413,13 @@ class HarnessSolver(Solver):
     # Custom pool sized to self.concurrency: asyncio.to_thread routes onto
     # Python's default executor, capped at min(32, cpu+4) — which would
     # silently cap real concurrency below self.concurrency.
-    _worker_pool: ThreadPoolExecutor | None = field(default=None, init=False, repr=False, compare=False)
+    _worker_pool: ThreadPoolExecutor | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
     _knowledge_store: TrialKnowledgeStore = field(
         default_factory=TrialKnowledgeStore, init=False, repr=False, compare=False
     )
+    _knowledge_run_id: str = field(default="", init=False, repr=False, compare=False)
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -1305,6 +1506,11 @@ class HarnessSolver(Solver):
         )
 
     def _setup(self) -> None:
+        self._knowledge_run_id = (
+            Path(self.job_dir).name
+            if self.job_dir is not None
+            else f"session-{id(self)}"
+        )
         knowledge_path = os.environ.get("LOCAL_ANALYZER_KNOWLEDGE_PATH", "").strip()
         if not knowledge_path and self.job_dir is not None:
             knowledge_path = str(Path(self.job_dir) / "cross_trial_knowledge.json")
@@ -1339,9 +1545,16 @@ class HarnessSolver(Solver):
             # consume verified mechanics without reducing cross-game parallelism.
             async with game_locks.setdefault(game_id, asyncio.Lock()):
                 async with semaphore:
-                    args = (game, index, pass_index, self._local_server_for_game_index(index))
+                    args = (
+                        game,
+                        index,
+                        pass_index,
+                        self._local_server_for_game_index(index),
+                    )
                     if pool is not None:
-                        await loop.run_in_executor(pool, functools.partial(self._play_one, *args))
+                        await loop.run_in_executor(
+                            pool, functools.partial(self._play_one, *args)
+                        )
                     else:
                         # _setup wasn't called (direct test invocation).
                         await asyncio.to_thread(self._play_one, *args)
@@ -1643,8 +1856,11 @@ class HarnessSolver(Solver):
             or None,
             provider="vllm" if local_server is not None else None,
             knowledge_store=self._knowledge_store,
-            game_id=(game.game_run.game_id if game.game_run is not None else str(index)),
+            game_id=(
+                game.game_run.game_id if game.game_run is not None else str(index)
+            ),
             pass_index=pass_index,
+            evidence_id=f"{self._knowledge_run_id}:pass={pass_index}",
         )
 
     def _play_one(

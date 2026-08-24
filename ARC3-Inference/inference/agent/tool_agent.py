@@ -1,4 +1,5 @@
 """Direct OpenAI-compatible tool-calling analyzer for ARC puzzle runs."""
+
 from __future__ import annotations
 
 import ast
@@ -16,12 +17,17 @@ from urllib.parse import urlparse, urlunparse
 
 import requests
 
-from inference.agent.action_names import MAX_ACTION_BATCH, to_engine_action, to_model_action
+from inference.agent.action_names import (
+    MAX_ACTION_BATCH,
+    to_engine_action,
+    to_model_action,
+)
 from inference.agent.causal_model import normalize_causal_model
 from inference.agent.inference_controller import (
     InferenceControllerConfig,
     action_family,
     build_experience_snapshot,
+    harmful_evidence_is_decisive,
     normalize_action_key,
 )
 from inference.agent.prompts import (
@@ -55,7 +61,9 @@ from inference.utils.openai_compat import build_chat_payload, build_headers
 log = logging.getLogger(__name__)
 
 _LOCAL_ANALYZER_MODEL_ID = os.environ.get("LOCAL_ANALYZER_MODEL_ID", "")
-_LOCAL_ANALYZER_BASE_URL = os.environ.get("LOCAL_ANALYZER_BASE_URL", "http://127.0.0.1:1234/v1")
+_LOCAL_ANALYZER_BASE_URL = os.environ.get(
+    "LOCAL_ANALYZER_BASE_URL", "http://127.0.0.1:1234/v1"
+)
 _DEFAULT_ANALYZER_MODEL = os.environ.get(
     "INFERENCE_ANALYZER_MODEL",
     _LOCAL_ANALYZER_MODEL_ID,
@@ -134,6 +142,60 @@ def _parse_bounded_generated_python(code: str) -> ast.AST:
                 f"Python code is limited to {_LOCAL_ANALYZER_MAX_AST_NODES} syntax nodes."
             )
     return tree
+
+
+def _static_candidate_value(node: ast.AST, bindings: dict[str, Any]) -> Any:
+    """Resolve bounded literal data and simple variable aliases without execution."""
+    if isinstance(node, ast.Name) and node.id in bindings:
+        return bindings[node.id]
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.List, ast.Tuple)):
+        values = [_static_candidate_value(item, bindings) for item in node.elts]
+        return values if isinstance(node, ast.List) else tuple(values)
+    if isinstance(node, ast.Dict):
+        return {
+            _static_candidate_value(key, bindings): _static_candidate_value(
+                value, bindings
+            )
+            for key, value in zip(node.keys, node.values)
+            if key is not None
+        }
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        value = _static_candidate_value(node.operand, bindings)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError("non-numeric unary candidate value")
+        return -value if isinstance(node.op, ast.USub) else value
+    raise ValueError("candidate action is dynamic")
+
+
+def _static_candidate_action_arguments(tree: ast.AST) -> list[Any]:
+    bindings: dict[str, Any] = {}
+    for statement in getattr(tree, "body", []):
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+        ):
+            try:
+                bindings[statement.targets[0].id] = _static_candidate_value(
+                    statement.value, bindings
+                )
+            except ValueError:
+                bindings.pop(statement.targets[0].id, None)
+    arguments: list[Any] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "action"
+            and node.args
+        ):
+            try:
+                arguments.append(_static_candidate_value(node.args[0], bindings))
+            except ValueError:
+                continue
+    return arguments
 
 
 def _normalize_generated_python_code(value: Any) -> str:
@@ -264,15 +326,25 @@ def _get_env_float(name: str, default: float) -> float:
 
 
 _LOCAL_ANALYZER_MAX_OUTPUT = _get_env_int("LOCAL_ANALYZER_MAX_OUTPUT", 0)
-_LOCAL_ANALYZER_INITIAL_MAX_OUTPUT = _get_env_int("LOCAL_ANALYZER_INITIAL_MAX_OUTPUT", 2048)
-_LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT = _get_env_int("LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT", 1024)
-_LOCAL_ANALYZER_REPAIR_MAX_OUTPUT = _get_env_int("LOCAL_ANALYZER_REPAIR_MAX_OUTPUT", 512)
-_LOCAL_ANALYZER_FORCE_PYTHON_TOOL = _get_env_bool("LOCAL_ANALYZER_FORCE_PYTHON_TOOL", True)
+_LOCAL_ANALYZER_INITIAL_MAX_OUTPUT = _get_env_int(
+    "LOCAL_ANALYZER_INITIAL_MAX_OUTPUT", 2048
+)
+_LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT = _get_env_int(
+    "LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT", 1024
+)
+_LOCAL_ANALYZER_REPAIR_MAX_OUTPUT = _get_env_int(
+    "LOCAL_ANALYZER_REPAIR_MAX_OUTPUT", 512
+)
+_LOCAL_ANALYZER_FORCE_PYTHON_TOOL = _get_env_bool(
+    "LOCAL_ANALYZER_FORCE_PYTHON_TOOL", True
+)
 _LOCAL_ANALYZER_CONTEXT_WINDOW = _get_env_int("LOCAL_ANALYZER_CONTEXT_WINDOW", 32768)
 _LOCAL_ANALYZER_TIMEOUT = _get_env_float("LOCAL_ANALYZER_TIMEOUT", 0.0)
 _LOCAL_ANALYZER_TOOL_STEPS = _get_env_int("LOCAL_ANALYZER_TOOL_STEPS", 12)
 _LOCAL_ANALYZER_TOOL_TIMEOUT = _get_env_int("LOCAL_ANALYZER_TOOL_TIMEOUT", 30)
-_LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS = _get_env_int("LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS", 1024)
+_LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS = _get_env_int(
+    "LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS", 1024
+)
 _LOCAL_ANALYZER_YIELD_SECONDS = _get_env_float("LOCAL_ANALYZER_YIELD_SECONDS", 0.0)
 _LOCAL_ANALYZER_ENABLE_THINKING = _get_env_bool("LOCAL_ANALYZER_ENABLE_THINKING", True)
 _LOCAL_ANALYZER_TEMPERATURE = _get_env_float("LOCAL_ANALYZER_TEMPERATURE", 0.6)
@@ -296,7 +368,10 @@ _LOCAL_ANALYZER_MAX_AST_NODES = max(
     256, _get_env_int("LOCAL_ANALYZER_MAX_AST_NODES", 20_000)
 )
 _LOCAL_ANALYZER_CANDIDATES = min(
-    4, max(1, _get_env_int("LOCAL_ANALYZER_CANDIDATES", 1))
+    4, max(1, _get_env_int("LOCAL_ANALYZER_CANDIDATES", 2))
+)
+_LOCAL_ANALYZER_GAME_TOKEN_BUDGET = max(
+    0, _get_env_int("LOCAL_ANALYZER_GAME_TOKEN_BUDGET", 250_000)
 )
 _LOCAL_ANALYZER_DURABLE_STATE_BYTES = max(
     16_384, _get_env_int("LOCAL_ANALYZER_DURABLE_STATE_BYTES", 1_048_576)
@@ -320,6 +395,7 @@ _PYTHON_TOOL_DESCRIPTION = (
     "`previous_frame` or `last_transition` for before/after analysis. A final expression is returned "
     "notebook-style; use `print(...)` or assign `result` for compact output."
 )
+
 
 def _normalize_valid_actions(valid_actions: list[str] | None) -> list[str]:
     names: list[str] = []
@@ -372,6 +448,15 @@ def _display_action_number(action_num: int) -> int:
     return max(1, int(action_num) + 1)
 
 
+def _remaining_deadline_seconds(
+    deadline: float | None, *, now: float | None = None
+) -> float | None:
+    if deadline is None:
+        return None
+    current = time.monotonic() if now is None else float(now)
+    return max(0.0, float(deadline) - current)
+
+
 def _normalize_summary_text(value: Any, *, max_chars: int | None = 280) -> str:
     text = " ".join(str(value or "").split())
     if max_chars is None or max_chars <= 0 or len(text) <= max_chars:
@@ -398,7 +483,7 @@ def _extract_labeled_blocks(content: str, labels: list[str]) -> dict[str, str]:
         for target in targets:
             if lowered.startswith(target):
                 matched_label = normalized_labels[target[:-1]]
-                inline_value = candidate[len(target):].strip()
+                inline_value = candidate[len(target) :].strip()
                 break
 
         if matched_label is not None:
@@ -511,7 +596,9 @@ def _format_model_response_meta(
         lines.extend(f"- {issue}" for issue in malformed_argument_errors)
     if tool_calls:
         lines.append("raw_tool_calls:")
-        lines.append(_trim_log_text(json.dumps(tool_calls, indent=2, ensure_ascii=True)))
+        lines.append(
+            _trim_log_text(json.dumps(tool_calls, indent=2, ensure_ascii=True))
+        )
     return "\n".join(lines)
 
 
@@ -523,7 +610,9 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt += MULTIMODAL_CONTEXT_ADDENDUM
     prompt += VISUAL_GAME_ADDENDUM
     prompt += PYTHON_ADDENDUM
-    prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(tool_output_tokens=tool_output_tokens)
+    prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(
+        tool_output_tokens=tool_output_tokens
+    )
     return prompt
 
 
@@ -540,6 +629,7 @@ class AnalyzerTurnResult:
     retryable_failure: bool = False
     reasoning: str = ""
     yielded_control: bool = False
+    yield_reason: str | None = None
     efficiency_metrics: dict[str, float | int] | None = None
     failure_category: str | None = None
     failure_detail: str = ""
@@ -562,7 +652,9 @@ class _AsciiFrameView:
 
     def __str__(self) -> str:
         rows, cols = self.shape
-        return f"AsciiFrameView(level={self.level}, step={self.step}, shape={rows}x{cols})"
+        return (
+            f"AsciiFrameView(level={self.level}, step={self.step}, shape={rows}x{cols})"
+        )
 
     __repr__ = __str__
 
@@ -605,7 +697,9 @@ def _to_ascii_frame_view(frame: Frame | None) -> _AsciiFrameView | None:
     )
 
 
-def _to_ascii_history_views(history_entries: list[HistoryEntry]) -> list[_AsciiHistoryEntryView]:
+def _to_ascii_history_views(
+    history_entries: list[HistoryEntry],
+) -> list[_AsciiHistoryEntryView]:
     views: list[_AsciiHistoryEntryView] = []
     for entry in history_entries:
         frame_view = _to_ascii_frame_view(entry.frame)
@@ -654,7 +748,9 @@ def _ascii_frame_delta_payload(
     }
 
 
-def _ascii_history_view_payload(history_entries: list[HistoryEntry]) -> list[dict[str, Any]]:
+def _ascii_history_view_payload(
+    history_entries: list[HistoryEntry],
+) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     previous_frame: Frame | None = None
     for entry in history_entries:
@@ -690,7 +786,9 @@ def _current_frame_transport_payload(
     return full_payload
 
 
-def _format_action_span(start_action_num: int | None, end_action_num: int | None) -> str | None:
+def _format_action_span(
+    start_action_num: int | None, end_action_num: int | None
+) -> str | None:
     if start_action_num is None or end_action_num is None:
         return None
     if start_action_num <= 0 or end_action_num <= 0:
@@ -736,16 +834,31 @@ def _resolve_analyzer_model(model: str) -> AnalyzerModelConfig:
     requested = (model or "").strip()
     lowered = requested.lower()
     if lowered in {"local", "local-qwen", "qwen-local", "qwen"}:
-        configured_base_url = os.environ.get("LOCAL_ANALYZER_BASE_URL", _LOCAL_ANALYZER_BASE_URL).strip()
+        configured_base_url = os.environ.get(
+            "LOCAL_ANALYZER_BASE_URL", _LOCAL_ANALYZER_BASE_URL
+        ).strip()
         if not configured_base_url:
-            raise ValueError("LOCAL_ANALYZER_BASE_URL must be set for the local analyzer preset.")
+            raise ValueError(
+                "LOCAL_ANALYZER_BASE_URL must be set for the local analyzer preset."
+            )
 
-        provider = os.environ.get("LOCAL_ANALYZER_PROVIDER", os.environ.get("OPENAI_PROVIDER", "vllm")).strip().lower()
+        provider = (
+            os.environ.get(
+                "LOCAL_ANALYZER_PROVIDER", os.environ.get("OPENAI_PROVIDER", "vllm")
+            )
+            .strip()
+            .lower()
+        )
         if not provider:
             provider = "vllm"
-        model_id = os.environ.get("LOCAL_ANALYZER_MODEL_ID", "").strip() or _LOCAL_ANALYZER_MODEL_ID.strip()
+        model_id = (
+            os.environ.get("LOCAL_ANALYZER_MODEL_ID", "").strip()
+            or _LOCAL_ANALYZER_MODEL_ID.strip()
+        )
         if not model_id:
-            raise ValueError("LOCAL_ANALYZER_MODEL_ID must be set for the local analyzer preset.")
+            raise ValueError(
+                "LOCAL_ANALYZER_MODEL_ID must be set for the local analyzer preset."
+            )
         return AnalyzerModelConfig(
             provider=provider,
             base_url=_host_accessible_base_url(configured_base_url),
@@ -760,14 +873,25 @@ def _resolve_analyzer_model(model: str) -> AnalyzerModelConfig:
             "or set LOCAL_ANALYZER_MODEL_ID / INFERENCE_ANALYZER_MODEL."
         )
 
-    provider = os.environ.get("OPENAI_PROVIDER", os.environ.get("LOCAL_ANALYZER_PROVIDER", "vllm")).strip().lower()
+    provider = (
+        os.environ.get(
+            "OPENAI_PROVIDER", os.environ.get("LOCAL_ANALYZER_PROVIDER", "vllm")
+        )
+        .strip()
+        .lower()
+    )
     if not provider:
         provider = "vllm"
     base_url = _host_accessible_base_url(
-        os.environ.get("OPENAI_BASE_URL", os.environ.get("LOCAL_ANALYZER_BASE_URL", _LOCAL_ANALYZER_BASE_URL)).strip()
+        os.environ.get(
+            "OPENAI_BASE_URL",
+            os.environ.get("LOCAL_ANALYZER_BASE_URL", _LOCAL_ANALYZER_BASE_URL),
+        ).strip()
     )
     if not base_url:
-        raise ValueError("OPENAI_BASE_URL or LOCAL_ANALYZER_BASE_URL must be set for direct model ids.")
+        raise ValueError(
+            "OPENAI_BASE_URL or LOCAL_ANALYZER_BASE_URL must be set for direct model ids."
+        )
     return AnalyzerModelConfig(provider=provider, base_url=base_url, model_id=requested)
 
 
@@ -943,7 +1067,11 @@ def _render_jsonish_text(value: Any) -> str:
     parsed = _json_like_payload(value)
     if parsed is not None:
         return _render_human_readable_value(parsed)
-    return _normalize_message_content(value) if not isinstance(value, str) else value.strip()
+    return (
+        _normalize_message_content(value)
+        if not isinstance(value, str)
+        else value.strip()
+    )
 
 
 def _render_tool_parameter_text(value: Any) -> str:
@@ -968,7 +1096,9 @@ def _normalize_tool_call_arguments(arguments: Any) -> dict[str, Any]:
         if stripped.startswith("<tool_call>"):
             recovered_tool_calls = _recover_tool_calls_from_markup(stripped)
             if recovered_tool_calls:
-                recovered_arguments = recovered_tool_calls[0].get("function", {}).get("arguments", "{}")
+                recovered_arguments = (
+                    recovered_tool_calls[0].get("function", {}).get("arguments", "{}")
+                )
                 return _normalize_tool_call_arguments(recovered_arguments)
             return {}
         try:
@@ -1018,7 +1148,11 @@ def _render_tool_call_markup(
 
 
 def _render_tool_result_display(content: Any) -> str:
-    parsed = _json_like_payload(content) if isinstance(content, str) else (content if isinstance(content, dict) else None)
+    parsed = (
+        _json_like_payload(content)
+        if isinstance(content, str)
+        else (content if isinstance(content, dict) else None)
+    )
     if isinstance(parsed, dict):
         stdout = str(parsed.get("stdout", "") or "").rstrip("\n")
         error = str(parsed.get("error", "") or "").rstrip("\n")
@@ -1114,7 +1248,9 @@ def _bounded_python_memory(
         except (TypeError, ValueError, RecursionError) as exc:
             raise ValueError("memory values must be finite JSON data.") from exc
         if len(encoded_value) > max_value_bytes:
-            raise ValueError(f"each memory value is limited to {max_value_bytes} bytes.")
+            raise ValueError(
+                f"each memory value is limited to {max_value_bytes} bytes."
+            )
         normalized[key] = value
 
     encoded_memory = json.dumps(
@@ -1138,7 +1274,9 @@ def _resolve_run_artifact_location(state_path: Path) -> tuple[Path, str | None]:
         runtime_state_stem = Path(RUNTIME_STATE_FILENAME).stem
         suffix = f"_{runtime_state_stem}"
         state_stem = state_path.stem
-        game_stem = state_stem[:-len(suffix)] if state_stem.endswith(suffix) else state_stem
+        game_stem = (
+            state_stem[: -len(suffix)] if state_stem.endswith(suffix) else state_stem
+        )
         return run_root, game_stem
     return parent, None
 
@@ -1167,7 +1305,9 @@ def _render_prompt_log_message(message: dict[str, Any]) -> str:
 
     content = _normalize_message_content(message.get("content", ""))
     if content:
-        blocks.append(_render_tool_result_display(content) if role == "TOOL" else content)
+        blocks.append(
+            _render_tool_result_display(content) if role == "TOOL" else content
+        )
 
     reasoning = _extract_reasoning_text(message)
     if reasoning:
@@ -1177,24 +1317,36 @@ def _render_prompt_log_message(message: dict[str, Any]) -> str:
     tool_calls = message.get("tool_calls") or []
     if tool_calls:
         for tool_call in tool_calls:
-            function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+            function = (
+                tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+            )
             name = str(function.get("name", "")).strip() or "unknown"
             blocks.append(f"[ASSISTANT TOOL CALL: {name}]")
             tool_call_id = str(tool_call.get("id", "")).strip()
             if tool_call_id:
                 blocks.append(f"id: {tool_call_id}")
-            rendered_tool_call = _render_tool_call_markup(name, function.get("arguments", "{}"))
+            rendered_tool_call = _render_tool_call_markup(
+                name, function.get("arguments", "{}")
+            )
             if rendered_tool_call:
                 blocks.append(rendered_tool_call)
             else:
                 raw_arguments = function.get("arguments", "{}")
                 try:
-                    parsed_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
-                    rendered_arguments = json.dumps(parsed_arguments, indent=2, ensure_ascii=True)
+                    parsed_arguments = (
+                        json.loads(raw_arguments)
+                        if isinstance(raw_arguments, str)
+                        else raw_arguments
+                    )
+                    rendered_arguments = json.dumps(
+                        parsed_arguments, indent=2, ensure_ascii=True
+                    )
                 except (TypeError, ValueError, json.JSONDecodeError):
                     rendered_arguments = str(raw_arguments)
                 blocks.append("arguments:")
-                blocks.append(rendered_arguments if rendered_arguments.strip() else "{}")
+                blocks.append(
+                    rendered_arguments if rendered_arguments.strip() else "{}"
+                )
 
     return "\n".join(blocks)
 
@@ -1267,7 +1419,9 @@ def _write_prompt_log_snapshot(
     tool_choice: Any,
     transcript: str,
 ) -> None:
-    rendered_messages = "\n\n".join(_render_prompt_log_message(message) for message in messages)
+    rendered_messages = "\n\n".join(
+        _render_prompt_log_message(message) for message in messages
+    )
     rendered_tools: list[str] = []
     for tool in tools or []:
         function = tool.get("function", {}) if isinstance(tool, dict) else {}
@@ -1375,11 +1529,13 @@ class ToolAgent:
         knowledge_store: TrialKnowledgeStore | None = None,
         game_id: str = "",
         pass_index: int = 0,
+        evidence_id: str = "",
     ) -> None:
         resolved_model = _resolve_analyzer_model(model)
         if base_url is not None or provider is not None:
             resolved_model = AnalyzerModelConfig(
-                provider=str(provider or resolved_model.provider).strip() or resolved_model.provider,
+                provider=str(provider or resolved_model.provider).strip()
+                or resolved_model.provider,
                 base_url=(
                     _host_accessible_base_url(str(base_url).strip())
                     if base_url is not None and str(base_url).strip()
@@ -1390,11 +1546,23 @@ class ToolAgent:
         self._model = resolved_model
         self._fallback_models = _resolve_fallback_models()
         configured_timeout = _LOCAL_ANALYZER_TIMEOUT if timeout is None else timeout
-        self._timeout = None if configured_timeout is None or configured_timeout <= 0 else float(configured_timeout)
+        self._timeout = (
+            None
+            if configured_timeout is None or configured_timeout <= 0
+            else float(configured_timeout)
+        )
         self._api_key = str(api_key or "").strip()
-        self._tool_steps = None if _LOCAL_ANALYZER_TOOL_STEPS <= 0 else max(1, _LOCAL_ANALYZER_TOOL_STEPS)
+        self._tool_steps = (
+            None
+            if _LOCAL_ANALYZER_TOOL_STEPS <= 0
+            else max(1, _LOCAL_ANALYZER_TOOL_STEPS)
+        )
         self._python_timeout = min(30, max(1, _LOCAL_ANALYZER_TOOL_TIMEOUT))
-        self._yield_seconds = None if _LOCAL_ANALYZER_YIELD_SECONDS <= 0 else float(_LOCAL_ANALYZER_YIELD_SECONDS)
+        self._yield_seconds = (
+            None
+            if _LOCAL_ANALYZER_YIELD_SECONDS <= 0
+            else float(_LOCAL_ANALYZER_YIELD_SECONDS)
+        )
         configured_max_output = _LOCAL_ANALYZER_MAX_OUTPUT
         self._max_output_tokens = (
             max(1, configured_max_output)
@@ -1411,13 +1579,17 @@ class ToolAgent:
         self._request_safety_margin_tokens = _REQUEST_SAFETY_MARGIN_TOKENS
         self._context_budget_tokens = max(
             1024,
-            _LOCAL_ANALYZER_CONTEXT_WINDOW - self._reply_reserve_tokens - self._request_safety_margin_tokens,
+            _LOCAL_ANALYZER_CONTEXT_WINDOW
+            - self._reply_reserve_tokens
+            - self._request_safety_margin_tokens,
         )
         self._history_messages: list[dict[str, Any]] = []
         self._session_runtime_dir: Path | None = None
         self._session_total_tokens = 0
         self._session_generated_tokens = 0
-        self._step_env_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        self._step_env_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = (
+            None
+        )
         self._current_valid_actions: list[str] = []
         self._last_step_summary: dict[str, Any] | None = None
         self._last_action_result: dict[str, Any] | None = None
@@ -1426,6 +1598,7 @@ class ToolAgent:
         self._knowledge_store = knowledge_store
         self._knowledge_game_id = str(game_id or "")
         self._knowledge_pass_index = max(0, int(pass_index))
+        self._knowledge_evidence_id = str(evidence_id or "")[:160]
         self._current_experience_snapshot: dict[str, Any] = {}
         self._strategy_memory: dict[str, Any] = {}
         self._python_memory: dict[str, Any] = {}
@@ -1439,7 +1612,9 @@ class ToolAgent:
         self._http_retry_base_seconds = _LOCAL_ANALYZER_HTTP_RETRY_BASE_SECONDS
         self._http_retry_max_seconds = _LOCAL_ANALYZER_HTTP_RETRY_MAX_SECONDS
         self._candidate_count = _LOCAL_ANALYZER_CANDIDATES
-        self._tokenizer_path = os.environ.get("LOCAL_ANALYZER_TOKENIZER_PATH", "").strip()
+        self._tokenizer_path = os.environ.get(
+            "LOCAL_ANALYZER_TOKENIZER_PATH", ""
+        ).strip()
         self._tokenizer: Any | None = None
         self._tokenizer_load_attempted = False
         self._should_stop_callback: Callable[[], bool] | None = None
@@ -1470,14 +1645,49 @@ class ToolAgent:
             except Exception:
                 pass
 
-    def _adaptive_output_limit(self, request_index: int, *, repair: bool = False) -> int:
+    def _adaptive_output_limit(
+        self, request_index: int, *, repair: bool = False
+    ) -> int:
         if _LOCAL_ANALYZER_MAX_OUTPUT > 0:
-            return self._max_output_tokens
-        if repair:
-            return max(1, min(self._max_output_tokens, _LOCAL_ANALYZER_REPAIR_MAX_OUTPUT))
-        if request_index <= 1:
-            return self._max_output_tokens
-        return max(1, min(self._max_output_tokens, _LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT))
+            limit = self._max_output_tokens
+        elif repair:
+            limit = max(
+                1, min(self._max_output_tokens, _LOCAL_ANALYZER_REPAIR_MAX_OUTPUT)
+            )
+        elif request_index <= 1:
+            limit = self._max_output_tokens
+        else:
+            limit = max(
+                1, min(self._max_output_tokens, _LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT)
+            )
+        remaining = self._remaining_game_tokens()
+        return min(limit, max(1, remaining)) if remaining is not None else limit
+
+    def _remaining_game_tokens(self) -> int | None:
+        if _LOCAL_ANALYZER_GAME_TOKEN_BUDGET <= 0:
+            return None
+        return max(
+            0, _LOCAL_ANALYZER_GAME_TOKEN_BUDGET - self._session_generated_tokens
+        )
+
+    def _adaptive_candidate_count(self, output_limit: int) -> int:
+        remaining = self._remaining_game_tokens()
+        if remaining is not None and remaining < max(1, output_limit) * 2:
+            return 1
+        snapshot = self._current_experience_snapshot or {}
+        if not snapshot:
+            return self._candidate_count
+        uncertainty = max(
+            (
+                float(item.get("uncertainty") or 0.0)
+                for item in snapshot.get("ranked_actions") or []
+                if isinstance(item, dict)
+            ),
+            default=0.0,
+        )
+        if str(snapshot.get("phase") or "") == "recover" or uncertainty >= 0.6:
+            return self._candidate_count
+        return 1
 
     def _exact_request_tokens(
         self,
@@ -1497,7 +1707,11 @@ class ToolAgent:
                     trust_remote_code=False,
                 )
             except Exception as exc:  # noqa: BLE001 - optional optimization
-                log.warning("analyzer tokenizer unavailable at %s: %s", self._tokenizer_path, exc)
+                log.warning(
+                    "analyzer tokenizer unavailable at %s: %s",
+                    self._tokenizer_path,
+                    exc,
+                )
                 self._tokenizer = None
         if self._tokenizer is None:
             return None
@@ -1525,7 +1739,9 @@ class ToolAgent:
             or os.environ.get("OPENAI_API_KEY", "").strip()
         )
         site_url = os.environ.get("LOCAL_ANALYZER_SITE_URL", "").strip()
-        app_name = os.environ.get("LOCAL_ANALYZER_APP_NAME", "ARC3 Agent Harness").strip()
+        app_name = os.environ.get(
+            "LOCAL_ANALYZER_APP_NAME", "ARC3 Agent Harness"
+        ).strip()
         return build_headers(
             provider=self._model.provider,
             api_key=api_key,
@@ -1562,7 +1778,9 @@ class ToolAgent:
             return
         try:
             if path.stat().st_size > _LOCAL_ANALYZER_DURABLE_STATE_BYTES:
-                raise ValueError("durable agent state exceeds its configured size limit")
+                raise ValueError(
+                    "durable agent state exceeds its configured size limit"
+                )
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict) or payload.get("version") != 1:
                 raise ValueError("unsupported durable agent state")
@@ -1576,7 +1794,9 @@ class ToolAgent:
                     setattr(self, attribute, dict(value))
             history = payload.get("history_messages")
             if isinstance(history, list):
-                self._history_messages = [dict(item) for item in history if isinstance(item, dict)]
+                self._history_messages = [
+                    dict(item) for item in history if isinstance(item, dict)
+                ]
             for attribute, key in (
                 ("_last_step_summary", "last_step_summary"),
                 ("_last_action_result", "last_action_result"),
@@ -1584,7 +1804,9 @@ class ToolAgent:
                 value = payload.get(key)
                 if isinstance(value, dict):
                     setattr(self, attribute, dict(value))
-            self._session_total_tokens = max(0, int(payload.get("total_tokens", 0) or 0))
+            self._session_total_tokens = max(
+                0, int(payload.get("total_tokens", 0) or 0)
+            )
             self._session_generated_tokens = max(
                 0, int(payload.get("generated_tokens", 0) or 0)
             )
@@ -1593,7 +1815,8 @@ class ToolAgent:
 
     def _persist_durable_state(self) -> None:
         path = self._durable_state_path()
-        if path is None:
+        runtime_path = getattr(self, "_session_runtime_dir", None)
+        if path is None or runtime_path is None or not runtime_path.exists():
             return
         history = list(self._history_messages)
         payload = {
@@ -1626,7 +1849,9 @@ class ToolAgent:
                     payload, ensure_ascii=False, separators=(",", ":"), default=str
                 )
             if len(encoded.encode("utf-8")) > _LOCAL_ANALYZER_DURABLE_STATE_BYTES:
-                raise ValueError("durable analyzer state exceeds its configured size limit")
+                raise ValueError(
+                    "durable analyzer state exceeds its configured size limit"
+                )
             path.parent.mkdir(parents=True, exist_ok=True)
             temporary = path.with_suffix(f"{path.suffix}.tmp")
             temporary.write_text(encoded, encoding="utf-8")
@@ -1694,12 +1919,17 @@ class ToolAgent:
             valid_actions,
             self._controller_config,
             external_transitions=(cross_trial or {}).get("transition_records"),
+            evidence_id=self._knowledge_evidence_id,
         )
         if cross_trial is not None:
             payload = dict(payload)
             payload["cross_trial"] = self._knowledge_store.snapshot(
                 self._knowledge_game_id,
                 state_id=str(payload.get("state_id") or ""),
+            )
+        if self._strategy_memory.get("causal_model"):
+            payload["causal_model"] = normalize_causal_model(
+                self._strategy_memory["causal_model"]
             )
         self._experience_snapshot_cache = _ExperienceSnapshotCache(
             current_frame=current_frame,
@@ -1801,8 +2031,17 @@ class ToolAgent:
         if contradictions:
             persisted["contradictions"] = contradictions
 
-        if isinstance(update.get("causal_model"), dict):
-            persisted["causal_model"] = normalize_causal_model(update["causal_model"])
+        causal_model_updated = isinstance(update.get("causal_model"), dict)
+        if causal_model_updated:
+            causal_model = normalize_causal_model(update["causal_model"])
+            snapshot_state = self._current_experience_snapshot.get(
+                "behavioral_state_id"
+            ) or self._current_experience_snapshot.get("state_id")
+            if snapshot_state:
+                for prediction in causal_model["predictions"]:
+                    if not prediction.get("conditions"):
+                        prediction["conditions"] = f"state:{snapshot_state}"
+            persisted["causal_model"] = causal_model
 
         try:
             if update.get("confidence") is not None:
@@ -1813,11 +2052,20 @@ class ToolAgent:
             pass
 
         self._strategy_memory = persisted
+        if causal_model_updated:
+            self._current_experience_snapshot["causal_model"] = persisted[
+                "causal_model"
+            ]
+            self._experience_snapshot_cache = None
         if persisted.get("goal"):
             self._summarized_knowledge["goal_model"] = str(persisted["goal"])
         if persisted.get("hypothesis"):
             confidence = persisted.get("confidence")
-            suffix = f" (confidence={confidence:.2f})" if isinstance(confidence, float) else ""
+            suffix = (
+                f" (confidence={confidence:.2f})"
+                if isinstance(confidence, float)
+                else ""
+            )
             self._summarized_knowledge["world_model"] = (
                 f"{persisted['hypothesis']}{suffix}"
             )
@@ -1864,9 +2112,7 @@ class ToolAgent:
         if not test_action or not expected:
             return None
         candidates = [
-            item
-            for item in action_result.get("steps") or []
-            if isinstance(item, dict)
+            item for item in action_result.get("steps") or [] if isinstance(item, dict)
         ]
         candidates.append(action_result)
         observed = next(
@@ -1884,7 +2130,10 @@ class ToolAgent:
         if observed is None:
             return None
         actual = str(observed.get("outcome_class") or "unknown")
-        if not observed.get("executed", action_result.get("executed")) or expected == "unknown":
+        if (
+            not observed.get("executed", action_result.get("executed"))
+            or expected == "unknown"
+        ):
             status = "inconclusive"
         else:
             matched = {
@@ -1906,6 +2155,117 @@ class ToolAgent:
         }
         self._consume_strategy_prediction(result)
         return dict(result)
+
+    def _update_causal_model_from_actions(
+        self, action_results: list[dict[str, Any]]
+    ) -> None:
+        """Ground causal relations and structured predictions in observations."""
+        causal = normalize_causal_model(self._strategy_memory.get("causal_model") or {})
+        changed = False
+        relations = causal["relations"]
+        predictions = causal["predictions"]
+        for observed in action_results:
+            if not observed.get("executed"):
+                continue
+            action = normalize_action_key(observed.get("action_display") or "")
+            outcome = str(observed.get("outcome_class") or "unknown")
+            effect = f"outcome:{outcome}"
+            condition = f"state:{observed.get('behavioral_before_state_id') or observed.get('before_state_id') or 'unknown'}"
+            matching = next(
+                (
+                    relation
+                    for relation in relations
+                    if normalize_action_key(relation.get("cause") or "") == action
+                    and str(relation.get("effect") or "") == effect
+                    and str(relation.get("conditions") or "") == condition
+                ),
+                None,
+            )
+            if matching is None and len(relations) >= 24:
+                evictable = [
+                    relation
+                    for relation in relations
+                    if str(relation.get("evidence") or "").startswith(
+                        "automatically grounded"
+                    )
+                ]
+                if evictable:
+                    relations.remove(
+                        min(
+                            evictable,
+                            key=lambda relation: (
+                                float(relation.get("confidence") or 0.0),
+                                int(relation.get("support") or 0),
+                                int(relation.get("last_observed_action") or 0),
+                            ),
+                        )
+                    )
+            if matching is None and len(relations) < 24:
+                matching = {
+                    "cause": action,
+                    "effect": effect,
+                    "conditions": condition,
+                    "evidence": "automatically grounded from executed transition",
+                    "confidence": 0.5,
+                    "support": 0,
+                    "contradictions": 0,
+                    "last_observed_action": int(observed.get("action_num") or 0),
+                }
+                relations.append(matching)
+            if matching is not None:
+                matching["support"] = int(matching.get("support") or 0) + 1
+                matching["last_observed_action"] = int(observed.get("action_num") or 0)
+                matching["confidence"] = round(
+                    (int(matching["support"]) + 1)
+                    / (
+                        int(matching["support"])
+                        + int(matching.get("contradictions") or 0)
+                        + 2
+                    ),
+                    3,
+                )
+                changed = True
+            for relation in relations:
+                if (
+                    relation is not matching
+                    and normalize_action_key(relation.get("cause") or "") == action
+                    and str(relation.get("effect") or "").startswith("outcome:")
+                    and str(relation.get("conditions") or "") == condition
+                ):
+                    relation["contradictions"] = (
+                        int(relation.get("contradictions") or 0) + 1
+                    )
+                    changed = True
+            for relation in relations:
+                if (
+                    normalize_action_key(relation.get("cause") or "") != action
+                    or str(relation.get("conditions") or "") != condition
+                ):
+                    continue
+                support = int(relation.get("support") or 0)
+                contradictions = int(relation.get("contradictions") or 0)
+                relation["confidence"] = round(
+                    (support + 1) / (support + contradictions + 2), 3
+                )
+            for prediction in predictions:
+                prediction_conditions = str(prediction.get("conditions") or "")
+                if (
+                    str(prediction.get("status") or "untested") == "untested"
+                    and normalize_action_key(prediction.get("action") or "") == action
+                    and (
+                        not prediction_conditions.startswith("state:")
+                        or prediction_conditions == condition
+                    )
+                ):
+                    expected = str(prediction.get("expected_outcome") or "")
+                    if expected:
+                        prediction["status"] = (
+                            "supported" if expected == outcome else "contradicted"
+                        )
+                        changed = True
+        if changed:
+            self._strategy_memory["causal_model"] = normalize_causal_model(causal)
+            self._persist_durable_state()
 
     @property
     def total_tokens(self) -> int:
@@ -1946,7 +2306,9 @@ class ToolAgent:
         input_token_count = first_token_count("prompt_tokens", "input_tokens")
         self._session_total_tokens += input_token_count + generated_token_count
 
-    def _summarize_step_sequence(self, action_results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    def _summarize_step_sequence(
+        self, action_results: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
         if not action_results:
             return None
         executed_results = [item for item in action_results if item.get("executed")]
@@ -1964,7 +2326,9 @@ class ToolAgent:
             total_executed += max(1, parsed)
             action_names = item.get("executed_actions")
             if isinstance(action_names, list):
-                executed_actions.extend(str(name).strip() for name in action_names if str(name).strip())
+                executed_actions.extend(
+                    str(name).strip() for name in action_names if str(name).strip()
+                )
             else:
                 fallback_action = str(item.get("action_display") or "").strip()
                 if fallback_action:
@@ -1985,10 +2349,16 @@ class ToolAgent:
             "executed_count": total_executed,
             "executed_actions": executed_actions,
             "level": last.get("level"),
-            "level_transition": any(bool(item.get("level_completed")) for item in executed_results),
-            "run_complete": any(bool(item.get("run_complete")) for item in executed_results),
+            "level_transition": any(
+                bool(item.get("level_completed")) for item in executed_results
+            ),
+            "run_complete": any(
+                bool(item.get("run_complete")) for item in executed_results
+            ),
             "game_over": any(bool(item.get("game_over")) for item in executed_results),
-            "board_changed": any(bool(item.get("board_changed")) for item in executed_results),
+            "board_changed": any(
+                bool(item.get("board_changed")) for item in executed_results
+            ),
             "stop_reason": last.get("stop_reason"),
         }
 
@@ -2019,9 +2389,13 @@ class ToolAgent:
 
         pieces = [prefix]
         if summary.get("board_changed"):
-            pieces.append("produced a board change; verify that it affected gameplay objects rather than only HUD elements.")
+            pieces.append(
+                "produced a board change; verify that it affected gameplay objects rather than only HUD elements."
+            )
         else:
-            pieces.append("did not show a confirmed board change; treat this as weak evidence until verified.")
+            pieces.append(
+                "did not show a confirmed board change; treat this as weak evidence until verified."
+            )
         stop_reason = _normalize_summary_text(summary.get("stop_reason"))
         if stop_reason:
             pieces.append(f"stop_reason={stop_reason}.")
@@ -2039,7 +2413,11 @@ class ToolAgent:
         summary = self._last_step_summary
         if not summary:
             return
-        if summary.get("level_transition") or summary.get("run_complete") or summary.get("game_over"):
+        if (
+            summary.get("level_transition")
+            or summary.get("run_complete")
+            or summary.get("game_over")
+        ):
             for key in (
                 "world_model",
                 "goal_model",
@@ -2058,7 +2436,10 @@ class ToolAgent:
             ("Recent findings", self._summarized_knowledge.get("recent_findings", "")),
             ("Open questions", self._summarized_knowledge.get("open_questions", "")),
             ("Plan", self._summarized_knowledge.get("current_plan", "")),
-            ("Cross-level notes", self._summarized_knowledge.get("cross_level_notes", "")),
+            (
+                "Cross-level notes",
+                self._summarized_knowledge.get("cross_level_notes", ""),
+            ),
         ]
         lines = [f"- {label}: {value}" for label, value in entries if value]
         if not lines:
@@ -2069,19 +2450,41 @@ class ToolAgent:
             "- Revise any item above immediately if `current_frame` or `history` contradicts it.",
         ]
 
-    def _build_user_message(self, user_prompt: str, current_frame: Frame | None) -> dict[str, Any]:
+    def _build_user_message(
+        self,
+        user_prompt: str,
+        current_frame: Frame | None,
+        previous_frame: Frame | None = None,
+    ) -> dict[str, Any]:
         image_part = current_grid_image_part(current_frame)
         if image_part is None:
             return {"role": "user", "content": user_prompt}
 
+        content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+        previous_image = (
+            current_grid_image_part(previous_frame)
+            if previous_frame is not None
+            and current_frame is not None
+            and previous_frame.grid != current_frame.grid
+            else None
+        )
+        if previous_image is not None:
+            content.extend(
+                [
+                    {"type": "text", "text": "Previous grid image:"},
+                    previous_image,
+                ]
+            )
+        content.extend(
+            [
+                {"type": "text", "text": "Current grid image:"},
+                image_part,
+            ]
+        )
         return {
             "role": "user",
-            "content": [
-                {"type": "text", "text": f"{user_prompt}\n\nCurrent grid image:"},
-                image_part,
-            ],
+            "content": content,
         }
-
 
     def _build_user_prompt(
         self,
@@ -2094,7 +2497,13 @@ class ToolAgent:
         experience_snapshot: dict[str, Any] | None = None,
     ) -> str:
         history_entries = history_entries or []
-        current_step = max(current_frame.step if current_frame is not None else 0, max(0, action_num)) + 1
+        current_step = (
+            max(
+                current_frame.step if current_frame is not None else 0,
+                max(0, action_num),
+            )
+            + 1
+        )
         current_level = current_frame.level if current_frame is not None else 1
         summary_level = None
         if previous_step_summary is not None:
@@ -2105,7 +2514,14 @@ class ToolAgent:
         if summary_level is not None:
             current_level = max(current_level, summary_level)
         observed_max_level = max(
-            [current_level, *[entry.frame.level for entry in history_entries if entry.frame is not None]],
+            [
+                current_level,
+                *[
+                    entry.frame.level
+                    for entry in history_entries
+                    if entry.frame is not None
+                ],
+            ],
             default=current_level,
         )
         lines: list[str] = []
@@ -2116,13 +2532,21 @@ class ToolAgent:
             except (TypeError, ValueError):
                 normalized_count = None
             action_label = "action" if normalized_count == 1 else "actions"
-            lines.append(f"The code executed {normalized_count or 0} {action_label} in the previous sequence.")
+            lines.append(
+                f"The code executed {normalized_count or 0} {action_label} in the previous sequence."
+            )
             executed_actions = previous_step_summary.get("executed_actions")
             rendered_actions: list[str] = []
             if isinstance(executed_actions, list):
-                rendered_actions = [str(name).strip() for name in executed_actions if str(name).strip()]
+                rendered_actions = [
+                    str(name).strip() for name in executed_actions if str(name).strip()
+                ]
             if rendered_actions:
-                action_prefix = "Executed actions (first 10):" if len(rendered_actions) > 10 else "Executed actions:"
+                action_prefix = (
+                    "Executed actions (first 10):"
+                    if len(rendered_actions) > 10
+                    else "Executed actions:"
+                )
                 lines.append(f"{action_prefix} {', '.join(rendered_actions[:10])}.")
             else:
                 lines.append("Executed actions: none.")
@@ -2168,6 +2592,7 @@ class ToolAgent:
                     "behavioral_no_op_streak",
                     "stagnation_actions",
                     "cycle_period",
+                    "cycle_signal",
                     "latest_outcome",
                     "recovery_reasons",
                     "tried_here",
@@ -2179,6 +2604,8 @@ class ToolAgent:
                     "recommended_plan",
                     "transition_models_here",
                     "model_conflicts_here",
+                    "outcome_utilities",
+                    "causal_model",
                 )
             }
             cross_trial = experience_snapshot.get("cross_trial")
@@ -2186,13 +2613,19 @@ class ToolAgent:
                 compact_experience["cross_trial"] = {
                     key: cross_trial.get(key)
                     for key in (
-                        "prior_trials", "observations", "state_action_evidence", "progress_lessons"
+                        "prior_trials",
+                        "observations",
+                        "independent_evidence",
+                        "state_action_evidence",
+                        "progress_lessons",
                     )
                 }
             lines.extend(
                 [
                     "Deterministic experience controller snapshot:",
-                    json.dumps(compact_experience, separators=(",", ":"), sort_keys=True),
+                    json.dumps(
+                        compact_experience, separators=(",", ":"), sort_keys=True
+                    ),
                     "Honor the controller phase, action budget, rankings, and deterministic transition evidence; never retry a discouraged exact action, and revise the hypothesis on conflicts.",
                 ]
             )
@@ -2254,11 +2687,16 @@ class ToolAgent:
                     score -= 100
                     continue
                 function = raw_call.get("function")
-                if not isinstance(function, dict) or str(function.get("name", "")).strip() != "python":
+                if (
+                    not isinstance(function, dict)
+                    or str(function.get("name", "")).strip() != "python"
+                ):
                     score -= 50
                     continue
                 try:
-                    arguments = _normalize_tool_call_arguments(function.get("arguments", "{}"))
+                    arguments = _normalize_tool_call_arguments(
+                        function.get("arguments", "{}")
+                    )
                     code = _normalize_generated_python_code(arguments.get("code", ""))
                     if not code:
                         raise ValueError("empty Python code")
@@ -2270,19 +2708,14 @@ class ToolAgent:
                 score += 100
                 valid = True
                 literal_action_batches: list[list[dict[str, Any]]] = []
-                for node in ast.walk(tree):
-                    if not (
-                        isinstance(node, ast.Call)
-                        and isinstance(node.func, ast.Name)
-                        and node.func.id == "action"
-                        and node.args
-                    ):
-                        continue
+                candidate_action_arguments = _static_candidate_action_arguments(tree)
+                for literal_actions in candidate_action_arguments:
                     try:
-                        literal_actions = ast.literal_eval(node.args[0])
-                        normalized_actions = self._normalize_python_actions(literal_actions)
-                    except (TypeError, ValueError, SyntaxError):
-                        score -= 40
+                        normalized_actions = self._normalize_python_actions(
+                            literal_actions
+                        )
+                    except (TypeError, ValueError):
+                        score -= 100
                     else:
                         score += 20
                         literal_action_batches.append(normalized_actions)
@@ -2296,9 +2729,7 @@ class ToolAgent:
             score -= 20
         return score, valid
 
-    def _semantic_action_score(
-        self, action_batches: list[list[dict[str, Any]]]
-    ) -> int:
+    def _semantic_action_score(self, action_batches: list[list[dict[str, Any]]]) -> int:
         """Rank executable candidates against current empirical evidence."""
         snapshot = self._current_experience_snapshot or {}
         if not snapshot or not action_batches:
@@ -2322,8 +2753,23 @@ class ToolAgent:
         }
         cross_evidence = {
             normalize_action_key(item.get("action") or ""): item
-            for item in (snapshot.get("cross_trial") or {}).get("state_action_evidence", [])
+            for item in (snapshot.get("cross_trial") or {}).get(
+                "state_action_evidence", []
+            )
             if isinstance(item, dict) and item.get("action")
+        }
+        causal_relations = [
+            item
+            for item in (snapshot.get("causal_model") or {}).get("relations", [])
+            if isinstance(item, dict)
+        ]
+        current_state_conditions = {
+            f"state:{state_id}"
+            for state_id in (
+                snapshot.get("state_id"),
+                snapshot.get("behavioral_state_id"),
+            )
+            if state_id
         }
         mouse_recent = {
             (int(item["row"]), int(item["col"])): str(item.get("outcome") or "")
@@ -2333,13 +2779,30 @@ class ToolAgent:
         recommended_plan = snapshot.get("recommended_plan") or {}
         planned = list(recommended_plan.get("actions") or [])
         plan_confidence = float(recommended_plan.get("confidence") or 0.0)
-        outcome_values = {
-            "level_progress": 120,
-            "novel": 45,
-            "revisit": 10,
-            "unknown": 0,
-            "volatile_only": -45,
-            "exact_noop": -90,
+        configured_utilities = snapshot.get("outcome_utilities") or {}
+        outcome_values = (
+            {
+                outcome: round(120 * float(value))
+                for outcome, value in configured_utilities.items()
+            }
+            if configured_utilities
+            else {
+                "level_progress": 120,
+                "novel": 24,
+                "revisit": -6,
+                "volatile_only": -24,
+                "exact_noop": -48,
+                "terminal_failure": -240,
+                "negative_reward": -240,
+            }
+        )
+        outcome_values.setdefault("unknown", 0)
+        recommended_mouse = {
+            (int(item["row"]), int(item["col"]))
+            for item in (snapshot.get("mouse_search") or {}).get(
+                "recommended_coordinates", []
+            )
+            if isinstance(item, dict) and "row" in item and "col" in item
         }
         for index, item in enumerate(actions):
             name = str(item.get("action") or "")
@@ -2351,6 +2814,8 @@ class ToolAgent:
                     if mouse_recent.get(coordinate) in {"exact_noop", "volatile_only"}
                     else 20
                 )
+                if coordinate in recommended_mouse:
+                    score += 35
             else:
                 key = normalize_action_key(name)
             if key in discouraged:
@@ -2362,18 +2827,40 @@ class ToolAgent:
             if model is not None:
                 confidence = float(model.get("confidence") or 0.0)
                 score += round(
-                    outcome_values.get(str(model.get("predicted_outcome") or "unknown"), 0)
+                    outcome_values.get(
+                        str(model.get("predicted_outcome") or "unknown"), 0
+                    )
                     * confidence
                 )
+                score += round(120 * float(model.get("mean_reward") or 0.0))
                 score -= 25 * int(model.get("contradictions") or 0)
             evidence = cross_evidence.get(key)
             if evidence is not None:
                 outcomes = evidence.get("outcomes") or {}
                 trials = max(1, int(evidence.get("trials") or 1))
                 score += round(
-                    sum(outcome_values.get(str(outcome), 0) * int(count or 0) for outcome, count in outcomes.items())
+                    sum(
+                        outcome_values.get(str(outcome), 0) * int(count or 0)
+                        for outcome, count in outcomes.items()
+                    )
                     / trials
                 )
+            for relation in causal_relations:
+                if normalize_action_key(relation.get("cause") or "") != key:
+                    continue
+                conditions = str(relation.get("conditions") or "")
+                if (
+                    conditions.startswith("state:")
+                    and conditions not in current_state_conditions
+                ):
+                    continue
+                effect = str(relation.get("effect") or "")
+                if not effect.startswith("outcome:"):
+                    continue
+                causal_outcome = effect.split(":", 1)[1]
+                confidence = float(relation.get("confidence") or 0.0)
+                score += round(outcome_values.get(causal_outcome, 0) * confidence)
+                score -= 10 * int(relation.get("contradictions") or 0)
             if index < len(planned) and normalize_action_key(planned[index]) == key:
                 score += round(80 * plan_confidence)
         return score
@@ -2388,11 +2875,12 @@ class ToolAgent:
     ) -> _ChatCompletionResult:
         force_tool = self._forced_tool_choice_supported is not False
         tool_choice = _request_tool_choice(tools, force=force_tool)
+        output_limit = max_output_tokens or self._max_output_tokens
         payload = build_chat_payload(
             provider=self._model.provider,
             model=self._model.model_id,
             messages=messages,
-            max_tokens=max_output_tokens or self._max_output_tokens,
+            max_tokens=output_limit,
             temperature=_LOCAL_ANALYZER_TEMPERATURE,
             top_p=_LOCAL_ANALYZER_TOP_P,
             top_k=_LOCAL_ANALYZER_TOP_K,
@@ -2400,7 +2888,7 @@ class ToolAgent:
             tools=tools,
             tool_choice=tool_choice,
             seed=_LOCAL_ANALYZER_SEED,
-            candidates=self._candidate_count,
+            candidates=self._adaptive_candidate_count(output_limit),
         )
         started_at = time.monotonic()
         deadline = (
@@ -2473,7 +2961,9 @@ class ToolAgent:
                 try:
                     candidate = post_chat(request_payload)
                 except requests.RequestException:
-                    if request_attempts >= self._http_max_attempts or not wait_to_retry(None):
+                    if request_attempts >= self._http_max_attempts or not wait_to_retry(
+                        None
+                    ):
                         raise
                     continue
                 if (
@@ -2493,7 +2983,11 @@ class ToolAgent:
             and request_attempts < self._http_max_attempts
         ):
             detail = response.text.lower()
-            if "tool_choice" in detail or "function" in detail or "tool choice" in detail:
+            if (
+                "tool_choice" in detail
+                or "function" in detail
+                or "tool choice" in detail
+            ):
                 fallback_payload = dict(payload)
                 fallback_payload["tool_choice"] = "auto"
                 response.close()
@@ -2542,12 +3036,44 @@ class ToolAgent:
         message = choice.get("message")
         if not isinstance(message, dict):
             response.close()
-            raise requests.RequestException("server returned a choice without a message")
+            raise requests.RequestException(
+                "server returned a choice without a message"
+            )
         usage = payload.get("usage")
+        usage_payload = dict(usage) if isinstance(usage, dict) else {}
+        has_generated_usage = False
+        for usage_key in ("completion_tokens", "output_tokens", "generated_tokens"):
+            try:
+                if usage_key in usage_payload and int(usage_payload[usage_key]) >= 0:
+                    has_generated_usage = True
+                    break
+            except (TypeError, ValueError):
+                continue
+        if not has_generated_usage:
+            estimated_generated_tokens = sum(
+                max(
+                    1,
+                    (
+                        len(
+                            json.dumps(
+                                candidate.get("message") or {},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                default=str,
+                            )
+                        )
+                        + 3
+                    )
+                    // 4,
+                )
+                for candidate in choices
+                if isinstance(candidate, dict)
+            )
+            usage_payload["generated_tokens"] = max(1, estimated_generated_tokens)
         return _ChatCompletionResult(
             message=message,
             finish_reason=str(choice.get("finish_reason", "") or ""),
-            usage=usage if isinstance(usage, dict) else None,
+            usage=usage_payload,
             latency_seconds=time.monotonic() - started_at,
             request_attempts=request_attempts,
             forced_tool_fallback=forced_tool_fallback,
@@ -2560,7 +3086,10 @@ class ToolAgent:
         if len(text) <= self._tool_output_chars:
             return text, False
         omitted = len(text) - self._tool_output_chars
-        return f"{text[:self._tool_output_chars]}\n... [truncated {omitted} chars]", True
+        return (
+            f"{text[: self._tool_output_chars]}\n... [truncated {omitted} chars]",
+            True,
+        )
 
     def _summarize_planned_actions(self, value: Any) -> Any:
         if isinstance(value, dict):
@@ -2577,13 +3106,17 @@ class ToolAgent:
                     try:
                         compacted["executed_action_count"] = int(executed_count)
                     except (TypeError, ValueError):
-                        compacted["executed_action_count"] = 1 if action_result.get("executed") else 0
+                        compacted["executed_action_count"] = (
+                            1 if action_result.get("executed") else 0
+                        )
             return compacted
         if isinstance(value, list):
             return [self._summarize_planned_actions(item) for item in value]
         return value
 
-    def _render_tool_payload(self, payload: dict[str, Any], *, truncate_fields: tuple[str, ...] = ()) -> str:
+    def _render_tool_payload(
+        self, payload: dict[str, Any], *, truncate_fields: tuple[str, ...] = ()
+    ) -> str:
         result = self._summarize_planned_actions(dict(payload))
         truncated = False
         for field in truncate_fields:
@@ -2622,8 +3155,15 @@ class ToolAgent:
                 action_name = item.strip()
                 if not action_name:
                     raise ValueError(f"Action {index} is empty.")
-                canonical_name = to_model_action(to_engine_action(action_name) or action_name)
-                if self._current_valid_actions and canonical_name not in self._current_valid_actions:
+                engine_name = to_engine_action(action_name)
+                if engine_name is None:
+                    raise ValueError(f"Action {index} ({action_name}) is unknown.")
+                canonical_name = to_model_action(engine_name)
+                if (
+                    index == 1
+                    and self._current_valid_actions
+                    and canonical_name not in self._current_valid_actions
+                ):
                     raise ValueError(
                         f"Action {index} ({canonical_name}) is not currently valid; "
                         f"choose one of {self._current_valid_actions}."
@@ -2634,15 +3174,24 @@ class ToolAgent:
                 action_name = str(item.get("action", "")).strip()
                 if not action_name:
                     raise ValueError(f"Action {index} is missing an `action` field.")
-                canonical_name = to_model_action(to_engine_action(action_name) or action_name)
-                if self._current_valid_actions and canonical_name not in self._current_valid_actions:
+                engine_name = to_engine_action(action_name)
+                if engine_name is None:
+                    raise ValueError(f"Action {index} ({action_name}) is unknown.")
+                canonical_name = to_model_action(engine_name)
+                if (
+                    index == 1
+                    and self._current_valid_actions
+                    and canonical_name not in self._current_valid_actions
+                ):
                     raise ValueError(
                         f"Action {index} ({canonical_name}) is not currently valid; "
                         f"choose one of {self._current_valid_actions}."
                     )
                 entry = {"action": canonical_name}
                 if canonical_name == "MOUSE" and ("x" in item or "y" in item):
-                    raise ValueError(f"Action {index} uses legacy MOUSE x/y fields; use row and col.")
+                    raise ValueError(
+                        f"Action {index} uses legacy MOUSE x/y fields; use row and col."
+                    )
                 if canonical_name == "MOUSE":
                     if "row" not in item or "col" not in item:
                         raise ValueError(
@@ -2661,7 +3210,50 @@ class ToolAgent:
                 normalized.append(entry)
                 continue
             raise TypeError(f"Action {index} must be a string or a dict.")
+        if normalized and self._is_known_harmful_action(normalized[0]):
+            raise ValueError(
+                "The first action has observed terminal-failure or negative-reward "
+                "evidence in the current state. Choose a safer probe or split the "
+                "batch so the action can be reevaluated after the state changes."
+            )
         return normalized
+
+    def _is_known_harmful_action(self, action: dict[str, Any]) -> bool:
+        snapshot = self._current_experience_snapshot or {}
+        name = str(action.get("action") or "")
+        key = (
+            f"MOUSE(ROW={int(action['row'])}, COL={int(action['col'])})"
+            if name == "MOUSE" and "row" in action and "col" in action
+            else normalize_action_key(name)
+        )
+        for model in snapshot.get("transition_models_here") or []:
+            if not isinstance(model, dict):
+                continue
+            harmful_trials = int(model.get("terminal_failures") or 0)
+            total_trials = max(harmful_trials, int(model.get("trials") or 0))
+            if normalize_action_key(model.get("action") or "") == key and (
+                harmful_evidence_is_decisive(harmful_trials, total_trials)
+            ):
+                return True
+        for evidence in (snapshot.get("cross_trial") or {}).get(
+            "state_action_evidence", []
+        ):
+            if not isinstance(evidence, dict):
+                continue
+            outcomes = evidence.get("outcomes") or {}
+            harmful_trials = int(outcomes.get("terminal_failure") or 0) + int(
+                outcomes.get("negative_reward") or 0
+            )
+            total_trials = max(
+                harmful_trials,
+                int(evidence.get("trials") or 0),
+                sum(int(count or 0) for count in outcomes.values()),
+            )
+            if normalize_action_key(evidence.get("action") or "") == key and (
+                harmful_evidence_is_decisive(harmful_trials, total_trials)
+            ):
+                return True
+        return False
 
     def _compact_action_result(self, payload: dict[str, Any]) -> dict[str, Any]:
         compact = {
@@ -2677,7 +3269,8 @@ class ToolAgent:
             "level_completed": bool(payload.get("level_completed")),
             "game_over": bool(payload.get("game_over")),
             "run_complete": bool(payload.get("run_complete")),
-            "action_display": payload.get("action_display") or payload.get("action_name"),
+            "action_display": payload.get("action_display")
+            or payload.get("action_name"),
         }
         for controller_key in (
             "guarded",
@@ -2706,7 +3299,9 @@ class ToolAgent:
                 compact[controller_key] = payload.get(controller_key)
         steps = payload.get("steps")
         if isinstance(steps, list):
-            compact["steps"] = [dict(item) for item in steps[:12] if isinstance(item, dict)]
+            compact["steps"] = [
+                dict(item) for item in steps[:12] if isinstance(item, dict)
+            ]
         executed_actions = payload.get("executed_actions")
         if isinstance(executed_actions, list) and executed_actions:
             compact["executed_actions"] = [
@@ -2754,13 +3349,18 @@ class ToolAgent:
             compact["error"] = payload.get("error")
         return compact
 
-    def _run_python_tool(self, state_path: Path, arguments: dict[str, Any]) -> _ToolDispatchResult:
+    def _run_python_tool(
+        self, state_path: Path, arguments: dict[str, Any]
+    ) -> _ToolDispatchResult:
         self._ensure_session(state_path)
         code = _normalize_generated_python_code(arguments.get("code", ""))
         if not code:
-            return _ToolDispatchResult(json.dumps(
-                {"error": "python requires a non-empty `code` string."}, separators=(",", ":")
-            ))
+            return _ToolDispatchResult(
+                json.dumps(
+                    {"error": "python requires a non-empty `code` string."},
+                    separators=(",", ":"),
+                )
+            )
         try:
             tree = _parse_bounded_generated_python(code)
             compile(tree, "<python_tool>", "exec")
@@ -2800,6 +3400,7 @@ class ToolAgent:
             )
 
         current_frame, history_entries = load_runtime_state(state_path)
+
         def _serialized_runtime_state(
             *,
             next_valid_actions: list[str] | None = None,
@@ -2815,7 +3416,11 @@ class ToolAgent:
                 refreshed_history,
             )
             if isinstance(next_valid_actions, list):
-                sanitized_actions = [str(item).strip() for item in next_valid_actions if str(item).strip()]
+                sanitized_actions = [
+                    str(item).strip()
+                    for item in next_valid_actions
+                    if str(item).strip()
+                ]
             else:
                 sanitized_actions = list(self._current_valid_actions)
             persisted_action_result = (
@@ -2869,7 +3474,9 @@ class ToolAgent:
                             f"the current frame shape {rows}x{cols}."
                         )
             if terminal_action_result is not None:
-                reason = _terminal_action_reason(terminal_action_result) or "terminal_state"
+                reason = (
+                    _terminal_action_reason(terminal_action_result) or "terminal_state"
+                )
                 compact_payload = {
                     "executed": False,
                     "action_num": terminal_action_result.get("action_num"),
@@ -2880,7 +3487,9 @@ class ToolAgent:
                     "valid_actions": [],
                     "board_changed": False,
                     "done": bool(terminal_action_result.get("done")),
-                    "level_completed": bool(terminal_action_result.get("level_completed")),
+                    "level_completed": bool(
+                        terminal_action_result.get("level_completed")
+                    ),
                     "game_over": bool(terminal_action_result.get("game_over")),
                     "run_complete": bool(terminal_action_result.get("run_complete")),
                     "requested_count": len(normalized_actions),
@@ -2908,21 +3517,29 @@ class ToolAgent:
                 }
             )
             if not isinstance(raw_payload, dict):
-                raise RuntimeError("action(actions) did not return a JSON-like payload.")
+                raise RuntimeError(
+                    "action(actions) did not return a JSON-like payload."
+                )
             compact_payload = self._compact_action_result(raw_payload)
             prediction_result = self._evaluate_strategy_prediction(compact_payload)
             if prediction_result is not None:
                 compact_payload["prediction_result"] = prediction_result
             next_valid_actions = raw_payload.get("valid_actions")
             if isinstance(next_valid_actions, list):
-                self._current_valid_actions = _normalize_valid_actions(next_valid_actions)
-            if compact_payload.get("executed") and _terminal_action_reason(compact_payload):
+                self._current_valid_actions = _normalize_valid_actions(
+                    next_valid_actions
+                )
+            if compact_payload.get("executed") and _terminal_action_reason(
+                compact_payload
+            ):
                 terminal_action_result = compact_payload
             self._last_action_result = dict(compact_payload)
             return {
                 "action_result": compact_payload,
                 "state": _serialized_runtime_state(
-                    next_valid_actions=next_valid_actions if isinstance(next_valid_actions, list) else None,
+                    next_valid_actions=next_valid_actions
+                    if isinstance(next_valid_actions, list)
+                    else None,
                     last_action_result=compact_payload,
                 ),
             }
@@ -2979,7 +3596,9 @@ class ToolAgent:
                     action_result,
                     strategy=self._strategy_memory,
                     pass_index=self._knowledge_pass_index,
+                    evidence_id=self._knowledge_evidence_id,
                 )
+        self._update_causal_model_from_actions(action_results)
         payload = _python_tool_payload(sandbox_result)
 
         step_executed = any(bool(item.get("executed")) for item in action_results)
@@ -2987,17 +3606,21 @@ class ToolAgent:
             self._last_step_summary = self._summarize_step_sequence(action_results)
             self._update_summarized_knowledge_from_step_summary()
         return _ToolDispatchResult(
-            self._render_tool_payload(payload, truncate_fields=("stdout", "error", "result")),
+            self._render_tool_payload(
+                payload, truncate_fields=("stdout", "error", "result")
+            ),
             step_executed=step_executed,
         )
 
-    def _dispatch_tool(self, state_path: Path, name: str, arguments: dict[str, Any]) -> _ToolDispatchResult:
+    def _dispatch_tool(
+        self, state_path: Path, name: str, arguments: dict[str, Any]
+    ) -> _ToolDispatchResult:
         self._ensure_session(state_path)
         if name == "python":
             return self._run_python_tool(state_path, arguments)
-        return _ToolDispatchResult(json.dumps(
-            {"error": f"Unknown tool: {name}"}, separators=(",", ":")
-        ))
+        return _ToolDispatchResult(
+            json.dumps({"error": f"Unknown tool: {name}"}, separators=(",", ":"))
+        )
 
     def _estimate_request_input_tokens(
         self,
@@ -3014,19 +3637,33 @@ class ToolAgent:
             payload["tool_choice"] = _request_tool_choice(tools)
         return _estimate_tokens(payload)
 
-    def _drop_oldest_history_block(self, history: list[dict[str, Any]], *, preserve_recent: int) -> bool:
+    def _drop_oldest_history_block(
+        self, history: list[dict[str, Any]], *, preserve_recent: int
+    ) -> bool:
         removable = len(history) - preserve_recent
         if removable <= 0:
             return False
         first = history.pop(0)
         first_role = str(first.get("role", "")).strip()
         if first_role in {"assistant", "tool"}:
-            while history and history[0].get("role") == "tool" and len(history) > preserve_recent:
+            while (
+                history
+                and history[0].get("role") == "tool"
+                and len(history) > preserve_recent
+            ):
                 history.pop(0)
             return True
-        while history and history[0].get("role") == "tool" and len(history) > preserve_recent:
+        while (
+            history
+            and history[0].get("role") == "tool"
+            and len(history) > preserve_recent
+        ):
             history.pop(0)
-        while history and history[0].get("role") != "user" and len(history) > preserve_recent:
+        while (
+            history
+            and history[0].get("role") != "user"
+            and len(history) > preserve_recent
+        ):
             history.pop(0)
         return True
 
@@ -3053,7 +3690,9 @@ class ToolAgent:
             kept.pop(0)
         return kept
 
-    def _drop_until_first_user_message(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _drop_until_first_user_message(
+        self, history: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         trimmed = list(history)
         while trimmed and str(trimmed[0].get("role", "")).strip() != "user":
             trimmed.pop(0)
@@ -3105,7 +3744,9 @@ class ToolAgent:
         system_message = messages[0]
         history = list(messages[1:])
         preserve_recent = max(0, preserve_recent)
-        budget_tokens = max(1, self._context_budget_tokens - max(0, extra_safety_tokens))
+        budget_tokens = max(
+            1, self._context_budget_tokens - max(0, extra_safety_tokens)
+        )
         request_chars = (
             _estimated_request_base_length(tools)
             if request_base_chars is None
@@ -3146,7 +3787,9 @@ class ToolAgent:
 
         while history and estimated_tokens() > budget_tokens:
             previous_length = len(history)
-            if not self._drop_oldest_history_block(history, preserve_recent=preserve_recent):
+            if not self._drop_oldest_history_block(
+                history, preserve_recent=preserve_recent
+            ):
                 break
             removed_count = previous_length - len(history)
             history_chars_total -= sum(history_chars[:removed_count])
@@ -3164,7 +3807,9 @@ class ToolAgent:
             return []
         system_message = messages[0]
         history = list(messages[1:])
-        if not self._drop_oldest_history_block(history, preserve_recent=max(0, preserve_recent)):
+        if not self._drop_oldest_history_block(
+            history, preserve_recent=max(0, preserve_recent)
+        ):
             return list(messages)
         return [system_message, *history]
 
@@ -3191,7 +3836,9 @@ class ToolAgent:
         self._current_valid_actions = _normalize_valid_actions(valid_actions)
         self._turn_efficiency_metrics = {}
 
-        analyzer_log = transcript_path or (state_path.parent / f"{state_path.stem}_analyzer.txt")
+        analyzer_log = transcript_path or (
+            state_path.parent / f"{state_path.stem}_analyzer.txt"
+        )
         prompt_log = _resolve_prompt_log_path(state_path)
         current_frame, history_entries = load_runtime_state(state_path)
         cross_trial = None
@@ -3203,12 +3850,17 @@ class ToolAgent:
             self._current_valid_actions,
             self._controller_config,
             external_transitions=(cross_trial or {}).get("transition_records"),
+            evidence_id=self._knowledge_evidence_id,
         )
         if cross_trial is not None:
             experience_snapshot = dict(experience_snapshot)
             experience_snapshot["cross_trial"] = self._knowledge_store.snapshot(
                 self._knowledge_game_id,
                 state_id=str(experience_snapshot.get("state_id") or ""),
+            )
+        if self._strategy_memory.get("causal_model"):
+            experience_snapshot["causal_model"] = normalize_causal_model(
+                self._strategy_memory["causal_model"]
             )
         self._current_experience_snapshot = experience_snapshot
         user_prompt = self._build_user_prompt(
@@ -3221,7 +3873,9 @@ class ToolAgent:
         )
         display_action_num = _display_action_number(action_num)
 
-        step_label = f"analysis_step={analysis_step} | " if analysis_step is not None else ""
+        step_label = (
+            f"analysis_step={analysis_step} | " if analysis_step is not None else ""
+        )
         transcript_header = (
             f"\n--- {step_label}action={display_action_num} | "
             f"{time.strftime('%H:%M:%S')} | tool-agent ---\n"
@@ -3248,7 +3902,15 @@ class ToolAgent:
         request_base_chars = _estimated_request_base_length(tools)
         message_length_cache: dict[int, tuple[dict[str, Any], int]] = {}
         messages: list[dict[str, Any]] = self._trim_messages_for_context(
-            [{"role": "system", "content": self._system_prompt}, *self._history_messages, self._build_user_message(user_prompt, current_frame)],
+            [
+                {"role": "system", "content": self._system_prompt},
+                *self._history_messages,
+                self._build_user_message(
+                    user_prompt,
+                    current_frame,
+                    history_entries[-2].frame if len(history_entries) >= 2 else None,
+                ),
+            ],
             tools=tools,
             preserve_recent=1,
             request_base_chars=request_base_chars,
@@ -3261,6 +3923,11 @@ class ToolAgent:
         latest_request_tool_choice: Any = None
         latest_request_index = 0
         turn_started_at = time.monotonic()
+        request_deadline = (
+            turn_started_at + max(0.0, float(request_timeout_seconds))
+            if request_timeout_seconds is not None
+            else None
+        )
         yielded_control_reason: str | None = None
         repair_next_request = False
 
@@ -3270,9 +3937,21 @@ class ToolAgent:
                     if should_stop():
                         return "stop_requested"
                 except Exception as exc:
-                    log.warning("analyzer stop check failed at action %d: %s", display_action_num, exc)
-            if self._yield_seconds is not None and (time.monotonic() - turn_started_at) >= self._yield_seconds:
+                    log.warning(
+                        "analyzer stop check failed at action %d: %s",
+                        display_action_num,
+                        exc,
+                    )
+            if (
+                self._yield_seconds is not None
+                and (time.monotonic() - turn_started_at) >= self._yield_seconds
+            ):
                 return "turn_time_budget"
+            remaining_request_time = _remaining_deadline_seconds(request_deadline)
+            if remaining_request_time is not None and remaining_request_time <= 0:
+                return "request_time_budget"
+            if self._remaining_game_tokens() == 0:
+                return "game_token_budget"
             return None
 
         self._should_stop_callback = should_stop
@@ -3302,8 +3981,13 @@ class ToolAgent:
                         ),
                     }
                     repair_next_request = False
-                    if request_timeout_seconds is not None:
-                        request_kwargs["request_timeout_seconds"] = request_timeout_seconds
+                    remaining_request_time = _remaining_deadline_seconds(
+                        request_deadline
+                    )
+                    if remaining_request_time is not None:
+                        request_kwargs["request_timeout_seconds"] = max(
+                            0.1, remaining_request_time
+                        )
                     if self._save_request_logs:
                         _safe_append_request_snapshot(
                             _resolve_request_log_path(state_path),
@@ -3368,24 +4052,40 @@ class ToolAgent:
                     messages = trimmed_messages
                     continue
                 raw_reasoning = _extract_reasoning_text(result.message)
-                raw_content = _normalize_message_content(result.message.get("content", ""))
+                raw_content = _normalize_message_content(
+                    result.message.get("content", "")
+                )
                 tool_calls = self._normalize_response_tool_calls(
                     json.loads(json.dumps(result.message.get("tool_calls") or []))
                 )
-                tool_call_markup_in_text = _contains_tool_call_markup(raw_reasoning, raw_content)
+                tool_call_markup_in_text = _contains_tool_call_markup(
+                    raw_reasoning, raw_content
+                )
                 recovered_tool_calls_from_markup = False
                 if not tool_calls and tool_call_markup_in_text:
                     tool_calls = self._normalize_response_tool_calls(
                         _recover_tool_calls_from_markup(raw_reasoning, raw_content)
                     )
                     recovered_tool_calls_from_markup = bool(tool_calls)
-                reasoning = _strip_tool_call_markup(raw_reasoning) if tool_call_markup_in_text else raw_reasoning
-                content = _strip_tool_call_markup(raw_content) if tool_call_markup_in_text else raw_content
+                reasoning = (
+                    _strip_tool_call_markup(raw_reasoning)
+                    if tool_call_markup_in_text
+                    else raw_reasoning
+                )
+                content = (
+                    _strip_tool_call_markup(raw_content)
+                    if tool_call_markup_in_text
+                    else raw_content
+                )
                 normalized_tool_arguments: list[dict[str, Any] | None] = []
                 tool_argument_errors: list[str | None] = []
                 malformed_argument_errors: list[str] = []
                 for tool_call in tool_calls:
-                    function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+                    function = (
+                        tool_call.get("function", {})
+                        if isinstance(tool_call, dict)
+                        else {}
+                    )
                     tool_name = str(function.get("name", "")).strip() or "unknown"
                     raw_arguments = function.get("arguments", "{}")
                     try:
@@ -3458,7 +4158,11 @@ class ToolAgent:
                 messages.append(assistant_message)
 
                 for tool_index, tool_call in enumerate(tool_calls):
-                    function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+                    function = (
+                        tool_call.get("function", {})
+                        if isinstance(tool_call, dict)
+                        else {}
+                    )
                     tool_name = str(function.get("name", "")).strip()
                     raw_args = function.get("arguments", "{}")
                     normalized_arguments = normalized_tool_arguments[tool_index]
@@ -3471,7 +4175,8 @@ class ToolAgent:
                     )
                     append_transcript(
                         f"TOOL CALL: {tool_name}",
-                        rendered_tool_call or (json.dumps(arguments, indent=2) if arguments else "{}"),
+                        rendered_tool_call
+                        or (json.dumps(arguments, indent=2) if arguments else "{}"),
                     )
                     if argument_error is not None:
                         repair_next_request = True
@@ -3488,7 +4193,10 @@ class ToolAgent:
                         dispatch = self._dispatch_tool(state_path, tool_name, arguments)
                     if dispatch.step_executed:
                         step_executed = True
-                    append_transcript(f"TOOL RESULT: {tool_name}", _render_tool_result_display(dispatch.content))
+                    append_transcript(
+                        f"TOOL RESULT: {tool_name}",
+                        _render_tool_result_display(dispatch.content),
+                    )
                     messages.append(
                         {
                             "role": "tool",
@@ -3526,7 +4234,9 @@ class ToolAgent:
                     tool_choice=latest_request_tool_choice,
                     transcript=transcript_buffer.render(),
                 )
-            log.warning("analyzer request failed at action %d: %s", display_action_num, exc)
+            log.warning(
+                "analyzer request failed at action %d: %s", display_action_num, exc
+            )
             transcript_buffer.close()
             return AnalyzerTurnResult(
                 step_executed=False,
@@ -3626,6 +4336,7 @@ class ToolAgent:
             step_executed=step_executed,
             reasoning=captured_reasoning,
             yielded_control=yielded_control_reason is not None,
+            yield_reason=yielded_control_reason,
             efficiency_metrics=dict(self._turn_efficiency_metrics),
             failure_category="tool_step_exhausted" if exhausted else None,
             failure_detail=(

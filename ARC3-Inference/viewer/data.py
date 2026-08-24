@@ -396,8 +396,9 @@ def _run_dir_fingerprint(run_dir: Path) -> tuple[Any, ...]:
     relevant_paths: list[Path] = []
     relevant_paths.extend(_viewer_data_paths(run_dir))
     relevant_paths.extend(sorted(run_dir.glob("*requests.jsonl")))
-    relevant_paths.extend(sorted(run_dir.glob("seeds/*/*requests.jsonl")))
-    relevant_paths.extend(sorted(run_dir.glob("seeds/*/run_config.json")))
+    for split_name in ("passes", "seeds"):
+        relevant_paths.extend(sorted(run_dir.glob(f"{split_name}/*/*requests.jsonl")))
+        relevant_paths.extend(sorted(run_dir.glob(f"{split_name}/*/run_config.json")))
     total_size = 0
     max_mtime_ns = 0
     for path in relevant_paths:
@@ -433,13 +434,22 @@ def _hex_to_rgb(value: str) -> tuple[int, int, int]:
 
 def _viewer_data_paths(run_dir: Path) -> list[Path]:
     artifacts_dir = run_dir / "artifacts"
-    if artifacts_dir.exists():
-        return sorted(artifacts_dir.glob("*viewer_data.json"))
-
     paths: list[Path] = []
+    if artifacts_dir.exists():
+        paths.extend(sorted(artifacts_dir.glob("*viewer_data.json"), key=_viewer_data_sort_key))
     for seed_artifacts_dir in _seed_artifact_dirs(run_dir):
-        paths.extend(sorted(seed_artifacts_dir.glob("*viewer_data.json")))
+        paths.extend(
+            sorted(seed_artifacts_dir.glob("*viewer_data.json"), key=_viewer_data_sort_key)
+        )
     return paths
+
+
+def _viewer_data_sort_key(path: Path) -> tuple[str, int, str]:
+    match = _PASS_INDEX_RE.search(path.name)
+    if match is None:
+        return (path.name.casefold(), -1, path.name)
+    game_stem = path.name[: match.start()]
+    return (game_stem.casefold(), int(match.group("pass_index")), path.name)
 
 
 def _viewer_data_path_for_index(run_dir: Path, game_index: int) -> Path:

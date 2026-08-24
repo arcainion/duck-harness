@@ -668,7 +668,7 @@
     let currentGameIndex = 0;
     let currentSteps = [];
     let activeStepIndex = 0;
-    let isLoadingPayload = false;
+    let currentPayloadLoadToken = 0;
     let currentGameSignature = null;
     let currentGameLoadToken = 0;
     let currentViewerVersion = null;
@@ -827,18 +827,32 @@
       });
     }
 
+    function gameProgressSignature(game) {
+      if (!game) {
+        return null;
+      }
+      const lastEvent = game.lastEvent || null;
+      return JSON.stringify({
+        gameId: game.game_id || "",
+        status: game.status || "",
+        eventCount: Number(game.eventCount || 0),
+        lastEventType: lastEvent?.type || "",
+        lastEventStatus: lastEvent?.status || "",
+        lastEventActionNum: lastEvent?.action_num ?? null,
+        lastEventScore: lastEvent?.score ?? null,
+        lastEventReward: lastEvent?.reward ?? null,
+      });
+    }
+
     async function loadPayload(requestedRun = currentRunName, options = {}) {
       const {
         preserveSelection = false,
         silent = false,
       } = options;
-      if (isLoadingPayload) {
-        return;
-      }
-
+      const requestToken = ++currentPayloadLoadToken;
       const previousActiveStepIndex = activeStepIndex;
+      const previousPayload = payload;
 
-      isLoadingPayload = true;
       currentGameLoadToken += 1;
       if (!silent) {
         runSubtitleEl.textContent = requestedRun
@@ -852,10 +866,22 @@
         }
         const response = await fetch(url, { cache: "no-store" });
         const nextPayload = await response.json();
-        payload = nextPayload;
         if (!response.ok) {
-          throw new Error(payload.error || "Failed to load run payload");
+          throw new Error(nextPayload.error || "Failed to load run payload");
         }
+        if (requestToken !== currentPayloadLoadToken) {
+          return;
+        }
+        const previousGame = previousPayload?.games?.[currentGameIndex];
+        const nextGame = nextPayload?.games?.[currentGameIndex];
+        if (
+          silent
+          && Array.isArray(previousGame?.viewer_steps)
+          && gameProgressSignature(previousGame) === gameProgressSignature(nextGame)
+        ) {
+          nextPayload.games[currentGameIndex] = { ...previousGame, ...nextGame };
+        }
+        payload = nextPayload;
         currentRunName = payload.selected_run || null;
         currentGameIndex = Math.min(currentGameIndex, Math.max((payload.games?.length || 1) - 1, 0));
         renderHeader();
@@ -865,6 +891,9 @@
           silent,
         });
       } catch (error) {
+        if (requestToken !== currentPayloadLoadToken) {
+          return;
+        }
         if (silent && payload) {
           return;
         }
@@ -885,8 +914,6 @@
         clearBoard();
         asciiBoardEl.hidden = false;
         asciiBoardEl.textContent = "No run data available yet.\nRun `make run` first, then reload the viewer.";
-      } finally {
-        isLoadingPayload = false;
       }
     }
 
@@ -1755,6 +1782,9 @@
     loadPayload();
     pollViewerVersion();
     window.setInterval(pollViewerVersion, 1000);
+    window.setInterval(() => {
+      loadPayload(currentRunName, { preserveSelection: true, silent: true });
+    }, 2000);
   </script>
 </body>
 </html>

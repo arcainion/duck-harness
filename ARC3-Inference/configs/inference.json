@@ -64,6 +64,7 @@
     "tool_timeout": 30,
     "tool_output_tokens": 1024,
     "candidates": 2,
+    "game_token_budget": 250000,
     "strategy_enabled": true,
     "strategy_policy": "outcome_aware",
     "same_state_noop_limit": 2,
@@ -72,6 +73,12 @@
     "plan_min_support": 2,
     "plan_min_confidence": 0.75,
     "plan_max_depth": 6,
+    "progress_utility": 1.0,
+    "novel_utility": 0.2,
+    "revisit_utility": -0.05,
+    "noop_utility": -0.4,
+    "terminal_failure_utility": -2.0,
+    "exploration_weight": 0.75,
     "save_request_logs": false
   },
   "chat": {

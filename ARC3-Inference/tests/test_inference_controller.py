@@ -10,6 +10,7 @@ from inference.agent.inference_controller import (
     action_guard_reason,
     build_experience_snapshot,
     frame_fingerprint,
+    harmful_evidence_is_decisive,
     transition_metadata,
 )
 from inference.agent.runtime_state import Frame, HistoryEntry
@@ -20,6 +21,176 @@ def _frame(value: int, *, step: int, level: int = 1) -> Frame:
 
 
 class InferenceControllerTests(TestCase):
+    def test_state_identity_includes_observable_decision_context(self) -> None:
+        base = Frame(
+            grid=((1,),),
+            step=1,
+            level=1,
+            valid_actions=("LEFT",),
+            engine_state="NOT_FINISHED",
+            score=0,
+        )
+        same_grid_different_actions = Frame(
+            grid=((1,),),
+            step=2,
+            level=1,
+            valid_actions=("RIGHT",),
+            engine_state="NOT_FINISHED",
+            score=0,
+        )
+        same_grid_different_state = Frame(
+            grid=((1,),),
+            step=2,
+            level=1,
+            valid_actions=("LEFT",),
+            engine_state="GAME_OVER",
+            score=0,
+        )
+
+        self.assertNotEqual(
+            frame_fingerprint(base), frame_fingerprint(same_grid_different_actions)
+        )
+        self.assertNotEqual(
+            frame_fingerprint(base), frame_fingerprint(same_grid_different_state)
+        )
+
+    def test_object_state_tracks_translation_without_structural_change(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        before = Frame(grid=((1, 1, 0), (0, 0, 0), (0, 0, 0)), step=0, level=1)
+        after = Frame(grid=((0, 0, 0), (0, 1, 1), (0, 0, 0)), step=1, level=1)
+        before_snapshot = build_experience_snapshot([], before, ["RIGHT"], config)
+        after_snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=before)], after, ["RIGHT"], config
+        )
+
+        self.assertEqual(
+            before_snapshot["object_state"]["shape_signature"],
+            after_snapshot["object_state"]["shape_signature"],
+        )
+        self.assertEqual(
+            before_snapshot["object_state_id"], after_snapshot["object_state_id"]
+        )
+        self.assertFalse(after_snapshot["object_temporal"]["structural_change"])
+        self.assertEqual(
+            after_snapshot["object_temporal"]["motions"][0]["delta"], [1.0, 1.0]
+        )
+
+    def test_object_equivalent_evidence_drives_ranking_and_transition_model(
+        self,
+    ) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        current = Frame(grid=((1, 1, 0), (0, 0, 0), (0, 0, 0)), step=0, level=1)
+        current_object_id = build_experience_snapshot([], current, ["RIGHT"], config)[
+            "object_state_id"
+        ]
+        external = [
+            {
+                "before_state_id": "translated-visual-state",
+                "after_state_id": "translated-result-state",
+                "object_before_state_id": current_object_id,
+                "object_after_state_id": "abstract-result-state",
+                "action_display": "RIGHT",
+                "outcome_class": "novel",
+                "board_changed": True,
+                "evidence_id": "prior-object-trial",
+            }
+        ]
+
+        snapshot = build_experience_snapshot(
+            [], current, ["RIGHT"], config, external_transitions=external
+        )
+
+        self.assertEqual(snapshot["ranked_actions"][0]["trials"], 1)
+        model = snapshot["transition_models_here"][0]
+        self.assertEqual(model["state_abstraction"], "object_relational")
+        self.assertEqual(model["predicted_object_state_id"], "abstract-result-state")
+        self.assertEqual(model["predicted_outcome"], "novel")
+
+    def test_experiment_selection_prioritizes_conflicting_hypotheses(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        current = _frame(1, step=0)
+        current_id = frame_fingerprint(current)
+        external = [
+            {
+                "before_state_id": current_id,
+                "after_state_id": f"outcome-{source}",
+                "action_display": "RIGHT",
+                "outcome_class": outcome,
+                "evidence_id": source,
+            }
+            for source, outcome in (
+                ("trial-a", "novel"),
+                ("trial-b", "exact_noop"),
+            )
+        ]
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=current)],
+            current,
+            ["RIGHT"],
+            config,
+            external_transitions=external,
+        )
+
+        ranking = snapshot["ranked_actions"][0]
+        self.assertEqual(ranking["model_disagreement"], 0.5)
+        self.assertEqual(
+            snapshot["recommended_experiments"][0]["hypothesis"],
+            "resolve conflicting transition outcomes",
+        )
+        self.assertGreater(
+            ranking["adaptive_exploration_weight"], config.exploration_weight
+        )
+
+    def test_nonstationary_outcomes_trigger_a_recovery_portfolio(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        current = _frame(1, step=0)
+        current_id = frame_fingerprint(current)
+        external = [
+            {
+                "before_state_id": current_id,
+                "after_state_id": f"state-{index}",
+                "action_display": "RIGHT",
+                "outcome_class": outcome,
+                "evidence_id": f"trial-{index}",
+            }
+            for index, outcome in enumerate(
+                ("exact_noop", "exact_noop", "novel", "novel")
+            )
+        ]
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=current)],
+            current,
+            ["RIGHT", "LEFT"],
+            config,
+            external_transitions=external,
+        )
+
+        self.assertIn("nonstationary_dynamics", snapshot["recovery_reasons"])
+        self.assertEqual(
+            snapshot["nonstationary_actions"][0]["recent_outcome"], "novel"
+        )
+        self.assertEqual(
+            snapshot["recovery_portfolio"][0]["strategy"],
+            "revalidate_changed_model",
+        )
+        self.assertEqual(snapshot["recovery_portfolio"][0]["action"], "RIGHT")
+        ranking = next(
+            item for item in snapshot["ranked_actions"] if item["action"] == "RIGHT"
+        )
+        model = snapshot["transition_models_here"][0]
+        self.assertTrue(ranking["regime_adapted"])
+        self.assertEqual(ranking["trials"], 2)
+        self.assertEqual(ranking["novel"], 2)
+        self.assertTrue(model["regime_adapted"])
+        self.assertEqual(model["predicted_outcome"], "novel")
+
+    def test_harm_veto_requires_a_strict_majority_when_evidence_conflicts(self) -> None:
+        self.assertTrue(harmful_evidence_is_decisive(1, 1))
+        self.assertFalse(harmful_evidence_is_decisive(1, 2))
+        self.assertTrue(harmful_evidence_is_decisive(2, 3))
+
     def setUp(self) -> None:
         self.config = InferenceControllerConfig(
             enabled=True,
@@ -34,7 +205,9 @@ class InferenceControllerTests(TestCase):
         same_visible_state = _frame(1, step=99)
         next_level = _frame(1, step=0, level=2)
 
-        self.assertEqual(frame_fingerprint(first), frame_fingerprint(same_visible_state))
+        self.assertEqual(
+            frame_fingerprint(first), frame_fingerprint(same_visible_state)
+        )
         self.assertNotEqual(frame_fingerprint(first), frame_fingerprint(next_level))
 
     def test_absent_configuration_enables_outcome_aware_default(self) -> None:
@@ -80,6 +253,43 @@ class InferenceControllerTests(TestCase):
         self.assertIn("2 confirmed no-op trials", reason or "")
         self.assertIsNone(action_guard_reason(history, state, "RIGHT", self.config))
 
+    def test_transient_animation_is_informative_and_not_guarded_as_noop(self) -> None:
+        state = _frame(1, step=0)
+        animation = {
+            "transient_changed_cells": 1,
+            "temporally_reversible": True,
+        }
+        history = [
+            HistoryEntry(action="", frame=state),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=1), animation=animation),
+            HistoryEntry(action="LEFT", frame=_frame(1, step=2), animation=animation),
+        ]
+
+        snapshot = build_experience_snapshot(
+            history, history[-1].frame, ["LEFT"], self.config
+        )
+
+        self.assertEqual(snapshot["latest_outcome"], "transient_effect")
+        self.assertEqual(snapshot["behavioral_no_op_streak"], 0)
+        self.assertIsNone(
+            action_guard_reason(history, history[-1].frame, "LEFT", self.config)
+        )
+
+    def test_decisive_local_terminal_evidence_is_guarded(self) -> None:
+        state = _frame(1, step=0)
+        history = [
+            HistoryEntry(action="", frame=state),
+            HistoryEntry(
+                action="RIGHT",
+                frame=_frame(1, step=1),
+                outcome_class_override="terminal_failure",
+            ),
+        ]
+
+        reason = action_guard_reason(history, state, "RIGHT", self.config)
+
+        self.assertIn("terminal-failure evidence", reason or "")
+
     def test_cycle_and_stagnation_switch_to_recover(self) -> None:
         a = _frame(1, step=0)
         b = _frame(2, step=1)
@@ -91,7 +301,9 @@ class InferenceControllerTests(TestCase):
             HistoryEntry(action="LEFT", frame=_frame(1, step=4)),
         ]
 
-        snapshot = build_experience_snapshot(history, history[-1].frame, ["LEFT", "RIGHT"], self.config)
+        snapshot = build_experience_snapshot(
+            history, history[-1].frame, ["LEFT", "RIGHT"], self.config
+        )
 
         self.assertEqual(snapshot["phase"], "recover")
         self.assertEqual(snapshot["cycle_period"], 2)
@@ -106,9 +318,14 @@ class InferenceControllerTests(TestCase):
             HistoryEntry(action="SPACE", frame=second_level),
         ]
 
-        retained = build_experience_snapshot(run_history, second_level, ["SPACE"], self.config)
+        retained = build_experience_snapshot(
+            run_history, second_level, ["SPACE"], self.config
+        )
         fresh_pass = build_experience_snapshot(
-            [HistoryEntry(action="", frame=first_level)], first_level, ["SPACE"], self.config
+            [HistoryEntry(action="", frame=first_level)],
+            first_level,
+            ["SPACE"],
+            self.config,
         )
 
         self.assertEqual(retained["actions_observed"], 1)
@@ -124,7 +341,7 @@ class InferenceControllerTests(TestCase):
 
         self.assertTrue(metadata["novel_state"])
         self.assertNotEqual(metadata["before_state_id"], metadata["after_state_id"])
-        self.assertEqual(metadata["controller_phase"], "progress")
+        self.assertEqual(metadata["controller_phase"], "explore")
 
     def test_transition_metadata_reports_executed_actions_actual_rank(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
@@ -170,6 +387,64 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(snapshot["unique_behavioral_states"], 1)
         self.assertEqual(snapshot["phase"], "recover")
 
+    def test_repeatable_exact_action_effect_is_not_erased_by_volatility_mask(
+        self,
+    ) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            volatile_window=8,
+            volatile_min_samples=4,
+            volatile_ratio=0.75,
+        )
+        state_a = Frame(grid=((1, 9),), step=0, level=1)
+        state_b = Frame(grid=((2, 9),), step=1, level=1)
+        history = [
+            HistoryEntry(action="", frame=state_a),
+            HistoryEntry(action="RIGHT", frame=state_b),
+            HistoryEntry(action="LEFT", frame=state_a),
+            HistoryEntry(action="RIGHT", frame=state_b),
+            HistoryEntry(action="LEFT", frame=state_a),
+        ]
+
+        snapshot = build_experience_snapshot(history, state_a, ["RIGHT"], config)
+
+        self.assertEqual(snapshot["volatile_cells"], 1)
+        self.assertEqual(snapshot["latest_outcome"], "revisit")
+        self.assertTrue(snapshot["recent_transitions"][-1]["repeatable_exact_effect"])
+        self.assertEqual(
+            snapshot["transition_models_here"][0]["predicted_outcome"], "revisit"
+        )
+
+    def test_volatility_evidence_does_not_cross_reset_boundary(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            volatile_window=8,
+            volatile_min_samples=4,
+            volatile_ratio=0.75,
+        )
+        frames = [
+            Frame(grid=((value, 9),), step=index, level=1)
+            for index, value in enumerate((1, 2, 3, 4, 5))
+        ]
+        reset_frame = Frame(grid=((1, 9),), step=5, level=1)
+        current = Frame(grid=((2, 9),), step=6, level=1)
+        history = [HistoryEntry(action="", frame=frames[0])] + [
+            HistoryEntry(action="SPACE", frame=frame) for frame in frames[1:]
+        ]
+        history.extend(
+            [
+                HistoryEntry(action="RESET", frame=reset_frame),
+                HistoryEntry(action="RIGHT", frame=current),
+            ]
+        )
+
+        snapshot = build_experience_snapshot(history, current, ["RIGHT"], config)
+
+        self.assertEqual(snapshot["volatile_cells"], 0)
+        self.assertNotEqual(snapshot["latest_outcome"], "volatile_only")
+
     def test_outcome_aware_ranks_untried_before_noop_actions(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
         a = _frame(1, step=0)
@@ -205,7 +480,9 @@ class InferenceControllerTests(TestCase):
             HistoryEntry(action="LEFT", frame=_frame(1, step=2)),
         ]
 
-        snapshot = build_experience_snapshot(history, history[-1].frame, ["RIGHT"], config)
+        snapshot = build_experience_snapshot(
+            history, history[-1].frame, ["RIGHT"], config
+        )
         model = snapshot["transition_models_here"][0]
 
         self.assertEqual(model["action"], "RIGHT")
@@ -229,7 +506,9 @@ class InferenceControllerTests(TestCase):
             HistoryEntry(action="LEFT", frame=_frame(1, step=4)),
         ]
 
-        snapshot = build_experience_snapshot(history, history[-1].frame, ["RIGHT"], config)
+        snapshot = build_experience_snapshot(
+            history, history[-1].frame, ["RIGHT"], config
+        )
         model = snapshot["transition_models_here"][0]
 
         self.assertFalse(model["verified_deterministic"])
@@ -240,6 +519,77 @@ class InferenceControllerTests(TestCase):
         self.assertIn("transition_model_conflict", snapshot["recovery_reasons"])
         self.assertEqual(snapshot["phase"], "recover")
 
+    def test_transition_confidence_uses_joint_state_outcome_observations(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        state = _frame(1, step=0)
+        state_id = frame_fingerprint(state)
+        transitions = [
+            {
+                "before_state_id": state_id,
+                "after_state_id": "state-b",
+                "action_display": "RIGHT",
+                "outcome_class": outcome,
+                "board_changed": True,
+            }
+            for outcome in ("novel", "novel", "exact_noop")
+        ]
+
+        snapshot = build_experience_snapshot(
+            [], state, ["RIGHT"], config, external_transitions=transitions
+        )
+        model = snapshot["transition_models_here"][0]
+
+        self.assertEqual(model["predicted_behavioral_state_id"], "state-b")
+        self.assertEqual(model["predicted_outcome"], "novel")
+        self.assertTrue(model["verified_state_deterministic"])
+        self.assertFalse(model["verified_deterministic"])
+        self.assertEqual(model["state_confidence"], 1.0)
+        self.assertEqual(model["confidence"], 0.667)
+        self.assertEqual(model["support"], 2)
+        self.assertEqual(model["contradictions"], 1)
+
+    def test_action_models_weight_independent_trials_not_raw_repetitions(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        state = _frame(1, step=0)
+        state_id = frame_fingerprint(state)
+        failed = {
+            "before_state_id": state_id,
+            "after_state_id": "terminal",
+            "action_display": "RIGHT",
+            "outcome_class": "terminal_failure",
+            "reward": -1,
+            "evidence_id": "noisy-pass",
+        }
+        successful = [
+            {
+                "before_state_id": state_id,
+                "after_state_id": "progress",
+                "action_display": "RIGHT",
+                "outcome_class": "level_progress",
+                "evidence_id": source,
+            }
+            for source in ("successful-pass-a", "successful-pass-b")
+        ]
+
+        snapshot = build_experience_snapshot(
+            [],
+            state,
+            ["RIGHT"],
+            config,
+            external_transitions=[*[failed] * 6, *successful],
+        )
+        ranking = snapshot["ranked_actions"][0]
+        model = snapshot["transition_models_here"][0]
+
+        self.assertEqual(ranking["trials"], 3)
+        self.assertEqual(ranking["raw_observations"], 8)
+        self.assertFalse(ranking["harm_decisive"])
+        self.assertEqual(model["trials"], 3)
+        self.assertEqual(model["raw_observations"], 8)
+        self.assertEqual(model["predicted_outcome"], "level_progress")
+        self.assertEqual(model["confidence"], 0.667)
+        self.assertEqual(model["terminal_failures"], 1)
+
     def test_mouse_family_keeps_coordinate_search_open(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
         state = _frame(1, step=0)
@@ -248,16 +598,58 @@ class InferenceControllerTests(TestCase):
             HistoryEntry(action="MOUSE(row=1, col=1)", frame=_frame(1, step=1)),
         ]
 
-        snapshot = build_experience_snapshot(history, history[-1].frame, ["MOUSE"], config)
+        snapshot = build_experience_snapshot(
+            history, history[-1].frame, ["MOUSE"], config
+        )
 
         self.assertEqual(action_family("MOUSE(row=3, col=4)"), "MOUSE")
         self.assertTrue(snapshot["ranked_actions"][0]["parameterized"])
         self.assertEqual(snapshot["ranked_actions"][0]["priority"], 1)
         self.assertIsNone(
-            action_guard_reason(history, history[-1].frame, "MOUSE(row=2, col=2)", config)
+            action_guard_reason(
+                history, history[-1].frame, "MOUSE(row=2, col=2)", config
+            )
         )
         self.assertEqual(snapshot["mouse_search"]["unique_coordinates"], 1)
         self.assertEqual(snapshot["mouse_search"]["recent"][0]["row"], 1)
+        self.assertTrue(snapshot["mouse_search"]["recommended_coordinates"])
+        self.assertNotIn(
+            {"row": 1, "col": 1, "reason": "spatial frontier"},
+            snapshot["mouse_search"]["recommended_coordinates"],
+        )
+
+    def test_failed_mouse_coordinate_does_not_poison_untried_coordinates(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        state = _frame(1, step=0)
+        state_id = frame_fingerprint(state)
+
+        snapshot = build_experience_snapshot(
+            [],
+            state,
+            ["MOUSE", "LEFT"],
+            config,
+            external_transitions=[
+                {
+                    "before_state_id": state_id,
+                    "after_state_id": "terminal",
+                    "action_display": "MOUSE(row=0, col=0)",
+                    "outcome_class": "negative_reward",
+                    "reward": -1,
+                }
+            ],
+        )
+
+        mouse = next(
+            item for item in snapshot["ranked_actions"] if item["action"] == "MOUSE"
+        )
+        self.assertEqual(mouse["priority"], 1)
+        self.assertFalse(mouse["harm_decisive"])
+        self.assertGreaterEqual(mouse["expected_value"], 0)
+        self.assertIn([0, 0], snapshot["mouse_search"]["blocked_coordinates"])
+        self.assertNotIn(
+            {"row": 0, "col": 0, "reason": "spatial frontier"},
+            snapshot["mouse_search"]["recommended_coordinates"],
+        )
 
     def test_verified_transition_graph_proposes_short_progress_plan(self) -> None:
         config = InferenceControllerConfig(
@@ -276,11 +668,126 @@ class InferenceControllerTests(TestCase):
             HistoryEntry(action="RESET", frame=_frame(1, step=6)),
         ]
 
-        snapshot = build_experience_snapshot(history, history[-1].frame, ["RIGHT"], config)
+        snapshot = build_experience_snapshot(
+            history, history[-1].frame, ["RIGHT"], config
+        )
 
         self.assertEqual(snapshot["recommended_plan"]["actions"], ["RIGHT", "SPACE"])
         self.assertEqual(snapshot["recommended_plan"]["target"], "level_progress")
         self.assertEqual(snapshot["recommended_plan"]["confidence"], 1.0)
+
+    def test_plan_exposes_observation_contingencies_with_bounded_risk(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            plan_max_terminal_risk=0.25,
+        )
+        current, middle, progressed = (
+            _frame(1, step=0),
+            _frame(2, step=1),
+            _frame(3, step=2, level=2),
+        )
+        current_id, middle_id, progress_id = map(
+            frame_fingerprint, (current, middle, progressed)
+        )
+        external = [
+            {
+                "before_state_id": current_id,
+                "after_state_id": middle_id,
+                "action_display": "RIGHT",
+                "outcome_class": "novel",
+                "evidence_id": f"safe-{source}",
+            }
+            for source in range(3)
+        ]
+        external.append(
+            {
+                "before_state_id": current_id,
+                "after_state_id": "terminal",
+                "action_display": "RIGHT",
+                "outcome_class": "terminal_failure",
+                "evidence_id": "risky-branch",
+            }
+        )
+        external.extend(
+            {
+                "before_state_id": middle_id,
+                "after_state_id": progress_id,
+                "action_display": "SPACE",
+                "outcome_class": "level_progress",
+                "evidence_id": f"goal-{source}",
+            }
+            for source in range(2)
+        )
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=current)],
+            current,
+            ["RIGHT"],
+            config,
+            external_transitions=external,
+        )
+
+        plan = snapshot["recommended_plan"]
+        self.assertEqual(plan["actions"], ["RIGHT", "SPACE"])
+        self.assertEqual(plan["terminal_risk"], 0.25)
+        first_branches = plan["contingencies"][0]["branches"]
+        self.assertEqual(
+            [branch["probability"] for branch in first_branches], [0.75, 0.25]
+        )
+        self.assertEqual(first_branches[0]["next_action"], "SPACE")
+        self.assertEqual(first_branches[0]["status"], "continue_verified_route")
+        self.assertTrue(first_branches[1]["terminal"])
+        self.assertEqual(first_branches[1]["status"], "abort_terminal_branch")
+        self.assertIsNone(first_branches[1]["next_action"])
+        self.assertEqual(plan["observation_policy"][0]["action"], "RIGHT")
+
+    def test_action_ranking_assigns_discounted_credit_for_later_progress(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            credit_horizon=3,
+            credit_discount=0.8,
+        )
+        current, middle, progressed = (
+            _frame(1, step=0),
+            _frame(2, step=1),
+            _frame(3, step=2, level=2),
+        )
+        current_id, middle_id, progress_id = map(
+            frame_fingerprint, (current, middle, progressed)
+        )
+        external = [
+            {
+                "before_state_id": current_id,
+                "after_state_id": middle_id,
+                "action_display": "RIGHT",
+                "outcome_class": "novel",
+                "evidence_id": "trial-a",
+            },
+            {
+                "before_state_id": middle_id,
+                "after_state_id": progress_id,
+                "action_display": "SPACE",
+                "outcome_class": "level_progress",
+                "evidence_id": "trial-a",
+            },
+        ]
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=current)],
+            current,
+            ["RIGHT"],
+            config,
+            external_transitions=external,
+        )
+
+        ranking = snapshot["ranked_actions"][0]
+        self.assertEqual(ranking["action"], "RIGHT")
+        self.assertEqual(ranking["delayed_progress_credit"], 0.8)
+        self.assertEqual(
+            ranking["reason"], "observed delayed progress after this action"
+        )
 
     def test_single_observation_is_not_mislabeled_as_verified_plan(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
@@ -291,15 +798,102 @@ class InferenceControllerTests(TestCase):
             HistoryEntry(action="RESET", frame=_frame(1, step=3)),
         ]
 
-        snapshot = build_experience_snapshot(history, history[-1].frame, ["RIGHT"], config)
+        snapshot = build_experience_snapshot(
+            history, history[-1].frame, ["RIGHT"], config
+        )
 
         self.assertIsNone(snapshot["recommended_plan"])
+
+    def test_repeated_observations_from_one_evidence_source_do_not_verify_plan(
+        self,
+    ) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        current = _frame(1, step=0)
+        current_id = frame_fingerprint(current)
+        progress_id = frame_fingerprint(_frame(2, step=1, level=2))
+        external = [
+            {
+                "before_state_id": current_id,
+                "after_state_id": progress_id,
+                "action_display": "RIGHT",
+                "outcome_class": "level_progress",
+                "evidence_id": "run-a:pass=0",
+            }
+            for _ in range(5)
+        ]
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=current)],
+            current,
+            ["RIGHT"],
+            config,
+            external_transitions=external,
+            evidence_id="run-a:pass=0",
+        )
+
+        self.assertIsNone(snapshot["recommended_plan"])
+
+    def test_repeated_raw_observations_cannot_override_independent_outcome_consensus(
+        self,
+    ) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        current = _frame(1, step=0)
+        current_id = frame_fingerprint(current)
+        middle_id = frame_fingerprint(_frame(2, step=1))
+        progress_id = frame_fingerprint(_frame(3, step=2, level=2))
+        external = [
+            *[
+                {
+                    "before_state_id": current_id,
+                    "after_state_id": middle_id,
+                    "action_display": "RIGHT",
+                    "outcome_class": "exact_noop",
+                    "evidence_id": "run-a:pass=0",
+                }
+                for _ in range(6)
+            ],
+            *[
+                {
+                    "before_state_id": current_id,
+                    "after_state_id": middle_id,
+                    "action_display": "RIGHT",
+                    "outcome_class": "novel",
+                    "evidence_id": f"run-a:pass={pass_index}",
+                }
+                for pass_index in (1, 2, 3)
+            ],
+            *[
+                {
+                    "before_state_id": middle_id,
+                    "after_state_id": progress_id,
+                    "action_display": "SPACE",
+                    "outcome_class": "level_progress",
+                    "evidence_id": f"run-a:pass={pass_index}",
+                }
+                for pass_index in (1, 2)
+            ],
+        ]
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=current)],
+            current,
+            ["RIGHT"],
+            config,
+            external_transitions=external,
+        )
+
+        self.assertEqual(snapshot["recommended_plan"]["actions"], ["RIGHT", "SPACE"])
+        self.assertEqual(snapshot["recommended_plan"]["expected_utility"], 1.2)
 
     def test_persisted_exact_state_evidence_can_supply_a_verified_plan(self) -> None:
         config = InferenceControllerConfig(
             enabled=True, policy=OUTCOME_AWARE_POLICY, volatile_min_samples=20
         )
-        a, b, progressed = _frame(1, step=0), _frame(2, step=1), _frame(3, step=2, level=2)
+        a, b, progressed = (
+            _frame(1, step=0),
+            _frame(2, step=1),
+            _frame(3, step=2, level=2),
+        )
         a_id, b_id, progress_id = map(frame_fingerprint, (a, b, progressed))
         external = [
             {
@@ -324,6 +918,225 @@ class InferenceControllerTests(TestCase):
         )
 
         self.assertEqual(snapshot["recommended_plan"]["actions"], ["RIGHT", "SPACE"])
+
+    def test_planner_keeps_lower_confidence_route_when_utility_is_higher(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        current = _frame(1, step=0)
+        detour = _frame(2, step=1)
+        shared = _frame(3, step=2)
+        progressed = _frame(4, step=3, level=2)
+        current_id, detour_id, shared_id, progress_id = map(
+            frame_fingerprint, (current, detour, shared, progressed)
+        )
+
+        def evidence(
+            before: str,
+            after: str,
+            action: str,
+            outcome: str,
+            source: str,
+        ) -> dict[str, str]:
+            return {
+                "before_state_id": before,
+                "after_state_id": after,
+                "action_display": action,
+                "outcome_class": outcome,
+                "evidence_id": source,
+            }
+
+        external = [
+            evidence(current_id, shared_id, "RIGHT", "revisit", f"direct-{index}")
+            for index in range(2)
+        ]
+        external.extend(
+            evidence(current_id, detour_id, "LEFT", "novel", f"detour-{index}")
+            for index in range(3)
+        )
+        external.append(
+            evidence(current_id, detour_id, "LEFT", "exact_noop", "detour-noise")
+        )
+        external.extend(
+            evidence(detour_id, shared_id, "UP", "novel", f"join-{index}")
+            for index in range(2)
+        )
+        external.extend(
+            evidence(shared_id, progress_id, "SPACE", "level_progress", f"goal-{index}")
+            for index in range(2)
+        )
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=current)],
+            current,
+            ["RIGHT", "LEFT"],
+            config,
+            external_transitions=external,
+        )
+
+        self.assertEqual(
+            snapshot["recommended_plan"]["actions"], ["LEFT", "UP", "SPACE"]
+        )
+        self.assertEqual(snapshot["recommended_plan"]["expected_utility"], 1.4)
+
+    def test_planner_ranks_after_bounded_search_instead_of_first_four_goals(
+        self,
+    ) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        current = _frame(1, step=0)
+        detour = _frame(2, step=1)
+        progressed = _frame(3, step=2, level=2)
+        current_id, detour_id, progress_id = map(
+            frame_fingerprint, (current, detour, progressed)
+        )
+        external: list[dict[str, str]] = []
+        for action in ("UP", "DOWN", "LEFT", "RIGHT"):
+            for source in range(2):
+                external.append(
+                    {
+                        "before_state_id": current_id,
+                        "after_state_id": progress_id,
+                        "action_display": action,
+                        "outcome_class": "level_progress",
+                        "evidence_id": f"{action}-{source}",
+                    }
+                )
+        for source in range(2):
+            external.extend(
+                [
+                    {
+                        "before_state_id": current_id,
+                        "after_state_id": detour_id,
+                        "action_display": "SPACE",
+                        "outcome_class": "novel",
+                        "evidence_id": f"detour-{source}",
+                    },
+                    {
+                        "before_state_id": detour_id,
+                        "after_state_id": progress_id,
+                        "action_display": "ACTION6",
+                        "outcome_class": "level_progress",
+                        "evidence_id": f"finish-{source}",
+                    },
+                ]
+            )
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=current)],
+            current,
+            ["UP", "DOWN", "LEFT", "RIGHT", "SPACE"],
+            config,
+            external_transitions=external,
+        )
+
+        self.assertEqual(snapshot["recommended_plan"]["actions"], ["SPACE", "ACTION6"])
+        self.assertEqual(len(snapshot["plan_candidates"]), 4)
+
+    def test_planner_does_not_inflate_utility_by_revisiting_states(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        current = _frame(1, step=0)
+        middle = _frame(2, step=1)
+        progressed = _frame(3, step=2, level=2)
+        current_id, middle_id, progress_id = map(
+            frame_fingerprint, (current, middle, progressed)
+        )
+        external = [
+            {
+                "before_state_id": before,
+                "after_state_id": after,
+                "action_display": action,
+                "outcome_class": outcome,
+                "evidence_id": f"{action}-{source}",
+            }
+            for source in range(2)
+            for before, after, action, outcome in (
+                (current_id, middle_id, "RIGHT", "novel"),
+                (middle_id, current_id, "LEFT", "revisit"),
+                (middle_id, progress_id, "SPACE", "level_progress"),
+            )
+        ]
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=current)],
+            current,
+            ["RIGHT"],
+            config,
+            external_transitions=external,
+        )
+
+        self.assertEqual(snapshot["recommended_plan"]["actions"], ["RIGHT", "SPACE"])
+
+    def test_plan_rejects_currently_invalid_or_contextually_invalid_actions(
+        self,
+    ) -> None:
+        config = InferenceControllerConfig(
+            enabled=True, policy=OUTCOME_AWARE_POLICY, volatile_min_samples=20
+        )
+        a, b, progressed = (
+            _frame(1, step=0),
+            _frame(2, step=1),
+            _frame(3, step=2, level=2),
+        )
+        a_id, b_id, progress_id = map(frame_fingerprint, (a, b, progressed))
+        external = [
+            {
+                "before_state_id": before,
+                "after_state_id": after,
+                "action_display": action,
+                "outcome_class": outcome,
+                "valid_actions_after": valid_after,
+            }
+            for _ in range(2)
+            for before, after, action, outcome, valid_after in (
+                (a_id, b_id, "RIGHT", "novel", ["LEFT"]),
+                (b_id, progress_id, "SPACE", "level_progress", []),
+            )
+        ]
+
+        invalid_first = build_experience_snapshot(
+            [HistoryEntry(action="", frame=a)],
+            a,
+            ["LEFT"],
+            config,
+            external_transitions=external,
+        )
+        invalid_second = build_experience_snapshot(
+            [HistoryEntry(action="", frame=a)],
+            a,
+            ["RIGHT"],
+            config,
+            external_transitions=external,
+        )
+
+        self.assertIsNone(invalid_first["recommended_plan"])
+        self.assertIsNone(invalid_second["recommended_plan"])
+
+    def test_terminal_transition_is_classified_as_harm_and_not_planned(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        before, after = _frame(1, step=0), _frame(2, step=1)
+        metadata = transition_metadata(
+            before,
+            after,
+            [HistoryEntry(action="", frame=before)],
+            "RIGHT",
+            config,
+            ["RIGHT"],
+            game_over=True,
+        )
+
+        self.assertEqual(metadata["outcome_class"], "terminal_failure")
+        self.assertTrue(metadata["game_over"])
+
+    def test_rankings_expose_uncertainty_and_information_gain(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        frame = _frame(1, step=0)
+
+        snapshot = build_experience_snapshot(
+            [HistoryEntry(action="", frame=frame)], frame, ["LEFT", "RIGHT"], config
+        )
+
+        self.assertTrue(
+            all("information_gain" in item for item in snapshot["ranked_actions"])
+        )
+        self.assertEqual(snapshot["ranked_actions"][0]["trials"], 0)
 
     def test_outcome_metadata_reports_level_progress(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
@@ -353,8 +1166,8 @@ class InferenceControllerTests(TestCase):
 
         snapshot = build_experience_snapshot(history, after, ["RIGHT"], config)
 
-        self.assertEqual(snapshot["phase"], "progress")
-        self.assertEqual(snapshot["action_budget"], 3)
+        self.assertEqual(snapshot["phase"], "explore")
+        self.assertEqual(snapshot["action_budget"], 1)
 
     def test_snapshot_payloads_remain_bounded(self) -> None:
         config = InferenceControllerConfig(

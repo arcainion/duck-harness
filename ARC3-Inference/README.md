@@ -120,6 +120,10 @@ seconds. Batched action results include a bounded `steps` list so each action ca
 be attributed to its individual before/after state and outcome.
 Each batch is capped at 12 entries at both the sandbox and solver boundaries;
 larger batches are rejected before any environment action executes.
+Every queued action is screened for current-state terminal/negative-reward
+evidence. The host repeats that check against cross-trial knowledge immediately
+before each action, after any preceding state changes. Partial-batch failures
+return a bounded `stop_detail` for the next reasoning turn.
 
 ## Configuration
 
@@ -156,15 +160,37 @@ Useful sections in `configs/inference.json`:
   mouse-coordinate outcomes, support-weighted transition-graph plans, and
   phase-specific action budgets. Plans require repeated evidence by default;
   tune `plan_min_support`, `plan_min_confidence`, and `plan_max_depth`.
+  Repeated actions from one run/pass count as one evidence source, preventing
+  correlated observations from falsely satisfying the planner's support gate.
+  Cross-trial action rankings use the same independent-source weighting while
+  retaining raw observation totals for diagnostics.
+  Plans are filtered against current and observed intermediate action
+  availability, reject any edge with terminal/negative-reward evidence, and
+  retain non-dominated confidence/utility routes during bounded search before
+  selecting the best candidates. Candidate routes cannot revisit a state, so
+  positive novelty cannot make cycles look like useful plans. Action rankings combine
+  empirical value with uncertainty-weighted information gain; configure
+  `progress_utility`, `novel_utility`, `revisit_utility`, `noop_utility`,
+  `terminal_failure_utility`, and `exploration_weight`.
   The outcome-aware volatility detector can be tuned with `volatile_window`,
-  `volatile_min_samples`, and `volatile_ratio`.
+  `volatile_min_samples`, and `volatile_ratio`. Volatility evidence resets at
+  each `RESET`, and deterministically repeated exact state/action effects are
+  retained as controllable behavior even when their cells are otherwise masked.
 
 Restore the previous controller for an ablation:
 
 ```bash
 LOCAL_ANALYZER_STRATEGY_POLICY=legacy make interactive
 ```
-- `analyzer.candidates` defaults to two. Compilable candidates are ranked
+- `analyzer.candidates` defaults to two. Candidate fan-out is reduced to one
+  when the controller is confident or the per-game generation budget is low.
+  Set `analyzer.game_token_budget` (or
+  `LOCAL_ANALYZER_GAME_TOKEN_BUDGET`) to cap generated tokens per game.
+  Exhausting that budget finishes the pass cleanly instead of repeatedly
+  resubmitting an analyzer turn. If a compatible provider omits token usage,
+  response size supplies a conservative generated-token estimate so the budget
+  remains enforceable.
+  Compilable candidates are ranked
   against empirical transition outcomes and contradictions as well as current
   action rankings, discouraged exact actions, mouse search history, action
   budget, and the confidence of any recommended plan.
@@ -173,6 +199,20 @@ LOCAL_ANALYZER_STRATEGY_POLICY=legacy make interactive
   to `cross_trial_knowledge.json` in the run directory (or the path in
   `LOCAL_ANALYZER_KNOWLEDGE_PATH`) so interrupted runs can resume. It contains
   opaque state IDs and compact strategy/causal evidence, never raw frames.
+  Writes use a process lock and merge the latest disk state to prevent parallel
+  writers losing observations; a last-known-good backup is used after a
+  truncated or corrupt primary file. Persistence failure never aborts gameplay.
+  Executed transitions automatically ground causal action→outcome relations
+  and resolve structured predictions that declare `expected_outcome`.
+  Automatically grounded relations and predictions are conditioned on the
+  behavioral state where they were observed, and causal-model updates refresh
+  same-turn candidate scoring immediately. When the bounded relation store is
+  full, weak stale automatically-grounded relations are evicted before new
+  state evidence; model-authored rules are preserved.
+- Mouse probes expose untried spatial-frontier coordinates around productive
+  clicks. Animation summaries retain bounded per-frame change counts, motion
+  vectors/directions, and reversibility; multimodal turns include both previous
+  and current grids when the board changed.
 - `chat.*`: direct chat probing with `make chat`.
 - `viewer.port`: default viewer port.
 - `multimodal.*`: image context for the current grid.
@@ -436,7 +476,13 @@ make regression-gate REGRESSION_RUN_DIR=/path/to/run
 
 `configs/regression.json` requires whole-game wins and level completion in
 addition to score, trace coverage, and the declared outcome-aware/candidate/
-verified-planner configuration. It also caps no-ops, crashes, cancellations,
+verified-planner configuration. It also verifies the independent-evidence,
+process-safe-memory, and adaptive-budget controls, and records how often the
+duck follows a recommended plan and whether followed plans produce progress.
+Raw action traces preserve the animation and planner-decision fields consumed
+by these metrics. Loop interventions and empirical harm interventions are
+reported separately.
+The gate caps no-ops, crashes, cancellations,
 tokens per completed level, actions per completed level, and terminal-state
 violations. This intentionally rejects the old score-only zero-win example as
 evidence. It can also require a score ratio against `baseline_run_dir`. The

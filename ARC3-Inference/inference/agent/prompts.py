@@ -63,7 +63,7 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- `experience` is a read-only compact controller snapshot with the current phase, opaque state id, visits, tried/no-op actions, recent transitions, cycle/stagnation signals, and suggested probes. It never contains the raw numeric grid.\n"
     "- `strategy` is the latest structured strategy memory recorded during this run.\n"
     "- `memory` is a bounded JSON scratchpad persisted across fresh Python calls in this game run. Update it only with `remember(key, value)` or clear entries with `forget(key)` / `forget()`.\n"
-    "- Call `record_strategy(goal=..., hypothesis=..., evidence=[...], confidence=0.0_to_1.0, open_question=..., next_test=...)` whenever evidence materially changes the plan. For multi-step work also record `subgoals`, `current_subgoal`, ordered `plan_steps`, `success_criteria`, `risk`, and `abort_condition`. Maintain `causal_model={entities:[...], relations:[{cause,effect,conditions,evidence,confidence,support,contradictions}], subgoals:[...], predictions:[...]}` for durable entity, cause/effect, dependency, and falsifiable prediction structure. Omitted fields preserve their previous values. Optionally include test_action, expected_outcome, fallback, and contradictions so the next matching result can falsify the plan; a prediction is consumed after it is evaluated once.\n"
+    "- Call `record_strategy(goal=..., hypothesis=..., evidence=[...], confidence=0.0_to_1.0, open_question=..., next_test=...)` whenever evidence materially changes the plan. For multi-step work also record `subgoals`, `current_subgoal`, ordered `plan_steps`, `success_criteria`, `risk`, and `abort_condition`. Maintain `causal_model={entities:[...], relations:[{cause,effect,conditions,evidence,confidence,support,contradictions}], subgoals:[...], predictions:[{action,expected_changes,expected_outcome,confidence,status}]}` for durable entity, cause/effect, dependency, and falsifiable prediction structure. Use controller outcome names for `expected_outcome`; executed actions automatically ground relations and resolve matching predictions. Omitted fields preserve their previous values. Optionally include test_action, expected_outcome, fallback, and contradictions so the next matching result can falsify the plan; a prediction is consumed after it is evaluated once.\n"
     "- Call `action(actions)` to execute one or more real environment actions from Python.\n"
     "- Pass `action(actions)` a list like `['LEFT']` or `[{'action': 'MOUSE', 'row': 4, 'col': 7}]`.\n"
     "- One action usually returns one frame, but a single action can result in a short multi-frame animation.\n"
@@ -72,7 +72,7 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
 
 MULTIMODAL_CONTEXT_ADDENDUM = (
     "\n\nMultimodal context:\n"
-    "- User turns include an attached image of the current ARC grid.\n"
+    "- User turns include an attached image of the current ARC grid and, when it changed, the previous grid for direct temporal comparison.\n"
     "- The image and `current_frame.ascii` are two representations of the same current frame.\n"
     "- You can use images and other tools to understand the game state and guide your strategy, each may be useful depending on the current uncertainty.\n"
 )

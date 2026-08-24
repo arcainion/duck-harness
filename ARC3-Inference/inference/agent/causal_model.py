@@ -55,6 +55,7 @@ def normalize_causal_model(value: Any) -> dict[str, list[dict[str, Any]]]:
             "confidence": _confidence(item.get("confidence")),
             "support": _count(item.get("support")),
             "contradictions": _count(item.get("contradictions")),
+            "last_observed_action": _count(item.get("last_observed_action")),
         })
     for item in list(raw.get("subgoals") or [])[:12]:
         if not isinstance(item, dict) or not _text(item.get("id"), 64):
@@ -74,6 +75,8 @@ def normalize_causal_model(value: Any) -> dict[str, list[dict[str, Any]]]:
         result["predictions"].append({
             "action": _text(item.get("action"), 80),
             "expected_changes": _text(item.get("expected_changes"), 200),
+            "expected_outcome": _text(item.get("expected_outcome"), 40).lower(),
+            "conditions": _text(item.get("conditions"), 180),
             "confidence": _confidence(item.get("confidence")),
             "status": status if status in {"untested", "supported", "contradicted"} else "untested",
         })

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import colorsys
 import io
 import os
 from typing import Any
@@ -29,6 +30,16 @@ ARC_COLOR_MAP: dict[int, tuple[int, int, int]] = {
     14: (79, 204, 48),
     15: (163, 86, 214),
 }
+
+
+def color_for_value(value: int) -> tuple[int, int, int]:
+    """Render unknown symbols distinctly instead of silently as background."""
+    numeric = int(value)
+    if numeric in ARC_COLOR_MAP:
+        return ARC_COLOR_MAP[numeric]
+    hue = (abs(numeric) * 0.6180339887498949) % 1.0
+    red, green, blue = colorsys.hsv_to_rgb(hue, 0.75, 0.9)
+    return int(red * 255), int(green * 255), int(blue * 255)
 
 
 def multimodal_context() -> str:
@@ -61,7 +72,7 @@ def frame_to_png_data_url(frame: Frame, *, upscale: int | None = None) -> str:
     for row_idx, row in enumerate(frame.grid):
         for col_idx in range(cols):
             value = row[col_idx] if col_idx < len(row) else 0
-            pixels[col_idx, row_idx] = ARC_COLOR_MAP.get(int(value), ARC_COLOR_MAP[0])
+            pixels[col_idx, row_idx] = color_for_value(int(value))
     if scale > 1:
         image = image.resize((cols * scale, rows * scale), Image.Resampling.NEAREST)
 

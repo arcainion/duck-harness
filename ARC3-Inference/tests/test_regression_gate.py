@@ -50,7 +50,9 @@ class RegressionGateTests(TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(len(result.failures), 6)
 
-    def test_gate_rejects_score_only_run_without_wins_or_required_capabilities(self) -> None:
+    def test_gate_rejects_score_only_run_without_wins_or_required_capabilities(
+        self,
+    ) -> None:
         result = evaluate_gate(
             {
                 "overall_score": 2.0,
@@ -59,6 +61,9 @@ class RegressionGateTests(TestCase):
                 "outcome_aware_enabled": 0.0,
                 "candidate_count": 1.0,
                 "verified_plan_min_support": 0.0,
+                "reasoning_control_v2": 0.0,
+                "audit_controls_v3": 0.0,
+                "game_token_budget": 0.0,
             },
             {
                 "min_overall_score": 1.5,
@@ -67,6 +72,30 @@ class RegressionGateTests(TestCase):
                 "min_outcome_aware_enabled": 1,
                 "min_candidate_count": 2,
                 "min_verified_plan_support": 2,
+                "min_reasoning_control_v2": 1,
+                "min_audit_controls_v3": 1,
+                "min_game_token_budget": 1,
+            },
+        )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(len(result.failures), 8)
+
+    def test_gate_requires_runtime_inference_behavior(self) -> None:
+        result = evaluate_gate(
+            {
+                "inference_telemetry_rate": 0.2,
+                "prediction_evaluation_rate": 0.0,
+                "plan_recommendation_rate": 0.0,
+                "plan_follow_rate": 0.0,
+                "followed_plan_progress_rate": 0.0,
+            },
+            {
+                "min_inference_telemetry_rate": 0.95,
+                "min_prediction_evaluation_rate": 0.001,
+                "min_plan_recommendation_rate": 0.001,
+                "min_plan_follow_rate": 0.05,
+                "min_followed_plan_progress_rate": 0.01,
             },
         )
 

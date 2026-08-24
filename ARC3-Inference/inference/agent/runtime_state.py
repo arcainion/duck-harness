@@ -1,10 +1,11 @@
 """Structured runtime state shared with created Python tools."""
+
 from __future__ import annotations
 
 import json
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,9 @@ class Frame:
     grid: tuple[tuple[int, ...], ...]
     step: int
     level: int
+    valid_actions: tuple[str, ...] = ()
+    engine_state: str = ""
+    score: int = 0
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -35,6 +39,9 @@ class Frame:
         return (
             f"Level: {self.level}\n"
             f"Step: {self.step}\n"
+            f"Engine state: {self.engine_state or 'unknown'}\n"
+            f"Score: {self.score}\n"
+            f"Valid actions: {', '.join(self.valid_actions) or '(unknown)'}\n"
             f"Grid shape: {rows} x {cols}\n"
             f"Grid contents:\n{self.ascii}"
         )
@@ -44,6 +51,8 @@ class Frame:
 class HistoryEntry:
     action: str
     frame: Frame
+    animation: dict[str, Any] = field(default_factory=dict)
+    outcome_class_override: str = ""
 
 
 _RUNTIME_STATE_CACHE_LIMIT = 64
@@ -97,10 +106,31 @@ def frame_from_payload(payload: Any) -> Frame | None:
         level = max(1, int(payload.get("level", 1) or 1))
     except (TypeError, ValueError):
         level = 1
+    try:
+        score = max(0, int(payload.get("score", 0) or 0))
+    except (TypeError, ValueError):
+        score = 0
+    raw_valid_actions = payload.get("valid_actions")
+    valid_actions = (
+        raw_valid_actions
+        if isinstance(raw_valid_actions, (list, tuple, set, frozenset))
+        else ()
+    )
     return Frame(
         grid=normalize_grid(payload.get("grid")),
         step=step,
         level=level,
+        valid_actions=tuple(
+            sorted(
+                {
+                    str(action).strip().upper()
+                    for action in valid_actions
+                    if str(action).strip()
+                }
+            )
+        ),
+        engine_state=str(payload.get("engine_state") or "").strip().upper(),
+        score=score,
     )
 
 
@@ -111,6 +141,9 @@ def frame_to_payload(frame: Frame | None) -> dict[str, Any] | None:
         "grid": [list(row) for row in frame.grid],
         "step": frame.step,
         "level": frame.level,
+        "valid_actions": list(frame.valid_actions),
+        "engine_state": frame.engine_state,
+        "score": frame.score,
     }
 
 
@@ -120,13 +153,21 @@ def history_entry_from_payload(payload: Any) -> HistoryEntry | None:
     frame = frame_from_payload(payload.get("frame"))
     if frame is None:
         return None
-    return HistoryEntry(action=str(payload.get("action", "")).strip(), frame=frame)
+    raw_animation = payload.get("animation")
+    return HistoryEntry(
+        action=str(payload.get("action", "")).strip(),
+        frame=frame,
+        animation=dict(raw_animation) if isinstance(raw_animation, dict) else {},
+        outcome_class_override=str(payload.get("outcome_class_override") or "").strip(),
+    )
 
 
 def history_entry_to_payload(entry: HistoryEntry) -> dict[str, Any]:
     return {
         "action": entry.action,
         "frame": frame_to_payload(entry.frame),
+        "animation": dict(entry.animation),
+        "outcome_class_override": entry.outcome_class_override,
     }
 
 
