@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import json
 import logging
@@ -10,7 +11,7 @@ import os
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -122,6 +123,277 @@ def _strip_tool_call_markup(text: str) -> str:
 
 class _GeneratedCodeLimitError(ValueError):
     """Raised when generated source exceeds a host-side parsing limit."""
+
+
+class _GeneratedCodePreflightError(ValueError):
+    """Raised when generated source is valid Python but unsafe to execute."""
+
+
+_SANDBOX_SAFE_MODULES = frozenset(
+    {
+        "bisect",
+        "collections",
+        "copy",
+        "fractions",
+        "functools",
+        "heapq",
+        "itertools",
+        "json",
+        "math",
+        "operator",
+        "random",
+        "re",
+        "statistics",
+        "string",
+    }
+)
+_FRAME_VIEW_ATTRIBUTES = frozenset(
+    {
+        "analyze",
+        "ascii",
+        "border_summary",
+        "bounds",
+        "cell",
+        "center_summary",
+        "color_adjacency",
+        "color_summary",
+        "color_transitions",
+        "column_profile",
+        "compare_regions",
+        "components",
+        "corner_summary",
+        "crop",
+        "diff",
+        "distance",
+        "distance_between_colors",
+        "divider_lines",
+        "edge_distance",
+        "enclosed_regions",
+        "find",
+        "find_pattern",
+        "level",
+        "line_between",
+        "mirror_cells",
+        "nearest_cell",
+        "neighbors",
+        "object_relations",
+        "objects",
+        "panels",
+        "periodicity",
+        "quadrant_summary",
+        "ray",
+        "reachable_region",
+        "rectangles",
+        "region_summary",
+        "row_profile",
+        "runs",
+        "segmentation",
+        "shape",
+        "shortest_path",
+        "shortest_path_to_any",
+        "step",
+        "symmetry",
+        "tile_summary",
+        "track_objects",
+        "transform_relation",
+        "translate_cells",
+    }
+)
+_FRAME_VIEW_NAMES = frozenset(
+    {"current_frame", "latest_frame", "previous_frame", "last_action_frame"}
+)
+_TRANSITION_VIEW_ATTRIBUTES = frozenset(
+    {
+        "action",
+        "after_frame",
+        "before_frame",
+        "color_transitions",
+        "diff",
+        "frame",
+        "result",
+    }
+)
+
+
+def _loop_has_direct_break(loop: ast.While) -> bool:
+    class BreakFinder(ast.NodeVisitor):
+        found = False
+
+        def visit_Break(self, _node: ast.Break) -> None:
+            self.found = True
+
+        def visit_For(self, _node: ast.For) -> None:
+            return
+
+        def visit_AsyncFor(self, _node: ast.AsyncFor) -> None:
+            return
+
+        def visit_While(self, _node: ast.While) -> None:
+            return
+
+        def visit_FunctionDef(self, _node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, _node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_ClassDef(self, _node: ast.ClassDef) -> None:
+            return
+
+    finder = BreakFinder()
+    for statement in loop.body:
+        finder.visit(statement)
+    return finder.found
+
+
+def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
+    """Return definite, side-effect-free generated-code failures.
+
+    This deliberately reports only errors that can be proven from syntax. It
+    avoids speculative lint that could reject a valid model-generated program.
+    """
+    issues: list[dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = (
+                [alias.name for alias in node.names]
+                if isinstance(node, ast.Import)
+                else [str(node.module or "")]
+            )
+            for name in names:
+                if name not in _SANDBOX_SAFE_MODULES:
+                    issues.append(
+                        {
+                            "line": getattr(node, "lineno", None),
+                            "message": f"Module '{name}' is not available in the sandbox.",
+                            "hint": (
+                                "Use an approved module or implement the bounded operation "
+                                "with the preloaded frame APIs."
+                            ),
+                        }
+                    )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "action"
+            and (len(node.args) != 1 or node.keywords)
+        ):
+            issues.append(
+                {
+                    "line": getattr(node, "lineno", None),
+                    "message": "action(...) requires exactly one positional argument.",
+                    "hint": "Pass one action or one ordered action list.",
+                }
+            )
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in _FRAME_VIEW_NAMES
+            and node.attr not in _FRAME_VIEW_ATTRIBUTES
+        ):
+            issues.append(
+                {
+                    "line": getattr(node, "lineno", None),
+                    "message": (
+                        f"{node.value.id} has no documented attribute '{node.attr}'."
+                    ),
+                    "hint": "Use a documented FrameView property or method.",
+                }
+            )
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "last_transition"
+            and node.attr not in _TRANSITION_VIEW_ATTRIBUTES
+        ):
+            issues.append(
+                {
+                    "line": getattr(node, "lineno", None),
+                    "message": (
+                        f"last_transition has no documented attribute '{node.attr}'."
+                    ),
+                    "hint": "Use a documented TransitionView property or method.",
+                }
+            )
+        if (
+            isinstance(node, ast.While)
+            and isinstance(node.test, ast.Constant)
+            and node.test.value is True
+            and not _loop_has_direct_break(node)
+        ):
+            issues.append(
+                {
+                    "line": getattr(node, "lineno", None),
+                    "message": "Unbounded while-True loop has no break path.",
+                    "hint": "Use a finite range, explicit work limit, or reachable break.",
+                }
+            )
+    return issues
+
+
+def _choice_has_executable_python_tool(choice: Any) -> bool:
+    if not isinstance(choice, dict):
+        return False
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return False
+    for raw_call in message.get("tool_calls") or []:
+        function = raw_call.get("function") if isinstance(raw_call, dict) else None
+        if (
+            not isinstance(function, dict)
+            or str(function.get("name") or "").strip() != "python"
+        ):
+            continue
+        try:
+            arguments = _normalize_tool_call_arguments(
+                function.get("arguments", "{}")
+            )
+            code = _normalize_generated_python_code(arguments.get("code", ""))
+            tree = _parse_bounded_generated_python(code)
+            compile(tree, "<python_tool_candidate>", "exec")
+        except (SyntaxError, TypeError, ValueError, OverflowError):
+            continue
+        if code and not _generated_python_preflight_issues(tree):
+            return True
+    return False
+
+
+def _deterministic_generated_python_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Apply one conservative identifier repair from a structured diagnostic."""
+    suggestions = [
+        str(item)
+        for item in diagnostic.get("suggestions") or []
+        if isinstance(item, str) and item.isidentifier()
+    ]
+    if len(suggestions) != 1:
+        return None
+    replacement = suggestions[0]
+    error_type = str(diagnostic.get("type") or "")
+    if error_type == "NameError":
+        target = str(diagnostic.get("name") or "")
+        pattern = rf"\b{re.escape(target)}\b" if target.isidentifier() else ""
+    elif error_type == "AttributeError":
+        target = str(diagnostic.get("attribute") or "")
+        pattern = (
+            rf"(?<=\.){re.escape(target)}\b" if target.isidentifier() else ""
+        )
+    else:
+        return None
+    if not pattern:
+        return None
+    repaired, replacements = re.subn(pattern, replacement, code)
+    if replacements != 1 or repaired == code:
+        return None
+    try:
+        tree = _parse_bounded_generated_python(repaired)
+        compile(tree, "<python_tool_auto_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(tree):
+        return None
+    return repaired
 
 
 def _parse_bounded_generated_python(code: str) -> ast.AST:
@@ -1201,14 +1473,36 @@ def _python_tool_payload(sandbox_result: dict[str, Any]) -> dict[str, Any]:
         for item in sandbox_result.get("action_results") or []
         if isinstance(item, dict)
     ]
+    auto_repair = sandbox_result.get("auto_repair")
+    if isinstance(auto_repair, dict):
+        payload["auto_repair"] = dict(auto_repair)
     if rendered_error:
         payload["error"] = rendered_error
         diagnostic = sandbox_result.get("diagnostic")
         if isinstance(diagnostic, dict):
             payload["diagnostic"] = dict(diagnostic)
-            payload["retryable"] = True
+            payload["retryable"] = diagnostic.get("retry") != "do_not_retry"
         if rendered_stdout:
             payload["stdout"] = rendered_stdout
+        if action_results:
+            payload["action_results"] = action_results
+            executed_calls = sum(
+                1 for item in action_results if bool(item.get("executed"))
+            )
+            payload["partial_execution"] = {
+                "action_calls": len(action_results),
+                "executed_action_calls": executed_calls,
+                "side_effects_committed": executed_calls > 0,
+                "rollback_available": False,
+            }
+            payload["retryable"] = False
+            if isinstance(payload.get("diagnostic"), dict):
+                payload["diagnostic"]["retry"] = "replan_from_current_state"
+                payload["diagnostic"]["hint"] = (
+                    "Some environment actions already executed and cannot be rolled "
+                    "back. Inspect action_results and replan from the current state; "
+                    "do not rerun the same program."
+                )
         return payload
 
     payload["returncode"] = 0
@@ -1522,6 +1816,7 @@ class _ChatCompletionResult:
     candidate_count: int = 1
     selected_candidate_index: int = 0
     valid_candidate_count: int = 1
+    fallback_messages: list[dict[str, Any]] = dataclass_field(default_factory=list)
 
 
 class ToolAgent:
@@ -3102,6 +3397,16 @@ class ToolAgent:
             range(len(choices)),
             key=lambda index: (candidate_scores[index][0], -index),
         )
+        fallback_candidate_indices = sorted(
+            (
+                index
+                for index, (_score, valid) in enumerate(candidate_scores)
+                if valid
+                and index != selected_candidate_index
+                and _choice_has_executable_python_tool(choices[index])
+            ),
+            key=lambda index: (-candidate_scores[index][0], index),
+        )
         choice = choices[selected_candidate_index]
         if not isinstance(choice, dict):
             response.close()
@@ -3153,6 +3458,12 @@ class ToolAgent:
             candidate_count=len(choices),
             selected_candidate_index=selected_candidate_index,
             valid_candidate_count=sum(1 for _score, valid in candidate_scores if valid),
+            fallback_messages=[
+                json.loads(json.dumps(choices[index].get("message") or {}))
+                for index in fallback_candidate_indices
+                if isinstance(choices[index], dict)
+                and isinstance(choices[index].get("message"), dict)
+            ],
         )
 
     def _trim_tool_text(self, text: str) -> tuple[str, bool]:
@@ -3459,6 +3770,26 @@ class ToolAgent:
         try:
             tree = _parse_bounded_generated_python(code)
             compile(tree, "<python_tool>", "exec")
+            preflight_issues = _generated_python_preflight_issues(tree)
+            for static_actions in _static_candidate_action_arguments(tree)[:1]:
+                try:
+                    self._normalize_python_actions(static_actions)
+                except (TypeError, ValueError) as exc:
+                    preflight_issues.append(
+                        {
+                            "line": None,
+                            "message": str(exc),
+                            "hint": (
+                                "Use only currently valid actions and respect the "
+                                "current controller action budget."
+                            ),
+                        }
+                    )
+            if preflight_issues:
+                first_issue = preflight_issues[0]
+                raise _GeneratedCodePreflightError(
+                    str(first_issue.get("message") or "Generated-code preflight failed.")
+                )
         except _GeneratedCodeLimitError as exc:
             payload = _python_tool_payload(
                 {
@@ -3469,6 +3800,35 @@ class ToolAgent:
                         "column": None,
                         "source": None,
                         "hint": "Use a smaller bounded program and retry.",
+                        "retry": "correct_and_retry",
+                    },
+                    "stdout": "",
+                    "action_results": [],
+                }
+            )
+            return _ToolDispatchResult(
+                self._render_tool_payload(payload, truncate_fields=("error",))
+            )
+        except _GeneratedCodePreflightError as exc:
+            issue = preflight_issues[0] if preflight_issues else {}
+            line = issue.get("line")
+            code_lines = code.splitlines()
+            source = (
+                code_lines[line - 1].strip()[:240]
+                if isinstance(line, int) and 1 <= line <= len(code_lines)
+                else None
+            )
+            payload = _python_tool_payload(
+                {
+                    "error": f"Python preflight error: {exc}",
+                    "diagnostic": {
+                        "type": "GeneratedCodePreflightError",
+                        "line": line,
+                        "column": None,
+                        "source": source,
+                        "context": [],
+                        "suggestions": [],
+                        "hint": str(issue.get("hint") or "Correct the program and retry."),
                         "retry": "correct_and_retry",
                     },
                     "stdout": "",
@@ -3662,7 +4022,43 @@ class ToolAgent:
             memory_handler=self._record_python_memory,
             should_stop=self._should_stop_callback,
         )
-        self._record_efficiency("sandbox_calls", 1)
+        sandbox_calls = 1
+        first_diagnostic = sandbox_result.get("diagnostic")
+        first_action_results = [
+            item
+            for item in sandbox_result.get("action_results") or []
+            if isinstance(item, dict)
+        ]
+        repaired_code = (
+            _deterministic_generated_python_repair(code, first_diagnostic)
+            if sandbox_result.get("error")
+            and not first_action_results
+            and not re.search(r"\b(?:record_strategy|remember|forget)\s*\(", code)
+            and isinstance(first_diagnostic, dict)
+            else None
+        )
+        if repaired_code is not None:
+            repaired_result = run_sandboxed_python(
+                code=repaired_code,
+                timeout_seconds=self._python_timeout,
+                initial_state=initial_state,
+                action_handler=_handle_action,
+                strategy_handler=self._record_strategy,
+                memory_handler=self._record_python_memory,
+                should_stop=self._should_stop_callback,
+            )
+            sandbox_calls += 1
+            repaired_result["auto_repair"] = {
+                "applied": True,
+                "original_diagnostic_type": first_diagnostic.get("type"),
+                "original_source": first_diagnostic.get("source"),
+                "repaired_code_fingerprint": hashlib.blake2b(
+                    repaired_code.encode("utf-8"), digest_size=12
+                ).hexdigest(),
+            }
+            sandbox_result = repaired_result
+            self._record_efficiency("automatic_code_repairs", 1)
+        self._record_efficiency("sandbox_calls", sandbox_calls)
         self._record_efficiency(
             "sandbox_seconds",
             time.monotonic() - sandbox_started_at,
@@ -4026,6 +4422,10 @@ class ToolAgent:
         )
         yielded_control_reason: str | None = None
         repair_next_request = False
+        queued_candidate_messages: list[dict[str, Any]] = []
+        failed_code_fingerprints: set[str] = set()
+        failure_counts: dict[str, int] = {}
+        escalated_failures: set[str] = set()
 
         def control_yield_reason() -> str | None:
             if should_stop is not None:
@@ -4095,7 +4495,23 @@ class ToolAgent:
                             action=display_action_num,
                             request_index_within_turn=latest_request_index,
                         )
-                    result = self._chat_completion(messages, **request_kwargs)
+                    used_candidate_fallback = bool(queued_candidate_messages)
+                    if used_candidate_fallback:
+                        fallback_message = queued_candidate_messages.pop(0)
+                        result = _ChatCompletionResult(
+                            message=fallback_message,
+                            finish_reason="candidate_fallback",
+                            request_attempts=0,
+                            candidate_count=1,
+                            valid_candidate_count=1,
+                        )
+                        append_transcript(
+                            "ANALYZER STATUS",
+                            "candidate_fallback: trying the next statically valid "
+                            "candidate without another model request.",
+                        )
+                    else:
+                        result = self._chat_completion(messages, **request_kwargs)
                     self._record_efficiency("model_calls", result.request_attempts)
                     self._record_efficiency("model_seconds", result.latency_seconds)
                     self._record_efficiency("model_candidates", result.candidate_count)
@@ -4176,6 +4592,7 @@ class ToolAgent:
                 normalized_tool_arguments: list[dict[str, Any] | None] = []
                 tool_argument_errors: list[str | None] = []
                 malformed_argument_errors: list[str] = []
+                response_fallback_messages = list(result.fallback_messages)
                 for tool_call in tool_calls:
                     function = (
                         tool_call.get("function", {})
@@ -4253,6 +4670,7 @@ class ToolAgent:
                 assistant_message["tool_calls"] = tool_calls
                 messages.append(assistant_message)
 
+                repair_instruction: str | None = None
                 for tool_index, tool_call in enumerate(tool_calls):
                     function = (
                         tool_call.get("function", {})
@@ -4264,6 +4682,18 @@ class ToolAgent:
                     normalized_arguments = normalized_tool_arguments[tool_index]
                     arguments = normalized_arguments or {}
                     argument_error = tool_argument_errors[tool_index]
+                    generated_code = (
+                        _normalize_generated_python_code(arguments.get("code", ""))
+                        if tool_name == "python" and arguments
+                        else ""
+                    )
+                    code_fingerprint = (
+                        hashlib.blake2b(
+                            generated_code.encode("utf-8"), digest_size=12
+                        ).hexdigest()
+                        if generated_code
+                        else ""
+                    )
                     rendered_tool_call = _render_tool_call_markup(
                         tool_name,
                         arguments if normalized_arguments is not None else raw_args,
@@ -4285,10 +4715,118 @@ class ToolAgent:
                                 separators=(",", ":"),
                             )
                         )
+                    elif (
+                        code_fingerprint
+                        and code_fingerprint in failed_code_fingerprints
+                    ):
+                        dispatch = _ToolDispatchResult(
+                            json.dumps(
+                                {
+                                    "error": (
+                                        "Duplicate failed program suppressed before "
+                                        "sandbox execution."
+                                    ),
+                                    "retryable": True,
+                                    "diagnostic": {
+                                        "type": "DuplicateGeneratedCodeError",
+                                        "line": None,
+                                        "column": None,
+                                        "source": None,
+                                        "hint": (
+                                            "Produce a materially different program "
+                                            "that addresses the prior diagnostic."
+                                        ),
+                                        "retry": "change_approach",
+                                    },
+                                },
+                                separators=(",", ":"),
+                            )
+                        )
                     else:
                         dispatch = self._dispatch_tool(state_path, tool_name, arguments)
                     if dispatch.step_executed:
                         step_executed = True
+                    try:
+                        dispatch_payload = json.loads(dispatch.content)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        dispatch_payload = {}
+                    if isinstance(dispatch_payload, dict) and dispatch_payload.get(
+                        "error"
+                    ):
+                        diagnostic = dispatch_payload.get("diagnostic")
+                        diagnostic = (
+                            diagnostic if isinstance(diagnostic, dict) else {}
+                        )
+                        partial_execution = dispatch_payload.get("partial_execution")
+                        side_effects_committed = bool(
+                            isinstance(partial_execution, dict)
+                            and partial_execution.get("side_effects_committed")
+                        )
+                        failure_material = "|".join(
+                            (
+                                str(diagnostic.get("type") or "ToolError"),
+                                str(diagnostic.get("source") or ""),
+                                str(dispatch_payload.get("error") or "")[:500],
+                            )
+                        )
+                        failure_fingerprint = hashlib.blake2b(
+                            failure_material.encode("utf-8"), digest_size=12
+                        ).hexdigest()
+                        failure_counts[failure_fingerprint] = (
+                            failure_counts.get(failure_fingerprint, 0) + 1
+                        )
+                        if code_fingerprint and not side_effects_committed:
+                            failed_code_fingerprints.add(code_fingerprint)
+                        retry_directive = str(
+                            diagnostic.get("retry")
+                            or (
+                                "correct_and_retry"
+                                if dispatch_payload.get("retryable", True)
+                                else "do_not_retry"
+                            )
+                        )
+                        repeated = failure_counts[failure_fingerprint]
+                        quality_failed_over = False
+                        if (
+                            repeated >= 2
+                            and failure_fingerprint not in escalated_failures
+                        ):
+                            escalated_failures.add(failure_fingerprint)
+                            if self._activate_next_fallback_model():
+                                quality_failed_over = True
+                                queued_candidate_messages.clear()
+                                response_fallback_messages = []
+                                self._record_efficiency("model_failovers", 1)
+                                append_transcript(
+                                    "ANALYZER STATUS",
+                                    "quality_failover: repeated generated-code "
+                                    f"failure; switched to {self._model.model_id}.",
+                                )
+                        if side_effects_committed:
+                            repair_instruction = (
+                                "The failed program committed environment actions. "
+                                "Do not replay it. Re-ground from current_frame and "
+                                "action_results on the next solver turn."
+                            )
+                        elif retry_directive == "do_not_retry":
+                            yielded_control_reason = "tool_do_not_retry"
+                        else:
+                            repair_next_request = True
+                            if response_fallback_messages and not quality_failed_over:
+                                queued_candidate_messages.extend(
+                                    response_fallback_messages
+                                )
+                                response_fallback_messages = []
+                            repair_instruction = (
+                                "Repair policy: address the structured diagnostic "
+                                "directly and emit a materially different bounded "
+                                "program."
+                            )
+                            if repeated >= 2:
+                                repair_instruction += (
+                                    " The same failure repeated; change approach "
+                                    "instead of making a cosmetic edit."
+                                )
                     append_transcript(
                         f"TOOL RESULT: {tool_name}",
                         _render_tool_result_display(dispatch.content),
@@ -4313,6 +4851,9 @@ class ToolAgent:
                     break
                 if step_executed:
                     break
+                if repair_instruction:
+                    append_transcript("USER PROMPT", repair_instruction)
+                    messages.append({"role": "user", "content": repair_instruction})
 
         except requests.RequestException as exc:
             append_transcript("ANALYZER STATUS", f"request_error: {exc}")

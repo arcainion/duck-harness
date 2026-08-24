@@ -4,13 +4,14 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from inference.agent import tool_agent as tool_agent_module
 from inference.agent.python_tool_sandbox import _SANDBOX_BOOTSTRAP
 from inference.agent.tool_agent import (
     ToolAgent,
     _ChatCompletionResult,
+    _deterministic_generated_python_repair,
     _normalize_generated_python_code,
     _normalize_tool_call_arguments,
     _python_tool_payload,
@@ -175,6 +176,102 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(payload["diagnostic"]["source"], "if True print('x')")
         self.assertIn("retry", payload["diagnostic"]["hint"].lower())
 
+    def test_semantic_preflight_blocks_definite_failures_before_sandbox(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        cases = (
+            ("import pathlib\nresult = 1", "Module 'pathlib'"),
+            ("result = current_frame.objcts()", "no documented attribute"),
+            ("while True:\n    result = 1", "has no break path"),
+            ("action()", "exactly one positional argument"),
+        )
+        for code, expected in cases:
+            with (
+                self.subTest(code=code),
+                patch.object(tool_agent_module, "run_sandboxed_python") as sandbox,
+            ):
+                response = agent._run_python_tool(
+                    Path("unused/tool_runtime_state.json"), {"code": code}
+                )
+
+            payload = json.loads(response.content)
+            self.assertEqual(
+                payload["diagnostic"]["type"], "GeneratedCodePreflightError"
+            )
+            self.assertIn(expected, payload["error"])
+            sandbox.assert_not_called()
+
+    def test_deterministic_repair_applies_one_unambiguous_name_fix(self) -> None:
+        repaired = _deterministic_generated_python_repair(
+            "result = currnt_frame.shape",
+            {
+                "type": "NameError",
+                "name": "currnt_frame",
+                "suggestions": ["current_frame"],
+            },
+        )
+
+        self.assertEqual(repaired, "result = current_frame.shape")
+        self.assertIsNone(
+            _deterministic_generated_python_repair(
+                "result = missing",
+                {
+                    "type": "NameError",
+                    "name": "missing",
+                    "suggestions": ["memory", "history"],
+                },
+            )
+        )
+
+    def test_run_python_tool_retries_one_safe_deterministic_repair(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        failed = {
+            "error": "NameError: currnt_frame",
+            "diagnostic": {
+                "type": "NameError",
+                "name": "currnt_frame",
+                "source": "result = currnt_frame.shape",
+                "suggestions": ["current_frame"],
+                "retry": "correct_and_retry",
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        repaired = {
+            "error": "",
+            "result": [2, 2],
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[failed, repaired],
+            ) as sandbox:
+                response = agent._run_python_tool(
+                    state_path, {"code": "result = currnt_frame.shape"}
+                )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], [2, 2])
+        self.assertTrue(payload["auto_repair"]["applied"])
+        self.assertEqual(sandbox.call_count, 2)
+
     def test_captures_notebook_style_final_expression(self) -> None:
         runtime = self._execute_prepared_code("values = [2, 3, 5]\nsum(values)")
 
@@ -325,6 +422,199 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(normalize_arguments.call_count, 1)
         self.assertEqual(build_tools.call_count, 1)
 
+    def test_analyze_tries_valid_runner_up_after_side_effect_free_failure(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._tool_steps = 3
+        completion = Mock(
+            return_value=_ChatCompletionResult(
+                message={
+                    "tool_calls": [
+                        {
+                            "id": "failing-candidate",
+                            "type": "function",
+                            "function": {
+                                "name": "python",
+                                "arguments": '{"code":"result = missing_name"}',
+                            },
+                        }
+                    ]
+                },
+                finish_reason="tool_calls",
+                fallback_messages=[
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "runner-up",
+                                "type": "function",
+                                "function": {
+                                    "name": "python",
+                                    "arguments": '{"code":"action(\\"LEFT\\")"}',
+                                },
+                            }
+                        ]
+                    }
+                ],
+            )
+        )
+        agent._chat_completion = completion
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            result = agent.analyze(
+                state_path,
+                action_num=0,
+                valid_actions=["LEFT"],
+                step_env=lambda _request: {
+                    "executed": True,
+                    "action_num": 1,
+                    "action_display": "LEFT",
+                    "valid_actions": ["LEFT"],
+                },
+            )
+            transcript = state_path.with_name(
+                "tool_runtime_state_analyzer.txt"
+            ).read_text(encoding="utf-8")
+
+        self.assertTrue(result.step_executed)
+        self.assertEqual(completion.call_count, 1)
+        self.assertIn("candidate_fallback", transcript)
+
+    def test_analyze_suppresses_identical_failed_program(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._tool_steps = 2
+        agent._chat_completion = Mock(
+            return_value=_ChatCompletionResult(
+                message={
+                    "tool_calls": [
+                        {
+                            "id": "same-failure",
+                            "type": "function",
+                            "function": {
+                                "name": "python",
+                                "arguments": '{"code":"result = missing_name"}',
+                            },
+                        }
+                    ]
+                },
+                finish_reason="tool_calls",
+            )
+        )
+        sandbox_failure = {
+            "error": "NameError: missing_name",
+            "diagnostic": {
+                "type": "NameError",
+                "name": "missing_name",
+                "source": "result = missing_name",
+                "suggestions": [],
+                "retry": "correct_and_retry",
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=sandbox_failure,
+            ) as sandbox:
+                agent.analyze(state_path, action_num=0, valid_actions=["LEFT"])
+            transcript = state_path.with_name(
+                "tool_runtime_state_analyzer.txt"
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual(sandbox.call_count, 1)
+        self.assertIn("Duplicate failed program suppressed", transcript)
+
+    def test_repeated_failure_triggers_quality_model_failover(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._tool_steps = 2
+        agent._chat_completion = Mock(
+            side_effect=[
+                _ChatCompletionResult(
+                    message={
+                        "tool_calls": [
+                            {
+                                "id": "failure-a",
+                                "type": "function",
+                                "function": {
+                                    "name": "python",
+                                    "arguments": '{"code":"result = missing_name"}',
+                                },
+                            }
+                        ]
+                    }
+                ),
+                _ChatCompletionResult(
+                    message={
+                        "tool_calls": [
+                            {
+                                "id": "failure-b",
+                                "type": "function",
+                                "function": {
+                                    "name": "python",
+                                    "arguments": (
+                                        '{"code":"# different candidate\\n'
+                                        'result = missing_name"}'
+                                    ),
+                                },
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+        failover = Mock(return_value=True)
+        agent._activate_next_fallback_model = failover
+        sandbox_failure = {
+            "error": "NameError: missing_name",
+            "diagnostic": {
+                "type": "NameError",
+                "name": "missing_name",
+                "source": "result = missing_name",
+                "suggestions": [],
+                "retry": "correct_and_retry",
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=sandbox_failure,
+            ):
+                agent.analyze(state_path, action_num=0, valid_actions=["LEFT"])
+
+        failover.assert_called_once_with()
+
     def test_analyze_streams_monotonic_transcript_snapshots_and_writes_prompt_log_once(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -466,6 +756,30 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(
             payload["result"]["last_action_result"]["action_display"],
             "UP",
+        )
+
+    def test_error_payload_preserves_committed_action_journal(self) -> None:
+        payload = _python_tool_payload(
+            {
+                "stdout": "before failure",
+                "error": "NameError: missing",
+                "diagnostic": {
+                    "type": "NameError",
+                    "retry": "correct_and_retry",
+                    "hint": "fix it",
+                },
+                "action_results": [
+                    {"executed": True, "action_display": "LEFT", "action_num": 1}
+                ],
+            }
+        )
+
+        self.assertFalse(payload["retryable"])
+        self.assertEqual(payload["action_results"][0]["action_display"], "LEFT")
+        self.assertTrue(payload["partial_execution"]["side_effects_committed"])
+        self.assertFalse(payload["partial_execution"]["rollback_available"])
+        self.assertEqual(
+            payload["diagnostic"]["retry"], "replan_from_current_state"
         )
 
     def test_generated_python_limits_block_source_before_sandbox_execution(self) -> None:

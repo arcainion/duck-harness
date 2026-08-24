@@ -397,8 +397,60 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
         self.assertEqual(result.selected_candidate_index, 1)
         self.assertEqual(result.candidate_count, 2)
         self.assertEqual(result.valid_candidate_count, 1)
+        self.assertEqual(result.fallback_messages, [])
         request_payload = agent._http_session.post.call_args.kwargs["json"]
         self.assertEqual(request_payload["n"], 2)
+
+    def test_chat_completion_retains_ranked_valid_runner_up(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._candidate_count = 2
+        agent._current_valid_actions = ["LEFT", "RIGHT"]
+        response = _Response(
+            200,
+            "",
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "python",
+                                        "arguments": '{"code":"action(\\"LEFT\\")"}',
+                                    }
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    },
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "python",
+                                        "arguments": '{"code":"action(\\"RIGHT\\")"}',
+                                    }
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    },
+                ]
+            },
+        )
+        agent._http_session.post = Mock(return_value=response)
+
+        result = agent._chat_completion(
+            [{"role": "user", "content": "go"}], tools=None
+        )
+
+        self.assertEqual(result.selected_candidate_index, 0)
+        self.assertEqual(len(result.fallback_messages), 1)
+        self.assertIn(
+            "RIGHT",
+            result.fallback_messages[0]["tool_calls"][0]["function"]["arguments"],
+        )
 
     def test_chat_completion_estimates_generated_tokens_when_usage_is_missing(self) -> None:
         agent = ToolAgent(model="unit-test-model")
