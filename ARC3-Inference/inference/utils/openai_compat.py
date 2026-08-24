@@ -1,7 +1,16 @@
 """Helpers for provider-specific OpenAI-compatible requests and responses."""
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True)
+class ProviderRequest:
+    endpoint: str
+    payload: dict[str, Any]
+    responses_api: bool = False
 
 
 def normalize_provider(value: str | None) -> str:
@@ -164,32 +173,106 @@ def build_responses_payload(
     return payload
 
 
+def build_provider_request(
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int | None,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    thinking: bool,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    seed: int | None = None,
+    candidates: int = 1,
+    stream: bool = False,
+) -> ProviderRequest:
+    """Build one normalized request through the selected provider adapter."""
+    normalized = normalize_provider(provider)
+    if normalized == "openai-responses":
+        return ProviderRequest(
+            endpoint="responses",
+            responses_api=True,
+            payload=build_responses_payload(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+            ),
+        )
+    return ProviderRequest(
+        endpoint="chat/completions",
+        payload=build_chat_payload(
+            provider=normalized,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            thinking=thinking,
+            tools=tools,
+            tool_choice=tool_choice,
+            seed=seed,
+            candidates=candidates,
+            stream=stream,
+        ),
+    )
+
+
+def normalize_provider_response(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("provider response must be a JSON object")
+    if normalize_provider(provider) == "openai-responses":
+        return normalize_responses_response(payload)
+    return payload
+
+
 def normalize_responses_response(payload: dict[str, Any]) -> dict[str, Any]:
     """Convert a Responses API result into the chat-shaped internal contract."""
+    if not isinstance(payload, dict):
+        raise ValueError("Responses API response must be a JSON object")
     content: list[str] = []
     reasoning: list[str] = []
     tool_calls: list[dict[str, Any]] = []
-    for item in payload.get("output") or []:
+    output = payload.get("output")
+    for item in output if isinstance(output, list) else []:
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
         if item_type == "function_call":
+            raw_arguments = item.get("arguments", "{}")
+            arguments = (
+                raw_arguments
+                if isinstance(raw_arguments, str)
+                else json.dumps(raw_arguments, separators=(",", ":"))
+                if isinstance(raw_arguments, (dict, list))
+                else "{}"
+            )
             tool_calls.append(
                 {
                     "id": str(item.get("call_id") or item.get("id") or ""),
                     "type": "function",
                     "function": {
                         "name": str(item.get("name", "")),
-                        "arguments": str(item.get("arguments", "{}")),
+                        "arguments": arguments,
                     },
                 }
             )
         elif item_type == "message":
-            for part in item.get("content") or []:
+            item_content = item.get("content")
+            for part in item_content if isinstance(item_content, list) else []:
                 if isinstance(part, dict) and part.get("type") in {"output_text", "text"}:
                     content.append(str(part.get("text", "")))
         elif item_type == "reasoning":
-            for part in item.get("summary") or []:
+            summary = item.get("summary")
+            for part in summary if isinstance(summary, list) else []:
                 if isinstance(part, dict):
                     reasoning.append(str(part.get("text", "")))
     message: dict[str, Any] = {"role": "assistant", "content": "\n".join(content)}
@@ -197,12 +280,14 @@ def normalize_responses_response(payload: dict[str, Any]) -> dict[str, Any]:
         message["reasoning"] = "\n".join(reasoning)
     if tool_calls:
         message["tool_calls"] = tool_calls
-    incomplete = payload.get("incomplete_details") or {}
+    incomplete_value = payload.get("incomplete_details")
+    incomplete = incomplete_value if isinstance(incomplete_value, dict) else {}
     reason = str(incomplete.get("reason", ""))
     finish_reason = "length" if reason in {"max_output_tokens", "max_tokens"} else (
         "tool_calls" if tool_calls else "stop"
     )
-    usage = dict(payload.get("usage") or {})
+    usage_value = payload.get("usage")
+    usage = dict(usage_value) if isinstance(usage_value, dict) else {}
     if "input_tokens" in usage:
         usage.setdefault("prompt_tokens", usage["input_tokens"])
     if "output_tokens" in usage:

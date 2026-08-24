@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import hashlib
 import io
 import json
@@ -10,6 +11,7 @@ import logging
 import os
 import re
 import time
+import tokenize
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field as dataclass_field
@@ -46,6 +48,7 @@ from inference.agent.python_tool_sandbox import (
     _sandbox_exception_diagnostic,
     prewarm_sandbox,
     run_sandboxed_python,
+    validate_sandbox_isolation,
 )
 from inference.agent.runtime_state import (
     RUNTIME_STATE_FILENAME,
@@ -59,11 +62,10 @@ from inference.agent.vision_context import (
     current_grid_image_part,
 )
 from inference.utils.openai_compat import (
-    build_chat_payload,
     build_headers,
-    build_responses_payload,
+    build_provider_request,
     merge_chat_completion_stream,
-    normalize_responses_response,
+    normalize_provider_response,
 )
 
 log = logging.getLogger(__name__)
@@ -154,6 +156,27 @@ _SANDBOX_SAFE_MODULES = frozenset(
         "string",
     }
 )
+_SAFE_GENERATED_PYTHON_IMPORTS = {
+    "Counter": "from collections import Counter",
+    "Fraction": "from fractions import Fraction",
+    "chain": "from itertools import chain",
+    "combinations": "from itertools import combinations",
+    "defaultdict": "from collections import defaultdict",
+    "deque": "from collections import deque",
+    "heapify": "from heapq import heapify",
+    "heappop": "from heapq import heappop",
+    "heappush": "from heapq import heappush",
+    "lru_cache": "from functools import lru_cache",
+    "permutations": "from itertools import permutations",
+    "product": "from itertools import product",
+    **{module: f"import {module}" for module in _SANDBOX_SAFE_MODULES},
+}
+_MAX_DETERMINISTIC_RUNTIME_REPAIRS = 4
+_JSON_LITERAL_REPLACEMENTS: dict[str, Any] = {
+    "false": False,
+    "null": None,
+    "true": True,
+}
 _FRAME_VIEW_ATTRIBUTES = frozenset(
     {
         "analyze",
@@ -235,6 +258,34 @@ def _constant_truth(node: ast.AST) -> bool | None:
         if True in values:
             return True
         return False if all(value is False for value in values) else None
+    if isinstance(node, ast.Compare) and len(node.ops) == len(node.comparators):
+        try:
+            values = [ast.literal_eval(node.left)] + [
+                ast.literal_eval(comparator) for comparator in node.comparators
+            ]
+            comparisons: list[bool] = []
+            for left, operator, right in zip(values, node.ops, values[1:]):
+                if isinstance(operator, ast.Eq):
+                    comparisons.append(left == right)
+                elif isinstance(operator, ast.NotEq):
+                    comparisons.append(left != right)
+                elif isinstance(operator, ast.Lt):
+                    comparisons.append(left < right)
+                elif isinstance(operator, ast.LtE):
+                    comparisons.append(left <= right)
+                elif isinstance(operator, ast.Gt):
+                    comparisons.append(left > right)
+                elif isinstance(operator, ast.GtE):
+                    comparisons.append(left >= right)
+                elif isinstance(operator, ast.In):
+                    comparisons.append(left in right)
+                elif isinstance(operator, ast.NotIn):
+                    comparisons.append(left not in right)
+                else:
+                    return None
+            return all(comparisons)
+        except (TypeError, ValueError):
+            return None
     return None
 
 
@@ -354,8 +405,155 @@ def _reachable_module_node_ids(tree: ast.AST) -> set[int]:
                 for statement in [*node.body, *node.orelse]:
                     self.visit(statement)
 
-    Visitor().visit(tree)
+    visitor = Visitor()
+    visitor.visit(tree)
+    definitions = {
+        node.name: node
+        for node in getattr(tree, "body", [])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    expanded: set[str] = set()
+    while True:
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if id(node) in reachable
+            and isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in definitions
+        } - expanded
+        if not called:
+            break
+        for name in called:
+            expanded.add(name)
+            for statement in definitions[name].body:
+                visitor.visit(statement)
     return reachable
+
+
+def _constant_range_size(node: ast.Call) -> int | None:
+    if not isinstance(node.func, ast.Name) or node.func.id != "range":
+        return None
+    try:
+        values = [ast.literal_eval(argument) for argument in node.args]
+        if not 1 <= len(values) <= 3 or not all(
+            isinstance(value, int) and not isinstance(value, bool) for value in values
+        ):
+            return None
+        return len(range(*values))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _generated_python_semantic_fingerprint(code: str) -> str:
+    try:
+        tree = _parse_bounded_generated_python(code)
+        material = ast.dump(tree, annotate_fields=True, include_attributes=False)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        material = "\n".join(line.strip() for line in code.splitlines() if line.strip())
+    return hashlib.blake2b(material.encode("utf-8"), digest_size=12).hexdigest()
+
+
+def _deterministic_boolean_operator_repair(code: str) -> str | None:
+    """Replace adjacent JS boolean operator tokens outside strings/comments."""
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
+    except (IndentationError, tokenize.TokenError):
+        return None
+    replacements: list[tuple[int, int, int, str]] = []
+    for first, second in zip(tokens, tokens[1:]):
+        if (
+            first.type == tokenize.OP
+            and second.type == tokenize.OP
+            and first.string == second.string
+            and first.string in {"&", "|"}
+            and first.end == second.start
+            and first.start[0] == second.end[0]
+        ):
+            replacements.append(
+                (
+                    first.start[0] - 1,
+                    first.start[1],
+                    second.end[1],
+                    " and " if first.string == "&" else " or ",
+                )
+            )
+    if not replacements:
+        return None
+    lines = code.splitlines(keepends=True)
+    for line_index, start, end, replacement in sorted(
+        replacements, reverse=True
+    ):
+        if not 0 <= line_index < len(lines):
+            return None
+        lines[line_index] = (
+            lines[line_index][:start] + replacement + lines[line_index][end:]
+        )
+    repaired = "".join(lines)
+    try:
+        tree = _parse_bounded_generated_python(repaired)
+        compile(tree, "<python_tool_boolean_operator_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    return repaired
+
+
+def _deterministic_syntax_repair(code: str, error: SyntaxError) -> str | None:
+    """Repair one deterministic syntax artifact and revalidate the result."""
+    if "expected ':'" not in str(error.msg):
+        return _deterministic_boolean_operator_repair(code)
+    if not isinstance(error.lineno, int):
+        return None
+    lines = code.splitlines(keepends=True)
+    index = error.lineno - 1
+    if not 0 <= index < len(lines):
+        return None
+    original = lines[index]
+    ending = "\n" if original.endswith("\n") else ""
+    body = original[:-1] if ending else original
+    comment_column: int | None = None
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(body).readline):
+            if token.type == tokenize.COMMENT:
+                comment_column = token.start[1]
+                break
+    except (IndentationError, tokenize.TokenError):
+        return None
+    header = body[:comment_column] if comment_column is not None else body
+    if header.rstrip().endswith(":") or not re.match(
+        r"^\s*(?:if|elif|else|for|while|def|class|try|except|finally|with|match|case)\b",
+        header,
+    ):
+        return None
+    trailing = header[len(header.rstrip()) :]
+    comment = body[comment_column:] if comment_column is not None else ""
+    lines[index] = f"{header.rstrip()}:{trailing}{comment}{ending}"
+    repaired = "".join(lines)
+    try:
+        tree = _parse_bounded_generated_python(repaired)
+        compile(tree, "<python_tool_syntax_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    return repaired
+
+
+def _unique_documented_attribute_suggestion(
+    name: str, attributes: frozenset[str]
+) -> list[str]:
+    """Return one high-confidence typo correction with a clear runner-up gap."""
+    ranked = sorted(
+        (
+            (difflib.SequenceMatcher(None, name, candidate).ratio(), candidate)
+            for candidate in attributes
+        ),
+        reverse=True,
+    )
+    if not ranked or ranked[0][0] < 0.8:
+        return []
+    runner_up_score = ranked[1][0] if len(ranked) > 1 else 0.0
+    if ranked[0][0] - runner_up_score < 0.15:
+        return []
+    return [ranked[0][1]]
 
 
 def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
@@ -367,6 +565,53 @@ def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     alias_kinds = _view_alias_kinds(tree)
     reachable_nodes = _reachable_module_node_ids(tree)
+    parent: dict[int, ast.AST] = {
+        id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    definitions = {
+        node.name: node
+        for node in getattr(tree, "body", [])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    call_graph = {
+        name: {
+            call.func.id
+            for call in ast.walk(definition)
+            if id(call) in reachable_nodes
+            and isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id in definitions
+        }
+        for name, definition in definitions.items()
+    }
+    reported_cycles: set[frozenset[str]] = set()
+
+    def find_cycle(start: str, current: str, path: tuple[str, ...]) -> tuple[str, ...] | None:
+        for target in call_graph.get(current, set()):
+            if target == start and len(path) > 1:
+                return path
+            if target not in path:
+                cycle = find_cycle(start, target, (*path, target))
+                if cycle is not None:
+                    return cycle
+        return None
+
+    for function_name in call_graph:
+        cycle = find_cycle(function_name, function_name, (function_name,))
+        cycle_key = frozenset(cycle or ())
+        if not cycle or cycle_key in reported_cycles:
+            continue
+        reported_cycles.add(cycle_key)
+        issues.append(
+            {
+                "line": getattr(definitions[function_name], "lineno", None),
+                "message": (
+                    "Mutual recursion among reachable generated functions is not "
+                    f"bounded statically: {', '.join(sorted(cycle_key))}."
+                ),
+                "hint": "Use an explicit finite work queue or loop bound.",
+            }
+        )
     for node in ast.walk(tree):
         if id(node) not in reachable_nodes:
             continue
@@ -401,14 +646,44 @@ def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
                     "hint": "Pass one action or one ordered action list.",
                 }
             )
+        if isinstance(node, ast.Call):
+            range_size = _constant_range_size(node)
+            if range_size is not None and range_size > 1_000_000:
+                issues.append(
+                    {
+                        "line": getattr(node, "lineno", None),
+                        "message": f"Constant range expands to {range_size} iterations.",
+                        "hint": "Use a bounded search limit no larger than 1,000,000 iterations.",
+                    }
+                )
+            if isinstance(node.func, ast.Name):
+                ancestor = parent.get(id(node))
+                while ancestor is not None and not isinstance(
+                    ancestor, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    ancestor = parent.get(id(ancestor))
+                if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.func.id == ancestor.name:
+                    issues.append(
+                        {
+                            "line": getattr(node, "lineno", None),
+                            "message": f"Direct recursion in '{ancestor.name}' is not bounded statically.",
+                            "hint": "Use an explicit finite work queue or loop bound.",
+                        }
+                    )
         if (
             isinstance(node, ast.Attribute)
             and _view_expression_kind(node.value, alias_kinds) == "frame"
             and node.attr not in _FRAME_VIEW_ATTRIBUTES
         ):
+            suggestions = _unique_documented_attribute_suggestion(
+                node.attr, _FRAME_VIEW_ATTRIBUTES
+            )
             issues.append(
                 {
+                    "type": "AttributeError",
                     "line": getattr(node, "lineno", None),
+                    "attribute": node.attr,
+                    "suggestions": suggestions,
                     "message": (
                         f"{ast.unparse(node.value)[:80]} has no documented attribute '{node.attr}'."
                     ),
@@ -420,9 +695,15 @@ def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
             and _view_expression_kind(node.value, alias_kinds) == "transition"
             and node.attr not in _TRANSITION_VIEW_ATTRIBUTES
         ):
+            suggestions = _unique_documented_attribute_suggestion(
+                node.attr, _TRANSITION_VIEW_ATTRIBUTES
+            )
             issues.append(
                 {
+                    "type": "AttributeError",
                     "line": getattr(node, "lineno", None),
+                    "attribute": node.attr,
+                    "suggestions": suggestions,
                     "message": (
                         f"{ast.unparse(node.value)[:80]} has no documented transition attribute '{node.attr}'."
                     ),
@@ -444,7 +725,7 @@ def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
     return issues
 
 
-def _choice_has_executable_python_tool(choice: Any) -> bool:
+def _choice_has_executable_tool(choice: Any) -> bool:
     if not isinstance(choice, dict):
         return False
     message = choice.get("message")
@@ -452,27 +733,40 @@ def _choice_has_executable_python_tool(choice: Any) -> bool:
         return False
     for raw_call in message.get("tool_calls") or []:
         function = raw_call.get("function") if isinstance(raw_call, dict) else None
-        if (
-            not isinstance(function, dict)
-            or str(function.get("name") or "").strip() != "python"
-        ):
+        if not isinstance(function, dict):
             continue
+        tool_name = str(function.get("name") or "").strip()
         try:
             arguments = _normalize_tool_call_arguments(
                 function.get("arguments", "{}")
             )
+            if tool_name == "action":
+                return isinstance(arguments.get("actions"), list) and bool(
+                    arguments["actions"]
+                )
+            if tool_name == "inspect":
+                return str(arguments.get("view") or "") in {
+                    "frame_summary",
+                    "history_summary",
+                    "experience",
+                    "strategy",
+                    "memory",
+                }
+            if tool_name != "python":
+                continue
             code = _normalize_generated_python_code(arguments.get("code", ""))
-            tree = _parse_bounded_generated_python(code)
-            compile(tree, "<python_tool_candidate>", "exec")
         except (SyntaxError, TypeError, ValueError, OverflowError):
             continue
-        if code and not _generated_python_preflight_issues(tree):
+        if code and _prepare_generated_python_candidate(code) is not None:
             return True
     return False
 
 
 def _deterministic_generated_python_repair(
-    code: str, diagnostic: dict[str, Any]
+    code: str,
+    diagnostic: dict[str, Any],
+    *,
+    require_clean_preflight: bool = True,
 ) -> str | None:
     """Apply one conservative identifier repair from a structured diagnostic."""
     suggestions = [
@@ -539,9 +833,202 @@ def _deterministic_generated_python_repair(
         compile(tree, "<python_tool_auto_repair>", "exec")
     except (SyntaxError, TypeError, ValueError, OverflowError):
         return None
-    if _generated_python_preflight_issues(tree):
+    if require_clean_preflight and _generated_python_preflight_issues(tree):
         return None
     return repaired
+
+
+def _deterministic_safe_import_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Insert one missing import from the sandbox's curated safe surface."""
+    if str(diagnostic.get("type") or "") != "NameError":
+        return None
+    name = str(diagnostic.get("name") or "")
+    statement = _SAFE_GENERATED_PYTHON_IMPORTS.get(name)
+    if statement is None:
+        return None
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    matching_loads = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id == name
+    ]
+    diagnostic_line = diagnostic.get("line")
+    if isinstance(diagnostic_line, int) and not any(
+        getattr(node, "lineno", None) == diagnostic_line for node in matching_loads
+    ):
+        return None
+    if not matching_loads:
+        return None
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.Import):
+            bound_names = {
+                alias.asname or alias.name.split(".", 1)[0] for alias in node.names
+            }
+        elif isinstance(node, ast.ImportFrom):
+            bound_names = {alias.asname or alias.name for alias in node.names}
+        else:
+            continue
+        if name in bound_names:
+            return None
+
+    insertion_line = 0
+    body = list(getattr(tree, "body", []))
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        insertion_line = int(getattr(body.pop(0), "end_lineno", 0))
+    for node in body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            insertion_line = int(getattr(node, "end_lineno", insertion_line))
+        else:
+            break
+    lines = code.splitlines(keepends=True)
+    lines.insert(insertion_line, f"{statement}\n")
+    repaired = "".join(lines)
+    try:
+        repaired_tree = _parse_bounded_generated_python(repaired)
+        compile(repaired_tree, "<python_tool_safe_import_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(repaired_tree):
+        return None
+    return repaired
+
+
+def _deterministic_json_literal_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Normalize JSON literals only after Python reports the name as missing."""
+    if str(diagnostic.get("type") or "") != "NameError":
+        return None
+    target = str(diagnostic.get("name") or "")
+    if target not in _JSON_LITERAL_REPLACEMENTS:
+        return None
+    diagnostic_line = diagnostic.get("line")
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+
+    replacement_count = 0
+
+    class ReplaceMissingLiteral(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name) -> ast.AST:
+            nonlocal replacement_count
+            if (
+                isinstance(node.ctx, ast.Load)
+                and node.id == target
+                and (
+                    not isinstance(diagnostic_line, int)
+                    or getattr(node, "lineno", None) == diagnostic_line
+                )
+            ):
+                replacement_count += 1
+                return ast.copy_location(
+                    ast.Constant(value=_JSON_LITERAL_REPLACEMENTS[target]), node
+                )
+            return node
+
+    repaired_tree = ReplaceMissingLiteral().visit(tree)
+    if replacement_count == 0:
+        return None
+    ast.fix_missing_locations(repaired_tree)
+    repaired = ast.unparse(repaired_tree)
+    try:
+        compile(repaired_tree, "<python_tool_json_literal_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(repaired_tree):
+        return None
+    return repaired
+
+
+def _deterministic_runtime_python_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> tuple[str, str] | None:
+    repaired = _deterministic_json_literal_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "normalize_json_literal"
+    repaired = _deterministic_generated_python_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "correct_identifier"
+    repaired = _deterministic_safe_import_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "insert_safe_import"
+    return None
+
+
+def _deterministic_preflight_python_repair(
+    code: str, issues: list[dict[str, Any]]
+) -> tuple[str, int] | None:
+    """Atomically repair a bounded set of independently unambiguous issues."""
+    if not issues or len(issues) > 8:
+        return None
+    repaired = code
+    repair_count = 0
+    for issue in issues:
+        candidate = _deterministic_generated_python_repair(
+            repaired,
+            issue,
+            require_clean_preflight=False,
+        )
+        if candidate is None or candidate == repaired:
+            return None
+        repaired = candidate
+        repair_count += 1
+    try:
+        tree = _parse_bounded_generated_python(repaired)
+        compile(tree, "<python_tool_preflight_auto_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(tree):
+        return None
+    return repaired, repair_count
+
+
+def _prepare_generated_python_candidate(code: str) -> tuple[str, ast.AST] | None:
+    """Compile a candidate after applying only deterministic, validated repairs."""
+    prepared = code
+    try:
+        tree = _parse_bounded_generated_python(prepared)
+        compile(tree, "<python_tool_candidate>", "exec")
+    except SyntaxError as exc:
+        repaired_syntax = _deterministic_syntax_repair(prepared, exc)
+        if repaired_syntax is None:
+            return None
+        prepared = repaired_syntax
+        try:
+            tree = _parse_bounded_generated_python(prepared)
+            compile(tree, "<python_tool_candidate_repaired>", "exec")
+        except (SyntaxError, TypeError, ValueError, OverflowError):
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    issues = _generated_python_preflight_issues(tree)
+    if issues:
+        repaired_preflight = _deterministic_preflight_python_repair(
+            prepared, issues
+        )
+        if repaired_preflight is None:
+            return None
+        prepared = repaired_preflight[0]
+        try:
+            tree = _parse_bounded_generated_python(prepared)
+            compile(tree, "<python_tool_candidate_repaired>", "exec")
+        except (SyntaxError, TypeError, ValueError, OverflowError):
+            return None
+    return prepared, tree
 
 
 def _parse_bounded_generated_python(code: str) -> ast.AST:
@@ -686,18 +1173,36 @@ def _normalize_generated_python_code(value: Any) -> str:
         if depth > 4:
             return None
         candidates: list[str] = []
+        candidate_fingerprints: set[str] = set()
 
         def add(candidate: Any) -> None:
             normalized = executable(candidate)
-            if normalized is not None and normalized not in candidates:
+            if normalized is None:
+                return
+            fingerprint = _generated_python_semantic_fingerprint(normalized)
+            if fingerprint not in candidate_fingerprints:
                 candidates.append(normalized)
+                candidate_fingerprints.add(fingerprint)
 
         if isinstance(payload, dict):
             keys = set(payload)
             if "code" in payload and keys <= {"code", *metadata_keys}:
                 language = str(payload.get("language") or "").strip().lower()
                 if language in python_languages:
-                    add(payload.get("code"))
+                    code_value = payload.get("code")
+                    add(code_value)
+                    if (
+                        isinstance(code_value, list)
+                        and 0 < len(code_value) <= 128
+                        and all(isinstance(line, str) for line in code_value)
+                    ):
+                        # Schema-constrained generators sometimes model source as
+                        # an array of lines instead of one JSON string.
+                        add("\n".join(code_value))
+                    elif isinstance(code_value, (dict, list)):
+                        recovered = nested_code(code_value, depth + 1)
+                        if recovered is not None:
+                            add(recovered)
             if "content" in payload and keys <= {"content", *metadata_keys}:
                 recovered = nested_code(payload.get("content"), depth + 1)
                 if recovered is not None:
@@ -706,10 +1211,32 @@ def _normalize_generated_python_code(value: Any) -> str:
             if part_type in {"text", "output_text"} and keys <= {"type", "text", *metadata_keys}:
                 add(payload.get("text"))
         elif isinstance(payload, list) and len(payload) <= 16:
+            text_fragments: list[str] = []
+            all_text_parts = bool(payload)
             for part in payload:
                 recovered = nested_code(part, depth + 1)
                 if recovered is not None:
                     add(recovered)
+                if not isinstance(part, dict):
+                    all_text_parts = False
+                    continue
+                keys = set(part)
+                part_type = str(part.get("type", "")).lower()
+                text = part.get("text")
+                if (
+                    part_type not in {"text", "output_text"}
+                    or keys - {"type", "text", *metadata_keys}
+                    or not isinstance(text, str)
+                ):
+                    all_text_parts = False
+                    continue
+                text_fragments.append(text)
+            if all_text_parts and len(text_fragments) > 1 and not candidates:
+                # Providers may split one output program at arbitrary token or
+                # line boundaries. Try the two lossless/common joins and rely on
+                # semantic fingerprints above to reject competing programs.
+                add("".join(text_fragments))
+                add("\n".join(text_fragments))
         return candidates[0] if len(candidates) == 1 else None
 
     direct_nested = nested_code(value)
@@ -866,6 +1393,9 @@ _LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS = _get_env_int(
 _LOCAL_ANALYZER_YIELD_SECONDS = _get_env_float("LOCAL_ANALYZER_YIELD_SECONDS", 0.0)
 _LOCAL_ANALYZER_ENABLE_THINKING = _get_env_bool("LOCAL_ANALYZER_ENABLE_THINKING", True)
 _LOCAL_ANALYZER_STREAM = _get_env_bool("LOCAL_ANALYZER_STREAM", False)
+_LOCAL_ANALYZER_VERIFY_CANDIDATES = _get_env_bool(
+    "LOCAL_ANALYZER_VERIFY_CANDIDATES", True
+)
 _LOCAL_ANALYZER_TEMPERATURE = _get_env_float("LOCAL_ANALYZER_TEMPERATURE", 0.6)
 _LOCAL_ANALYZER_TOP_P = _get_env_float("LOCAL_ANALYZER_TOP_P", 0.95)
 _LOCAL_ANALYZER_TOP_K = _get_env_int("LOCAL_ANALYZER_TOP_K", 20)
@@ -2227,6 +2757,7 @@ class ToolAgent:
         self._current_experience_snapshot: dict[str, Any] = {}
         self._strategy_memory: dict[str, Any] = {}
         self._python_memory: dict[str, Any] = {}
+        self._verified_programs: dict[str, dict[str, Any]] = {}
         self._frame_payload_cache: _FramePayloadCache | None = None
         self._experience_snapshot_cache: _ExperienceSnapshotCache | None = None
         self._generated_tool_call_count = 0
@@ -2246,6 +2777,7 @@ class ToolAgent:
         self._tokenizer: Any | None = None
         self._tokenizer_load_attempted = False
         self._should_stop_callback: Callable[[], bool] | None = None
+        validate_sandbox_isolation()
 
     def _activate_next_fallback_model(self) -> bool:
         if not self._fallback_models:
@@ -2392,6 +2924,7 @@ class ToolAgent:
             self._summarized_knowledge = _empty_world_model()
             self._strategy_memory = {}
             self._python_memory = {}
+            self._verified_programs = {}
             self._frame_payload_cache = None
             self._experience_snapshot_cache = None
             self._generated_tool_call_count = 0
@@ -3231,7 +3764,7 @@ class ToolAgent:
             [
                 state_line,
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-                "Use the documented `python` state and bounded helpers to inspect current evidence, update the working world model, and select the shortest reliable action or batch.",
+                "Use structured `inspect`, direct `action`, or documented bounded `python` as appropriate; update the working world model and select the shortest reliable action or batch.",
                 "Keep output decision-focused; record material strategy changes and stop acting on any terminal result.",
             ]
         )
@@ -3291,6 +3824,13 @@ class ToolAgent:
                 ]
             )
         lines.extend(self._summarized_knowledge_lines())
+        matching_programs = self._matching_verified_programs(current_frame)
+        if matching_programs:
+            lines.append("Verified read-only programs for this frame precondition:")
+            for program in matching_programs[:2]:
+                lines.append(
+                    json.dumps(program, ensure_ascii=False, separators=(",", ":"))
+                )
         lines.append(
             "Before executing new actions you must always give the revised version of this working world model, updated from the newest evidence."
         )
@@ -3304,7 +3844,7 @@ class ToolAgent:
             )
         lines.extend(
             [
-                "Then call `action(actions)` inside `python` with the selected valid action; prefer batching it in one call only when the short sequence is reliable.",
+                "Then use the direct `action` tool or call `action(actions)` inside `python`; when a short sequence is reliable, prefer batching it in one call.",
             ]
         )
         if "MOUSE" in _normalize_valid_actions(valid_actions):
@@ -3335,7 +3875,183 @@ class ToolAgent:
                         "additionalProperties": False,
                     },
                 },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "action",
+                    "description": "Execute one validated game action or a short ordered action batch without writing Python.",
+                    "strict": True,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "actions": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": MAX_ACTION_BATCH,
+                                "items": {
+                                    "anyOf": [
+                                        {"type": "string"},
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "action": {"type": "string"},
+                                                "row": {"type": "integer"},
+                                                "col": {"type": "integer"},
+                                            },
+                                            "required": ["action"],
+                                            "additionalProperties": False,
+                                        },
+                                    ]
+                                },
+                            }
+                            ,
+                            "dry_run": {
+                                "type": "boolean",
+                                "description": "Validate and normalize without executing.",
+                            },
+                        },
+                        "required": ["actions"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "inspect",
+                    "description": "Read a compact structured runtime view without generating Python.",
+                    "strict": True,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "view": {
+                                "type": "string",
+                                "enum": [
+                                    "frame_summary",
+                                    "history_summary",
+                                    "experience",
+                                    "strategy",
+                                    "memory",
+                                ],
+                            }
+                        },
+                        "required": ["view"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    def _verify_python_candidate(self, code: str) -> bool:
+        """Execute a candidate against read-only state and a no-op action host."""
+        if not _LOCAL_ANALYZER_VERIFY_CANDIDATES or self._session_runtime_dir is None:
+            return True
+        if not self._session_runtime_dir.is_file():
+            self._record_efficiency("candidate_verification_failures", 1)
+            return False
+        try:
+            frame, history = load_runtime_state(self._session_runtime_dir)
+            frame_payload, history_payload = self._cached_frame_payloads(frame, history)
+            state = {
+                "current_frame": _current_frame_transport_payload(
+                    frame, history, frame_payload
+                ),
+                "history": history_payload,
+                "valid_actions": list(self._current_valid_actions),
+                "experience": dict(self._current_experience_snapshot or {}),
+                "strategy": dict(self._strategy_memory),
+                "memory": dict(self._python_memory),
+                "last_action_result": dict(self._last_action_result or {}),
             }
+
+            def readonly_action(actions: list[dict[str, Any]]) -> dict[str, Any]:
+                normalized = self._normalize_python_actions(actions)
+                return {
+                    "action_result": {
+                        "executed": False,
+                        "requested_count": len(normalized),
+                        "executed_count": 0,
+                        "dry_run": True,
+                    },
+                    "state": state,
+                }
+
+            verification_code = code
+            seen_fingerprints = {_generated_python_semantic_fingerprint(code)}
+            for repair_index in range(_MAX_DETERMINISTIC_RUNTIME_REPAIRS + 1):
+                result = run_sandboxed_python(
+                    code=verification_code,
+                    timeout_seconds=min(3, self._python_timeout),
+                    initial_state=state,
+                    action_handler=readonly_action,
+                    should_stop=self._should_stop_callback,
+                )
+                if not result.get("error") or repair_index >= _MAX_DETERMINISTIC_RUNTIME_REPAIRS:
+                    break
+                diagnostic = result.get("diagnostic")
+                repair = (
+                    _deterministic_runtime_python_repair(
+                        verification_code, diagnostic
+                    )
+                    if not result.get("action_results")
+                    and isinstance(diagnostic, dict)
+                    else None
+                )
+                if repair is None:
+                    break
+                repaired_code, _repair_kind = repair
+                fingerprint = _generated_python_semantic_fingerprint(repaired_code)
+                if fingerprint in seen_fingerprints:
+                    break
+                seen_fingerprints.add(fingerprint)
+                verification_code = repaired_code
+            self._record_efficiency("candidate_verifications", 1)
+            if result.get("error"):
+                self._record_efficiency("candidate_verification_failures", 1)
+                return False
+            return True
+        except (OSError, TypeError, ValueError):
+            self._record_efficiency("candidate_verification_failures", 1)
+            return False
+
+    def _remember_verified_program(
+        self, code: str, frame: Frame | None, result: Any
+    ) -> None:
+        if frame is None or len(code) > 1_200:
+            return
+        fingerprint = _generated_python_semantic_fingerprint(code)
+        self._verified_programs[fingerprint] = {
+            "fingerprint": fingerprint,
+            "precondition": self._verified_program_precondition(frame),
+            "code": code,
+            "result_type": type(result).__name__,
+        }
+        while len(self._verified_programs) > 16:
+            self._verified_programs.pop(next(iter(self._verified_programs)))
+
+    def _verified_program_precondition(self, frame: Frame) -> dict[str, Any]:
+        frame_digest = hashlib.blake2b(
+            frame.ascii.encode("utf-8"), digest_size=10
+        ).hexdigest()
+        return {
+            "shape": list(frame.shape),
+            "level": frame.level,
+            "step": frame.step,
+            "frame_digest": frame_digest,
+            "valid_actions": list(self._current_valid_actions),
+        }
+
+    def _matching_verified_programs(
+        self, frame: Frame | None
+    ) -> list[dict[str, Any]]:
+        if frame is None:
+            return []
+        expected = self._verified_program_precondition(frame)
+        return [
+            dict(program)
+            for program in reversed(list(self._verified_programs.values()))
+            if program.get("precondition") == expected
         ]
 
     def _score_candidate_choice(self, choice: Any) -> tuple[int, bool]:
@@ -3351,10 +4067,32 @@ class ToolAgent:
                     score -= 100
                     continue
                 function = raw_call.get("function")
-                if (
-                    not isinstance(function, dict)
-                    or str(function.get("name", "")).strip() != "python"
-                ):
+                if not isinstance(function, dict):
+                    score -= 50
+                    continue
+                tool_name = str(function.get("name", "")).strip()
+                if tool_name in {"action", "inspect"}:
+                    try:
+                        arguments = _normalize_tool_call_arguments(
+                            function.get("arguments", "{}")
+                        )
+                        if tool_name == "action":
+                            self._normalize_python_actions(arguments.get("actions"))
+                        elif str(arguments.get("view") or "") not in {
+                            "frame_summary",
+                            "history_summary",
+                            "experience",
+                            "strategy",
+                            "memory",
+                        }:
+                            raise ValueError("unknown inspect view")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        score -= 100
+                    else:
+                        score += 120
+                        valid = True
+                    continue
+                if tool_name != "python":
                     score -= 50
                     continue
                 try:
@@ -3364,15 +4102,20 @@ class ToolAgent:
                     code = _normalize_generated_python_code(arguments.get("code", ""))
                     if not code:
                         raise ValueError("empty Python code")
-                    tree = _parse_bounded_generated_python(code)
-                    compile(tree, "<python_tool_candidate>", "exec")
-                    if _generated_python_preflight_issues(tree):
+                    prepared = _prepare_generated_python_candidate(code)
+                    if prepared is None:
                         raise ValueError("generated Python failed semantic preflight")
+                    prepared_code, tree = prepared
                 except (SyntaxError, TypeError, ValueError, OverflowError):
                     score -= 100
                     continue
-                score += 100
+                score += 90 if prepared_code != code else 100
                 valid = True
+                if self._verify_python_candidate(prepared_code):
+                    score += 30
+                else:
+                    score -= 130
+                    valid = False
                 literal_action_batches: list[list[dict[str, Any]]] = []
                 candidate_action_arguments = _static_candidate_action_arguments(tree)
                 for literal_actions in candidate_action_arguments:
@@ -3586,38 +4329,27 @@ class ToolAgent:
                     if isinstance(prop, dict):
                         prop.pop("maxLength", None)
         stream_requested = _LOCAL_ANALYZER_STREAM and self._streaming_supported is not False
-        responses_api = self._model.provider == "openai-responses"
-        if responses_api:
-            payload = build_responses_payload(
-                model=self._model.model_id,
-                messages=messages,
-                max_tokens=output_limit,
-                temperature=_LOCAL_ANALYZER_TEMPERATURE,
-                top_p=_LOCAL_ANALYZER_TOP_P,
-                tools=request_tools,
-                tool_choice=tool_choice,
-                stream=stream_requested,
-            )
-        else:
-            payload = build_chat_payload(
-                provider=self._model.provider,
-                model=self._model.model_id,
-                messages=messages,
-                max_tokens=output_limit,
-                temperature=_LOCAL_ANALYZER_TEMPERATURE,
-                top_p=_LOCAL_ANALYZER_TOP_P,
-                top_k=_LOCAL_ANALYZER_TOP_K,
-                thinking=bool(_LOCAL_ANALYZER_ENABLE_THINKING),
-                tools=request_tools,
-                tool_choice=tool_choice,
-                seed=_LOCAL_ANALYZER_SEED,
-                candidates=(
-                    self._adaptive_candidate_count(output_limit)
-                    if self._candidate_count_supported is not False
-                    else 1
-                ),
-                stream=stream_requested,
-            )
+        provider_request = build_provider_request(
+            provider=self._model.provider,
+            model=self._model.model_id,
+            messages=messages,
+            max_tokens=output_limit,
+            temperature=_LOCAL_ANALYZER_TEMPERATURE,
+            top_p=_LOCAL_ANALYZER_TOP_P,
+            top_k=_LOCAL_ANALYZER_TOP_K,
+            thinking=bool(_LOCAL_ANALYZER_ENABLE_THINKING),
+            tools=request_tools,
+            tool_choice=tool_choice,
+            seed=_LOCAL_ANALYZER_SEED,
+            candidates=(
+                self._adaptive_candidate_count(output_limit)
+                if self._candidate_count_supported is not False
+                else 1
+            ),
+            stream=stream_requested,
+        )
+        payload = provider_request.payload
+        responses_api = provider_request.responses_api
         started_at = time.monotonic()
         deadline = (
             started_at + request_timeout_seconds
@@ -3647,7 +4379,7 @@ class ToolAgent:
             if deadline is not None:
                 timeout = max(0.1, deadline - time.monotonic())
             request_attempts += 1
-            endpoint = "responses" if responses_api else "chat/completions"
+            endpoint = provider_request.endpoint
             request_kwargs: dict[str, Any] = {}
             if request_payload.get("stream"):
                 request_kwargs["stream"] = True
@@ -3808,14 +4540,20 @@ class ToolAgent:
                     )
                     if completed is None:
                         raise ValueError("Responses stream omitted its final response")
-                    payload = normalize_responses_response(completed)
+                    payload = normalize_provider_response(
+                        self._model.provider, completed
+                    )
                 else:
                     payload = merge_chat_completion_stream(events)
                 self._streaming_supported = True
             else:
                 payload = response.json()
-                if responses_api:
-                    payload = normalize_responses_response(payload)
+                if not isinstance(payload, dict):
+                    response.close()
+                    raise requests.RequestException(
+                        "server returned a non-object response"
+                    )
+                payload = normalize_provider_response(self._model.provider, payload)
         except (ValueError, json.JSONDecodeError) as exc:
             response.close()
             raise requests.RequestException("server returned invalid JSON") from exc
@@ -3837,7 +4575,7 @@ class ToolAgent:
                 for index, (_score, valid) in enumerate(candidate_scores)
                 if valid
                 and index != selected_candidate_index
-                and _choice_has_executable_python_tool(choices[index])
+                and _choice_has_executable_tool(choices[index])
             ),
             key=lambda index: (-candidate_scores[index][0], index),
         )
@@ -4036,6 +4774,24 @@ class ToolAgent:
             )
         return normalized
 
+    @staticmethod
+    def _validate_mouse_action_bounds(
+        actions: list[dict[str, Any]], frame: Frame | None
+    ) -> None:
+        if frame is None:
+            return
+        rows, cols = frame.shape
+        for index, action in enumerate(actions, start=1):
+            if action.get("action") != "MOUSE":
+                continue
+            row = int(action["row"])
+            col = int(action["col"])
+            if not (0 <= row < rows and 0 <= col < cols):
+                raise ValueError(
+                    f"Action {index} MOUSE coordinate ({row}, {col}) is outside "
+                    f"the current frame shape {rows}x{cols}."
+                )
+
     def _is_known_harmful_action(self, action: dict[str, Any]) -> bool:
         snapshot = self._current_experience_snapshot or {}
         name = str(action.get("action") or "")
@@ -4223,6 +4979,35 @@ class ToolAgent:
                     )
             if preflight_issues:
                 first_issue = preflight_issues[0]
+                repair = _deterministic_preflight_python_repair(
+                    code, preflight_issues
+                )
+                if repair is not None:
+                    repaired, repair_count = repair
+                    repaired_response = self._run_python_tool(
+                        state_path, {"code": repaired}
+                    )
+                    try:
+                        repaired_payload = json.loads(repaired_response.content)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        return repaired_response
+                    repaired_payload["auto_repair"] = {
+                        "applied": True,
+                        "original_diagnostic_type": "GeneratedCodePreflightError",
+                        "original_source": first_issue.get("message"),
+                        "repair": "correct_documented_attribute",
+                        "repair_count": repair_count,
+                        "repaired_code_fingerprint": (
+                            _generated_python_semantic_fingerprint(repaired)
+                        ),
+                    }
+                    self._record_efficiency("automatic_code_repairs", 1)
+                    return _ToolDispatchResult(
+                        self._render_tool_payload(
+                            repaired_payload, truncate_fields=("stdout", "error")
+                        ),
+                        step_executed=repaired_response.step_executed,
+                    )
                 raise _GeneratedCodePreflightError(
                     str(first_issue.get("message") or "Generated-code preflight failed.")
                 )
@@ -4275,6 +5060,35 @@ class ToolAgent:
                 self._render_tool_payload(payload, truncate_fields=("error",))
             )
         except SyntaxError as exc:
+            repaired = _deterministic_syntax_repair(code, exc)
+            if repaired is not None:
+                repaired_response = self._run_python_tool(
+                    state_path, {"code": repaired}
+                )
+                try:
+                    repaired_payload = json.loads(repaired_response.content)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return repaired_response
+                repaired_payload["auto_repair"] = {
+                    "applied": True,
+                    "original_diagnostic_type": "SyntaxError",
+                    "original_source": exc.text.strip() if exc.text else None,
+                    "repair": (
+                        "insert_missing_colon"
+                        if "expected ':'" in str(exc.msg)
+                        else "normalize_boolean_operators"
+                    ),
+                    "repaired_code_fingerprint": _generated_python_semantic_fingerprint(
+                        repaired
+                    ),
+                }
+                self._record_efficiency("automatic_code_repairs", 1)
+                return _ToolDispatchResult(
+                    self._render_tool_payload(
+                        repaired_payload, truncate_fields=("stdout", "error")
+                    ),
+                    step_executed=repaired_response.step_executed,
+                )
             payload = _python_tool_payload(
                 {
                     "error": f"Python syntax error: {exc.msg}",
@@ -4352,18 +5166,10 @@ class ToolAgent:
             except (TypeError, ValueError) as exc:
                 raise SandboxHostActionError(str(exc)) from exc
             live_frame, _live_history = load_runtime_state(state_path)
-            if live_frame is not None:
-                rows, cols = live_frame.shape
-                for index, action in enumerate(normalized_actions, start=1):
-                    if action.get("action") != "MOUSE":
-                        continue
-                    row = int(action["row"])
-                    col = int(action["col"])
-                    if not (0 <= row < rows and 0 <= col < cols):
-                        raise SandboxHostActionError(
-                            f"Action {index} MOUSE coordinate ({row}, {col}) is outside "
-                            f"the current frame shape {rows}x{cols}."
-                        )
+            try:
+                self._validate_mouse_action_bounds(normalized_actions, live_frame)
+            except ValueError as exc:
+                raise SandboxHostActionError(str(exc)) from exc
             if terminal_action_result is not None:
                 reason = (
                     _terminal_action_reason(terminal_action_result) or "terminal_state"
@@ -4460,21 +5266,36 @@ class ToolAgent:
         )
         sandbox_calls = 1
         first_diagnostic = sandbox_result.get("diagnostic")
-        first_action_results = [
-            item
-            for item in sandbox_result.get("action_results") or []
-            if isinstance(item, dict)
-        ]
-        repaired_code = (
-            _deterministic_generated_python_repair(code, first_diagnostic)
-            if sandbox_result.get("error")
-            and not first_action_results
-            and not re.search(r"\b(?:record_strategy|remember|forget)\s*\(", code)
-            and isinstance(first_diagnostic, dict)
-            else None
+        repaired_code: str | None = None
+        execution_code = code
+        applied_repairs: list[str] = []
+        seen_fingerprints = {_generated_python_semantic_fingerprint(code)}
+        may_repair = not re.search(
+            r"\b(?:record_strategy|remember|forget)\s*\(", code
         )
-        if repaired_code is not None:
-            repaired_result = run_sandboxed_python(
+        while (
+            may_repair
+            and sandbox_result.get("error")
+            and len(applied_repairs) < _MAX_DETERMINISTIC_RUNTIME_REPAIRS
+            and not sandbox_result.get("action_results")
+        ):
+            diagnostic = sandbox_result.get("diagnostic")
+            runtime_repair = (
+                _deterministic_runtime_python_repair(execution_code, diagnostic)
+                if isinstance(diagnostic, dict)
+                else None
+            )
+            if runtime_repair is None:
+                break
+            candidate_code, repair_kind = runtime_repair
+            fingerprint = _generated_python_semantic_fingerprint(candidate_code)
+            if fingerprint in seen_fingerprints:
+                break
+            seen_fingerprints.add(fingerprint)
+            execution_code = candidate_code
+            repaired_code = candidate_code
+            applied_repairs.append(repair_kind)
+            sandbox_result = run_sandboxed_python(
                 code=repaired_code,
                 timeout_seconds=self._python_timeout,
                 initial_state=initial_state,
@@ -4484,16 +5305,25 @@ class ToolAgent:
                 should_stop=self._should_stop_callback,
             )
             sandbox_calls += 1
-            repaired_result["auto_repair"] = {
+        if applied_repairs:
+            sandbox_result["auto_repair"] = {
                 "applied": True,
                 "original_diagnostic_type": first_diagnostic.get("type"),
                 "original_source": first_diagnostic.get("source"),
+                "repair": (
+                    applied_repairs[0]
+                    if len(applied_repairs) == 1
+                    else "repair_chain"
+                ),
+                "repairs": applied_repairs,
+                "repair_count": len(applied_repairs),
                 "repaired_code_fingerprint": hashlib.blake2b(
                     repaired_code.encode("utf-8"), digest_size=12
                 ).hexdigest(),
             }
-            sandbox_result = repaired_result
-            self._record_efficiency("automatic_code_repairs", 1)
+            self._record_efficiency(
+                "automatic_code_repairs", len(applied_repairs)
+            )
         self._record_efficiency("sandbox_calls", sandbox_calls)
         self._record_efficiency(
             "sandbox_seconds",
@@ -4529,6 +5359,15 @@ class ToolAgent:
         self._update_causal_model_from_actions(transition_observations)
         payload = _python_tool_payload(sandbox_result)
 
+        if (
+            not sandbox_result.get("error")
+            and not action_results
+            and not re.search(r"\b(?:action|record_strategy|remember|forget)\s*\(", code)
+        ):
+            self._remember_verified_program(
+                repaired_code or code, current_frame, sandbox_result.get("result")
+            )
+
         step_executed = any(bool(item.get("executed")) for item in action_results)
         if step_executed:
             self._last_step_summary = self._summarize_step_sequence(action_results)
@@ -4546,6 +5385,54 @@ class ToolAgent:
         self._ensure_session(state_path)
         if name == "python":
             return self._run_python_tool(state_path, arguments)
+        if name == "action":
+            actions = arguments.get("actions")
+            if arguments.get("dry_run") is True:
+                try:
+                    normalized = self._normalize_python_actions(actions)
+                    frame = load_runtime_state(state_path)[0] if state_path.is_file() else None
+                    self._validate_mouse_action_bounds(normalized, frame)
+                except (TypeError, ValueError) as exc:
+                    return _ToolDispatchResult(
+                        json.dumps(
+                            {"error": str(exc), "dry_run": True, "valid": False},
+                            separators=(",", ":"),
+                        )
+                    )
+                return _ToolDispatchResult(
+                    json.dumps(
+                        {"dry_run": True, "valid": True, "actions": normalized},
+                        separators=(",", ":"),
+                    )
+                )
+            code = (
+                f"action({actions!r})\n"
+                "result = {'submitted_actions': "
+                f"{len(actions) if isinstance(actions, list) else 0}"
+                "}"
+            )
+            return self._run_python_tool(state_path, {"code": code})
+        if name == "inspect":
+            view = str(arguments.get("view") or "")
+            programs = {
+                "frame_summary": (
+                    "result = {'shape': list(current_frame.shape), 'step': current_frame.step, "
+                    "'level': current_frame.level, 'border': current_frame.border_summary()}"
+                ),
+                "history_summary": (
+                    "result = {'entries': len(history), 'transitions': len(transitions), "
+                    "'last_action': last_action, 'valid_actions': list(valid_actions)}"
+                ),
+                "experience": "result = experience",
+                "strategy": "result = strategy",
+                "memory": "result = memory",
+            }
+            code = programs.get(view)
+            if code is None:
+                return _ToolDispatchResult(
+                    json.dumps({"error": f"Unknown inspect view: {view}"}, separators=(",", ":"))
+                )
+            return self._run_python_tool(state_path, {"code": code})
         return _ToolDispatchResult(
             json.dumps({"error": f"Unknown tool: {name}"}, separators=(",", ":"))
         )
@@ -5095,8 +5982,8 @@ class ToolAgent:
                         )
                     followup_prompt = (
                         f"{followup_prefix}"
-                        "Emit exactly one parsed `python` tool call now. Combine useful inspections in one snippet, "
-                        "update the world model if needed, and call `action(actions)` with the selected valid action or batch. "
+                        "Emit exactly one parsed executable tool call now. Use `inspect` for a standard summary, "
+                        "`action` for a direct validated action batch, or `python` for custom bounded analysis. "
                         f"{TOOL_CALL_FORMAT_GUIDANCE}"
                     )
                     append_transcript("USER PROMPT", followup_prompt)
@@ -5129,9 +6016,7 @@ class ToolAgent:
                         else ""
                     )
                     code_fingerprint = (
-                        hashlib.blake2b(
-                            generated_code.encode("utf-8"), digest_size=12
-                        ).hexdigest()
+                        _generated_python_semantic_fingerprint(generated_code)
                         if generated_code
                         else ""
                     )
@@ -5160,6 +6045,15 @@ class ToolAgent:
                         code_fingerprint
                         and code_fingerprint in failed_code_fingerprints
                     ):
+                        if self._activate_next_fallback_model():
+                            queued_candidate_messages.clear()
+                            response_fallback_messages = []
+                            self._record_efficiency("model_failovers", 1)
+                            append_transcript(
+                                "ANALYZER STATUS",
+                                "quality_failover: semantically duplicate failed "
+                                f"program; switched to {self._model.model_id}.",
+                            )
                         dispatch = _ToolDispatchResult(
                             json.dumps(
                                 {
@@ -5389,7 +6283,7 @@ class ToolAgent:
             f"request_safety_margin_tokens: {self._request_safety_margin_tokens}\n"
             f"tool_output_tokens: {self._tool_output_tokens}\n"
             f"yield_seconds: {self._yield_seconds if self._yield_seconds is not None else 'disabled'}\n"
-            f"available_tools: python\n"
+            f"available_tools: python, action, inspect\n"
             f"python_timeout_seconds: {self._python_timeout}\n"
             f"history_messages: {len(self._history_messages)}\n"
             f"efficiency_metrics: {json.dumps(self._turn_efficiency_metrics, separators=(',', ':'))}\n"

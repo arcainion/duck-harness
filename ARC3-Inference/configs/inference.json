@@ -57,6 +57,8 @@
     "max_output": 0,
     "thinking": true,
     "stream": false,
+    "require_os_sandbox": false,
+    "verify_candidates": true,
     "temperature": 0.6,
     "top_p": 0.95,
     "top_k": 20,

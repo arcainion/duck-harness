@@ -8,13 +8,18 @@ from unittest.mock import Mock, patch
 
 from inference.agent import tool_agent as tool_agent_module
 from inference.agent.python_tool_sandbox import _SANDBOX_BOOTSTRAP
+from inference.agent.runtime_state import load_runtime_state
 from inference.agent.tool_agent import (
     ToolAgent,
     _ChatCompletionResult,
+    _choice_has_executable_tool,
     _deterministic_generated_python_repair,
+    _generated_python_preflight_issues,
     _normalize_generated_python_code,
     _normalize_tool_call_arguments,
+    _parse_bounded_generated_python,
     _recover_tool_calls_from_markup,
+    _generated_python_semantic_fingerprint,
     _python_tool_payload,
     _render_tool_result_display,
 )
@@ -59,6 +64,38 @@ class ToolAgentCodeGenerationTests(TestCase):
         value = json.dumps({"code": "result = 8"})
 
         self.assertEqual(_normalize_generated_python_code(value), "result = 8")
+
+    def test_recovers_code_line_array_from_structured_payload(self) -> None:
+        value = {
+            "language": "python",
+            "code": [
+                "values = [2, 3, 5]",
+                "result = sum(values)",
+            ],
+        }
+
+        self.assertEqual(
+            _normalize_generated_python_code(value),
+            "values = [2, 3, 5]\nresult = sum(values)",
+        )
+
+    def test_recovers_exact_nested_code_content_wrapper(self) -> None:
+        value = json.dumps(
+            {
+                "code": {
+                    "language": "python",
+                    "content": [
+                        {"type": "output_text", "text": "result = (current_frame."},
+                        {"type": "output_text", "text": "shape)"},
+                    ],
+                }
+            }
+        )
+
+        self.assertEqual(
+            _normalize_generated_python_code(value),
+            "result = (current_frame.shape)",
+        )
 
     def test_recovers_exact_xml_python_wrapper(self) -> None:
         value = "<python>\nresult = 13\n</python>"
@@ -110,9 +147,19 @@ class ToolAgentCodeGenerationTests(TestCase):
     def test_does_not_unwrap_invalid_or_ambiguous_nested_payload(self) -> None:
         invalid = json.dumps({"code": "for"})
         ambiguous = json.dumps({"code": "result = 1", "alternative": "result = 2"})
+        invalid_lines = json.dumps({"code": ["for", "while"]})
+        non_python_nested = json.dumps(
+            {"code": {"language": "javascript", "code": "result = 1"}}
+        )
 
         self.assertEqual(_normalize_generated_python_code(invalid), invalid)
         self.assertEqual(_normalize_generated_python_code(ambiguous), ambiguous)
+        self.assertEqual(
+            _normalize_generated_python_code(invalid_lines), invalid_lines
+        )
+        self.assertEqual(
+            _normalize_generated_python_code(non_python_nested), non_python_nested
+        )
 
     def test_recovers_content_parts_and_metadata_wrappers(self) -> None:
         wrapped = {
@@ -134,6 +181,39 @@ class ToolAgentCodeGenerationTests(TestCase):
         wrapped = {"content": [{"type": "text", "text": "result = 1"}, {"type": "text", "text": "result = 2"}]}
 
         self.assertEqual(_normalize_generated_python_code(wrapped), str(wrapped))
+
+    def test_recovers_program_split_across_provider_content_parts(self) -> None:
+        token_split = {
+            "content": [
+                {"type": "output_text", "text": "result = (current_frame."},
+                {"type": "output_text", "text": "shape)"},
+            ]
+        }
+        line_split = {
+            "content": [
+                {"type": "text", "text": "if True:"},
+                {"type": "text", "text": "    result = 7"},
+            ]
+        }
+
+        self.assertEqual(
+            _normalize_generated_python_code(token_split),
+            "result = (current_frame.shape)",
+        )
+        self.assertIn(
+            _normalize_generated_python_code(line_split),
+            {"if True:    result = 7", "if True:\n    result = 7"},
+        )
+
+    def test_deduplicates_semantically_identical_wrapped_programs(self) -> None:
+        wrapped = {
+            "content": [
+                {"type": "text", "text": "result=1"},
+                {"type": "text", "text": "result = 1  # same program"},
+            ]
+        }
+
+        self.assertEqual(_normalize_generated_python_code(wrapped), "result=1")
 
     def test_does_not_extract_non_python_xml_wrapper(self) -> None:
         value = '<code language="javascript">result = 1</code>'
@@ -226,6 +306,548 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(payload["diagnostic"]["source"], "if True print('x')")
         self.assertIn("retry", payload["diagnostic"]["hint"].lower())
 
+    def test_missing_colon_is_repaired_locally_before_execution(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        response = agent._run_python_tool(
+            Path("unused/tool_runtime_state.json"),
+            {"code": "if True\n    result = 7"},
+        )
+        payload = json.loads(response.content)
+
+        self.assertEqual(payload["result"], 7)
+        self.assertEqual(payload["auto_repair"]["repair"], "insert_missing_colon")
+
+    def test_missing_colon_repair_preserves_inline_comment(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        response = agent._run_python_tool(
+            Path("unused/tool_runtime_state.json"),
+            {"code": "if True  # bounded branch\n    result = 7"},
+        )
+        payload = json.loads(response.content)
+
+        self.assertEqual(payload["result"], 7)
+        self.assertEqual(payload["auto_repair"]["repair"], "insert_missing_colon")
+
+    def test_boolean_operator_repair_preserves_strings_and_comments(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": True,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = (
+            'label = "literal && text"  # comment || text\n'
+            "result = (True && False) || True"
+        )
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertTrue(payload["result"])
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "normalize_boolean_operators"
+        )
+        repaired_code = sandbox.call_args.kwargs["code"]
+        self.assertIn('"literal && text"', repaired_code)
+        self.assertIn("# comment || text", repaired_code)
+        self.assertIn("True  and  False", repaired_code)
+        self.assertIn(" or  True", repaired_code)
+
+    def test_semantic_fingerprint_ignores_formatting_and_comments(self) -> None:
+        self.assertEqual(
+            _generated_python_semantic_fingerprint("result=1 # first"),
+            _generated_python_semantic_fingerprint("\nresult = 1\n"),
+        )
+
+    def test_semantic_fingerprint_distinguishes_behavioral_constants(self) -> None:
+        self.assertNotEqual(
+            _generated_python_semantic_fingerprint("result = 1"),
+            _generated_python_semantic_fingerprint("result = 2"),
+        )
+
+    def test_preflight_range_limit_is_inclusive_and_handles_negative_steps(self) -> None:
+        at_limit = _parse_bounded_generated_python("result = range(1000000)")
+        over_limit = _parse_bounded_generated_python(
+            "result = range(1000001, 0, -1)"
+        )
+
+        self.assertFalse(_generated_python_preflight_issues(at_limit))
+        issues = _generated_python_preflight_issues(over_limit)
+        self.assertIn("1000001 iterations", issues[0]["message"])
+
+    def test_preflight_ignores_invalid_operations_in_uncalled_helpers(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "def dormant():\n"
+            "    import pathlib\n"
+            "    return current_frame.not_a_real_attribute\n"
+            "result = 1"
+        )
+
+        self.assertEqual(_generated_python_preflight_issues(tree), [])
+
+    def test_preflight_evaluates_constant_comparisons_in_while_conditions(self) -> None:
+        tree = _parse_bounded_generated_python("while 0 < 1 < 2:\n    result = 1")
+
+        issues = _generated_python_preflight_issues(tree)
+
+        self.assertIn("has no break path", issues[0]["message"])
+
+    def test_structured_inspect_tool_executes_without_custom_code(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "current_frame": {
+                            "grid": [[0, 1], [1, 0]],
+                            "ascii": "WB\nBW",
+                            "shape": [2, 2],
+                            "step": 3,
+                            "level": 2,
+                        },
+                        "history": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            response = agent._dispatch_tool(
+                state_path, "inspect", {"view": "history_summary"}
+            )
+            original_frame = load_runtime_state(state_path)[0]
+            self.assertEqual(len(agent._matching_verified_programs(original_frame)), 1)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "current_frame": {
+                            "grid": [[1, 1], [1, 1]],
+                            "ascii": "BB\nBB",
+                            "shape": [2, 2],
+                            "step": 3,
+                            "level": 2,
+                        },
+                        "history": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            changed_frame = load_runtime_state(state_path)[0]
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"]["entries"], 0)
+        self.assertFalse(response.step_executed)
+        self.assertEqual(len(agent._verified_programs), 1)
+        self.assertEqual(agent._matching_verified_programs(changed_frame), [])
+
+    def test_structured_action_tool_reuses_validated_action_runtime(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._current_valid_actions = ["LEFT"]
+        captured: list[dict] = []
+
+        def step_env(request: dict) -> dict:
+            captured.extend(request["actions"])
+            return {
+                "executed": True,
+                "action_num": 1,
+                "action_display": "LEFT",
+                "valid_actions": ["RIGHT"],
+            }
+
+        agent._step_env_callback = step_env
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            response = agent._dispatch_tool(
+                state_path, "action", {"actions": [{"action": "LEFT"}]}
+            )
+
+        self.assertEqual(captured, [{"action": "LEFT"}])
+        self.assertTrue(response.step_executed)
+
+    def test_structured_action_dry_run_has_no_environment_side_effect(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._current_valid_actions = ["LEFT"]
+        agent._step_env_callback = Mock(side_effect=AssertionError("must not execute"))
+
+        response = agent._dispatch_tool(
+            Path("unused/tool_runtime_state.json"),
+            "action",
+            {"actions": [{"action": "LEFT"}], "dry_run": True},
+        )
+        payload = json.loads(response.content)
+
+        self.assertTrue(payload["dry_run"])
+        self.assertTrue(payload["valid"])
+        self.assertFalse(response.step_executed)
+        agent._step_env_callback.assert_not_called()
+
+    def test_structured_action_invalid_dry_run_is_non_throwing_and_read_only(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._current_valid_actions = ["LEFT"]
+        agent._step_env_callback = Mock(side_effect=AssertionError("must not execute"))
+
+        response = agent._dispatch_tool(
+            Path("unused/tool_runtime_state.json"),
+            "action",
+            {"actions": [{"action": "RIGHT"}], "dry_run": True},
+        )
+        payload = json.loads(response.content)
+
+        self.assertFalse(payload["valid"])
+        self.assertTrue(payload["dry_run"])
+        self.assertIn("not currently valid", payload["error"])
+        self.assertFalse(response.step_executed)
+        agent._step_env_callback.assert_not_called()
+
+    def test_structured_mouse_dry_run_checks_current_frame_bounds(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._current_valid_actions = ["MOUSE"]
+        agent._step_env_callback = Mock(side_effect=AssertionError("must not execute"))
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "current_frame": {
+                            "grid": [[0, 0], [0, 0]],
+                            "ascii": "WW\nWW",
+                            "shape": [2, 2],
+                            "step": 0,
+                            "level": 1,
+                        },
+                        "history": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            response = agent._dispatch_tool(
+                state_path,
+                "action",
+                {"actions": [{"action": "MOUSE", "row": 2, "col": 1}], "dry_run": True},
+            )
+
+        payload = json.loads(response.content)
+        self.assertFalse(payload["valid"])
+        self.assertIn("outside the current frame shape 2x2", payload["error"])
+        agent._step_env_callback.assert_not_called()
+
+    def test_unknown_structured_tool_and_inspect_view_return_errors(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        unknown_tool = agent._dispatch_tool(
+            Path("unused/tool_runtime_state.json"), "shell", {}
+        )
+        unknown_view = agent._dispatch_tool(
+            Path("unused/tool_runtime_state.json"),
+            "inspect",
+            {"view": "raw_runtime"},
+        )
+
+        self.assertEqual(json.loads(unknown_tool.content)["error"], "Unknown tool: shell")
+        self.assertEqual(
+            json.loads(unknown_view.content)["error"],
+            "Unknown inspect view: raw_runtime",
+        )
+
+    def test_candidate_verification_uses_read_only_action_handler(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._current_valid_actions = ["LEFT"]
+        agent._step_env_callback = Mock(side_effect=AssertionError("must not execute"))
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "current_frame": {
+                            "grid": [[0]],
+                            "ascii": "W",
+                            "shape": [1, 1],
+                            "step": 0,
+                            "level": 1,
+                        },
+                        "history": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            agent._session_runtime_dir = state_path
+
+            verified = agent._verify_python_candidate("action('RIGHT')")
+
+        self.assertFalse(verified)
+        agent._step_env_callback.assert_not_called()
+
+    def test_candidate_verification_fails_closed_for_missing_active_state(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        with TemporaryDirectory() as temp_dir:
+            agent._session_runtime_dir = Path(temp_dir) / "missing-state.json"
+
+            verified = agent._verify_python_candidate("result = 1")
+
+        self.assertFalse(verified)
+        self.assertEqual(
+            agent._turn_efficiency_metrics["candidate_verification_failures"], 1
+        )
+
+    def test_candidate_verification_retries_one_missing_safe_import(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        state_path = Mock()
+        state_path.is_file.return_value = True
+        agent._session_runtime_dir = state_path
+        failed = {
+            "error": "NameError: Counter",
+            "diagnostic": {
+                "type": "NameError",
+                "name": "Counter",
+                "line": 1,
+                "source": "result = Counter('ABBA')",
+            },
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": {"A": 2, "B": 2},
+            "action_results": [],
+        }
+
+        with (
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(agent, "_cached_frame_payloads", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[failed, successful],
+            ) as sandbox,
+        ):
+            verified = agent._verify_python_candidate(
+                "result = dict(Counter('ABBA'))"
+            )
+
+        self.assertTrue(verified)
+        self.assertEqual(sandbox.call_count, 2)
+        self.assertEqual(
+            sandbox.call_args_list[1].kwargs["code"],
+            "from collections import Counter\nresult = dict(Counter('ABBA'))",
+        )
+
+    def test_candidate_verification_chains_multiple_safe_imports(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        state_path = Mock()
+        state_path.is_file.return_value = True
+        agent._session_runtime_dir = state_path
+        missing_counter = {
+            "error": "NameError: Counter",
+            "diagnostic": {"type": "NameError", "name": "Counter", "line": 1},
+            "action_results": [],
+        }
+        missing_product = {
+            "error": "NameError: product",
+            "diagnostic": {"type": "NameError", "name": "product", "line": 3},
+            "action_results": [],
+        }
+        successful = {"error": "", "result": 4, "action_results": []}
+        code = (
+            "counts = Counter('ABBA')\n"
+            "result = len(list(product(counts, repeat=2)))"
+        )
+
+        with (
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(agent, "_cached_frame_payloads", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_counter, missing_product, successful],
+            ) as sandbox,
+        ):
+            verified = agent._verify_python_candidate(code)
+
+        self.assertTrue(verified)
+        self.assertEqual(sandbox.call_count, 3)
+        final_code = sandbox.call_args_list[2].kwargs["code"]
+        self.assertIn("from collections import Counter", final_code)
+        self.assertIn("from itertools import product", final_code)
+
+    def test_candidate_verification_normalizes_json_literals(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        state_path = Mock()
+        state_path.is_file.return_value = True
+        agent._session_runtime_dir = state_path
+        missing_true = {
+            "error": "NameError: true",
+            "diagnostic": {"type": "NameError", "name": "true", "line": 1},
+            "action_results": [],
+        }
+        missing_null = {
+            "error": "NameError: null",
+            "diagnostic": {"type": "NameError", "name": "null", "line": 1},
+            "action_results": [],
+        }
+        successful = {"error": "", "result": {"ok": True, "missing": None}}
+        code = "result = {'ok': true, 'missing': null}"
+
+        with (
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(agent, "_cached_frame_payloads", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_true, missing_null, successful],
+            ) as sandbox,
+        ):
+            verified = agent._verify_python_candidate(code)
+
+        self.assertTrue(verified)
+        final_code = sandbox.call_args_list[2].kwargs["code"]
+        self.assertIn("True", final_code)
+        self.assertIn("None", final_code)
+        self.assertNotIn("true", final_code)
+        self.assertNotIn("null", final_code)
+
+    def test_candidate_selection_accepts_only_deterministically_repairable_code(self) -> None:
+        def choice(code: str) -> dict:
+            return {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "python",
+                                "arguments": json.dumps({"code": code}),
+                            }
+                        }
+                    ]
+                }
+            }
+
+        self.assertTrue(
+            _choice_has_executable_tool(
+                choice("if True\n    result = current_frame.objcts()")
+            )
+        )
+        self.assertTrue(
+            _choice_has_executable_tool(choice("result = True && False || True"))
+        )
+        self.assertFalse(
+            _choice_has_executable_tool(
+                choice("result = current_frame.not_a_real_attribute")
+            )
+        )
+        self.assertFalse(
+            _choice_has_executable_tool(choice("result = True & & False"))
+        )
+
+    def test_candidate_ranking_verifies_repaired_code_with_small_penalty(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+
+        def choice(code: str) -> dict:
+            return {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "python",
+                                "arguments": json.dumps({"code": code}),
+                            }
+                        }
+                    ]
+                }
+            }
+
+        with patch.object(
+            agent, "_verify_python_candidate", return_value=True
+        ) as verify:
+            repaired_score, repaired_valid = agent._score_candidate_choice(
+                choice("result = current_frame.objcts()")
+            )
+            native_score, native_valid = agent._score_candidate_choice(
+                choice("result = current_frame.objects()")
+            )
+
+        self.assertTrue(repaired_valid)
+        self.assertTrue(native_valid)
+        self.assertEqual(native_score - repaired_score, 10)
+        self.assertEqual(
+            verify.call_args_list[0].args[0],
+            "result = current_frame.objects()",
+        )
+
     def test_semantic_preflight_blocks_definite_failures_before_sandbox(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -235,12 +857,30 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         cases = (
             ("import pathlib\nresult = 1", "Module 'pathlib'"),
-            ("result = current_frame.objcts()", "no documented attribute"),
-            ("frame = current_frame\nresult = frame.objcts()", "no documented attribute"),
-            ("result = history[-1].frame.objcts()", "no documented attribute"),
+            (
+                "result = current_frame.not_a_real_attribute",
+                "no documented attribute",
+            ),
             ("while True:\n    result = 1", "has no break path"),
             ("while 1:\n    if False:\n        break", "has no break path"),
             ("action()", "exactly one positional argument"),
+            (
+                "def inspect_frame():\n"
+                "    return current_frame.not_a_real_attribute\n"
+                "result = inspect_frame()",
+                "no documented attribute",
+            ),
+            (
+                "def recurse():\n    return recurse()\nresult = recurse()",
+                "Direct recursion",
+            ),
+            (
+                "def first():\n    return second()\n"
+                "def second():\n    return first()\n"
+                "result = first()",
+                "Mutual recursion",
+            ),
+            ("result = list(range(1000001))", "expands to 1000001 iterations"),
         )
         for code, expected in cases:
             with (
@@ -257,6 +897,90 @@ class ToolAgentCodeGenerationTests(TestCase):
             )
             self.assertIn(expected, payload["error"])
             sandbox.assert_not_called()
+
+    def test_preflight_repairs_one_unambiguous_documented_attribute(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": [],
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "result = current_frame.objcts()"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], [])
+        self.assertEqual(
+            payload["auto_repair"]["repair"], "correct_documented_attribute"
+        )
+        self.assertEqual(payload["auto_repair"]["repair_count"], 1)
+        repaired_code = sandbox.call_args.kwargs["code"]
+        self.assertEqual(repaired_code, "result = current_frame.objects()")
+
+    def test_preflight_repairs_multiple_unambiguous_attributes_atomically(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": [[], []],
+            "stdout": "",
+            "action_results": [],
+        }
+        code = (
+            "first = current_frame.objcts()\n"
+            "result = [first, current_frame.objcts()]"
+        )
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                return_value=successful,
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], [[], []])
+        self.assertEqual(payload["auto_repair"]["repair_count"], 2)
+        self.assertEqual(
+            sandbox.call_args.kwargs["code"],
+            "first = current_frame.objects()\n"
+            "result = [first, current_frame.objects()]",
+        )
+
+    def test_preflight_allows_uncalled_mutually_recursive_helpers(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "def first():\n    return second()\n"
+            "def second():\n    return first()\n"
+            "result = 1"
+        )
+
+        self.assertEqual(_generated_python_preflight_issues(tree), [])
 
     def test_deterministic_repair_applies_one_unambiguous_name_fix(self) -> None:
         repaired = _deterministic_generated_python_repair(
@@ -385,6 +1109,151 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(payload["result"], [2, 2])
         self.assertTrue(payload["auto_repair"]["applied"])
         self.assertEqual(sandbox.call_count, 2)
+
+    def test_run_python_tool_inserts_one_missing_safe_import(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        failed = {
+            "error": "NameError: Counter",
+            "diagnostic": {
+                "type": "NameError",
+                "name": "Counter",
+                "line": 1,
+                "source": "result = dict(Counter('ABBA'))",
+            },
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": {"A": 2, "B": 2},
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[failed, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "result = dict(Counter('ABBA'))"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], {"A": 2, "B": 2})
+        self.assertEqual(payload["auto_repair"]["repair"], "insert_safe_import")
+        self.assertEqual(
+            sandbox.call_args_list[1].kwargs["code"],
+            "from collections import Counter\nresult = dict(Counter('ABBA'))",
+        )
+
+    def test_run_python_tool_chains_multiple_side_effect_free_repairs(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        missing_counter = {
+            "error": "NameError: Counter",
+            "diagnostic": {"type": "NameError", "name": "Counter", "line": 1},
+            "stdout": "",
+            "action_results": [],
+        }
+        missing_product = {
+            "error": "NameError: product",
+            "diagnostic": {"type": "NameError", "name": "product", "line": 3},
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": 4,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = (
+            "counts = Counter('ABBA')\n"
+            "result = len(list(product(counts, repeat=2)))"
+        )
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_counter, missing_product, successful],
+            ) as sandbox,
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], 4)
+        self.assertEqual(payload["auto_repair"]["repair"], "repair_chain")
+        self.assertEqual(payload["auto_repair"]["repair_count"], 2)
+        self.assertEqual(
+            payload["auto_repair"]["repairs"],
+            ["insert_safe_import", "insert_safe_import"],
+        )
+        self.assertEqual(sandbox.call_count, 3)
+
+    def test_run_python_tool_reports_json_literal_repair_chain(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        missing_true = {
+            "error": "NameError: true",
+            "diagnostic": {"type": "NameError", "name": "true", "line": 1},
+            "stdout": "",
+            "action_results": [],
+        }
+        missing_null = {
+            "error": "NameError: null",
+            "diagnostic": {"type": "NameError", "name": "null", "line": 1},
+            "stdout": "",
+            "action_results": [],
+        }
+        successful = {
+            "error": "",
+            "result": {"ok": True, "missing": None},
+            "stdout": "",
+            "action_results": [],
+        }
+
+        with (
+            patch.object(agent, "_ensure_session"),
+            patch.object(tool_agent_module, "load_runtime_state", return_value=(None, [])),
+            patch.object(
+                tool_agent_module,
+                "run_sandboxed_python",
+                side_effect=[missing_true, missing_null, successful],
+            ),
+        ):
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"),
+                {"code": "result = {'ok': true, 'missing': null}"},
+            )
+
+        payload = json.loads(response.content)
+        self.assertEqual(payload["result"], {"ok": True, "missing": None})
+        self.assertEqual(payload["auto_repair"]["repair_count"], 2)
+        self.assertEqual(
+            payload["auto_repair"]["repairs"],
+            ["normalize_json_literal", "normalize_json_literal"],
+        )
 
     def test_captures_notebook_style_final_expression(self) -> None:
         runtime = self._execute_prepared_code("values = [2, 3, 5]\nsum(values)")

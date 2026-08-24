@@ -66,7 +66,11 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
             tools[0]["function"]["description"],
             _PYTHON_TOOL_DESCRIPTION,
         )
-        self.assertLess(_estimate_tokens(tools), 500)
+        self.assertLess(_estimate_tokens(tools), 800)
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["python", "action", "inspect"],
+        )
         self.assertTrue(tools[0]["function"]["strict"])
         parameters = tools[0]["function"]["parameters"]
         self.assertFalse(parameters["additionalProperties"])

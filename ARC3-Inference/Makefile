@@ -167,6 +167,8 @@ LOCAL_ANALYZER_EXPLORATION_WEIGHT ?= $(shell $(CONFIG_VALUE) analyzer.exploratio
 LOCAL_ANALYZER_YIELD_SECONDS ?= $(shell $(CONFIG_VALUE) analyzer.yield_seconds 60)
 LOCAL_ANALYZER_ENABLE_THINKING ?= $(shell $(CONFIG_VALUE) analyzer.thinking true)
 LOCAL_ANALYZER_STREAM ?= $(shell $(CONFIG_VALUE) analyzer.stream false)
+LOCAL_ANALYZER_REQUIRE_OS_SANDBOX ?= $(shell $(CONFIG_VALUE) analyzer.require_os_sandbox false)
+LOCAL_ANALYZER_VERIFY_CANDIDATES ?= $(shell $(CONFIG_VALUE) analyzer.verify_candidates true)
 LOCAL_ANALYZER_SITE_URL ?= $(shell $(CONFIG_VALUE) analyzer.site_url)
 LOCAL_ANALYZER_APP_NAME ?= $(shell $(CONFIG_VALUE) analyzer.app_name ARC3 Agent Harness)
 ANALYZER_TIMEOUT ?= $(shell $(CONFIG_VALUE) analyzer.timeout 120)
@@ -194,6 +196,9 @@ SCORE_OUTPUT_PATH ?=
 SCORE_RUN_DIR ?=
 SIGNIFICANCE_CONFIG_PATH ?= configs/significance.json
 REGRESSION_CONFIG_PATH ?= configs/regression.json
+CODEGEN_CORPUS_PATH ?= configs/codegen_corpus.jsonl
+CODEGEN_THRESHOLDS_PATH ?= configs/codegen_quality.json
+CODEGEN_REPORT_PATH ?=
 REGRESSION_RUN_DIR ?=
 BASELINE_SCORE ?=
 CANDIDATE_SCORE ?=
@@ -243,6 +248,8 @@ export LOCAL_ANALYZER_EXPLORATION_WEIGHT
 export LOCAL_ANALYZER_YIELD_SECONDS
 export LOCAL_ANALYZER_ENABLE_THINKING
 export LOCAL_ANALYZER_STREAM
+export LOCAL_ANALYZER_REQUIRE_OS_SANDBOX
+export LOCAL_ANALYZER_VERIFY_CANDIDATES
 export LOCAL_ANALYZER_SITE_URL
 export LOCAL_ANALYZER_APP_NAME
 export MULTIMODAL_CONTEXT
@@ -556,6 +563,11 @@ significance:
 
 regression-gate:
 	$(UV_RUN) python -m inference.tools.regression_gate --config "$(REGRESSION_CONFIG_PATH)" $(if $(REGRESSION_RUN_DIR),"$(REGRESSION_RUN_DIR)")
+
+codegen-quality:
+	$(UV_RUN) python -m inference.tools.codegen_quality "$(CODEGEN_CORPUS_PATH)" \
+		--thresholds "$(CODEGEN_THRESHOLDS_PATH)" \
+		$(if $(CODEGEN_REPORT_PATH),--output "$(CODEGEN_REPORT_PATH)")
 
 view:
 	$(UV_RUN) inference-view \

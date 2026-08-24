@@ -5093,6 +5093,13 @@ def prewarm_sandbox() -> None:
         threading.Thread(target=start_one, daemon=True).start()
 
 
+def validate_sandbox_isolation() -> None:
+    """Fail early when a deployment requires unavailable OS isolation."""
+    if not _SANDBOX_REQUIRE_OS_ISOLATION:
+        return
+    _sandbox_command()
+
+
 def _take_prepared_sandbox() -> _PreparedSandboxProcess | None:
     try:
         worker = _SANDBOX_PREWARM_QUEUE.get_nowait()

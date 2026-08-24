@@ -12,6 +12,7 @@ from inference.agent.python_tool_sandbox import (
     _sandbox_command,
     SandboxHostActionError,
     run_sandboxed_python,
+    validate_sandbox_isolation,
 )
 
 
@@ -55,6 +56,14 @@ def _run_with_frame(code: str) -> dict:
 
 
 class PythonToolSandboxTests(TestCase):
+    def test_required_os_isolation_fails_closed_without_bubblewrap(self) -> None:
+        with (
+            mock.patch.object(sandbox_module, "_SANDBOX_REQUIRE_OS_ISOLATION", True),
+            mock.patch.object(sandbox_module.shutil, "which", return_value=None),
+            self.assertRaisesRegex(OSError, "bubblewrap is unavailable"),
+        ):
+            validate_sandbox_isolation()
+
     def test_runtime_state_update_appends_history_and_omits_unchanged_fields(self) -> None:
         previous = {"history": [{"frame": "one"}], "valid_actions": ["LEFT"], "memory": {}}
         current = {
