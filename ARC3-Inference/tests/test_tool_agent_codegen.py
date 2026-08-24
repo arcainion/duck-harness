@@ -14,6 +14,7 @@ from inference.agent.tool_agent import (
     _deterministic_generated_python_repair,
     _normalize_generated_python_code,
     _normalize_tool_call_arguments,
+    _recover_tool_calls_from_markup,
     _python_tool_payload,
     _render_tool_result_display,
 )
@@ -113,6 +114,27 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(_normalize_generated_python_code(invalid), invalid)
         self.assertEqual(_normalize_generated_python_code(ambiguous), ambiguous)
 
+    def test_recovers_content_parts_and_metadata_wrappers(self) -> None:
+        wrapped = {
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "result = current_frame.shape",
+                    "description": "generated program",
+                }
+            ],
+            "mime_type": "application/json",
+        }
+        metadata = {"code": "result = 42", "language": "python", "explanation": "bounded"}
+
+        self.assertEqual(_normalize_generated_python_code(wrapped), "result = current_frame.shape")
+        self.assertEqual(_normalize_generated_python_code(metadata), "result = 42")
+
+    def test_does_not_guess_between_competing_content_parts(self) -> None:
+        wrapped = {"content": [{"type": "text", "text": "result = 1"}, {"type": "text", "text": "result = 2"}]}
+
+        self.assertEqual(_normalize_generated_python_code(wrapped), str(wrapped))
+
     def test_does_not_extract_non_python_xml_wrapper(self) -> None:
         value = '<code language="javascript">result = 1</code>'
 
@@ -150,6 +172,34 @@ class ToolAgentCodeGenerationTests(TestCase):
         with self.assertRaises(json.JSONDecodeError):
             _normalize_tool_call_arguments("for item in")
 
+    def test_repairs_complete_unambiguous_json_arguments(self) -> None:
+        self.assertEqual(
+            _normalize_tool_call_arguments('{"code":"result = 1",}'),
+            {"code": "result = 1"},
+        )
+        self.assertEqual(
+            _normalize_tool_call_arguments("Arguments: {'code': 'result = 2'}"),
+            {"code": "result = 2"},
+        )
+        self.assertEqual(
+            _normalize_tool_call_arguments('{"code":"line1\nline2"}'),
+            {"code": "line1\nline2"},
+        )
+
+    def test_rejects_ambiguous_or_truncated_json_recovery(self) -> None:
+        with self.assertRaises(json.JSONDecodeError):
+            _normalize_tool_call_arguments('first {"code":"result=1"} second {"code":"result=2"}')
+        with self.assertRaises(json.JSONDecodeError):
+            _normalize_tool_call_arguments('{"code":"result=1"')
+
+    def test_xml_tool_call_cdata_preserves_parameter_like_code(self) -> None:
+        calls = _recover_tool_calls_from_markup(
+            '<tool_call><function name="python"><parameter name="code"><![CDATA[result = "</parameter>"]]></parameter></function></tool_call>'
+        )
+
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(arguments["code"], 'result = "</parameter>"')
+
     def test_preserves_valid_raw_python_containing_backticks(self) -> None:
         value = 'result = "```python\\nnot executable\\n```"'
 
@@ -186,7 +236,10 @@ class ToolAgentCodeGenerationTests(TestCase):
         cases = (
             ("import pathlib\nresult = 1", "Module 'pathlib'"),
             ("result = current_frame.objcts()", "no documented attribute"),
+            ("frame = current_frame\nresult = frame.objcts()", "no documented attribute"),
+            ("result = history[-1].frame.objcts()", "no documented attribute"),
             ("while True:\n    result = 1", "has no break path"),
+            ("while 1:\n    if False:\n        break", "has no break path"),
             ("action()", "exactly one positional argument"),
         )
         for code, expected in cases:
@@ -226,6 +279,67 @@ class ToolAgentCodeGenerationTests(TestCase):
                 },
             )
         )
+
+    def test_deterministic_repair_is_syntax_aware(self) -> None:
+        repaired = _deterministic_generated_python_repair(
+            'label = "currnt_frame"\nresult = currnt_frame.shape',
+            {
+                "type": "NameError",
+                "name": "currnt_frame",
+                "line": 2,
+                "suggestions": ["current_frame"],
+            },
+        )
+
+        self.assertEqual(
+            repaired,
+            'label = "currnt_frame"\nresult = current_frame.shape',
+        )
+        self.assertIsNone(
+            _deterministic_generated_python_repair(
+                "first = missng\nsecond = missng",
+                {
+                    "type": "NameError",
+                    "name": "missng",
+                    "suggestions": ["missing"],
+                },
+            )
+        )
+
+    def test_static_action_analysis_skips_dead_and_uncalled_code(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        successful = {
+            "error": "",
+            "result": 1,
+            "stdout": "",
+            "action_results": [],
+        }
+        code = (
+            "def unused():\n"
+            "    action()\n"
+            "    return current_frame.objcts()\n"
+            "if False:\n"
+            "    action()\n"
+            "    result = current_frame.objcts()\n"
+            "result = 1"
+        )
+
+        with patch.object(
+            tool_agent_module,
+            "run_sandboxed_python",
+            return_value=successful,
+        ) as sandbox:
+            response = agent._run_python_tool(
+                Path("unused/tool_runtime_state.json"), {"code": code}
+            )
+
+        self.assertEqual(json.loads(response.content)["result"], 1)
+        sandbox.assert_called_once()
+
 
     def test_run_python_tool_retries_one_safe_deterministic_repair(self) -> None:
         agent = ToolAgent(
@@ -372,6 +486,33 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertIsNotNone(result)
         self.assertFalse(result.step_executed)
         self.assertIn("Provide one JSON object and retry", transcript)
+
+    def test_analyze_requests_complete_regeneration_after_truncation(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._tool_steps = 1
+        agent._chat_completion = lambda *_args, **_kwargs: _ChatCompletionResult(
+            message={"content": "partial tool payload"},
+            finish_reason="length",
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            result = agent.analyze(state_path, action_num=0, valid_actions=["LEFT"])
+            transcript = state_path.with_name("tool_runtime_state_analyzer.txt").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertFalse(result.step_executed)
+        self.assertIn("truncated by the output limit", transcript)
+        self.assertIn("complete tool call from the beginning", transcript)
 
     def test_analyze_executes_direct_python_tool_arguments(self) -> None:
         agent = ToolAgent(

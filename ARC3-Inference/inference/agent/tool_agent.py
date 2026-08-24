@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
@@ -57,7 +58,13 @@ from inference.agent.vision_context import (
     current_grid_image_enabled,
     current_grid_image_part,
 )
-from inference.utils.openai_compat import build_chat_payload, build_headers
+from inference.utils.openai_compat import (
+    build_chat_payload,
+    build_headers,
+    build_responses_payload,
+    merge_chat_completion_stream,
+    normalize_responses_response,
+)
 
 log = logging.getLogger(__name__)
 
@@ -213,6 +220,22 @@ _TRANSITION_VIEW_ATTRIBUTES = frozenset(
         "result",
     }
 )
+def _constant_truth(node: ast.AST) -> bool | None:
+    if isinstance(node, ast.Constant):
+        return bool(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        value = _constant_truth(node.operand)
+        return None if value is None else not value
+    if isinstance(node, ast.BoolOp):
+        values = [_constant_truth(value) for value in node.values]
+        if isinstance(node.op, ast.And):
+            if False in values:
+                return False
+            return True if all(value is True for value in values) else None
+        if True in values:
+            return True
+        return False if all(value is False for value in values) else None
+    return None
 
 
 def _loop_has_direct_break(loop: ast.While) -> bool:
@@ -221,6 +244,12 @@ def _loop_has_direct_break(loop: ast.While) -> bool:
 
         def visit_Break(self, _node: ast.Break) -> None:
             self.found = True
+
+        def visit_If(self, node: ast.If) -> None:
+            truth = _constant_truth(node.test)
+            statements = node.body if truth is True else node.orelse if truth is False else [*node.body, *node.orelse]
+            for statement in statements:
+                self.visit(statement)
 
         def visit_For(self, _node: ast.For) -> None:
             return
@@ -246,6 +275,89 @@ def _loop_has_direct_break(loop: ast.While) -> bool:
     return finder.found
 
 
+def _view_expression_kind(node: ast.AST, aliases: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Name):
+        return aliases.get(node.id)
+    if isinstance(node, ast.Attribute):
+        parent = _view_expression_kind(node.value, aliases)
+        if parent == "transition" and node.attr in {"frame", "before_frame", "after_frame"}:
+            return "frame"
+        if parent == "history_entry" and node.attr == "frame":
+            return "frame"
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+        if node.value.id == "history":
+            return "history_entry"
+        if node.value.id == "transitions":
+            return "transition"
+    return None
+
+
+def _view_alias_kinds(tree: ast.AST) -> dict[str, str]:
+    """Track definite top-level aliases for documented runtime view objects."""
+    aliases = {name: "frame" for name in _FRAME_VIEW_NAMES}
+    aliases["last_transition"] = "transition"
+
+    for statement in getattr(tree, "body", []):
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            value_kind = (
+                _view_expression_kind(statement.value, aliases)
+                if statement.value is not None
+                else None
+            )
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    if value_kind:
+                        aliases[target.id] = value_kind
+                    else:
+                        aliases.pop(target.id, None)
+    return aliases
+
+
+def _reachable_module_node_ids(tree: ast.AST) -> set[int]:
+    """Nodes that may execute while evaluating the generated module body."""
+    reachable: set[int] = set()
+
+    class Visitor(ast.NodeVisitor):
+        def generic_visit(self, node: ast.AST) -> None:
+            reachable.add(id(node))
+            super().generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            reachable.add(id(node))
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            for default in [*node.args.defaults, *node.args.kw_defaults]:
+                if default is not None:
+                    self.visit(default)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            reachable.add(id(node))
+            for default in [*node.args.defaults, *node.args.kw_defaults]:
+                if default is not None:
+                    self.visit(default)
+
+        def visit_If(self, node: ast.If) -> None:
+            reachable.add(id(node))
+            self.visit(node.test)
+            truth = _constant_truth(node.test)
+            statements = node.body if truth is True else node.orelse if truth is False else [*node.body, *node.orelse]
+            for statement in statements:
+                self.visit(statement)
+
+        def visit_While(self, node: ast.While) -> None:
+            reachable.add(id(node))
+            self.visit(node.test)
+            if _constant_truth(node.test) is not False:
+                for statement in [*node.body, *node.orelse]:
+                    self.visit(statement)
+
+    Visitor().visit(tree)
+    return reachable
+
+
 def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
     """Return definite, side-effect-free generated-code failures.
 
@@ -253,7 +365,11 @@ def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
     avoids speculative lint that could reject a valid model-generated program.
     """
     issues: list[dict[str, Any]] = []
+    alias_kinds = _view_alias_kinds(tree)
+    reachable_nodes = _reachable_module_node_ids(tree)
     for node in ast.walk(tree):
+        if id(node) not in reachable_nodes:
+            continue
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             names = (
                 [alias.name for alias in node.names]
@@ -287,38 +403,35 @@ def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
             )
         if (
             isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id in _FRAME_VIEW_NAMES
+            and _view_expression_kind(node.value, alias_kinds) == "frame"
             and node.attr not in _FRAME_VIEW_ATTRIBUTES
         ):
             issues.append(
                 {
                     "line": getattr(node, "lineno", None),
                     "message": (
-                        f"{node.value.id} has no documented attribute '{node.attr}'."
+                        f"{ast.unparse(node.value)[:80]} has no documented attribute '{node.attr}'."
                     ),
                     "hint": "Use a documented FrameView property or method.",
                 }
             )
         if (
             isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "last_transition"
+            and _view_expression_kind(node.value, alias_kinds) == "transition"
             and node.attr not in _TRANSITION_VIEW_ATTRIBUTES
         ):
             issues.append(
                 {
                     "line": getattr(node, "lineno", None),
                     "message": (
-                        f"last_transition has no documented attribute '{node.attr}'."
+                        f"{ast.unparse(node.value)[:80]} has no documented transition attribute '{node.attr}'."
                     ),
                     "hint": "Use a documented TransitionView property or method.",
                 }
             )
         if (
             isinstance(node, ast.While)
-            and isinstance(node.test, ast.Constant)
-            and node.test.value is True
+            and _constant_truth(node.test) is True
             and not _loop_has_direct_break(node)
         ):
             issues.append(
@@ -371,21 +484,56 @@ def _deterministic_generated_python_repair(
         return None
     replacement = suggestions[0]
     error_type = str(diagnostic.get("type") or "")
+    target = ""
+    nodes: list[ast.AST] = []
+    try:
+        original_tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    diagnostic_line = diagnostic.get("line")
     if error_type == "NameError":
         target = str(diagnostic.get("name") or "")
-        pattern = rf"\b{re.escape(target)}\b" if target.isidentifier() else ""
+        nodes = [
+            node
+            for node in ast.walk(original_tree)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id == target
+        ]
     elif error_type == "AttributeError":
         target = str(diagnostic.get("attribute") or "")
-        pattern = (
-            rf"(?<=\.){re.escape(target)}\b" if target.isidentifier() else ""
-        )
+        nodes = [
+            node
+            for node in ast.walk(original_tree)
+            if isinstance(node, ast.Attribute) and node.attr == target
+        ]
     else:
         return None
-    if not pattern:
+    if not target.isidentifier():
         return None
-    repaired, replacements = re.subn(pattern, replacement, code)
-    if replacements != 1 or repaired == code:
+    if isinstance(diagnostic_line, int):
+        line_nodes = [node for node in nodes if getattr(node, "lineno", None) == diagnostic_line]
+        if line_nodes:
+            nodes = line_nodes
+    if len(nodes) != 1:
         return None
+    node = nodes[0]
+    source = code.encode("utf-8")
+    encoded_lines = code.splitlines(keepends=True)
+    line_index = int(getattr(node, "lineno", 0)) - 1
+    end_line_index = int(getattr(node, "end_lineno", 0)) - 1
+    if line_index < 0 or line_index != end_line_index or line_index >= len(encoded_lines):
+        return None
+    line_offset = len("".join(encoded_lines[:line_index]).encode("utf-8"))
+    if isinstance(node, ast.Name):
+        start = line_offset + int(node.col_offset)
+        end = line_offset + int(node.end_col_offset)
+    else:
+        end = line_offset + int(node.end_col_offset)
+        start = end - len(target.encode("utf-8"))
+    if source[start:end].decode("utf-8", errors="replace") != target:
+        return None
+    repaired = (source[:start] + replacement.encode("utf-8") + source[end:]).decode("utf-8")
     try:
         tree = _parse_bounded_generated_python(repaired)
         compile(tree, "<python_tool_auto_repair>", "exec")
@@ -443,31 +591,66 @@ def _static_candidate_value(node: ast.AST, bindings: dict[str, Any]) -> Any:
 
 
 def _static_candidate_action_arguments(tree: ast.AST) -> list[Any]:
-    bindings: dict[str, Any] = {}
-    for statement in getattr(tree, "body", []):
-        if (
-            isinstance(statement, ast.Assign)
-            and len(statement.targets) == 1
-            and isinstance(statement.targets[0], ast.Name)
-        ):
-            try:
-                bindings[statement.targets[0].id] = _static_candidate_value(
-                    statement.value, bindings
-                )
-            except ValueError:
-                bindings.pop(statement.targets[0].id, None)
     arguments: list[Any] = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "action"
-            and node.args
-        ):
-            try:
-                arguments.append(_static_candidate_value(node.args[0], bindings))
-            except ValueError:
+
+    class ExecutedExpressionVisitor(ast.NodeVisitor):
+        def __init__(self, bindings: dict[str, Any]) -> None:
+            self.bindings = bindings
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Name) and node.func.id == "action" and node.args:
+                try:
+                    arguments.append(_static_candidate_value(node.args[0], self.bindings))
+                except ValueError:
+                    pass
+            self.generic_visit(node)
+
+        def visit_Lambda(self, _node: ast.Lambda) -> None:
+            return
+
+    def visit_statements(statements: list[ast.stmt], bindings: dict[str, Any]) -> None:
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bindings.pop(statement.name, None)
                 continue
+            if isinstance(statement, ast.If):
+                ExecutedExpressionVisitor(bindings).visit(statement.test)
+                truth = _constant_truth(statement.test)
+                if truth is True:
+                    visit_statements(statement.body, bindings)
+                elif truth is False:
+                    visit_statements(statement.orelse, bindings)
+                else:
+                    visit_statements(statement.body, dict(bindings))
+                    visit_statements(statement.orelse, dict(bindings))
+                continue
+            if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
+                expression = statement.iter if isinstance(statement, (ast.For, ast.AsyncFor)) else statement.test
+                ExecutedExpressionVisitor(bindings).visit(expression)
+                visit_statements(statement.body, dict(bindings))
+                visit_statements(statement.orelse, dict(bindings))
+                continue
+            if isinstance(statement, ast.Assign):
+                ExecutedExpressionVisitor(bindings).visit(statement.value)
+                if len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
+                    name = statement.targets[0].id
+                    try:
+                        bindings[name] = _static_candidate_value(statement.value, bindings)
+                    except ValueError:
+                        bindings.pop(name, None)
+                continue
+            if isinstance(statement, ast.AnnAssign):
+                if statement.value is not None:
+                    ExecutedExpressionVisitor(bindings).visit(statement.value)
+                if isinstance(statement.target, ast.Name):
+                    try:
+                        bindings[statement.target.id] = _static_candidate_value(statement.value, bindings)
+                    except (TypeError, ValueError):
+                        bindings.pop(statement.target.id, None)
+                continue
+            ExecutedExpressionVisitor(bindings).visit(statement)
+
+    visit_statements(list(getattr(tree, "body", [])), {})
     return arguments
 
 
@@ -497,16 +680,37 @@ def _normalize_generated_python_code(value: Any) -> str:
             return None
         return candidate
 
-    def nested_code(payload: Any) -> str | None:
-        if not isinstance(payload, dict) or set(payload) not in (
-            {"code"},
-            {"code", "language"},
-        ):
+    metadata_keys = {"language", "explanation", "description", "type", "mime_type"}
+
+    def nested_code(payload: Any, depth: int = 0) -> str | None:
+        if depth > 4:
             return None
-        language = str(payload.get("language") or "").strip().lower()
-        if language not in python_languages:
-            return None
-        return executable(payload.get("code"))
+        candidates: list[str] = []
+
+        def add(candidate: Any) -> None:
+            normalized = executable(candidate)
+            if normalized is not None and normalized not in candidates:
+                candidates.append(normalized)
+
+        if isinstance(payload, dict):
+            keys = set(payload)
+            if "code" in payload and keys <= {"code", *metadata_keys}:
+                language = str(payload.get("language") or "").strip().lower()
+                if language in python_languages:
+                    add(payload.get("code"))
+            if "content" in payload and keys <= {"content", *metadata_keys}:
+                recovered = nested_code(payload.get("content"), depth + 1)
+                if recovered is not None:
+                    add(recovered)
+            part_type = str(payload.get("type", "")).lower()
+            if part_type in {"text", "output_text"} and keys <= {"type", "text", *metadata_keys}:
+                add(payload.get("text"))
+        elif isinstance(payload, list) and len(payload) <= 16:
+            for part in payload:
+                recovered = nested_code(part, depth + 1)
+                if recovered is not None:
+                    add(recovered)
+        return candidates[0] if len(candidates) == 1 else None
 
     direct_nested = nested_code(value)
     if direct_nested is not None:
@@ -566,6 +770,39 @@ def _recover_tool_calls_from_markup(*chunks: str) -> list[dict[str, Any]]:
     for chunk in chunks:
         if not chunk.strip():
             continue
+        # Prefer real XML. CDATA safely permits generated code containing text
+        # that resembles a closing parameter tag.
+        root = None
+        for xml_candidate in (chunk.strip(), f"<root>{chunk}</root>"):
+            try:
+                root = ET.fromstring(xml_candidate)
+                break
+            except ET.ParseError:
+                continue
+        xml_calls = [root] if root is not None and root.tag == "tool_call" else (
+            list(root.iter("tool_call")) if root is not None else []
+        )
+        for call in xml_calls:
+            function = call.find("function")
+            if function is None:
+                continue
+            tool_name = str(function.get("name") or "").strip()
+            arguments = {
+                str(parameter.get("name") or "").strip(): "".join(parameter.itertext())
+                for parameter in function.findall("parameter")
+                if str(parameter.get("name") or "").strip()
+            }
+            if tool_name:
+                cache_key = (tool_name, json.dumps(arguments, ensure_ascii=True, sort_keys=True))
+                if cache_key not in seen:
+                    seen.add(cache_key)
+                    recovered.append(
+                        {
+                            "id": f"markup-call-{len(recovered) + 1}",
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": json.dumps(arguments)},
+                        }
+                    )
         for match in _TOOL_CALL_BLOCK_RE.finditer(chunk):
             tool_name = str(match.group(1) or "").strip()
             if not tool_name:
@@ -628,6 +865,7 @@ _LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS = _get_env_int(
 )
 _LOCAL_ANALYZER_YIELD_SECONDS = _get_env_float("LOCAL_ANALYZER_YIELD_SECONDS", 0.0)
 _LOCAL_ANALYZER_ENABLE_THINKING = _get_env_bool("LOCAL_ANALYZER_ENABLE_THINKING", True)
+_LOCAL_ANALYZER_STREAM = _get_env_bool("LOCAL_ANALYZER_STREAM", False)
 _LOCAL_ANALYZER_TEMPERATURE = _get_env_float("LOCAL_ANALYZER_TEMPERATURE", 0.6)
 _LOCAL_ANALYZER_TOP_P = _get_env_float("LOCAL_ANALYZER_TOP_P", 0.95)
 _LOCAL_ANALYZER_TOP_K = _get_env_int("LOCAL_ANALYZER_TOP_K", 20)
@@ -1368,6 +1606,85 @@ def _render_tool_parameter_text(value: Any) -> str:
     return str(value)
 
 
+def _repair_json_object(text: str) -> dict[str, Any] | None:
+    """Apply bounded, deterministic repairs to one object; never close truncation."""
+    if len(text.encode("utf-8")) > _LOCAL_ANALYZER_MAX_CODE_BYTES:
+        return None
+    candidates = [text.strip()]
+    fenced = re.findall(r"```(?:json)?\s*({.*?})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if len(fenced) == 1:
+        candidates.append(fenced[0])
+
+    # Extract exactly one balanced top-level object from surrounding prose.
+    objects: list[str] = []
+    depth = 0
+    start = -1
+    quoted = False
+    escaped = False
+    for index, char in enumerate(text):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+            continue
+        if char == '"':
+            quoted = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                objects.append(text[start : index + 1])
+    if depth == 0 and len(objects) == 1:
+        candidates.append(objects[0])
+
+    for candidate in dict.fromkeys(candidates):
+        repaired: list[str] = []
+        quoted = False
+        escaped = False
+        index = 0
+        while index < len(candidate):
+            char = candidate[index]
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+                elif char in "\r\n\t":
+                    repaired.append({"\r": "\\r", "\n": "\\n", "\t": "\\t"}[char])
+                    index += 1
+                    continue
+            elif char == '"':
+                quoted = True
+            elif char == ",":
+                cursor = index + 1
+                while cursor < len(candidate) and candidate[cursor].isspace():
+                    cursor += 1
+                if cursor < len(candidate) and candidate[cursor] in "}]":
+                    index += 1
+                    continue
+            repaired.append(char)
+            index += 1
+        repaired_text = "".join(repaired)
+        try:
+            parsed = json.loads(repaired_text)
+        except json.JSONDecodeError:
+            try:
+                parsed = ast.literal_eval(candidate)
+            except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+                continue
+        if isinstance(parsed, dict):
+            return json.loads(json.dumps(parsed))
+    return None
+
+
 def _normalize_tool_call_arguments(arguments: Any) -> dict[str, Any]:
     if isinstance(arguments, dict):
         return json.loads(json.dumps(arguments))
@@ -1386,6 +1703,9 @@ def _normalize_tool_call_arguments(arguments: Any) -> dict[str, Any]:
         try:
             parsed = json.loads(stripped)
         except json.JSONDecodeError as json_error:
+            repaired = _repair_json_object(stripped)
+            if repaired is not None:
+                return repaired
             code = _normalize_generated_python_code(stripped)
             try:
                 compile(code, "<python_tool_arguments>", "exec")
@@ -1912,6 +2232,9 @@ class ToolAgent:
         self._generated_tool_call_count = 0
         self._http_session = requests.Session()
         self._forced_tool_choice_supported: bool | None = None
+        self._candidate_count_supported: bool | None = None
+        self._strict_tools_supported: bool | None = None
+        self._streaming_supported: bool | None = None
         self._turn_efficiency_metrics: dict[str, float | int] = {}
         self._http_max_attempts = _LOCAL_ANALYZER_HTTP_MAX_ATTEMPTS
         self._http_retry_base_seconds = _LOCAL_ANALYZER_HTTP_RETRY_BASE_SECONDS
@@ -1930,6 +2253,9 @@ class ToolAgent:
         previous = self._model
         self._model = self._fallback_models.pop(0)
         self._forced_tool_choice_supported = None
+        self._candidate_count_supported = None
+        self._strict_tools_supported = None
+        self._streaming_supported = None
         log.warning(
             "analyzer failover: %s at %s -> %s at %s",
             previous.model_id,
@@ -2993,6 +3319,7 @@ class ToolAgent:
                 "function": {
                     "name": "python",
                     "description": _PYTHON_TOOL_DESCRIPTION,
+                    "strict": True,
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -3001,9 +3328,11 @@ class ToolAgent:
                                 "description": (
                                     "Python code to run. The snippet is ephemeral and is not saved across tool calls."
                                 ),
+                                "maxLength": _LOCAL_ANALYZER_MAX_CODE_BYTES,
                             },
                         },
                         "required": ["code"],
+                        "additionalProperties": False,
                     },
                 },
             }
@@ -3037,6 +3366,8 @@ class ToolAgent:
                         raise ValueError("empty Python code")
                     tree = _parse_bounded_generated_python(code)
                     compile(tree, "<python_tool_candidate>", "exec")
+                    if _generated_python_preflight_issues(tree):
+                        raise ValueError("generated Python failed semantic preflight")
                 except (SyntaxError, TypeError, ValueError, OverflowError):
                     score -= 100
                     continue
@@ -3244,20 +3575,49 @@ class ToolAgent:
         force_tool = self._forced_tool_choice_supported is not False
         tool_choice = _request_tool_choice(tools, force=force_tool)
         output_limit = max_output_tokens or self._max_output_tokens
-        payload = build_chat_payload(
-            provider=self._model.provider,
-            model=self._model.model_id,
-            messages=messages,
-            max_tokens=output_limit,
-            temperature=_LOCAL_ANALYZER_TEMPERATURE,
-            top_p=_LOCAL_ANALYZER_TOP_P,
-            top_k=_LOCAL_ANALYZER_TOP_K,
-            thinking=bool(_LOCAL_ANALYZER_ENABLE_THINKING),
-            tools=tools,
-            tool_choice=tool_choice,
-            seed=_LOCAL_ANALYZER_SEED,
-            candidates=self._adaptive_candidate_count(output_limit),
-        )
+        request_tools = json.loads(json.dumps(tools)) if tools else None
+        if request_tools and self._strict_tools_supported is False:
+            for tool in request_tools:
+                function = tool.get("function", {})
+                function.pop("strict", None)
+                parameters = function.get("parameters", {})
+                parameters.pop("additionalProperties", None)
+                for prop in parameters.get("properties", {}).values():
+                    if isinstance(prop, dict):
+                        prop.pop("maxLength", None)
+        stream_requested = _LOCAL_ANALYZER_STREAM and self._streaming_supported is not False
+        responses_api = self._model.provider == "openai-responses"
+        if responses_api:
+            payload = build_responses_payload(
+                model=self._model.model_id,
+                messages=messages,
+                max_tokens=output_limit,
+                temperature=_LOCAL_ANALYZER_TEMPERATURE,
+                top_p=_LOCAL_ANALYZER_TOP_P,
+                tools=request_tools,
+                tool_choice=tool_choice,
+                stream=stream_requested,
+            )
+        else:
+            payload = build_chat_payload(
+                provider=self._model.provider,
+                model=self._model.model_id,
+                messages=messages,
+                max_tokens=output_limit,
+                temperature=_LOCAL_ANALYZER_TEMPERATURE,
+                top_p=_LOCAL_ANALYZER_TOP_P,
+                top_k=_LOCAL_ANALYZER_TOP_K,
+                thinking=bool(_LOCAL_ANALYZER_ENABLE_THINKING),
+                tools=request_tools,
+                tool_choice=tool_choice,
+                seed=_LOCAL_ANALYZER_SEED,
+                candidates=(
+                    self._adaptive_candidate_count(output_limit)
+                    if self._candidate_count_supported is not False
+                    else 1
+                ),
+                stream=stream_requested,
+            )
         started_at = time.monotonic()
         deadline = (
             started_at + request_timeout_seconds
@@ -3287,11 +3647,16 @@ class ToolAgent:
             if deadline is not None:
                 timeout = max(0.1, deadline - time.monotonic())
             request_attempts += 1
+            endpoint = "responses" if responses_api else "chat/completions"
+            request_kwargs: dict[str, Any] = {}
+            if request_payload.get("stream"):
+                request_kwargs["stream"] = True
             return self._http_session.post(
-                f"{self._model.base_url.rstrip('/')}/chat/completions",
+                f"{self._model.base_url.rstrip('/')}/{endpoint}",
                 headers=self._headers(),
                 json=request_payload,
                 timeout=timeout,
+                **request_kwargs,
             )
 
         def retry_delay(response: requests.Response | None) -> float:
@@ -3345,24 +3710,61 @@ class ToolAgent:
 
         response = post_with_retry(payload)
         forced_tool_fallback = False
-        if (
-            isinstance(tool_choice, dict)
-            and response.status_code in {400, 404, 422}
+        attempted_downgrades: set[str] = set()
+        while (
+            response.status_code in {400, 404, 422}
             and request_attempts < self._http_max_attempts
         ):
             detail = response.text.lower()
+            fallback_payload = json.loads(json.dumps(payload))
+            downgrade = ""
             if (
-                "tool_choice" in detail
-                or "function" in detail
-                or "tool choice" in detail
+                isinstance(tool_choice, dict)
+                and "forced_tool_choice" not in attempted_downgrades
+                and (
+                    "tool_choice" in detail
+                    or "function" in detail
+                    or "tool choice" in detail
+                )
             ):
-                fallback_payload = dict(payload)
                 fallback_payload["tool_choice"] = "auto"
-                response.close()
-                response = post_with_retry(fallback_payload)
+                downgrade = "forced_tool_choice"
                 forced_tool_fallback = True
                 self._forced_tool_choice_supported = False
-        elif isinstance(tool_choice, dict) and response.status_code < 400:
+            elif "n" in fallback_payload and "candidate_count" not in attempted_downgrades and (
+                " n " in f" {detail} " or "multiple choice" in detail or "candidate" in detail
+            ):
+                fallback_payload.pop("n", None)
+                downgrade = "candidate_count"
+                self._candidate_count_supported = False
+            elif fallback_payload.get("tools") and "strict_tools" not in attempted_downgrades and (
+                "strict" in detail or "additionalproperties" in detail or "maxlength" in detail or "schema" in detail
+            ):
+                for tool in fallback_payload["tools"]:
+                    function = tool.get("function", tool)
+                    function.pop("strict", None)
+                    parameters = function.get("parameters", {})
+                    parameters.pop("additionalProperties", None)
+                    for prop in parameters.get("properties", {}).values():
+                        if isinstance(prop, dict):
+                            prop.pop("maxLength", None)
+                downgrade = "strict_tools"
+                self._strict_tools_supported = False
+            elif fallback_payload.get("stream") and "streaming" not in attempted_downgrades and "stream" in detail:
+                fallback_payload["stream"] = False
+                downgrade = "streaming"
+                self._streaming_supported = False
+            if not downgrade:
+                break
+            attempted_downgrades.add(downgrade)
+            payload = fallback_payload
+            response.close()
+            response = post_with_retry(payload)
+        if (
+            isinstance(tool_choice, dict)
+            and not forced_tool_fallback
+            and response.status_code < 400
+        ):
             self._forced_tool_choice_supported = True
         try:
             response.raise_for_status()
@@ -3381,8 +3783,40 @@ class ToolAgent:
             response.close()
             raise requests.RequestException(message)
         try:
-            payload = response.json()
-        except ValueError as exc:
+            if payload.get("stream"):
+                events: list[dict[str, Any]] = []
+                for raw_line in response.iter_lines(decode_unicode=True):
+                    if stop_requested():
+                        raise requests.RequestException("analyzer request cancelled")
+                    line = str(raw_line or "").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    event = json.loads(data)
+                    if isinstance(event, dict):
+                        events.append(event)
+                if responses_api:
+                    completed = next(
+                        (
+                            event.get("response")
+                            for event in reversed(events)
+                            if isinstance(event.get("response"), dict)
+                        ),
+                        None,
+                    )
+                    if completed is None:
+                        raise ValueError("Responses stream omitted its final response")
+                    payload = normalize_responses_response(completed)
+                else:
+                    payload = merge_chat_completion_stream(events)
+                self._streaming_supported = True
+            else:
+                payload = response.json()
+                if responses_api:
+                    payload = normalize_responses_response(payload)
+        except (ValueError, json.JSONDecodeError) as exc:
             response.close()
             raise requests.RequestException("server returned invalid JSON") from exc
         if not isinstance(payload, dict):
@@ -3771,6 +4205,8 @@ class ToolAgent:
             tree = _parse_bounded_generated_python(code)
             compile(tree, "<python_tool>", "exec")
             preflight_issues = _generated_python_preflight_issues(tree)
+            # Only the first literal action is checked against the current state;
+            # later calls execute after the environment may change valid_actions.
             for static_actions in _static_candidate_action_arguments(tree)[:1]:
                 try:
                     self._normalize_python_actions(static_actions)
@@ -4648,7 +5084,12 @@ class ToolAgent:
                     if yielded_control_reason is not None:
                         break
                     followup_prefix = "No action was executed. "
-                    if tool_call_markup_in_text:
+                    if result.finish_reason == "length":
+                        followup_prefix = (
+                            "The previous generation was truncated by the output limit. "
+                            "Re-emit the complete tool call from the beginning; do not send only a suffix. "
+                        )
+                    elif tool_call_markup_in_text:
                         followup_prefix = (
                             "Tool markup appeared as text and was not executable. "
                         )
@@ -4817,11 +5258,18 @@ class ToolAgent:
                                     response_fallback_messages
                                 )
                                 response_fallback_messages = []
-                            repair_instruction = (
-                                "Repair policy: address the structured diagnostic "
-                                "directly and emit a materially different bounded "
-                                "program."
-                            )
+                            if result.finish_reason == "length" and argument_error:
+                                repair_instruction = (
+                                    "The tool arguments were truncated by the output limit. "
+                                    "Re-emit one complete Python tool call from the beginning; "
+                                    "do not continue with only the missing suffix."
+                                )
+                            else:
+                                repair_instruction = (
+                                    "Repair policy: address the structured diagnostic "
+                                    "directly and emit a materially different bounded "
+                                    "program."
+                                )
                             if repeated >= 2:
                                 repair_instruction += (
                                     " The same failure repeated; change approach "

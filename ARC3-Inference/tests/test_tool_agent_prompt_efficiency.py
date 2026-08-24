@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -21,11 +21,12 @@ from inference.agent.tool_agent import (
 
 
 class _Response:
-    def __init__(self, status_code: int, text: str, payload: dict) -> None:
+    def __init__(self, status_code: int, text: str, payload: dict, lines: list[str] | None = None) -> None:
         self.status_code = status_code
         self.text = text
         self._payload = payload
         self.closed = False
+        self._lines = lines or []
 
     def close(self) -> None:
         self.closed = True
@@ -36,6 +37,10 @@ class _Response:
 
     def json(self) -> dict:
         return self._payload
+
+    def iter_lines(self, decode_unicode: bool = False):
+        del decode_unicode
+        return iter(self._lines)
 
 
 class ToolAgentPromptEfficiencyTests(unittest.TestCase):
@@ -62,6 +67,10 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
             _PYTHON_TOOL_DESCRIPTION,
         )
         self.assertLess(_estimate_tokens(tools), 500)
+        self.assertTrue(tools[0]["function"]["strict"])
+        parameters = tools[0]["function"]["parameters"]
+        self.assertFalse(parameters["additionalProperties"])
+        self.assertGreater(parameters["properties"]["code"]["maxLength"], 0)
 
     def test_dynamic_turn_prompt_does_not_repeat_static_api_guidance(self) -> None:
         agent = ToolAgent(model="unit-test-model")
@@ -248,6 +257,83 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
         self.assertEqual(payload["max_tokens"], 321)
         self.assertEqual(result.request_attempts, 1)
         self.assertFalse(result.forced_tool_fallback)
+
+    def test_chat_completion_downgrades_rejected_strict_schema(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._http_session.post = Mock(
+            side_effect=[
+                _Response(400, "strict schema unsupported", {}),
+                _Response(200, "", {"choices": [{"message": {"content": "ok"}}]}),
+            ]
+        )
+        tools = agent._tools(Path("unused/tool_runtime_state.json"))
+
+        result = agent._chat_completion([{"role": "user", "content": "go"}], tools=tools)
+
+        fallback_tool = agent._http_session.post.call_args_list[1].kwargs["json"]["tools"][0]["function"]
+        self.assertEqual(result.message["content"], "ok")
+        self.assertNotIn("strict", fallback_tool)
+        self.assertNotIn("additionalProperties", fallback_tool["parameters"])
+        self.assertFalse(agent._strict_tools_supported)
+
+    def test_chat_completion_uses_responses_api(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="openai-responses",
+            base_url="https://api.openai.test/v1",
+        )
+        agent._http_session.post = Mock(
+            return_value=_Response(
+                200,
+                "",
+                {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call-1",
+                            "name": "python",
+                            "arguments": '{"code":"result=1"}',
+                        }
+                    ],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            )
+        )
+        tools = agent._tools(Path("unused/tool_runtime_state.json"))
+
+        result = agent._chat_completion([{"role": "user", "content": "go"}], tools=tools)
+
+        call = agent._http_session.post.call_args
+        self.assertEqual(call.args[0], "https://api.openai.test/v1/responses")
+        self.assertIn("input", call.kwargs["json"])
+        self.assertNotIn("messages", call.kwargs["json"])
+        self.assertEqual(result.message["tool_calls"][0]["function"]["name"], "python")
+        self.assertEqual(result.usage["prompt_tokens"], 10)
+
+    def test_chat_completion_assembles_streamed_tool_call(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        response = _Response(
+            200,
+            "",
+            {},
+            lines=[
+                'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"python","arguments":"{\\\"code\\\":"}}]}}]}',
+                'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\\"result=1\\\"}"}}]},"finish_reason":"tool_calls"}]}',
+                "data: [DONE]",
+            ],
+        )
+        agent._http_session.post = Mock(return_value=response)
+        tools = [{"type": "function", "function": {"name": "python"}}]
+
+        with patch("inference.agent.tool_agent._LOCAL_ANALYZER_STREAM", True):
+            result = agent._chat_completion([{"role": "user", "content": "go"}], tools=tools)
+
+        self.assertTrue(agent._http_session.post.call_args.kwargs["stream"])
+        self.assertEqual(
+            result.message["tool_calls"][0]["function"]["arguments"],
+            '{"code":"result=1"}',
+        )
+        self.assertTrue(agent._streaming_supported)
 
     def test_successful_forced_choice_marks_endpoint_supported(self) -> None:
         agent = ToolAgent(model="unit-test-model")
