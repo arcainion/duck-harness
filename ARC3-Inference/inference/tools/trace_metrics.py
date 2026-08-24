@@ -44,6 +44,7 @@ def summarize_event_file(path: Path) -> dict[str, Any]:
     no_ops = 0
     repeated_no_ops = 0
     rewarding_actions = 0
+    decision_context_actions = 0
     multi_frame_actions = 0
     transient_animation_actions = 0
     loop_interventions = 0
@@ -112,6 +113,7 @@ def summarize_event_file(path: Path) -> dict[str, Any]:
         no_ops += int(no_op)
         repeated_no_ops += int(no_op and previous_no_op and action == previous_action)
         rewarding_actions += int(float(event.get("reward") or 0.0) > 0.0)
+        decision_context_actions += int(bool(event.get("decision_context_changed")))
         animation = event.get("animation")
         if isinstance(animation, dict):
             multi_frame_actions += int(
@@ -176,6 +178,7 @@ def summarize_event_file(path: Path) -> dict[str, Any]:
         "no_op_rate": no_ops / actions if actions else 0.0,
         "repeated_no_ops": repeated_no_ops,
         "rewarding_actions": rewarding_actions,
+        "decision_context_actions": decision_context_actions,
         "rewarding_action_rate": rewarding_actions / actions if actions else 0.0,
         "multi_frame_actions": multi_frame_actions,
         "multi_frame_action_rate": multi_frame_actions / actions if actions else 0.0,
@@ -245,6 +248,7 @@ def _combine(items: list[dict[str, Any]]) -> dict[str, Any]:
             "no_op_actions",
             "repeated_no_ops",
             "rewarding_actions",
+            "decision_context_actions",
             "multi_frame_actions",
             "transient_animation_actions",
             "unique_states_observed",

@@ -28,6 +28,7 @@ class TrialKnowledgeStore:
         self._lock = threading.RLock()
         self._transitions: dict[str, deque[dict[str, Any]]] = {}
         self._lessons: dict[str, deque[dict[str, Any]]] = {}
+        self._revision = 0
         self._persistence_path: Path | None = None
         if persistence_path is not None:
             self.configure_path(persistence_path)
@@ -82,6 +83,12 @@ class TrialKnowledgeStore:
                     ],
                     maxlen=self._lesson_limit,
                 )
+            self._revision += 1
+
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
 
     def _persist_locked(self) -> None:
         path = self._persistence_path
@@ -220,6 +227,7 @@ class TrialKnowledgeStore:
                 "level_completed",
                 "run_complete",
                 "board_changed",
+                "decision_context_changed",
                 "reward",
                 "game_over",
                 "state",
@@ -237,10 +245,12 @@ class TrialKnowledgeStore:
             self._transitions.setdefault(
                 game_id, deque(maxlen=self._transition_limit)
             ).append(record)
+            self._revision += 1
             if record.get("level_completed") or record.get("run_complete"):
                 plan = strategy or {}
                 lesson = {
                     "pass_index": record["pass_index"],
+                    "evidence_id": record["evidence_id"],
                     "level": record.get("level"),
                     "state_id": record.get("before_state_id"),
                     "action": record.get("action_display"),
@@ -256,10 +266,27 @@ class TrialKnowledgeStore:
                     lessons.append(lesson)
             self._persist_locked()
 
-    def snapshot(self, game_id: str, *, state_id: str = "") -> dict[str, Any]:
+    def snapshot(
+        self,
+        game_id: str,
+        *,
+        state_id: str = "",
+        exclude_evidence_id: str = "",
+    ) -> dict[str, Any]:
         with self._lock:
             transitions = list(self._transitions.get(game_id, ()))
             lessons = list(self._lessons.get(game_id, ()))
+        if exclude_evidence_id:
+            transitions = [
+                item
+                for item in transitions
+                if str(item.get("evidence_id") or "") != exclude_evidence_id
+            ]
+            lessons = [
+                item
+                for item in lessons
+                if str(item.get("evidence_id") or "") != exclude_evidence_id
+            ]
         local = [
             item
             for item in transitions

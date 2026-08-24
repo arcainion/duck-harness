@@ -849,6 +849,7 @@ def _transitions(
         after_id = frame_fingerprint(entry.frame)
         behavioral_before = _behavioral_fingerprint(before, masked_cells)
         behavioral_after = _behavioral_fingerprint(entry.frame, masked_cells)
+        grid_changed = before.grid != entry.frame.grid
         object_before = _object_state_id(before)
         object_after = _object_state_id(entry.frame)
         animation = dict(entry.animation)
@@ -881,12 +882,20 @@ def _transitions(
                 "behavioral_after_state_id": behavioral_after,
                 "object_before_state_id": object_before,
                 "object_after_state_id": object_after,
-                "board_changed": before_id != after_id,
+                "valid_actions_before": [
+                    normalize_action_key(value) for value in before.valid_actions
+                ],
+                "valid_actions_after": [
+                    normalize_action_key(value) for value in entry.frame.valid_actions
+                ],
+                "board_changed": grid_changed,
+                "decision_context_changed": before_id != after_id and not grid_changed,
                 "behavioral_changed": behavioral_before != behavioral_after
                 or transient_effect,
                 "transient_effect": transient_effect,
                 "animation": animation,
                 "outcome_class": outcome,
+                "reward": float(entry.reward),
                 "level_before": before.level,
                 "level_after": entry.frame.level,
             }
@@ -1152,7 +1161,9 @@ def _nonstationary_actions(
 ) -> list[dict[str, Any]]:
     """Detect recent outcome regime changes using independent observations."""
     observations: dict[str, list[str]] = {}
-    for item in _independent_transition_samples(transitions):
+    # Change points are temporal, so preserve chronological observations here.
+    # Provenance collapsing is still used by ranking and calibrated models.
+    for item in transitions:
         if not _matches_current_state(
             item,
             current_behavioral_id,
@@ -1223,10 +1234,20 @@ def _regime_adapted_transition_samples(
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item in relevant:
         grouped.setdefault(str(item["action_family"]), []).append(item)
+    chronological: dict[str, list[dict[str, Any]]] = {}
+    for item in transitions:
+        if _matches_current_state(
+            item,
+            current_behavioral_id,
+            current_state_id,
+            current_object_state_id,
+        ):
+            chronological.setdefault(str(item["action_family"]), []).append(item)
     adapted = []
     for family, samples in grouped.items():
         if family in shifted_families:
-            samples = samples[len(samples) // 2 :]
+            regime_samples = chronological.get(family, samples)
+            samples = regime_samples[len(regime_samples) // 2 :]
         adapted.extend(samples)
     return adapted, shifts
 
@@ -1368,7 +1389,13 @@ def _rank_actions(
         decisive_harm = not parameterized and harmful_evidence_is_decisive(
             failures, trials
         )
-        if parameterized and progress:
+        if family == "RESET":
+            decision_value = min(decision_value, config.noop_utility)
+            priority, reason = (
+                6,
+                "reserved for explicit cycle or stagnation recovery",
+            )
+        elif parameterized and progress:
             priority, reason = (
                 0,
                 "confirmed progress at a coordinate; continue coordinate search",
@@ -1586,6 +1613,7 @@ def build_experience_snapshot(
         item["object_before_state_id"] = str(item.get("object_before_state_id") or "")
         item["object_after_state_id"] = str(item.get("object_after_state_id") or "")
         item["board_changed"] = bool(item.get("board_changed"))
+        item["decision_context_changed"] = bool(item.get("decision_context_changed"))
         item["behavioral_changed"] = (
             item["behavioral_before_state_id"] != item["behavioral_after_state_id"]
         )
@@ -1884,6 +1912,7 @@ def transition_metadata(
         HistoryEntry(
             action=action,
             frame=after,
+            reward=float(reward),
             animation=dict(animation or {}),
             outcome_class_override=(
                 "terminal_failure"
@@ -1931,6 +1960,7 @@ def transition_metadata(
         "behavioral_after_state_id": transition["behavioral_after_state_id"],
         "object_before_state_id": transition["object_before_state_id"],
         "object_after_state_id": transition["object_after_state_id"],
+        "decision_context_changed": transition["decision_context_changed"],
         "novel_state": after_id not in known_states,
         "outcome_class": outcome_class,
         "reward": float(reward),

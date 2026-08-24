@@ -446,7 +446,7 @@ class _HarnessGameSession:
 
     @property
     def action_count(self) -> int:
-        run = self.game.game_run
+        run = getattr(self.game, "game_run", None)
         return len(run.history) if run is not None else 0
 
     def runtime_limit_reached(self) -> bool:
@@ -513,6 +513,7 @@ class _HarnessGameSession:
         self.write_viewer_payload()
         try:
             retry_analysis_step: int | None = None
+            controller_only_reason: str | None = None
             consecutive_failures = 0
             while not self.should_stop():
                 if (
@@ -521,6 +522,15 @@ class _HarnessGameSession:
                 ):
                     self._execute_auto_reset()
                     continue
+
+                if controller_only_reason is not None:
+                    if self._execute_controller_fallback(controller_only_reason):
+                        continue
+                    run.solver_note = (
+                        f"stopped: {controller_only_reason}; "
+                        f"tokens={_analyzer_reported_tokens(self.analyzer)}"
+                    )
+                    break
 
                 if retry_analysis_step is None:
                     self.analysis_step += 1
@@ -587,13 +597,8 @@ class _HarnessGameSession:
                 consecutive_failures = 0
                 if getattr(result, "yielded_control", False):
                     if getattr(result, "yield_reason", None) == "game_token_budget":
-                        if self._execute_controller_fallback("game_token_budget"):
-                            continue
-                        run.solver_note = (
-                            "stopped: game_token_budget; "
-                            f"tokens={_analyzer_reported_tokens(self.analyzer)}"
-                        )
-                        break
+                        controller_only_reason = "game_token_budget"
+                        continue
                     retry_analysis_step = analysis_step
                     continue
                 if not result.step_executed:
@@ -617,12 +622,7 @@ class _HarnessGameSession:
         """Execute one empirically safe action when model control is unavailable."""
         if not self.controller_config.outcome_aware or self.should_stop():
             return False
-        snapshot = build_experience_snapshot(
-            self.history_entries,
-            self.current_frame(),
-            _engine_action_names(self.game),
-            self.controller_config,
-        )
+        snapshot = self._controller_snapshot()
         candidates: list[dict[str, Any]] = []
         mouse_coordinates = list(
             (snapshot.get("mouse_search") or {}).get("recommended_coordinates") or ()
@@ -631,6 +631,8 @@ class _HarnessGameSession:
             if not isinstance(ranked, dict) or ranked.get("harm_decisive"):
                 continue
             action_name = str(ranked.get("action") or "")
+            if action_name == "RESET":
+                continue
             if action_name == "MOUSE":
                 if not mouse_coordinates:
                     continue
@@ -644,6 +646,12 @@ class _HarnessGameSession:
                 )
             elif action_name:
                 candidates.append({"action": action_name})
+        reset_recommended = any(
+            isinstance(item, dict) and item.get("strategy") == "reset_episode"
+            for item in snapshot.get("recovery_portfolio") or ()
+        )
+        if reset_recommended:
+            candidates.append({"action": "RESET"})
         for candidate in candidates:
             payload = self.step_env(
                 {
@@ -654,6 +662,36 @@ class _HarnessGameSession:
             if payload.get("executed"):
                 return True
         return False
+
+    def _controller_snapshot(self) -> dict[str, Any]:
+        """Build host control state with independent prior-pass evidence."""
+        external_transitions: list[dict[str, Any]] = []
+        run = getattr(self.game, "game_run", None)
+        solver = getattr(self, "solver", None)
+        store = getattr(solver, "_knowledge_store", None)
+        current_evidence_id = (
+            f"{getattr(solver, '_knowledge_run_id', '')}:pass="
+            f"{getattr(self, 'pass_index', 0)}"
+        )
+        if store is not None and run is not None:
+            knowledge = store.snapshot(
+                str(run.game_id),
+                state_id=frame_fingerprint(self.current_frame()),
+                exclude_evidence_id=current_evidence_id,
+            )
+            external_transitions = [
+                dict(item)
+                for item in knowledge.get("transition_records") or ()
+                if isinstance(item, dict)
+            ]
+        return build_experience_snapshot(
+            self.history_entries,
+            self.current_frame(),
+            _engine_action_names(self.game),
+            self.controller_config,
+            external_transitions=external_transitions,
+            evidence_id=current_evidence_id,
+        )
 
     def _finish_if_needed(self) -> None:
         run = self.game.game_run
@@ -749,6 +787,7 @@ class _HarnessGameSession:
                 "action_display": payload.get("action_display"),
                 "reward": payload.get("reward"),
                 "board_changed": payload.get("board_changed"),
+                "decision_context_changed": payload.get("decision_context_changed"),
                 "done": payload.get("done"),
                 "level_completed": payload.get("level_completed"),
                 "game_over": payload.get("game_over"),
@@ -950,12 +989,7 @@ class _HarnessGameSession:
         if error is not None or requested_actions is None:
             return self._error_payload(error or "Could not parse action request.")
         if self.controller_config.outcome_aware:
-            snapshot = build_experience_snapshot(
-                self.history_entries,
-                self.current_frame(),
-                _engine_action_names(self.game),
-                self.controller_config,
-            )
+            snapshot = self._controller_snapshot()
             action_budget = max(1, int(snapshot.get("action_budget") or 1))
             if len(requested_actions) > action_budget:
                 phase = str(snapshot.get("phase") or "explore")
@@ -993,12 +1027,7 @@ class _HarnessGameSession:
 
         for batch_index, action in enumerate(requested_actions, start=1):
             if batch_index > 1 and self.controller_config.outcome_aware:
-                current_snapshot = build_experience_snapshot(
-                    self.history_entries,
-                    self.current_frame(),
-                    _engine_action_names(self.game),
-                    self.controller_config,
-                )
+                current_snapshot = self._controller_snapshot()
                 current_budget = max(1, int(current_snapshot.get("action_budget") or 1))
                 if batch_index > current_budget:
                     stop_reason = "phase_action_budget"
@@ -1037,7 +1066,11 @@ class _HarnessGameSession:
                     guard_reason = cross_trial_harm
                     guard_reason_code = "known_harmful_cross_trial"
             if guard_reason is not None:
-                loop_guard = guard_reason_code != "known_harmful_cross_trial"
+                harm_guard = guard_reason_code in {
+                    "known_harmful_local",
+                    "known_harmful_cross_trial",
+                }
+                loop_guard = not harm_guard
                 stop_reason = "loop_guard" if loop_guard else "harm_guard"
                 stop_detail = guard_reason
                 current = self.current_frame()
@@ -1145,7 +1178,11 @@ class _HarnessGameSession:
             {
                 key: item.get(key)
                 for key in (
+                    "executed",
                     "action_num",
+                    "level",
+                    "score",
+                    "state",
                     "action_display",
                     "before_state_id",
                     "after_state_id",
@@ -1153,7 +1190,11 @@ class _HarnessGameSession:
                     "behavioral_after_state_id",
                     "object_before_state_id",
                     "object_after_state_id",
+                    "state_context_version",
+                    "valid_actions_before",
+                    "valid_actions_after",
                     "board_changed",
+                    "decision_context_changed",
                     "novel_state",
                     "outcome_class",
                     "reward",
@@ -1257,10 +1298,14 @@ class _HarnessGameSession:
         raw_state = new_state.raw.state
         animation = _summarize_animation(previous_grid, new_state)
         current_frame = _decision_frame(self.game, new_state, step=self.action_count)
+        reward = float(completed - previous_completed) / max(
+            1.0, float(self.game.number_of_levels)
+        )
         self.history_entries.append(
             HistoryEntry(
                 action=action_display,
                 frame=current_frame,
+                reward=reward,
                 animation=animation,
                 outcome_class_override=(
                     "terminal_failure"
@@ -1271,9 +1316,6 @@ class _HarnessGameSession:
         )
         self.write_runtime_state()
 
-        reward = float(completed - previous_completed) / max(
-            1.0, float(self.game.number_of_levels)
-        )
         board_changed = previous_grid != _grid_from_state(new_state)
         level_completed = bool(
             new_state.just_won_level and raw_state != arcengine.GameState.WIN

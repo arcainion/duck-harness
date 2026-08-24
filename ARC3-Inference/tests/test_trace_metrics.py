@@ -16,6 +16,7 @@ class TraceMetricsTests(TestCase):
                 "type": "action",
                 "action_display": "LEFT",
                 "board_changed": False,
+                "decision_context_changed": True,
                 "reward": 0,
                 "before_state_id": "initial",
                 "after_state_id": "a",
@@ -93,6 +94,7 @@ class TraceMetricsTests(TestCase):
         self.assertEqual(summary["no_op_actions"], 2)
         self.assertEqual(summary["repeated_no_ops"], 1)
         self.assertEqual(summary["rewarding_actions"], 1)
+        self.assertEqual(summary["decision_context_actions"], 1)
         self.assertEqual(summary["multi_frame_actions"], 1)
         self.assertEqual(summary["transient_animation_actions"], 1)
         self.assertEqual(summary["unique_states_observed"], 3)

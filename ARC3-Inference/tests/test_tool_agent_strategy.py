@@ -164,6 +164,54 @@ class ToolAgentStrategyTests(TestCase):
         self.assertEqual(snapshot["progress_lessons"][0]["pass_index"], 1)
         self.assertNotIn("grid", str(snapshot).lower())
 
+    def test_cross_trial_snapshot_excludes_the_live_evidence_source(self) -> None:
+        store = TrialKnowledgeStore()
+        for evidence_id, action in (("prior-pass", "LEFT"), ("live-pass", "RIGHT")):
+            store.observe(
+                "game",
+                {
+                    "executed": True,
+                    "before_state_id": "state-a",
+                    "after_state_id": f"after-{action}",
+                    "action_display": action,
+                    "outcome_class": "novel",
+                    "level_completed": evidence_id == "live-pass",
+                },
+                evidence_id=evidence_id,
+            )
+
+        snapshot = store.snapshot("game", exclude_evidence_id="live-pass")
+
+        self.assertEqual(snapshot["observations"], 1)
+        self.assertEqual(snapshot["transition_records"][0]["action_display"], "LEFT")
+        self.assertEqual(snapshot["progress_lessons"], [])
+
+    def test_experience_cache_invalidates_when_shared_knowledge_changes(self) -> None:
+        store = TrialKnowledgeStore()
+        agent = self._agent()
+        agent._knowledge_store = store
+        agent._knowledge_game_id = "game"
+        agent._knowledge_evidence_id = "live-pass"
+        frame = Frame(grid=((1,),), step=0, level=1)
+        history = [HistoryEntry(action="", frame=frame)]
+        first = agent._cached_experience_snapshot(frame, history, ["RIGHT"])
+
+        store.observe(
+            "game",
+            {
+                "executed": True,
+                "before_state_id": "prior-state",
+                "after_state_id": "prior-result",
+                "action_display": "RIGHT",
+                "outcome_class": "novel",
+            },
+            evidence_id="prior-pass",
+        )
+        second = agent._cached_experience_snapshot(frame, history, ["RIGHT"])
+
+        self.assertIsNot(first, second)
+        self.assertEqual(second["cross_trial"]["prior_trials"], 1)
+
     def test_cross_trial_store_resumes_from_atomic_json(self) -> None:
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "knowledge.json"
@@ -611,6 +659,180 @@ class ToolAgentStrategyTests(TestCase):
 
         self.assertLess(state_b_score, 0)
         self.assertGreater(state_a_score, 0)
+
+    def test_candidate_scoring_penalizes_untriggered_reset(self) -> None:
+        agent = self._agent()
+        agent._current_experience_snapshot = {
+            "action_budget": 1,
+            "ranked_actions": [
+                {"action": "RESET", "priority": 6},
+                {"action": "RIGHT", "priority": 1},
+            ],
+            "recovery_portfolio": [],
+        }
+
+        reset_score = agent._semantic_action_score([[{"action": "RESET"}]])
+        right_score = agent._semantic_action_score([[{"action": "RIGHT"}]])
+
+        self.assertLess(reset_score, right_score)
+
+    def test_candidate_scoring_does_not_double_count_exact_and_object_relations(
+        self,
+    ) -> None:
+        agent = self._agent()
+        exact = {
+            "cause": "RIGHT",
+            "effect": "outcome:level_progress",
+            "conditions": "state:stable-a",
+            "confidence": 0.8,
+        }
+        abstract = {
+            "cause": "RIGHT",
+            "effect": "outcome:level_progress",
+            "conditions": "object_state:objects-a",
+            "confidence": 0.8,
+        }
+        agent._current_experience_snapshot = {
+            "state_id": "exact-a",
+            "behavioral_state_id": "stable-a",
+            "object_state_id": "objects-a",
+            "action_budget": 1,
+            "causal_model": {"relations": [exact, abstract]},
+        }
+        combined_score = agent._semantic_action_score([[{"action": "RIGHT"}]])
+        agent._current_experience_snapshot["causal_model"] = {"relations": [exact]}
+        exact_score = agent._semantic_action_score([[{"action": "RIGHT"}]])
+
+        self.assertEqual(combined_score, exact_score)
+
+    def test_empirical_model_subsumes_duplicate_cross_trial_and_grounded_evidence(
+        self,
+    ) -> None:
+        agent = self._agent()
+        base_snapshot = {
+            "state_id": "state-a",
+            "behavioral_state_id": "stable-a",
+            "action_budget": 1,
+            "transition_models_here": [
+                {
+                    "action": "RIGHT",
+                    "predicted_outcome": "level_progress",
+                    "confidence": 1.0,
+                }
+            ],
+            "causal_model": {
+                "relations": [
+                    {
+                        "cause": "RIGHT",
+                        "effect": "outcome:level_progress",
+                        "conditions": "state:stable-a",
+                        "confidence": 1.0,
+                        "evidence": "automatically grounded from executed transition",
+                    }
+                ]
+            },
+        }
+        agent._current_experience_snapshot = {
+            **base_snapshot,
+            "cross_trial": {
+                "state_action_evidence": [
+                    {
+                        "action": "RIGHT",
+                        "outcomes": {"level_progress": 1},
+                        "trials": 1,
+                    }
+                ]
+            },
+        }
+        redundant_score = agent._semantic_action_score([[{"action": "RIGHT"}]])
+        agent._current_experience_snapshot = dict(base_snapshot)
+        model_only_score = agent._semantic_action_score([[{"action": "RIGHT"}]])
+
+        self.assertEqual(redundant_score, model_only_score)
+
+    def test_object_conditioned_causal_relation_scores_equivalent_state(self) -> None:
+        agent = self._agent()
+        agent._update_causal_model_from_actions(
+            [
+                {
+                    "executed": True,
+                    "action_display": "RIGHT",
+                    "outcome_class": "level_progress",
+                    "before_state_id": "translated-state-a",
+                    "object_before_state_id": "shared-object-layout",
+                }
+            ]
+        )
+        causal = agent._strategy_memory["causal_model"]
+        self.assertIn(
+            "object_state:shared-object-layout",
+            {relation["conditions"] for relation in causal["relations"]},
+        )
+        agent._current_experience_snapshot = {
+            "state_id": "translated-state-b",
+            "behavioral_state_id": "translated-stable-b",
+            "object_state_id": "shared-object-layout",
+            "action_budget": 1,
+            "causal_model": causal,
+        }
+
+        equivalent_score = agent._semantic_action_score([[{"action": "RIGHT"}]])
+        agent._current_experience_snapshot["object_state_id"] = "different-layout"
+        unrelated_score = agent._semantic_action_score([[{"action": "RIGHT"}]])
+
+        self.assertGreater(equivalent_score, unrelated_score)
+
+    def test_compact_action_result_preserves_object_transition_identity(self) -> None:
+        compact = self._agent()._compact_action_result(
+            {
+                "executed": True,
+                "object_before_state_id": "object-a",
+                "object_after_state_id": "object-b",
+                "decision_context_changed": True,
+            }
+        )
+
+        self.assertEqual(compact["object_before_state_id"], "object-a")
+        self.assertEqual(compact["object_after_state_id"], "object-b")
+        self.assertTrue(compact["decision_context_changed"])
+
+    def test_batch_results_expand_every_engine_transition_for_learning(self) -> None:
+        agent = self._agent()
+        observations = agent._engine_transition_observations(
+            [
+                {
+                    "executed": True,
+                    "action_display": "RIGHT",
+                    "steps": [
+                        {
+                            "action_num": 1,
+                            "action_display": "LEFT",
+                            "before_state_id": "state-a",
+                            "outcome_class": "novel",
+                        },
+                        {
+                            "action_num": 2,
+                            "action_display": "RIGHT",
+                            "before_state_id": "state-b",
+                            "outcome_class": "level_progress",
+                        },
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            [item["action_display"] for item in observations], ["LEFT", "RIGHT"]
+        )
+        self.assertTrue(all(item["executed"] for item in observations))
+        agent._update_causal_model_from_actions(observations)
+        self.assertEqual(
+            {
+                relation["cause"]
+                for relation in agent._strategy_memory["causal_model"]["relations"]
+            },
+            {"LEFT", "RIGHT"},
+        )
 
     def test_prediction_is_evaluated_once_then_consumed(self) -> None:
         agent = self._agent()

@@ -51,6 +51,7 @@ class Frame:
 class HistoryEntry:
     action: str
     frame: Frame
+    reward: float = 0.0
     animation: dict[str, Any] = field(default_factory=dict)
     outcome_class_override: str = ""
 
@@ -157,6 +158,7 @@ def history_entry_from_payload(payload: Any) -> HistoryEntry | None:
     return HistoryEntry(
         action=str(payload.get("action", "")).strip(),
         frame=frame,
+        reward=float(payload.get("reward") or 0.0),
         animation=dict(raw_animation) if isinstance(raw_animation, dict) else {},
         outcome_class_override=str(payload.get("outcome_class_override") or "").strip(),
     )
@@ -166,6 +168,7 @@ def history_entry_to_payload(entry: HistoryEntry) -> dict[str, Any]:
     return {
         "action": entry.action,
         "frame": frame_to_payload(entry.frame),
+        "reward": float(entry.reward),
         "animation": dict(entry.animation),
         "outcome_class_override": entry.outcome_class_override,
     }

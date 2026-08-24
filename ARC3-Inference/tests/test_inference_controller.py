@@ -54,6 +54,28 @@ class InferenceControllerTests(TestCase):
             frame_fingerprint(base), frame_fingerprint(same_grid_different_state)
         )
 
+    def test_context_only_transition_is_not_reported_as_changed_pixels(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        before = Frame(grid=((1,),), step=0, level=1, valid_actions=("LEFT",))
+        after = Frame(grid=((1,),), step=1, level=1, valid_actions=("RIGHT",))
+
+        snapshot = build_experience_snapshot(
+            [
+                HistoryEntry(action="", frame=before),
+                HistoryEntry(action="SPACE", frame=after),
+            ],
+            after,
+            ["RIGHT"],
+            config,
+        )
+
+        transition = snapshot["recent_transitions"][0]
+        self.assertFalse(transition["board_changed"])
+        self.assertTrue(transition["decision_context_changed"])
+        self.assertEqual(transition["outcome_class"], "novel")
+        self.assertEqual(snapshot["no_op_streak"], 1)
+        self.assertEqual(snapshot["behavioral_no_op_streak"], 0)
+
     def test_object_state_tracks_translation_without_structural_change(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
         before = Frame(grid=((1, 1, 0), (0, 0, 0), (0, 0, 0)), step=0, level=1)
@@ -186,10 +208,68 @@ class InferenceControllerTests(TestCase):
         self.assertTrue(model["regime_adapted"])
         self.assertEqual(model["predicted_outcome"], "novel")
 
+    def test_within_pass_regime_change_uses_recent_chronological_samples(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        current = _frame(1, step=0)
+        current_id = frame_fingerprint(current)
+        external = [
+            {
+                "before_state_id": current_id,
+                "after_state_id": f"state-{index}",
+                "action_display": "RIGHT",
+                "outcome_class": outcome,
+                "evidence_id": "same-live-pass",
+            }
+            for index, outcome in enumerate(
+                ("exact_noop", "exact_noop", "novel", "novel")
+            )
+        ]
+
+        snapshot = build_experience_snapshot(
+            [], current, ["RIGHT"], config, external_transitions=external
+        )
+
+        self.assertEqual(
+            snapshot["nonstationary_actions"][0]["recent_outcome"], "novel"
+        )
+        ranking = snapshot["ranked_actions"][0]
+        self.assertTrue(ranking["regime_adapted"])
+        self.assertEqual(ranking["trials"], 2)
+        self.assertEqual(ranking["novel"], 2)
+
     def test_harm_veto_requires_a_strict_majority_when_evidence_conflicts(self) -> None:
         self.assertTrue(harmful_evidence_is_decisive(1, 1))
         self.assertFalse(harmful_evidence_is_decisive(1, 2))
         self.assertTrue(harmful_evidence_is_decisive(2, 3))
+
+    def test_reset_is_reserved_below_healthy_exploration_actions(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        current = _frame(1, step=0)
+
+        snapshot = build_experience_snapshot([], current, ["RESET", "RIGHT"], config)
+
+        self.assertEqual(snapshot["ranked_actions"][0]["action"], "RIGHT")
+        reset = next(
+            item for item in snapshot["ranked_actions"] if item["action"] == "RESET"
+        )
+        self.assertEqual(reset["priority"], 6)
+        self.assertIn("reserved", reset["reason"])
+
+    def test_local_history_reward_reaches_action_value_model(self) -> None:
+        config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)
+        start = _frame(1, step=0)
+        changed = _frame(2, step=1)
+        history = [
+            HistoryEntry(action="", frame=start),
+            HistoryEntry(action="RIGHT", frame=changed, reward=0.5),
+            HistoryEntry(action="LEFT", frame=start),
+        ]
+
+        snapshot = build_experience_snapshot(history, start, ["RIGHT"], config)
+
+        ranking = snapshot["ranked_actions"][0]
+        self.assertEqual(ranking["mean_reward"], 0.5)
+        self.assertGreater(ranking["expected_value"], 0.5)
 
     def setUp(self) -> None:
         self.config = InferenceControllerConfig(
@@ -1108,6 +1188,29 @@ class InferenceControllerTests(TestCase):
 
         self.assertIsNone(invalid_first["recommended_plan"])
         self.assertIsNone(invalid_second["recommended_plan"])
+
+    def test_local_plan_respects_recorded_downstream_action_context(self) -> None:
+        config = InferenceControllerConfig(
+            enabled=True,
+            policy=OUTCOME_AWARE_POLICY,
+            plan_min_support=1,
+            plan_min_confidence=0.5,
+            volatile_min_samples=20,
+        )
+        start = Frame(grid=((1,),), step=0, level=1, valid_actions=("RIGHT",))
+        middle = Frame(grid=((2,),), step=1, level=1, valid_actions=("LEFT",))
+        progressed = Frame(grid=((3,),), step=2, level=2, valid_actions=("RIGHT",))
+        history = [
+            HistoryEntry(action="", frame=start),
+            HistoryEntry(action="RIGHT", frame=middle),
+            HistoryEntry(action="SPACE", frame=progressed),
+        ]
+
+        snapshot = build_experience_snapshot(history, start, ["RIGHT"], config)
+
+        self.assertIsNone(snapshot["recommended_plan"])
+        recent = snapshot["recent_transitions"]
+        self.assertEqual(recent[0]["valid_actions_after"], ["LEFT"])
 
     def test_terminal_transition_is_classified_as_harm_and_not_planned(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)

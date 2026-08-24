@@ -76,6 +76,30 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertEqual(_normalize_generated_python_code(value), value)
 
+    def test_recovers_unique_valid_python_from_multiple_code_fences(self) -> None:
+        value = (
+            "An invalid first attempt:\n```python\nfor\n```\n"
+            "Use this corrected program:\n```python\nresult = 2\n```"
+        )
+
+        self.assertEqual(_normalize_generated_python_code(value), "result = 2")
+
+    def test_ignores_non_python_fences_when_python_candidate_is_unique(self) -> None:
+        value = (
+            "Input shape:\n```json\n{\"rows\": 3}\n```\n"
+            "Program:\n```python\nresult = current_frame.shape\n```"
+        )
+
+        self.assertEqual(
+            _normalize_generated_python_code(value),
+            "result = current_frame.shape",
+        )
+
+    def test_recovers_tilde_fence_without_closing_newline(self) -> None:
+        value = "Use this:\n~~~python\nresult = 34~~~"
+
+        self.assertEqual(_normalize_generated_python_code(value), "result = 34")
+
     def test_does_not_extract_invalid_fenced_python(self) -> None:
         value = "Try this:\n```python\nfor\n```"
 

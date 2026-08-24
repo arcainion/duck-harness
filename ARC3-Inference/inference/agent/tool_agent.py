@@ -78,7 +78,8 @@ _TOOL_CALL_PARAMETER_RE = re.compile(
 )
 _THINK_TAG_RE = re.compile(r"</?think>", flags=re.IGNORECASE)
 _MARKDOWN_CODE_FENCE_RE = re.compile(
-    r"```(?P<language>[A-Za-z0-9_+.-]*)[ \t]*\r?\n(?P<code>.*?)\r?\n```",
+    r"(?P<fence>\x60{3,}|~{3,})(?P<language>[A-Za-z0-9_+.-]*)[ \t]*\r?\n"
+    r"(?P<code>.*?)(?:\r?\n)?(?P=fence)",
     flags=re.DOTALL,
 )
 
@@ -252,13 +253,21 @@ def _normalize_generated_python_code(value: Any) -> str:
     if raw is not None:
         return raw
 
-    matches = list(_MARKDOWN_CODE_FENCE_RE.finditer(code))
-    if len(matches) == 1:
-        match = matches[0]
-        if str(match.group("language") or "").lower() in python_languages:
-            fenced = executable(str(match.group("code") or ""))
-            if fenced is not None:
-                return fenced
+    # Models sometimes include an illustrative non-Python block alongside the
+    # program, or make one failed attempt before emitting valid Python. Recover
+    # the program when (and only when) the fenced candidates have one unique
+    # executable value. This keeps the previous no-guessing behavior for two
+    # competing valid programs while accepting standard backtick and tilde
+    # Markdown fences, with or without a newline before the closing fence.
+    fenced_candidates: list[str] = []
+    for match in _MARKDOWN_CODE_FENCE_RE.finditer(code):
+        if str(match.group("language") or "").lower() not in python_languages:
+            continue
+        fenced = executable(str(match.group("code") or ""))
+        if fenced is not None and fenced not in fenced_candidates:
+            fenced_candidates.append(fenced)
+    if len(fenced_candidates) == 1:
+        return fenced_candidates[0]
 
     xml_match = re.fullmatch(
         r"\s*<(?:python|code(?:\s+language=['\"](?:py|python|python3)['\"])?)>"
@@ -683,6 +692,7 @@ class _ExperienceSnapshotCache:
     current_frame: Frame | None
     history_entries: tuple[HistoryEntry, ...]
     valid_actions: tuple[str, ...]
+    knowledge_revision: int
     payload: dict[str, Any]
 
 
@@ -1895,11 +1905,15 @@ class ToolAgent:
         valid_actions: list[str],
     ) -> dict[str, Any]:
         action_key = tuple(valid_actions)
+        knowledge_revision = (
+            self._knowledge_store.revision if self._knowledge_store is not None else 0
+        )
         cached = self._experience_snapshot_cache
         if (
             cached is not None
             and cached.current_frame is current_frame
             and cached.valid_actions == action_key
+            and cached.knowledge_revision == knowledge_revision
             and len(cached.history_entries) == len(history_entries)
             and all(
                 cached_entry is current_entry
@@ -1912,7 +1926,10 @@ class ToolAgent:
 
         cross_trial = None
         if self._knowledge_store is not None and self._knowledge_game_id:
-            cross_trial = self._knowledge_store.snapshot(self._knowledge_game_id)
+            cross_trial = self._knowledge_store.snapshot(
+                self._knowledge_game_id,
+                exclude_evidence_id=self._knowledge_evidence_id,
+            )
         payload = build_experience_snapshot(
             history_entries,
             current_frame,
@@ -1926,6 +1943,7 @@ class ToolAgent:
             payload["cross_trial"] = self._knowledge_store.snapshot(
                 self._knowledge_game_id,
                 state_id=str(payload.get("state_id") or ""),
+                exclude_evidence_id=self._knowledge_evidence_id,
             )
         if self._strategy_memory.get("causal_model"):
             payload["causal_model"] = normalize_causal_model(
@@ -1935,6 +1953,7 @@ class ToolAgent:
             current_frame=current_frame,
             history_entries=tuple(history_entries),
             valid_actions=action_key,
+            knowledge_revision=knowledge_revision,
             payload=payload,
         )
         return payload
@@ -2164,13 +2183,10 @@ class ToolAgent:
         changed = False
         relations = causal["relations"]
         predictions = causal["predictions"]
-        for observed in action_results:
-            if not observed.get("executed"):
-                continue
-            action = normalize_action_key(observed.get("action_display") or "")
-            outcome = str(observed.get("outcome_class") or "unknown")
-            effect = f"outcome:{outcome}"
-            condition = f"state:{observed.get('behavioral_before_state_id') or observed.get('before_state_id') or 'unknown'}"
+
+        def ground_relation(
+            *, action: str, effect: str, condition: str, action_num: int
+        ) -> bool:
             matching = next(
                 (
                     relation
@@ -2187,6 +2203,11 @@ class ToolAgent:
                     for relation in relations
                     if str(relation.get("evidence") or "").startswith(
                         "automatically grounded"
+                    )
+                    and not (
+                        normalize_action_key(relation.get("cause") or "") == action
+                        and str(relation.get("effect") or "") == effect
+                        and int(relation.get("last_observed_action") or 0) == action_num
                     )
                 ]
                 if evictable:
@@ -2209,22 +2230,13 @@ class ToolAgent:
                     "confidence": 0.5,
                     "support": 0,
                     "contradictions": 0,
-                    "last_observed_action": int(observed.get("action_num") or 0),
+                    "last_observed_action": action_num,
                 }
                 relations.append(matching)
-            if matching is not None:
-                matching["support"] = int(matching.get("support") or 0) + 1
-                matching["last_observed_action"] = int(observed.get("action_num") or 0)
-                matching["confidence"] = round(
-                    (int(matching["support"]) + 1)
-                    / (
-                        int(matching["support"])
-                        + int(matching.get("contradictions") or 0)
-                        + 2
-                    ),
-                    3,
-                )
-                changed = True
+            if matching is None:
+                return False
+            matching["support"] = int(matching.get("support") or 0) + 1
+            matching["last_observed_action"] = action_num
             for relation in relations:
                 if (
                     relation is not matching
@@ -2235,7 +2247,6 @@ class ToolAgent:
                     relation["contradictions"] = (
                         int(relation.get("contradictions") or 0) + 1
                     )
-                    changed = True
             for relation in relations:
                 if (
                     normalize_action_key(relation.get("cause") or "") != action
@@ -2247,14 +2258,43 @@ class ToolAgent:
                 relation["confidence"] = round(
                     (support + 1) / (support + contradictions + 2), 3
                 )
+            return True
+
+        for observed in action_results:
+            if not observed.get("executed"):
+                continue
+            action = normalize_action_key(observed.get("action_display") or "")
+            outcome = str(observed.get("outcome_class") or "unknown")
+            effect = f"outcome:{outcome}"
+            state_condition = (
+                "state:"
+                f"{observed.get('behavioral_before_state_id') or observed.get('before_state_id') or 'unknown'}"
+            )
+            observed_conditions = [state_condition]
+            object_state_id = str(observed.get("object_before_state_id") or "")
+            if object_state_id:
+                observed_conditions.append(f"object_state:{object_state_id}")
+            action_num = int(observed.get("action_num") or 0)
+            for condition in observed_conditions:
+                changed = (
+                    ground_relation(
+                        action=action,
+                        effect=effect,
+                        condition=condition,
+                        action_num=action_num,
+                    )
+                    or changed
+                )
             for prediction in predictions:
                 prediction_conditions = str(prediction.get("conditions") or "")
                 if (
                     str(prediction.get("status") or "untested") == "untested"
                     and normalize_action_key(prediction.get("action") or "") == action
                     and (
-                        not prediction_conditions.startswith("state:")
-                        or prediction_conditions == condition
+                        not prediction_conditions.startswith(
+                            ("state:", "object_state:")
+                        )
+                        or prediction_conditions in observed_conditions
                     )
                 ):
                     expected = str(prediction.get("expected_outcome") or "")
@@ -2771,6 +2811,9 @@ class ToolAgent:
             )
             if state_id
         }
+        object_state_id = str(snapshot.get("object_state_id") or "")
+        if object_state_id:
+            current_state_conditions.add(f"object_state:{object_state_id}")
         mouse_recent = {
             (int(item["row"]), int(item["col"])): str(item.get("outcome") or "")
             for item in (snapshot.get("mouse_search") or {}).get("recent", [])
@@ -2779,6 +2822,10 @@ class ToolAgent:
         recommended_plan = snapshot.get("recommended_plan") or {}
         planned = list(recommended_plan.get("actions") or [])
         plan_confidence = float(recommended_plan.get("confidence") or 0.0)
+        reset_recommended = any(
+            isinstance(item, dict) and item.get("strategy") == "reset_episode"
+            for item in snapshot.get("recovery_portfolio") or ()
+        )
         configured_utilities = snapshot.get("outcome_utilities") or {}
         outcome_values = (
             {
@@ -2820,6 +2867,8 @@ class ToolAgent:
                 key = normalize_action_key(name)
             if key in discouraged:
                 score -= 100
+            if key == "RESET":
+                score += 60 if reset_recommended else -160
             ranking = rankings.get(action_family(key))
             if ranking is not None:
                 score += max(0, 40 - 10 * int(ranking.get("priority") or 0))
@@ -2835,7 +2884,7 @@ class ToolAgent:
                 score += round(120 * float(model.get("mean_reward") or 0.0))
                 score -= 25 * int(model.get("contradictions") or 0)
             evidence = cross_evidence.get(key)
-            if evidence is not None:
+            if evidence is not None and model is None:
                 outcomes = evidence.get("outcomes") or {}
                 trials = max(1, int(evidence.get("trials") or 1))
                 score += round(
@@ -2845,18 +2894,42 @@ class ToolAgent:
                     )
                     / trials
                 )
+            applicable_relations: dict[
+                str, tuple[tuple[int, float, int, int], dict[str, Any]]
+            ] = {}
             for relation in causal_relations:
                 if normalize_action_key(relation.get("cause") or "") != key:
                     continue
                 conditions = str(relation.get("conditions") or "")
                 if (
-                    conditions.startswith("state:")
+                    conditions.startswith(("state:", "object_state:"))
                     and conditions not in current_state_conditions
                 ):
                     continue
                 effect = str(relation.get("effect") or "")
                 if not effect.startswith("outcome:"):
                     continue
+                if model is not None and str(relation.get("evidence") or "").startswith(
+                    "automatically grounded"
+                ):
+                    continue
+                specificity = (
+                    2
+                    if conditions.startswith("state:")
+                    else 1
+                    if conditions.startswith("object_state:")
+                    else 0
+                )
+                existing = applicable_relations.get(effect)
+                relation_rank = (
+                    specificity,
+                    float(relation.get("confidence") or 0.0),
+                    -int(relation.get("contradictions") or 0),
+                    int(relation.get("support") or 0),
+                )
+                if existing is None or relation_rank > existing[0]:
+                    applicable_relations[effect] = (relation_rank, relation)
+            for effect, (_rank, relation) in applicable_relations.items():
                 causal_outcome = effect.split(":", 1)[1]
                 confidence = float(relation.get("confidence") or 0.0)
                 score += round(outcome_values.get(causal_outcome, 0) * confidence)
@@ -3265,6 +3338,7 @@ class ToolAgent:
             "state": payload.get("state"),
             "valid_actions": payload.get("valid_actions", []),
             "board_changed": bool(payload.get("board_changed")),
+            "decision_context_changed": bool(payload.get("decision_context_changed")),
             "done": bool(payload.get("done")),
             "level_completed": bool(payload.get("level_completed")),
             "game_over": bool(payload.get("game_over")),
@@ -3288,6 +3362,8 @@ class ToolAgent:
             "after_state_id",
             "behavioral_before_state_id",
             "behavioral_after_state_id",
+            "object_before_state_id",
+            "object_after_state_id",
             "novel_state",
             "outcome_class",
             "action_rank",
@@ -3348,6 +3424,25 @@ class ToolAgent:
         if payload.get("error"):
             compact["error"] = payload.get("error")
         return compact
+
+    @staticmethod
+    def _engine_transition_observations(
+        action_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Expand action-call aggregates into independently learnable steps."""
+        observations: list[dict[str, Any]] = []
+        for result in action_results:
+            steps = result.get("steps")
+            if isinstance(steps, list) and steps:
+                for raw_step in steps:
+                    if not isinstance(raw_step, dict):
+                        continue
+                    step = dict(raw_step)
+                    step["executed"] = True
+                    observations.append(step)
+            elif result.get("executed"):
+                observations.append(dict(result))
+        return observations
 
     def _run_python_tool(
         self, state_path: Path, arguments: dict[str, Any]
@@ -3589,8 +3684,9 @@ class ToolAgent:
             for item in sandbox_result.get("action_results") or []
             if isinstance(item, dict)
         ]
+        transition_observations = self._engine_transition_observations(action_results)
         if self._knowledge_store is not None and self._knowledge_game_id:
-            for action_result in action_results:
+            for action_result in transition_observations:
                 self._knowledge_store.observe(
                     self._knowledge_game_id,
                     action_result,
@@ -3598,7 +3694,7 @@ class ToolAgent:
                     pass_index=self._knowledge_pass_index,
                     evidence_id=self._knowledge_evidence_id,
                 )
-        self._update_causal_model_from_actions(action_results)
+        self._update_causal_model_from_actions(transition_observations)
         payload = _python_tool_payload(sandbox_result)
 
         step_executed = any(bool(item.get("executed")) for item in action_results)
