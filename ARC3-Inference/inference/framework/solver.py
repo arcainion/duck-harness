@@ -926,8 +926,15 @@ class _HarnessGameSession:
             data: dict[str, Any] = {}
             if action_id == arcengine.GameAction.ACTION6:
                 try:
-                    row = max(0, min(63, int(raw_action["row"])))
-                    column = max(0, min(63, int(raw_action["col"])))
+                    row = raw_action["row"]
+                    column = raw_action["col"]
+                    if any(
+                        isinstance(value, bool) or not isinstance(value, int)
+                        for value in (row, column)
+                    ):
+                        raise TypeError
+                    if not (0 <= row <= 63 and 0 <= column <= 63):
+                        raise ValueError
                     data = {
                         "x": column,
                         "y": row,
@@ -935,7 +942,7 @@ class _HarnessGameSession:
                 except (KeyError, TypeError, ValueError):
                     return (
                         None,
-                        f"MOUSE action at index {index} requires integer row and col arguments.",
+                        f"MOUSE action at index {index} requires integer row and col arguments between 0 and 63.",
                     )
             actions.append(arcengine.ActionInput(id=action_id, data=data))
         return actions, None

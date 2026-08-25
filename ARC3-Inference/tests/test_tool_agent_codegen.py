@@ -60,6 +60,11 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertEqual(_normalize_generated_python_code(value), "result = 5")
 
+    def test_recovers_hyphenated_python_language_tag(self) -> None:
+        value = {"language": "python-3", "code": "result = 5"}
+
+        self.assertEqual(_normalize_generated_python_code(value), "result = 5")
+
     def test_recovers_six_bounded_structured_wrapper_levels(self) -> None:
         value: object = "result = 6"
         for _ in range(6):
@@ -202,6 +207,22 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(_normalize_generated_python_code(wrapped), "result = current_frame.shape")
         self.assertEqual(_normalize_generated_python_code(metadata), "result = 42")
 
+    def test_recovers_text_delta_provider_part(self) -> None:
+        wrapped = {
+            "content": [{"type": "text_delta", "text": "result = 23"}]
+        }
+
+        self.assertEqual(_normalize_generated_python_code(wrapped), "result = 23")
+
+    def test_recovers_output_text_delta_provider_part(self) -> None:
+        wrapped = {
+            "content": [
+                {"type": "output_text_delta", "text": "result = 29"}
+            ]
+        }
+
+        self.assertEqual(_normalize_generated_python_code(wrapped), "result = 29")
+
     def test_recovers_provider_parts_with_benign_transport_metadata(self) -> None:
         wrapped = {
             "content": [
@@ -311,6 +332,46 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(
             _normalize_generated_python_code(wrapped), f"{first}{second}"
         )
+
+    def test_conditional_walrus_creates_fragment_dependency(self) -> None:
+        first = "if (score := 7):\n    pass\n"
+        second = "result = score"
+        wrapped = {
+            "content": [
+                {"type": "text", "text": first},
+                {"type": "text", "text": second},
+            ]
+        }
+
+        self.assertEqual(
+            _normalize_generated_python_code(wrapped), f"{first}{second}"
+        )
+
+    def test_exception_target_does_not_leak_fragment_binding(self) -> None:
+        wrapped = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "try:\n    pass\n"
+                        "except ValueError as error:\n    pass\n"
+                    ),
+                },
+                {"type": "text", "text": "result = error"},
+            ]
+        }
+
+        self.assertEqual(_normalize_generated_python_code(wrapped), str(wrapped))
+
+    def test_deleted_name_does_not_leak_fragment_binding(self) -> None:
+        wrapped = {
+            "content": [
+                {"type": "text", "text": "score = 7\ndel score\n"},
+                {"type": "text", "text": "result = score"},
+            ]
+        }
+
+        self.assertEqual(_normalize_generated_python_code(wrapped), str(wrapped))
 
     def test_try_star_body_binding_creates_fragment_dependency(self) -> None:
         first = (
@@ -712,6 +773,16 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertIn("True  and  False", repaired_code)
         self.assertIn(" or  True", repaired_code)
 
+    def test_javascript_syntax_repair_normalizes_var_declaration(self) -> None:
+        code = "var enabled = True\nresult = enabled"
+        repaired = tool_agent_module._deterministic_boolean_operator_repair(code)
+
+        self.assertEqual(repaired, "enabled = True\nresult = enabled")
+        self.assertEqual(
+            tool_agent_module._javascript_syntax_repair_kind(code),
+            "normalize_variable_declarations",
+        )
+
     def test_equality_operator_repair_preserves_strings_and_comments(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -958,6 +1029,24 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertIn("100000000000000000000 iterations", issues[0]["message"])
 
+    def test_preflight_rejects_huge_additive_range_expression(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "result = range(10 ** 20 + 7)"
+        )
+
+        issues = _generated_python_preflight_issues(tree)
+
+        self.assertIn("100000000000000000007 iterations", issues[0]["message"])
+
+    def test_preflight_rejects_huge_multiplicative_range_expression(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "result = range((10 ** 10) * (10 ** 10))"
+        )
+
+        issues = _generated_python_preflight_issues(tree)
+
+        self.assertIn("100000000000000000000 iterations", issues[0]["message"])
+
     def test_preflight_ignores_invalid_operations_in_uncalled_helpers(self) -> None:
         tree = _parse_bounded_generated_python(
             "def dormant():\n"
@@ -967,6 +1056,13 @@ class ToolAgentCodeGenerationTests(TestCase):
         )
 
         self.assertEqual(_generated_python_preflight_issues(tree), [])
+
+    def test_preflight_fails_closed_for_oversized_constant_power(self) -> None:
+        tree = _parse_bounded_generated_python("result = range(10 ** 100000)")
+
+        issues = _generated_python_preflight_issues(tree)
+
+        self.assertIn("exceeds 1,000,000 iterations", issues[0]["message"])
 
     def test_preflight_evaluates_constant_comparisons_in_while_conditions(self) -> None:
         tree = _parse_bounded_generated_python("while 0 < 1 < 2:\n    result = 1")
@@ -1000,6 +1096,31 @@ class ToolAgentCodeGenerationTests(TestCase):
             "for item in []:\n"
             "    import pathlib\n"
             "result = 1"
+        )
+
+        self.assertEqual(_generated_python_preflight_issues(tree), [])
+
+    def test_preflight_excludes_for_body_over_empty_comprehension(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "for item in [value for value in []]:\n"
+            "    import pathlib\n"
+            "result = 1"
+        )
+
+        self.assertEqual(_generated_python_preflight_issues(tree), [])
+
+    def test_preflight_excludes_false_filter_comprehension_loop(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "for item in [value for value in [1] if False]:\n"
+            "    import pathlib\n"
+            "result = 1"
+        )
+
+        self.assertEqual(_generated_python_preflight_issues(tree), [])
+
+    def test_preflight_does_not_visit_dead_comprehension_element(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "result = [current_frame.objcts for item in []]"
         )
 
         self.assertEqual(_generated_python_preflight_issues(tree), [])
@@ -1981,6 +2102,19 @@ class ToolAgentCodeGenerationTests(TestCase):
             )
         )
 
+    def test_identifier_repair_requires_reported_line_match(self) -> None:
+        repaired = _deterministic_generated_python_repair(
+            "result = currnt_frame.shape",
+            {
+                "type": "NameError",
+                "name": "currnt_frame",
+                "line": 2,
+                "suggestions": ["current_frame"],
+            },
+        )
+
+        self.assertIsNone(repaired)
+
     def test_preflight_invalidates_rebound_view_aliases(self) -> None:
         for code in (
             "frame = current_frame\ndel frame\nresult = frame.objcts",
@@ -2296,6 +2430,14 @@ class ToolAgentCodeGenerationTests(TestCase):
                 )
                 self.assertTrue(repaired.startswith(f"{import_line}\n"))
 
+    def test_safe_import_repair_allows_later_import(self) -> None:
+        repaired = tool_agent_module._deterministic_safe_import_repair(
+            "result = sqrt(4)\nfrom math import sqrt",
+            {"type": "NameError", "name": "sqrt", "line": 1},
+        )
+
+        self.assertTrue(repaired.startswith("from math import sqrt\n"))
+
     def test_run_python_tool_chains_multiple_side_effect_free_repairs(self) -> None:
         agent = ToolAgent(
             model="unit-test-model",
@@ -2544,6 +2686,44 @@ class ToolAgentCodeGenerationTests(TestCase):
             )
         )
 
+    def test_effectful_call_detection_ignores_shadowed_memory_helper(self) -> None:
+        code = "remember = lambda *args: None\nremember('key', 1)\nresult = 1"
+
+        self.assertFalse(
+            tool_agent_module._generated_python_calls_any(
+                code, frozenset({"remember", "forget", "record_strategy"})
+            )
+        )
+
+    def test_effectful_call_detection_ignores_helper_local_shadow(self) -> None:
+        code = (
+            "def wrapper():\n"
+            "    remember = lambda *args: None\n"
+            "    remember('key', 1)\n"
+            "wrapper()"
+        )
+
+        self.assertFalse(
+            tool_agent_module._generated_python_calls_any(
+                code, frozenset({"remember", "forget", "record_strategy"})
+            )
+        )
+
+    def test_effectful_call_detection_follows_memory_helper_alias(self) -> None:
+        names = frozenset({"remember", "forget", "record_strategy"})
+
+        self.assertTrue(
+            tool_agent_module._generated_python_calls_any(
+                "alias = remember\nalias('key', 1)", names
+            )
+        )
+        self.assertTrue(
+            tool_agent_module._generated_python_calls_any(
+                "def wrapper():\n    alias = remember\n    alias('key', 1)\nwrapper()",
+                names,
+            )
+        )
+
     def test_effectful_call_detection_discards_deleted_alias(self) -> None:
         code = (
             "def mutate():\n"
@@ -2558,6 +2738,14 @@ class ToolAgentCodeGenerationTests(TestCase):
                 code, frozenset({"remember", "forget", "record_strategy"})
             )
         )
+
+    def test_json_literal_repair_normalizes_undefined(self) -> None:
+        repaired = tool_agent_module._deterministic_json_literal_repair(
+            "result = undefined",
+            {"type": "NameError", "name": "undefined", "line": 1},
+        )
+
+        self.assertEqual(repaired, "result = None")
 
     def test_run_python_tool_reports_json_literal_repair_chain(self) -> None:
         agent = ToolAgent(
@@ -2619,6 +2807,19 @@ class ToolAgentCodeGenerationTests(TestCase):
         )
 
         self.assertEqual(repaired, "result = len(payload)")
+
+    def test_length_repair_allows_later_len_rebinding(self) -> None:
+        repaired = tool_agent_module._deterministic_length_attribute_repair(
+            "result = values.length\nlen = lambda value: 0",
+            {
+                "type": "AttributeError",
+                "attribute": "length",
+                "object_type": "list",
+                "line": 1,
+            },
+        )
+
+        self.assertIn("result = len(values)", repaired)
 
     def test_length_repair_accepts_size_property(self) -> None:
         repaired = tool_agent_module._deterministic_length_attribute_repair(
@@ -2994,6 +3195,104 @@ class ToolAgentCodeGenerationTests(TestCase):
 
         self.assertIsNone(repaired)
 
+    def test_builtin_keyword_repair_allows_later_module_rebinding(self) -> None:
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "keyword": "revers",
+            "line": 1,
+        }
+        code = (
+            "result = sorted([2, 1], revers=True)\n"
+            "sorted = lambda values, **kwargs: values"
+        )
+
+        repaired = tool_agent_module._deterministic_builtin_keyword_repair(
+            code, diagnostic
+        )
+
+        self.assertIn("reverse=True", repaired)
+
+    def test_builtin_keyword_repair_rejects_nested_local_definition(self) -> None:
+        code = (
+            "def build():\n"
+            "    def sorted(values, reverse=False):\n"
+            "        return values\n"
+            "    return sorted([2, 1], revers=True)"
+        )
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "keyword": "revers",
+            "line": 4,
+        }
+
+        self.assertIsNone(
+            tool_agent_module._deterministic_builtin_keyword_repair(
+                code, diagnostic
+            )
+        )
+
+    def test_builtin_keyword_repair_rejects_local_import_alias(self) -> None:
+        code = (
+            "def build():\n"
+            "    from functools import partial as sorted\n"
+            "    return sorted([2, 1], revers=True)"
+        )
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "keyword": "revers",
+            "line": 3,
+        }
+
+        self.assertIsNone(
+            tool_agent_module._deterministic_builtin_keyword_repair(
+                code, diagnostic
+            )
+        )
+
+    def test_builtin_keyword_repair_rejects_try_suite_binding(self) -> None:
+        code = (
+            "try:\n"
+            "    sorted = lambda values, reverse=False: values\n"
+            "except Exception:\n"
+            "    pass\n"
+            "result = sorted([2, 1], revers=True)"
+        )
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "keyword": "revers",
+            "line": 5,
+        }
+
+        self.assertIsNone(
+            tool_agent_module._deterministic_builtin_keyword_repair(
+                code, diagnostic
+            )
+        )
+
+    def test_builtin_keyword_repair_rejects_match_suite_binding(self) -> None:
+        code = (
+            "match 1:\n"
+            "    case 1:\n"
+            "        sorted = lambda values, reverse=False: values\n"
+            "result = sorted([2, 1], revers=True)"
+        )
+        diagnostic = {
+            "type": "TypeError",
+            "operation": "unexpected_keyword",
+            "keyword": "revers",
+            "line": 4,
+        }
+
+        self.assertIsNone(
+            tool_agent_module._deterministic_builtin_keyword_repair(
+                code, diagnostic
+            )
+        )
+
     def test_list_sort_keyword_repair_requires_static_list_receiver(self) -> None:
         diagnostic = {
             "type": "TypeError",
@@ -3134,6 +3433,168 @@ class ToolAgentCodeGenerationTests(TestCase):
         )
 
         self.assertEqual(repaired, "result = label.endswith('arc')")
+
+    def test_string_method_repair_accepts_upper_case(self) -> None:
+        repaired = tool_agent_module._deterministic_string_method_repair(
+            "result = label.toUpperCase()",
+            {
+                "type": "AttributeError",
+                "attribute": "toUpperCase",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = label.upper()")
+
+    def test_string_method_repair_accepts_lower_case(self) -> None:
+        repaired = tool_agent_module._deterministic_string_method_repair(
+            "result = label.toLowerCase()",
+            {
+                "type": "AttributeError",
+                "attribute": "toLowerCase",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = label.lower()")
+
+    def test_string_method_repair_accepts_trim(self) -> None:
+        repaired = tool_agent_module._deterministic_string_method_repair(
+            "result = label.trim()",
+            {
+                "type": "AttributeError",
+                "attribute": "trim",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = label.strip()")
+
+    def test_string_method_repair_accepts_index_of(self) -> None:
+        repaired = tool_agent_module._deterministic_string_method_repair(
+            "result = label.indexOf('arc', 2)",
+            {
+                "type": "AttributeError",
+                "attribute": "indexOf",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = label.find('arc', 2)")
+
+    def test_string_method_repair_accepts_replace_all(self) -> None:
+        repaired = tool_agent_module._deterministic_string_method_repair(
+            "result = label.replaceAll('A', 'B')",
+            {
+                "type": "AttributeError",
+                "attribute": "replaceAll",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = label.replace('A', 'B')")
+
+    def test_membership_repair_accepts_string_offset(self) -> None:
+        repaired = tool_agent_module._deterministic_membership_method_repair(
+            "result = label.includes('arc', 2)",
+            {
+                "type": "AttributeError",
+                "attribute": "includes",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = 'arc' in label[2:]")
+
+    def test_list_slice_repair_accepts_two_bounds(self) -> None:
+        repaired = tool_agent_module._deterministic_list_slice_repair(
+            "result = values.slice(1, -1)",
+            {
+                "type": "AttributeError",
+                "attribute": "slice",
+                "object_type": "list",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = values[1:-1]")
+
+    def test_string_repeat_repair_accepts_nonnegative_constant(self) -> None:
+        repaired = tool_agent_module._deterministic_string_expression_repair(
+            "result = label.repeat(3)",
+            {
+                "type": "AttributeError",
+                "attribute": "repeat",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = label * 3")
+
+    def test_string_repeat_repair_rejects_oversized_constant(self) -> None:
+        repaired = tool_agent_module._deterministic_string_expression_repair(
+            "result = label.repeat(1000001)",
+            {
+                "type": "AttributeError",
+                "attribute": "repeat",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertIsNone(repaired)
+
+    def test_string_char_at_repair_preserves_out_of_range_behavior(self) -> None:
+        repaired = tool_agent_module._deterministic_string_expression_repair(
+            "result = label.charAt(2)",
+            {
+                "type": "AttributeError",
+                "attribute": "charAt",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = label[2:3]")
+
+    def test_string_substring_repair_accepts_ordered_constant_bounds(self) -> None:
+        repaired = tool_agent_module._deterministic_string_expression_repair(
+            "result = label.substring(1, 4)",
+            {
+                "type": "AttributeError",
+                "attribute": "substring",
+                "object_type": "str",
+                "line": 1,
+            },
+        )
+
+        self.assertEqual(repaired, "result = label[1:4]")
+
+    def test_slice_repair_accepts_runtime_proven_string(self) -> None:
+        diagnostic = {
+            "type": "AttributeError",
+            "attribute": "slice",
+            "object_type": "str",
+            "line": 1,
+        }
+        repaired = tool_agent_module._deterministic_list_slice_repair(
+            "result = label.slice(1, -1)", diagnostic
+        )
+
+        self.assertEqual(repaired, "result = label[1:-1]")
+        self.assertEqual(
+            tool_agent_module._deterministic_runtime_python_repair(
+                "result = label.slice(1, -1)", diagnostic
+            ),
+            ("result = label[1:-1]", "replace_string_slice"),
+        )
 
     def test_run_python_tool_chains_membership_method_repairs(self) -> None:
         agent = ToolAgent(
@@ -3581,6 +4042,48 @@ class ToolAgentCodeGenerationTests(TestCase):
             tool_agent_module._static_candidate_action_arguments(tree), []
         )
 
+    def test_static_action_analysis_excludes_false_while_body(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "while False:\n"
+            "    action([{'action': 'LEFT'}])\n"
+            "result = 1"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
+    def test_static_action_analysis_excludes_empty_comprehension_loop(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "for item in [value for value in []]:\n"
+            "    action([{'action': 'LEFT'}])\n"
+            "result = 1"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
+    def test_static_action_analysis_excludes_false_filter_comprehension(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "for item in [value for value in [1] if False]:\n"
+            "    action([{'action': 'LEFT'}])\n"
+            "result = 1"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
+    def test_static_action_analysis_skips_dead_comprehension_element(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "result = [action([{'action': 'LEFT'}]) for item in []]"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
     def test_static_action_analysis_inspects_function_annotation(self) -> None:
         tree = _parse_bounded_generated_python(
             "def helper(value: action([{'action': 'LEFT'}])):\n"
@@ -3590,6 +4093,207 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertEqual(
             tool_agent_module._static_candidate_action_arguments(tree),
             [[{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_tracks_chained_assignments(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "first = second = [{'action': 'LEFT'}]\n"
+            "action(first)\n"
+            "action(second)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}], [{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_tracks_literal_destructuring(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "left, right = ([{'action': 'LEFT'}], [{'action': 'RIGHT'}])\n"
+            "action(left)\n"
+            "action(right)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}], [{"action": "RIGHT"}]],
+        )
+
+    def test_static_action_analysis_tracks_nested_walrus_binding(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "if (moves := [{'action': 'LEFT'}]):\n    action(moves)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_invalidates_deleted_binding(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "moves = [{'action': 'LEFT'}]\ndel moves\naction(moves)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
+    def test_static_action_analysis_invalidates_augmented_assignment(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "moves = [{'action': 'LEFT'}]\nmoves += dynamic\naction(moves)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
+    def test_static_action_analysis_invalidates_import_binding(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "moves = [{'action': 'LEFT'}]\nimport json as moves\naction(moves)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
+    def test_static_action_analysis_invalidates_with_target(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "moves = [{'action': 'LEFT'}]\n"
+            "with context as moves:\n    action(moves)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
+    def test_static_action_analysis_invalidates_loop_target(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "moves = [{'action': 'LEFT'}]\n"
+            "for moves in dynamic:\n    action(moves)\n"
+            "action(moves)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
+    def test_static_action_analysis_merges_uncertain_if_branches(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "moves = [{'action': 'LEFT'}]\n"
+            "if condition:\n    moves = dynamic\n"
+            "action(moves)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree), []
+        )
+
+    def test_static_action_analysis_recovers_starred_sequence(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "moves = [{'action': 'LEFT'}]\naction([*moves])"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_recovers_dictionary_unpack(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "base = {'action': 'MOUSE', 'row': 2}\n"
+            "action([{**base, 'col': 3}])"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "MOUSE", "row": 2, "col": 3}]],
+        )
+
+    def test_static_action_analysis_recovers_constant_index(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "plans = [[{'action': 'LEFT'}], [{'action': 'RIGHT'}]]\n"
+            "action(plans[1])"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "RIGHT"}]],
+        )
+
+    def test_static_action_analysis_recovers_constant_slice(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "moves = [{'action': 'LEFT'}, {'action': 'RIGHT'}]\n"
+            "action(moves[:1])"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_recovers_bounded_concatenation(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "first = [{'action': 'LE' + 'FT'}]\n"
+            "second = [{'action': 'RIGHT'}]\naction(first + second)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}, {"action": "RIGHT"}]],
+        )
+
+    def test_static_action_analysis_recovers_coordinate_arithmetic(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "row = 1 + 2\ncol = 9 // 2\n"
+            "action([{'action': 'MOUSE', 'row': row, 'col': col}])"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "MOUSE", "row": 3, "col": 4}]],
+        )
+
+    def test_static_action_analysis_recovers_selected_conditional(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "moves = ([{'action': 'LEFT'}] if 2 > 1 else dynamic)\n"
+            "action(moves)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_recovers_boolean_fallback_value(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "moves = [] or [{'action': 'LEFT'}]\naction(moves)"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_recovers_constant_f_string(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "direction = 'LEFT'\naction([{'action': f'{direction}'}])"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "LEFT"}]],
+        )
+
+    def test_static_action_analysis_honors_boolean_short_circuiting(self) -> None:
+        tree = _parse_bounded_generated_python(
+            "False and action([{'action': 'LEFT'}])\n"
+            "True or action([{'action': 'RIGHT'}])\n"
+            "action([{'action': 'DOWN'}])"
+        )
+
+        self.assertEqual(
+            tool_agent_module._static_candidate_action_arguments(tree),
+            [[{"action": "DOWN"}]],
         )
 
     def test_repeated_failure_triggers_quality_model_failover(self) -> None:

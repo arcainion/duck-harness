@@ -1,6 +1,7 @@
 """Bounded structured causal world-model persistence."""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -10,16 +11,25 @@ def _text(value: Any, limit: int) -> str:
 
 def _confidence(value: Any) -> float:
     try:
-        return round(max(0.0, min(1.0, float(value))), 3)
-    except (TypeError, ValueError):
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return 0.0
+        return round(max(0.0, min(1.0, numeric)), 3)
+    except (TypeError, ValueError, OverflowError):
         return 0.0
 
 
 def _count(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
     try:
         return max(0, int(value or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _items(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, (list, tuple)) else []
 
 
 def normalize_causal_model(value: Any) -> dict[str, list[dict[str, Any]]]:
@@ -31,7 +41,7 @@ def normalize_causal_model(value: Any) -> dict[str, list[dict[str, Any]]]:
         "subgoals": [],
         "predictions": [],
     }
-    for item in list(raw.get("entities") or [])[:16]:
+    for item in _items(raw.get("entities"))[:16]:
         if not isinstance(item, dict) or not _text(item.get("id"), 64):
             continue
         result["entities"].append({
@@ -41,7 +51,7 @@ def normalize_causal_model(value: Any) -> dict[str, list[dict[str, Any]]]:
             "evidence": _text(item.get("evidence"), 180),
             "confidence": _confidence(item.get("confidence")),
         })
-    for item in list(raw.get("relations") or [])[:24]:
+    for item in _items(raw.get("relations"))[:24]:
         if not isinstance(item, dict):
             continue
         cause, effect = _text(item.get("cause"), 96), _text(item.get("effect"), 96)
@@ -57,7 +67,7 @@ def normalize_causal_model(value: Any) -> dict[str, list[dict[str, Any]]]:
             "contradictions": _count(item.get("contradictions")),
             "last_observed_action": _count(item.get("last_observed_action")),
         })
-    for item in list(raw.get("subgoals") or [])[:12]:
+    for item in _items(raw.get("subgoals"))[:12]:
         if not isinstance(item, dict) or not _text(item.get("id"), 64):
             continue
         status = _text(item.get("status"), 24).lower()
@@ -66,9 +76,13 @@ def normalize_causal_model(value: Any) -> dict[str, list[dict[str, Any]]]:
             "description": _text(item.get("description"), 200),
             "status": status if status in {"pending", "active", "complete", "blocked"} else "pending",
             "success_criteria": _text(item.get("success_criteria"), 180),
-            "depends_on": [_text(entry, 64) for entry in list(item.get("depends_on") or [])[:6] if _text(entry, 64)],
+            "depends_on": [
+                _text(entry, 64)
+                for entry in _items(item.get("depends_on"))[:6]
+                if _text(entry, 64)
+            ],
         })
-    for item in list(raw.get("predictions") or [])[:8]:
+    for item in _items(raw.get("predictions"))[:8]:
         if not isinstance(item, dict) or not _text(item.get("action"), 80):
             continue
         status = _text(item.get("status"), 24).lower()

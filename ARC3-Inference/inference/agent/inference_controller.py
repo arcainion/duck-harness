@@ -40,9 +40,111 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(os.environ.get(name, "").strip() or default)
-    except ValueError:
+        value = float(os.environ.get(name, "").strip() or default)
+        return value if math.isfinite(value) else default
+    except (ValueError, OverflowError):
         return default
+
+
+def _transition_text(value: Any, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:limit]
+
+
+def _transition_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return False
+
+
+def _transition_reward(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        reward = float(value or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return reward if math.isfinite(reward) else 0.0
+
+
+def _transition_observation_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return 1
+    try:
+        return max(1, min(1_000_000, int(value or 1)))
+    except (TypeError, ValueError, OverflowError):
+        return 1
+
+
+def _transition_action_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    raw_values = [raw for raw in value if isinstance(raw, str)]
+    if isinstance(value, (set, frozenset)):
+        raw_values.sort()
+    actions: list[str] = []
+    for raw in raw_values[:16]:
+        text = _transition_text(raw, 80)
+        action = normalize_action_key(text) if text else ""
+        if action and action not in actions:
+            actions.append(action)
+    return actions
+
+
+def _normalize_external_transition(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    item = dict(raw)
+    raw_action = _transition_text(
+        item.get("action") or item.get("action_display"), 80
+    )
+    item["action"] = normalize_action_key(raw_action) if raw_action else ""
+    if not item["action"]:
+        return None
+    item["action_family"] = action_family(item["action"])
+    item["before_state_id"] = _transition_text(item.get("before_state_id"), 256)
+    item["after_state_id"] = _transition_text(item.get("after_state_id"), 256)
+    item["behavioral_before_state_id"] = _transition_text(
+        item.get("behavioral_before_state_id"), 256
+    ) or item["before_state_id"]
+    item["behavioral_after_state_id"] = _transition_text(
+        item.get("behavioral_after_state_id"), 256
+    ) or item["after_state_id"]
+    item["object_before_state_id"] = _transition_text(
+        item.get("object_before_state_id"), 256
+    )
+    item["object_after_state_id"] = _transition_text(
+        item.get("object_after_state_id"), 256
+    )
+    item["evidence_id"] = _transition_text(item.get("evidence_id"), 128)
+    item["outcome_class"] = (
+        _transition_text(item.get("outcome_class"), 40) or "unknown"
+    )
+    item["reward"] = _transition_reward(item.get("reward"))
+    item["raw_observations"] = _transition_observation_count(
+        item.get("raw_observations")
+    )
+    item["valid_actions_after"] = _transition_action_list(
+        item.get("valid_actions_after")
+    )
+    item["board_changed"] = _transition_bool(item.get("board_changed"))
+    item["decision_context_changed"] = _transition_bool(
+        item.get("decision_context_changed")
+    )
+    item["game_over"] = _transition_bool(item.get("game_over"))
+    item["behavioral_changed"] = (
+        item["behavioral_before_state_id"] != item["behavioral_after_state_id"]
+    )
+    return item
 
 
 def _normalize_policy(value: Any) -> str:
@@ -258,18 +360,21 @@ def normalize_action_key(action: str) -> str:
 
 def action_family(action: str) -> str:
     key = normalize_action_key(action)
-    return "MOUSE" if key.startswith("MOUSE") else key
+    return "MOUSE" if key == "MOUSE" or action_coordinate(key) is not None else key
 
 
 _MOUSE_COORDINATE_RE = re.compile(
-    r"^MOUSE\s*\(\s*ROW\s*=\s*(-?\d+)\s*,\s*COL\s*=\s*(-?\d+)\s*\)$"
+    r"^MOUSE\s*\(\s*ROW\s*=\s*(\d{1,2})\s*,\s*COL\s*=\s*(\d{1,2})\s*\)$"
 )
 
 
 def action_coordinate(action: str) -> tuple[int, int] | None:
     """Return the exact model-facing mouse coordinate, when present."""
     match = _MOUSE_COORDINATE_RE.match(normalize_action_key(action))
-    return (int(match.group(1)), int(match.group(2))) if match else None
+    if match is None:
+        return None
+    coordinate = int(match.group(1)), int(match.group(2))
+    return coordinate if all(0 <= value <= 63 for value in coordinate) else None
 
 
 def _object_state_summary(frame: Frame | None) -> dict[str, Any]:
@@ -1597,27 +1702,9 @@ def build_experience_snapshot(
             item["evidence_id"] = evidence_id
     external = []
     for raw in external_transitions or ():
-        if not isinstance(raw, dict):
-            continue
-        item = dict(raw)
-        item["action"] = normalize_action_key(
-            item.get("action") or item.get("action_display") or ""
-        )
-        item["action_family"] = action_family(item["action"])
-        item["behavioral_before_state_id"] = str(
-            item.get("behavioral_before_state_id") or item.get("before_state_id") or ""
-        )
-        item["behavioral_after_state_id"] = str(
-            item.get("behavioral_after_state_id") or item.get("after_state_id") or ""
-        )
-        item["object_before_state_id"] = str(item.get("object_before_state_id") or "")
-        item["object_after_state_id"] = str(item.get("object_after_state_id") or "")
-        item["board_changed"] = bool(item.get("board_changed"))
-        item["decision_context_changed"] = bool(item.get("decision_context_changed"))
-        item["behavioral_changed"] = (
-            item["behavioral_before_state_id"] != item["behavioral_after_state_id"]
-        )
-        external.append(item)
+        item = _normalize_external_transition(raw)
+        if item is not None:
+            external.append(item)
     # Persisted records carry observation timestamps and precede the live
     # in-memory trajectory. This preserves old-to-new ordering for change-point
     # detection while independent-evidence collapsing removes duplicates.

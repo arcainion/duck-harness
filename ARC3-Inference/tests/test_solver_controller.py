@@ -14,6 +14,7 @@ from inference.agent.action_names import (
     MAX_ACTION_BATCH,
     to_engine_action,
     to_model_action,
+    to_model_actions,
 )
 from inference.agent.inference_controller import (
     LEGACY_POLICY,
@@ -474,6 +475,45 @@ class SolverControllerTests(TestCase):
         self.assertIsNone(error)
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].id, arcengine.GameAction.ACTION7)
+
+    def test_mouse_action_rejects_boolean_coordinates(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+
+        actions, error = session._normalize_actions(
+            {"actions": [{"action": "MOUSE", "row": True, "col": 2}]}
+        )
+
+        self.assertIsNone(actions)
+        self.assertIn("between 0 and 63", error)
+
+    def test_mouse_action_rejects_coercive_coordinates(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+
+        for value in (1.5, "1"):
+            with self.subTest(value=value):
+                actions, error = session._normalize_actions(
+                    {"actions": [{"action": "MOUSE", "row": value, "col": 2}]}
+                )
+                self.assertIsNone(actions)
+                self.assertIn("between 0 and 63", error)
+
+    def test_mouse_action_rejects_out_of_range_coordinate(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+
+        actions, error = session._normalize_actions(
+            {"actions": [{"action": "MOUSE", "row": 64, "col": 2}]}
+        )
+
+        self.assertIsNone(actions)
+        self.assertIn("between 0 and 63", error)
+
+    def test_scalar_model_action_collection_is_one_action(self) -> None:
+        self.assertEqual(to_model_actions("ACTION1"), ["UP"])
+
+    def test_model_action_collection_skips_structured_values(self) -> None:
+        values = ["ACTION1", {"action": "ACTION2"}, None, "ACTION2"]
+
+        self.assertEqual(to_model_actions(values), ["UP", "DOWN"])  # type: ignore[arg-type]
 
     def test_outcome_aware_orient_phase_rejects_multi_action_probe(self) -> None:
         session = object.__new__(_HarnessGameSession)

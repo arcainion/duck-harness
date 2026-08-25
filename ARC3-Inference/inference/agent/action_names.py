@@ -1,7 +1,7 @@
 """Shared action-name mapping between model-facing labels and engine actions."""
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Any, Iterable
 
 
 MAX_ACTION_BATCH = 12
@@ -21,13 +21,17 @@ ENGINE_TO_MODEL_ACTION = {
 MODEL_TO_ENGINE_ACTION = {value: key for key, value in ENGINE_TO_MODEL_ACTION.items()}
 
 
+def _action_text(name: Any) -> str:
+    return name.strip().upper() if isinstance(name, str) else ""
+
+
 def to_model_action(name: str | None) -> str:
-    raw = str(name or "").strip().upper()
+    raw = _action_text(name)
     return ENGINE_TO_MODEL_ACTION.get(raw, raw)
 
 
 def to_engine_action(name: str | None) -> str | None:
-    raw = str(name or "").strip().upper()
+    raw = _action_text(name)
     if not raw:
         return None
     if raw in ENGINE_TO_MODEL_ACTION:
@@ -37,7 +41,10 @@ def to_engine_action(name: str | None) -> str | None:
 
 def to_model_actions(names: Iterable[str]) -> list[str]:
     resolved: list[str] = []
-    for name in names:
+    values = [names] if isinstance(names, str) else names
+    for name in values:
+        if not isinstance(name, str):
+            continue
         label = to_model_action(name)
         if label and label not in resolved:
             resolved.append(label)

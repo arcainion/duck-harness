@@ -6,6 +6,8 @@ from unittest import TestCase, mock
 from inference.agent.inference_controller import (
     OUTCOME_AWARE_POLICY,
     InferenceControllerConfig,
+    _normalize_external_transition,
+    action_coordinate,
     action_family,
     action_guard_reason,
     build_experience_snapshot,
@@ -21,6 +23,160 @@ def _frame(value: int, *, step: int, level: int = 1) -> Frame:
 
 
 class InferenceControllerTests(TestCase):
+    def test_action_family_does_not_accept_mouse_prefix_collisions(self) -> None:
+        self.assertEqual(action_family("MOUSETRAP"), "MOUSETRAP")
+        self.assertEqual(action_family("MOUSE"), "MOUSE")
+
+    def test_action_coordinate_rejects_unbounded_numeric_text(self) -> None:
+        coordinate = action_coordinate(
+            f"MOUSE(row={'9' * 5000}, col={'8' * 5000})"
+        )
+
+        self.assertIsNone(coordinate)
+
+    def test_action_coordinate_enforces_board_bounds(self) -> None:
+        self.assertIsNone(action_coordinate("MOUSE(row=-1, col=0)"))
+        self.assertIsNone(action_coordinate("MOUSE(row=64, col=0)"))
+        self.assertEqual(
+            action_coordinate(" mouse ( row = 3 , col = 4 ) "), (3, 4)
+        )
+
+    def test_nonfinite_environment_thresholds_use_defaults(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOCAL_ANALYZER_VOLATILE_RATIO": "nan",
+                "LOCAL_ANALYZER_PLAN_MIN_CONFIDENCE": "inf",
+            },
+        ):
+            config = InferenceControllerConfig.from_env()
+
+        self.assertEqual(config.volatile_ratio, 0.75)
+        self.assertEqual(config.plan_min_confidence, 0.75)
+
+    def test_nonfinite_environment_utilities_use_defaults(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOCAL_ANALYZER_PROGRESS_UTILITY": "inf",
+                "LOCAL_ANALYZER_TERMINAL_FAILURE_UTILITY": "nan",
+            },
+        ):
+            config = InferenceControllerConfig.from_env()
+
+        self.assertEqual(config.progress_utility, 1.0)
+        self.assertEqual(config.terminal_failure_utility, -2.0)
+
+    def test_external_transition_rejects_invalid_action(self) -> None:
+        self.assertIsNone(_normalize_external_transition({}))
+        self.assertIsNone(_normalize_external_transition({"action": {"bad": True}}))
+
+    def test_external_transition_bounds_base_state_ids(self) -> None:
+        normalized = _normalize_external_transition(
+            {
+                "action": "LEFT",
+                "before_state_id": f"  {'a' * 300}  ",
+                "after_state_id": "  after   state  ",
+            }
+        )
+
+        self.assertIsNotNone(normalized)
+        self.assertEqual(len(normalized["before_state_id"]), 256)
+        self.assertEqual(normalized["after_state_id"], "after state")
+
+    def test_external_transition_bounds_context_identifiers(self) -> None:
+        normalized = _normalize_external_transition(
+            {
+                "action": "LEFT",
+                "behavioral_before_state_id": "b" * 300,
+                "object_after_state_id": "o" * 300,
+                "evidence_id": "e" * 300,
+            }
+        )
+
+        self.assertIsNotNone(normalized)
+        self.assertEqual(len(normalized["behavioral_before_state_id"]), 256)
+        self.assertEqual(len(normalized["object_after_state_id"]), 256)
+        self.assertEqual(len(normalized["evidence_id"]), 128)
+
+    def test_external_transition_normalizes_outcome_label(self) -> None:
+        missing = _normalize_external_transition({"action": "LEFT"})
+        oversized = _normalize_external_transition(
+            {"action": "LEFT", "outcome_class": "x" * 100}
+        )
+
+        self.assertEqual(missing["outcome_class"], "unknown")
+        self.assertEqual(len(oversized["outcome_class"]), 40)
+
+    def test_external_transition_neutralizes_invalid_reward(self) -> None:
+        invalid = _normalize_external_transition(
+            {"action": "LEFT", "reward": "invalid"}
+        )
+        nonfinite = _normalize_external_transition(
+            {"action": "LEFT", "reward": float("nan")}
+        )
+
+        self.assertEqual(invalid["reward"], 0.0)
+        self.assertEqual(nonfinite["reward"], 0.0)
+
+    def test_external_transition_bounds_raw_observations(self) -> None:
+        invalid = _normalize_external_transition(
+            {"action": "LEFT", "raw_observations": True}
+        )
+        oversized = _normalize_external_transition(
+            {"action": "LEFT", "raw_observations": 10**12}
+        )
+
+        self.assertEqual(invalid["raw_observations"], 1)
+        self.assertEqual(oversized["raw_observations"], 1_000_000)
+
+    def test_external_transition_normalizes_valid_action_collection(self) -> None:
+        scalar = _normalize_external_transition(
+            {"action": "LEFT", "valid_actions_after": "RIGHT"}
+        )
+        collection = _normalize_external_transition(
+            {
+                "action": "LEFT",
+                "valid_actions_after": [" right ", "RIGHT", {"bad": True}],
+            }
+        )
+
+        self.assertEqual(scalar["valid_actions_after"], [])
+        self.assertEqual(collection["valid_actions_after"], ["RIGHT"])
+
+    def test_external_transition_parses_board_changed_boolean(self) -> None:
+        unchanged = _normalize_external_transition(
+            {"action": "LEFT", "board_changed": "false"}
+        )
+        changed = _normalize_external_transition(
+            {"action": "LEFT", "board_changed": "yes"}
+        )
+
+        self.assertFalse(unchanged["board_changed"])
+        self.assertTrue(changed["board_changed"])
+
+    def test_external_transition_parses_context_changed_boolean(self) -> None:
+        unchanged = _normalize_external_transition(
+            {"action": "LEFT", "decision_context_changed": "off"}
+        )
+        changed = _normalize_external_transition(
+            {"action": "LEFT", "decision_context_changed": 1}
+        )
+
+        self.assertFalse(unchanged["decision_context_changed"])
+        self.assertTrue(changed["decision_context_changed"])
+
+    def test_external_transition_parses_game_over_boolean(self) -> None:
+        running = _normalize_external_transition(
+            {"action": "LEFT", "game_over": "0"}
+        )
+        ended = _normalize_external_transition(
+            {"action": "LEFT", "game_over": "true"}
+        )
+
+        self.assertFalse(running["game_over"])
+        self.assertTrue(ended["game_over"])
+
     def test_state_identity_includes_observable_decision_context(self) -> None:
         base = Frame(
             grid=((1,),),

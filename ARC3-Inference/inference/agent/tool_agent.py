@@ -226,6 +226,9 @@ _SAFE_GENERATED_PYTHON_IMPORTS = {
     **{module: f"import {module}" for module in _SANDBOX_SAFE_MODULES},
 }
 _MAX_DETERMINISTIC_RUNTIME_REPAIRS = 8
+_STATIC_CANDIDATE_MAX_ITEMS = 256
+_STATIC_CANDIDATE_MAX_TEXT = 4096
+_STATIC_CANDIDATE_MAX_ABS_NUMBER = 1_000_000_000
 _SAFE_BUILTIN_KEYWORDS = {
     "enumerate": frozenset({"start"}),
     "max": frozenset({"default", "key"}),
@@ -241,6 +244,7 @@ _JSON_LITERAL_REPLACEMENTS: dict[str, Any] = {
     "false": False,
     "null": None,
     "true": True,
+    "undefined": None,
 }
 _FRAME_VIEW_ATTRIBUTES = frozenset(
     {
@@ -397,6 +401,15 @@ def _constant_iterable_is_empty(node: ast.AST) -> bool:
         return not node.elts
     if isinstance(node, ast.Dict):
         return not node.keys
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+        return bool(node.generators) and (
+            _constant_iterable_is_empty(node.generators[0].iter)
+            or any(
+                _constant_truth(condition) is False
+                for generator in node.generators
+                for condition in generator.ifs
+            )
+        )
     return (
         isinstance(node, ast.Constant)
         and isinstance(node.value, (str, bytes))
@@ -582,6 +595,32 @@ def _reachable_module_node_ids(tree: ast.AST) -> set[int]:
             for statement in statements:
                 self.visit(statement)
 
+        def _visit_comprehension(
+            self, node: ast.AST, result_nodes: list[ast.AST]
+        ) -> None:
+            reachable.add(id(node))
+            generators = list(getattr(node, "generators", []))
+            for generator in generators:
+                reachable.add(id(generator))
+                self.visit(generator.iter)
+                if _constant_iterable_is_empty(generator.iter):
+                    return
+                for condition in generator.ifs:
+                    self.visit(condition)
+                    if _constant_truth(condition) is False:
+                        return
+            for result_node in result_nodes:
+                self.visit(result_node)
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            self._visit_comprehension(node, [node.elt])
+
+        visit_SetComp = visit_ListComp
+        visit_GeneratorExp = visit_ListComp
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            self._visit_comprehension(node, [node.key, node.value])
+
     visitor = Visitor()
     visitor.visit(tree)
     definitions = {
@@ -682,7 +721,58 @@ def _constant_integer_for_range(node: ast.AST) -> int | None:
         large = _large_positive_constant_integer(node.operand)
         if large is not None:
             return -large
-    return None
+    return _bounded_large_constant_integer(node)
+
+
+def _bounded_large_constant_integer(node: ast.AST, depth: int = 0) -> int | None:
+    """Evaluate integer-only arithmetic with strict depth and bit-size bounds."""
+    if depth > 24:
+        return None
+    if isinstance(node, ast.Constant):
+        if (
+            isinstance(node.value, int)
+            and not isinstance(node.value, bool)
+            and node.value.bit_length() <= 4096
+        ):
+            return node.value
+        return None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _bounded_large_constant_integer(node.operand, depth + 1)
+        if value is None:
+            return None
+        return value if isinstance(node.op, ast.UAdd) else -value
+    if not isinstance(node, ast.BinOp):
+        return None
+    left = _bounded_large_constant_integer(node.left, depth + 1)
+    right = _bounded_large_constant_integer(node.right, depth + 1)
+    if left is None or right is None:
+        return None
+    try:
+        if isinstance(node.op, ast.Add):
+            value = left + right
+        elif isinstance(node.op, ast.Sub):
+            value = left - right
+        elif isinstance(node.op, ast.Mult):
+            if left.bit_length() + right.bit_length() > 4097:
+                return None
+            value = left * right
+        elif isinstance(node.op, ast.FloorDiv):
+            value = left // right
+        elif isinstance(node.op, ast.Mod):
+            value = left % right
+        elif isinstance(node.op, ast.Pow) and 0 <= right <= 128:
+            if abs(left).bit_length() * max(1, right) > 4096:
+                return None
+            value = left**right
+        elif isinstance(node.op, ast.LShift) and 0 <= right <= 4096:
+            if left.bit_length() + right > 4096:
+                return None
+            value = left << right
+        else:
+            return None
+    except (ArithmeticError, OverflowError):
+        return None
+    return value if value.bit_length() <= 4096 else None
 
 
 def _large_positive_constant_integer(node: ast.AST) -> int | None:
@@ -723,6 +813,42 @@ def _large_positive_constant_integer(node: ast.AST) -> int | None:
         ):
             return node.left.value << node.right.value
     return None
+
+
+def _one_arg_range_is_definitely_oversized(node: ast.Call) -> bool:
+    if len(node.args) != 1 or node.keywords:
+        return False
+    expression = node.args[0]
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Pow):
+        if not (
+            isinstance(expression.left, ast.Constant)
+            and isinstance(expression.left.value, int)
+            and not isinstance(expression.left.value, bool)
+            and expression.left.value > 1
+            and isinstance(expression.right, ast.Constant)
+            and isinstance(expression.right.value, int)
+            and not isinstance(expression.right.value, bool)
+            and expression.right.value >= 0
+        ):
+            return False
+        return (
+            expression.right.value * (expression.left.value.bit_length() - 1)
+            > (1_000_000).bit_length()
+        )
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.LShift):
+        return (
+            isinstance(expression.left, ast.Constant)
+            and isinstance(expression.left.value, int)
+            and not isinstance(expression.left.value, bool)
+            and expression.left.value > 0
+            and isinstance(expression.right, ast.Constant)
+            and isinstance(expression.right.value, int)
+            and not isinstance(expression.right.value, bool)
+            and expression.right.value >= 0
+            and expression.left.value.bit_length() + expression.right.value
+            > (1_000_000).bit_length()
+        )
+    return False
 
 
 def _generated_python_semantic_fingerprint(code: str) -> str:
@@ -772,14 +898,19 @@ def _generated_python_calls_any(code: str, names: frozenset[str]) -> bool:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or id(node) not in reachable_nodes:
             continue
-        if isinstance(node.func, ast.Name) and node.func.id in names:
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in names
+            and not _generated_name_shadowed_at(tree, node.func.id, node)
+        ):
             return True
     definitions = {
         node.name: node
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    aliases = {name: name for name in definitions}
+    effect_alias = object()
+    aliases: dict[str, str | object] = {name: name for name in definitions}
     parents = {
         id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
     }
@@ -823,8 +954,11 @@ def _generated_python_calls_any(code: str, names: frozenset[str]) -> bool:
         if event_kind == 0:
             call = event
             assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
-            if call.func.id in aliases:
-                called_aliases.add(aliases[call.func.id])
+            resolved = aliases.get(call.func.id)
+            if resolved is effect_alias:
+                return True
+            if isinstance(resolved, str):
+                called_aliases.add(resolved)
             continue
         statement = event
         assert isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Delete))
@@ -839,7 +973,14 @@ def _generated_python_calls_any(code: str, names: frozenset[str]) -> bool:
                     aliases.pop(target.id, None)
             continue
         value = statement.value
-        resolved = aliases.get(value.id) if isinstance(value, ast.Name) else None
+        resolved: str | object | None = None
+        if isinstance(value, ast.Name):
+            if value.id in names and not _generated_name_shadowed_at(
+                tree, value.id, value
+            ):
+                resolved = effect_alias
+            else:
+                resolved = aliases.get(value.id)
         for target in targets:
             if isinstance(target, ast.Name):
                 if resolved is None:
@@ -856,7 +997,9 @@ def _generated_python_calls_any(code: str, names: frozenset[str]) -> bool:
         definition = definitions[alias]
         function_tree = ast.Module(body=definition.body, type_ignores=[])
         function_reachable = _reachable_module_node_ids(function_tree)
-        function_aliases = {name: name for name in definitions}
+        function_aliases: dict[str, str | object] = {
+            name: name for name in definitions
+        }
         function_events: list[tuple[int, int, int, ast.AST]] = []
         for node in ast.walk(function_tree):
             if id(node) not in function_reachable:
@@ -879,10 +1022,14 @@ def _generated_python_calls_any(code: str, names: frozenset[str]) -> bool:
                 call = event
                 assert isinstance(call, ast.Call)
                 if isinstance(call.func, ast.Name):
-                    if call.func.id in names:
+                    if call.func.id in names and not _generated_name_shadowed_at(
+                        tree, call.func.id, call
+                    ):
                         return True
                     resolved = function_aliases.get(call.func.id)
-                    if resolved is not None and resolved not in inspected_aliases:
+                    if resolved is effect_alias:
+                        return True
+                    if isinstance(resolved, str) and resolved not in inspected_aliases:
                         pending_aliases.append(resolved)
                 continue
             statement = event
@@ -897,11 +1044,14 @@ def _generated_python_calls_any(code: str, names: frozenset[str]) -> bool:
                         function_aliases.pop(target.id, None)
                 continue
             value = statement.value
-            resolved = (
-                function_aliases.get(value.id)
-                if isinstance(value, ast.Name)
-                else None
-            )
+            resolved: str | object | None = None
+            if isinstance(value, ast.Name):
+                if value.id in names and not _generated_name_shadowed_at(
+                    tree, value.id, value
+                ):
+                    resolved = effect_alias
+                else:
+                    resolved = function_aliases.get(value.id)
             for target in targets:
                 if isinstance(target, ast.Name):
                     if resolved is None:
@@ -963,7 +1113,7 @@ def _deterministic_boolean_operator_repair(code: str) -> str | None:
             )
         if (
             first.type == tokenize.NAME
-            and first.string in {"const", "let"}
+            and first.string in {"const", "let", "var"}
             and 0 <= first.start[0] - 1 < len(lines)
             and not lines[first.start[0] - 1][: first.start[1]].strip()
             and index + 2 < len(tokens)
@@ -1172,7 +1322,7 @@ def _deterministic_top_level_return_repair(code: str) -> str | None:
 
 def _javascript_syntax_repair_kind(code: str) -> str:
     kinds: list[str] = []
-    if re.search(r"(?m)^[ \t]*(?:const|let)\s+[A-Za-z_]\w*\s*=", code):
+    if re.search(r"(?m)^[ \t]*(?:const|let|var)\s+[A-Za-z_]\w*\s*=", code):
         kinds.append("normalize_variable_declarations")
     if "&&" in code or "||" in code:
         kinds.append("normalize_boolean_operators")
@@ -1460,16 +1610,27 @@ def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
                 }
             )
         if isinstance(node, ast.Call):
-            range_size = (
-                None
-                if module_name_bound_before("range", node)
-                else _constant_range_size(node)
-            )
+            range_shadowed = module_name_bound_before("range", node)
+            range_size = None if range_shadowed else _constant_range_size(node)
             if range_size is not None and range_size > 1_000_000:
                 issues.append(
                     {
                         "line": getattr(node, "lineno", None),
                         "message": f"Constant range expands to {range_size} iterations.",
+                        "hint": "Use a bounded search limit no larger than 1,000,000 iterations.",
+                    }
+                )
+            elif (
+                range_size is None
+                and not range_shadowed
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "range"
+                and _one_arg_range_is_definitely_oversized(node)
+            ):
+                issues.append(
+                    {
+                        "line": getattr(node, "lineno", None),
+                        "message": "Constant range exceeds 1,000,000 iterations.",
                         "hint": "Use a bounded search limit no larger than 1,000,000 iterations.",
                     }
                 )
@@ -1630,8 +1791,9 @@ def _deterministic_generated_python_repair(
         return None
     if isinstance(diagnostic_line, int):
         line_nodes = [node for node in nodes if getattr(node, "lineno", None) == diagnostic_line]
-        if line_nodes:
-            nodes = line_nodes
+        if not line_nodes:
+            return None
+        nodes = line_nodes
     if len(nodes) != 1:
         return None
     node = nodes[0]
@@ -1683,23 +1845,22 @@ def _deterministic_safe_import_repair(
         and node.id == name
     ]
     diagnostic_line = diagnostic.get("line")
-    if isinstance(diagnostic_line, int) and not any(
-        getattr(node, "lineno", None) == diagnostic_line for node in matching_loads
-    ):
-        return None
     if not matching_loads:
         return None
-    for node in getattr(tree, "body", []):
-        if isinstance(node, ast.Import):
-            bound_names = {
-                alias.asname or alias.name.split(".", 1)[0] for alias in node.names
-            }
-        elif isinstance(node, ast.ImportFrom):
-            bound_names = {alias.asname or alias.name for alias in node.names}
-        else:
-            continue
-        if name in bound_names:
+    target_loads = matching_loads
+    if isinstance(diagnostic_line, int):
+        target_loads = [
+            node
+            for node in matching_loads
+            if getattr(node, "lineno", None) == diagnostic_line
+        ]
+        if not target_loads:
             return None
+    if any(
+        _generated_name_shadowed_at(tree, name, target)
+        for target in target_loads
+    ):
+        return None
 
     insertion_line = 0
     body = list(getattr(tree, "body", []))
@@ -1776,6 +1937,166 @@ def _deterministic_json_literal_repair(
     return repaired
 
 
+def _generated_name_shadowed_at(
+    tree: ast.AST, name: str, target: ast.AST
+) -> bool:
+    """Return whether a generated name is shadowed when target executes."""
+    parents = {
+        id(child): parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    enclosing: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | None = None
+    ancestor = parents.get(id(target))
+    while ancestor is not None:
+        if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            enclosing = ancestor
+            break
+        ancestor = parents.get(id(ancestor))
+
+    if enclosing is not None:
+        arguments = enclosing.args
+        if name in {
+            argument.arg
+            for argument in [
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+            ]
+        } or (arguments.vararg is not None and arguments.vararg.arg == name) or (
+            arguments.kwarg is not None and arguments.kwarg.arg == name
+        ):
+            return True
+
+        class LocalBindingFinder(ast.NodeVisitor):
+            found = False
+
+            def visit_Name(self, node: ast.Name) -> None:
+                if isinstance(node.ctx, ast.Store) and node.id == name:
+                    self.found = True
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                if node is enclosing:
+                    for statement in node.body:
+                        self.visit(statement)
+                elif node.name == name:
+                    self.found = True
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                if node is enclosing:
+                    self.visit(node.body)
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                if node.name == name:
+                    self.found = True
+
+            def visit_Import(self, node: ast.Import) -> None:
+                if any(
+                    (alias.asname or alias.name.split(".", 1)[0]) == name
+                    for alias in node.names
+                ):
+                    self.found = True
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                if any((alias.asname or alias.name) == name for alias in node.names):
+                    self.found = True
+
+            def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+                if node.name == name:
+                    self.found = True
+                for statement in node.body:
+                    self.visit(statement)
+
+        finder = LocalBindingFinder()
+        finder.visit(enclosing)
+        if finder.found:
+            return True
+
+    before_line = None if enclosing is not None else getattr(target, "lineno", None)
+
+    def process(statements: list[ast.stmt], bound: bool) -> bool:
+        for statement in statements:
+            if isinstance(before_line, int) and statement.lineno >= before_line:
+                continue
+            if isinstance(statement, ast.If):
+                truth = _constant_truth(statement.test)
+                if truth is True:
+                    bound = process(statement.body, bound)
+                elif truth is False:
+                    bound = process(statement.orelse, bound)
+                else:
+                    bound = process(statement.body, bound) or process(
+                        statement.orelse, bound
+                    )
+                continue
+            if isinstance(statement, ast.While):
+                truth = _constant_truth(statement.test)
+                if truth is False:
+                    bound = process(statement.orelse, bound)
+                elif truth is True:
+                    bound = process(statement.body, bound) or process(
+                        statement.orelse, bound
+                    )
+                else:
+                    bound = bound or process(statement.body, bound) or process(
+                        statement.orelse, bound
+                    )
+                continue
+            if isinstance(statement, (ast.Try, ast.TryStar)):
+                path_values = [process(statement.body, bound)]
+                path_values.extend(
+                    process(handler.body, bound) for handler in statement.handlers
+                )
+                path_values.append(process(statement.orelse, bound))
+                bound = any(path_values)
+                bound = process(statement.finalbody, bound)
+                continue
+            if isinstance(statement, ast.Match):
+                bound = bound or any(
+                    process(case.body, bound) for case in statement.cases
+                )
+                continue
+            targets: list[ast.AST] = []
+            if isinstance(statement, ast.Assign):
+                targets = statement.targets
+            elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+                targets = [statement.target]
+            elif isinstance(statement, (ast.For, ast.AsyncFor)):
+                targets = [statement.target]
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                targets = [
+                    item.optional_vars
+                    for item in statement.items
+                    if item.optional_vars is not None
+                ]
+            if any(
+                isinstance(node, ast.Name) and node.id == name
+                for target_node in targets
+                for node in ast.walk(target_node)
+            ):
+                bound = True
+            elif isinstance(statement, ast.Delete) and any(
+                isinstance(node, ast.Name) and node.id == name
+                for target_node in statement.targets
+                for node in ast.walk(target_node)
+            ):
+                bound = False
+            elif isinstance(
+                statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ) and statement.name == name:
+                bound = True
+            elif isinstance(statement, (ast.Import, ast.ImportFrom)) and any(
+                (alias.asname or alias.name.split(".", 1)[0]) == name
+                for alias in statement.names
+            ):
+                bound = True
+        return bound
+
+    return process(list(getattr(tree, "body", [])), False)
+
+
 def _deterministic_length_attribute_repair(
     code: str, diagnostic: dict[str, Any]
 ) -> str | None:
@@ -1808,12 +2129,6 @@ def _deterministic_length_attribute_repair(
         tree = _parse_bounded_generated_python(code)
     except (SyntaxError, TypeError, ValueError, OverflowError):
         return None
-    if any(
-        (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "len")
-        or (isinstance(node, ast.arg) and node.arg == "len")
-        for node in ast.walk(tree)
-    ):
-        return None
     parent = {
         id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
     }
@@ -1831,6 +2146,8 @@ def _deterministic_length_attribute_repair(
     if len(candidates) != 1:
         return None
     attribute = candidates[0]
+    if _generated_name_shadowed_at(tree, "len", attribute):
+        return None
     attribute_parent = parent.get(id(attribute))
     if isinstance(attribute_parent, ast.Call) and attribute_parent.func is attribute:
         if attribute_parent.args or attribute_parent.keywords:
@@ -2135,24 +2452,9 @@ def _deterministic_builtin_keyword_repair(
         candidates.append((node, target_keywords[0], node.func.id, replacement[0]))
     if len(candidates) != 1:
         return None
-    _call, target_keyword, builtin_name, replacement = candidates[0]
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Store)
-            and node.id == builtin_name
-        ) or (isinstance(node, ast.arg) and node.arg == builtin_name):
-            return None
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.name == builtin_name:
-                return None
-        if isinstance(node, ast.ExceptHandler) and node.name == builtin_name:
-            return None
-        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-            (alias.asname or alias.name.split(".", 1)[0]) == builtin_name
-            for alias in node.names
-        ):
-            return None
+    call, target_keyword, builtin_name, replacement = candidates[0]
+    if _generated_name_shadowed_at(tree, builtin_name, call):
+        return None
     target_keyword.arg = replacement
     ast.fix_missing_locations(tree)
     try:
@@ -2349,7 +2651,14 @@ def _deterministic_membership_method_repair(
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == attribute_name
-        and len(node.args) == 1
+        and (
+            len(node.args) == 1
+            or (
+                attribute_name == "includes"
+                and object_type == "str"
+                and len(node.args) == 2
+            )
+        )
         and not node.keywords
         and (
             not isinstance(diagnostic_line, int)
@@ -2359,11 +2668,18 @@ def _deterministic_membership_method_repair(
     if len(candidates) != 1:
         return None
     target = candidates[0]
+    membership_container: ast.AST = target.func.value
+    if attribute_name == "includes" and len(target.args) == 2:
+        membership_container = ast.Subscript(
+            value=target.func.value,
+            slice=ast.Slice(lower=target.args[1]),
+            ctx=ast.Load(),
+        )
     replacement = ast.copy_location(
         ast.Compare(
             left=target.args[0],
             ops=[ast.In()],
-            comparators=[target.func.value],
+            comparators=[membership_container],
         ),
         target,
     )
@@ -2399,6 +2715,11 @@ def _deterministic_string_method_repair(
     replacement_name = {
         "startsWith": "startswith",
         "endsWith": "endswith",
+        "indexOf": "find",
+        "replaceAll": "replace",
+        "toLowerCase": "lower",
+        "toUpperCase": "upper",
+        "trim": "strip",
     }.get(attribute_name)
     if replacement_name is None:
         return None
@@ -2407,6 +2728,15 @@ def _deterministic_string_method_repair(
     except (SyntaxError, TypeError, ValueError, OverflowError):
         return None
     diagnostic_line = diagnostic.get("line")
+    argument_bounds = {
+        "startsWith": (1, 2),
+        "endsWith": (1, 1),
+        "indexOf": (1, 2),
+        "replaceAll": (2, 2),
+        "toLowerCase": (0, 0),
+        "toUpperCase": (0, 0),
+        "trim": (0, 0),
+    }[attribute_name]
     candidates = [
         node
         for node in ast.walk(tree)
@@ -2414,11 +2744,7 @@ def _deterministic_string_method_repair(
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == attribute_name
         and not node.keywords
-        and (
-            1 <= len(node.args) <= 2
-            if attribute_name == "startsWith"
-            else len(node.args) == 1
-        )
+        and argument_bounds[0] <= len(node.args) <= argument_bounds[1]
         and (
             not isinstance(diagnostic_line, int)
             or getattr(node, "lineno", None) == diagnostic_line
@@ -2435,6 +2761,98 @@ def _deterministic_string_method_repair(
     if _generated_python_preflight_issues(tree):
         return None
     return ast.unparse(tree)
+
+
+def _deterministic_string_expression_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Rewrite JS string expressions whose constant bounds preserve semantics."""
+    if (
+        str(diagnostic.get("type") or "") != "AttributeError"
+        or str(diagnostic.get("object_type") or "") != "str"
+    ):
+        return None
+    attribute_name = str(diagnostic.get("attribute") or "")
+    if attribute_name not in {"repeat", "charAt", "substring"}:
+        return None
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    diagnostic_line = diagnostic.get("line")
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attribute_name
+        and not node.keywords
+        and (
+            not isinstance(diagnostic_line, int)
+            or getattr(node, "lineno", None) == diagnostic_line
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+    target = candidates[0]
+
+    def nonnegative_integer(node: ast.AST) -> int | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(
+            node.value, bool
+        ) and node.value >= 0:
+            return node.value
+        return None
+
+    values = [nonnegative_integer(argument) for argument in target.args]
+    receiver = target.func.value
+    replacement: ast.AST
+    if (
+        attribute_name == "repeat"
+        and len(values) == 1
+        and values[0] is not None
+        and values[0] <= 1_000_000
+    ):
+        replacement = ast.BinOp(left=receiver, op=ast.Mult(), right=target.args[0])
+    elif attribute_name == "charAt" and len(values) == 1 and values[0] is not None:
+        replacement = ast.Subscript(
+            value=receiver,
+            slice=ast.Slice(
+                lower=target.args[0], upper=ast.Constant(value=values[0] + 1)
+            ),
+            ctx=ast.Load(),
+        )
+    elif attribute_name == "substring" and len(values) in {1, 2} and all(
+        value is not None for value in values
+    ):
+        if len(values) == 2 and values[0] > values[1]:
+            return None
+        replacement = ast.Subscript(
+            value=receiver,
+            slice=ast.Slice(
+                lower=target.args[0],
+                upper=target.args[1] if len(target.args) == 2 else None,
+            ),
+            ctx=ast.Load(),
+        )
+    else:
+        return None
+    replacement = ast.copy_location(replacement, target)
+
+    class ReplaceStringExpression(ast.NodeTransformer):
+        def generic_visit(self, node: ast.AST) -> ast.AST:
+            if node is target:
+                return replacement
+            return super().generic_visit(node)
+
+    repaired_tree = ReplaceStringExpression().visit(tree)
+    ast.fix_missing_locations(repaired_tree)
+    try:
+        compile(repaired_tree, "<python_tool_string_expression_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(repaired_tree):
+        return None
+    return ast.unparse(repaired_tree)
 
 
 def _deterministic_list_push_repair(
@@ -2509,6 +2927,66 @@ def _deterministic_list_push_repair(
     return repaired
 
 
+def _deterministic_list_slice_repair(
+    code: str, diagnostic: dict[str, Any]
+) -> str | None:
+    """Rewrite one JS list or string slice call to Python slicing syntax."""
+    if (
+        str(diagnostic.get("type") or "") != "AttributeError"
+        or str(diagnostic.get("attribute") or "") != "slice"
+        or str(diagnostic.get("object_type") or "") not in {"list", "str"}
+    ):
+        return None
+    try:
+        tree = _parse_bounded_generated_python(code)
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    diagnostic_line = diagnostic.get("line")
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "slice"
+        and len(node.args) <= 2
+        and not node.keywords
+        and (
+            not isinstance(diagnostic_line, int)
+            or getattr(node, "lineno", None) == diagnostic_line
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+    target = candidates[0]
+    replacement = ast.copy_location(
+        ast.Subscript(
+            value=target.func.value,
+            slice=ast.Slice(
+                lower=target.args[0] if target.args else None,
+                upper=target.args[1] if len(target.args) == 2 else None,
+            ),
+            ctx=ast.Load(),
+        ),
+        target,
+    )
+
+    class ReplaceSlice(ast.NodeTransformer):
+        def generic_visit(self, node: ast.AST) -> ast.AST:
+            if node is target:
+                return replacement
+            return super().generic_visit(node)
+
+    repaired_tree = ReplaceSlice().visit(tree)
+    ast.fix_missing_locations(repaired_tree)
+    try:
+        compile(repaired_tree, "<python_tool_list_slice_repair>", "exec")
+    except (SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if _generated_python_preflight_issues(repaired_tree):
+        return None
+    return ast.unparse(repaired_tree)
+
+
 def _deterministic_runtime_python_repair(
     code: str, diagnostic: dict[str, Any]
 ) -> tuple[str, str] | None:
@@ -2543,9 +3021,19 @@ def _deterministic_runtime_python_repair(
     repaired = _deterministic_string_method_repair(code, diagnostic)
     if repaired is not None:
         return repaired, "replace_string_method"
+    repaired = _deterministic_string_expression_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, "replace_string_expression"
     repaired = _deterministic_list_push_repair(code, diagnostic)
     if repaired is not None:
         return repaired, "replace_list_push"
+    repaired = _deterministic_list_slice_repair(code, diagnostic)
+    if repaired is not None:
+        return repaired, (
+            "replace_string_slice"
+            if str(diagnostic.get("object_type") or "") == "str"
+            else "replace_list_slice"
+        )
     repaired = _deterministic_safe_import_repair(code, diagnostic)
     if repaired is not None:
         return repaired, "insert_safe_import"
@@ -2644,49 +3132,295 @@ def _parse_bounded_generated_python(code: str) -> ast.AST:
 
 
 def _static_candidate_value(node: ast.AST, bindings: dict[str, Any]) -> Any:
-    """Resolve bounded literal data and simple variable aliases without execution."""
+    """Resolve bounded side-effect-free values without executing generated code."""
+
+    def bounded(value: Any) -> Any:
+        if isinstance(value, str):
+            if len(value) > _STATIC_CANDIDATE_MAX_TEXT:
+                raise ValueError("static candidate text is too large")
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            if len(value) > _STATIC_CANDIDATE_MAX_TEXT:
+                raise ValueError("static candidate bytes are too large")
+            return value
+        if isinstance(value, (list, tuple)):
+            if len(value) > _STATIC_CANDIDATE_MAX_ITEMS:
+                raise ValueError("static candidate sequence is too large")
+            converted = [bounded(item) for item in value]
+            return converted if isinstance(value, list) else tuple(converted)
+        if isinstance(value, dict):
+            if len(value) > _STATIC_CANDIDATE_MAX_ITEMS:
+                raise ValueError("static candidate mapping is too large")
+            converted: dict[Any, Any] = {}
+            for key, item in value.items():
+                safe_key = bounded(key)
+                try:
+                    hash(safe_key)
+                except TypeError as exc:
+                    raise ValueError("static candidate mapping key is unhashable") from exc
+                converted[safe_key] = bounded(item)
+            return converted
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value != value or abs(value) > _STATIC_CANDIDATE_MAX_ABS_NUMBER:
+                raise ValueError("static candidate number is out of bounds")
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        raise ValueError("unsupported static candidate value")
+
     if isinstance(node, ast.Name) and node.id in bindings:
-        return bindings[node.id]
+        return bounded(bindings[node.id])
     if isinstance(node, ast.Constant):
-        return node.value
+        return bounded(node.value)
     if isinstance(node, (ast.List, ast.Tuple)):
-        values = [_static_candidate_value(item, bindings) for item in node.elts]
+        values: list[Any] = []
+        for item in node.elts:
+            if isinstance(item, ast.Starred):
+                expanded = _static_candidate_value(item.value, bindings)
+                if not isinstance(expanded, (list, tuple)):
+                    raise ValueError("starred static candidate is not a sequence")
+                values.extend(expanded)
+            else:
+                values.append(_static_candidate_value(item, bindings))
+            if len(values) > _STATIC_CANDIDATE_MAX_ITEMS:
+                raise ValueError("static candidate sequence is too large")
         return values if isinstance(node, ast.List) else tuple(values)
     if isinstance(node, ast.Dict):
-        return {
-            _static_candidate_value(key, bindings): _static_candidate_value(
-                value, bindings
-            )
-            for key, value in zip(node.keys, node.values)
-            if key is not None
-        }
+        result: dict[Any, Any] = {}
+        for key, value_node in zip(node.keys, node.values):
+            if key is None:
+                expanded = _static_candidate_value(value_node, bindings)
+                if not isinstance(expanded, dict):
+                    raise ValueError("dictionary unpack candidate is not a mapping")
+                result.update(expanded)
+            else:
+                candidate_key = _static_candidate_value(key, bindings)
+                try:
+                    hash(candidate_key)
+                except TypeError as exc:
+                    raise ValueError("static candidate mapping key is unhashable") from exc
+                result[candidate_key] = _static_candidate_value(value_node, bindings)
+            if len(result) > _STATIC_CANDIDATE_MAX_ITEMS:
+                raise ValueError("static candidate mapping is too large")
+        return bounded(result)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
         value = _static_candidate_value(node.operand, bindings)
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise ValueError("non-numeric unary candidate value")
-        return -value if isinstance(node.op, ast.USub) else value
+        return bounded(-value if isinstance(node.op, ast.USub) else value)
+    if isinstance(node, ast.BinOp):
+        left = _static_candidate_value(node.left, bindings)
+        right = _static_candidate_value(node.right, bindings)
+        try:
+            if isinstance(node.op, ast.Add) and (
+                (isinstance(left, str) and isinstance(right, str))
+                or (isinstance(left, list) and isinstance(right, list))
+                or (isinstance(left, tuple) and isinstance(right, tuple))
+            ):
+                return bounded(left + right)
+            numeric = (
+                isinstance(left, (int, float))
+                and not isinstance(left, bool)
+                and isinstance(right, (int, float))
+                and not isinstance(right, bool)
+            )
+            if numeric and isinstance(node.op, ast.Add):
+                return bounded(left + right)
+            if numeric and isinstance(node.op, ast.Sub):
+                return bounded(left - right)
+            if numeric and isinstance(node.op, ast.Mult):
+                return bounded(left * right)
+            if numeric and isinstance(node.op, ast.FloorDiv):
+                return bounded(left // right)
+            if numeric and isinstance(node.op, ast.Mod):
+                return bounded(left % right)
+        except (ArithmeticError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid bounded static operation") from exc
+        raise ValueError("unsupported static binary operation")
+    if isinstance(node, ast.Subscript):
+        container = _static_candidate_value(node.value, bindings)
+        if not isinstance(container, (str, bytes, list, tuple, dict)):
+            raise ValueError("static candidate is not subscriptable")
+        if isinstance(node.slice, ast.Slice):
+            parts: list[int | None] = []
+            for part in (node.slice.lower, node.slice.upper, node.slice.step):
+                if part is None:
+                    parts.append(None)
+                    continue
+                resolved = _static_candidate_value(part, bindings)
+                if not isinstance(resolved, int) or isinstance(resolved, bool):
+                    raise ValueError("static slice bounds must be integers")
+                parts.append(resolved)
+            key: Any = slice(*parts)
+        else:
+            key = _static_candidate_value(node.slice, bindings)
+        try:
+            return bounded(container[key])
+        except (IndexError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid static candidate subscript") from exc
+    if isinstance(node, ast.IfExp):
+        try:
+            truth = bool(_static_candidate_value(node.test, bindings))
+        except ValueError:
+            truth = _constant_truth(node.test)
+        if truth is None:
+            raise ValueError("conditional candidate is dynamic")
+        return _static_candidate_value(node.body if truth else node.orelse, bindings)
+    if isinstance(node, ast.BoolOp):
+        last: Any = None
+        for value_node in node.values:
+            last = _static_candidate_value(value_node, bindings)
+            truth = bool(last)
+            if isinstance(node.op, ast.And) and not truth:
+                return last
+            if isinstance(node.op, ast.Or) and truth:
+                return last
+        return last
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value_node in node.values:
+            if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
+                part = value_node.value
+            elif isinstance(value_node, ast.FormattedValue):
+                if value_node.format_spec is not None:
+                    raise ValueError("formatted static candidate specifications are unsupported")
+                value = _static_candidate_value(value_node.value, bindings)
+                if not (value is None or isinstance(value, (str, bool, int, float))):
+                    raise ValueError("formatted static candidate value is unsupported")
+                if value_node.conversion == 114:
+                    part = repr(value)
+                elif value_node.conversion == 97:
+                    part = ascii(value)
+                else:
+                    part = str(value)
+            else:
+                raise ValueError("joined static candidate is dynamic")
+            parts.append(part)
+            if sum(map(len, parts)) > _STATIC_CANDIDATE_MAX_TEXT:
+                raise ValueError("formatted static candidate is too large")
+        return "".join(parts)
     raise ValueError("candidate action is dynamic")
 
 
 def _static_candidate_action_arguments(tree: ast.AST) -> list[Any]:
     arguments: list[Any] = []
 
+    def target_names(target: ast.AST) -> set[str]:
+        return {
+            node.id
+            for node in ast.walk(target)
+            if isinstance(node, ast.Name)
+        }
+
+    def invalidate_target(target: ast.AST, bindings: dict[str, Any]) -> None:
+        for name in target_names(target):
+            bindings.pop(name, None)
+
+    def bind_target(target: ast.AST, value: Any, bindings: dict[str, Any]) -> None:
+        if isinstance(target, ast.Name):
+            bindings[target.id] = value
+            return
+        if (
+            isinstance(target, (ast.Tuple, ast.List))
+            and isinstance(value, (tuple, list))
+            and len(target.elts) == len(value)
+            and not any(isinstance(item, ast.Starred) for item in target.elts)
+        ):
+            for item, item_value in zip(target.elts, value):
+                bind_target(item, item_value, bindings)
+            return
+        invalidate_target(target, bindings)
+
+    def merge_bindings(
+        left: dict[str, Any], right: dict[str, Any]
+    ) -> dict[str, Any]:
+        merged: dict[str, Any] = {}
+        for name in left.keys() & right.keys():
+            try:
+                equal = left[name] == right[name]
+            except (TypeError, ValueError):
+                equal = False
+            if equal is True:
+                merged[name] = left[name]
+        return merged
+
     class ExecutedExpressionVisitor(ast.NodeVisitor):
         def __init__(self, bindings: dict[str, Any]) -> None:
             self.bindings = bindings
 
         def visit_Call(self, node: ast.Call) -> None:
+            self.visit(node.func)
+            for argument in node.args:
+                self.visit(argument)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
             if isinstance(node.func, ast.Name) and node.func.id == "action" and node.args:
                 try:
                     arguments.append(_static_candidate_value(node.args[0], self.bindings))
                 except ValueError:
                     pass
-            self.generic_visit(node)
+
+        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+            self.visit(node.value)
+            try:
+                value = _static_candidate_value(node.value, self.bindings)
+            except ValueError:
+                invalidate_target(node.target, self.bindings)
+            else:
+                bind_target(node.target, value, self.bindings)
+
+        def visit_BoolOp(self, node: ast.BoolOp) -> None:
+            for value_node in node.values:
+                self.visit(value_node)
+                try:
+                    truth = bool(_static_candidate_value(value_node, self.bindings))
+                except ValueError:
+                    truth = _constant_truth(value_node)
+                if isinstance(node.op, ast.And) and truth is False:
+                    break
+                if isinstance(node.op, ast.Or) and truth is True:
+                    break
+
+        def visit_IfExp(self, node: ast.IfExp) -> None:
+            self.visit(node.test)
+            try:
+                truth = bool(_static_candidate_value(node.test, self.bindings))
+            except ValueError:
+                truth = _constant_truth(node.test)
+            if truth is True:
+                self.visit(node.body)
+            elif truth is False:
+                self.visit(node.orelse)
+            else:
+                self.visit(node.body)
+                self.visit(node.orelse)
 
         def visit_Lambda(self, node: ast.Lambda) -> None:
             for default in [*node.args.defaults, *node.args.kw_defaults]:
                 if default is not None:
                     self.visit(default)
+
+        def _visit_comprehension(
+            self, node: ast.AST, result_nodes: list[ast.AST]
+        ) -> None:
+            for generator in list(getattr(node, "generators", [])):
+                self.visit(generator.iter)
+                if _constant_iterable_is_empty(generator.iter):
+                    return
+                for condition in generator.ifs:
+                    self.visit(condition)
+                    if _constant_truth(condition) is False:
+                        return
+            for result_node in result_nodes:
+                self.visit(result_node)
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            self._visit_comprehension(node, [node.elt])
+
+        visit_SetComp = visit_ListComp
+        visit_GeneratorExp = visit_ListComp
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            self._visit_comprehension(node, [node.key, node.value])
 
     def visit_statements(statements: list[ast.stmt], bindings: dict[str, Any]) -> None:
         for statement in statements:
@@ -2737,49 +3471,83 @@ def _static_candidate_action_arguments(tree: ast.AST) -> list[Any]:
                 elif truth is False:
                     visit_statements(statement.orelse, bindings)
                 else:
-                    visit_statements(statement.body, dict(bindings))
-                    visit_statements(statement.orelse, dict(bindings))
+                    body_bindings = dict(bindings)
+                    else_bindings = dict(bindings)
+                    visit_statements(statement.body, body_bindings)
+                    visit_statements(statement.orelse, else_bindings)
+                    bindings.clear()
+                    bindings.update(merge_bindings(body_bindings, else_bindings))
                 continue
             if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
                 expression = statement.iter if isinstance(statement, (ast.For, ast.AsyncFor)) else statement.test
                 ExecutedExpressionVisitor(bindings).visit(expression)
-                if not (
+                skip_body = (
                     isinstance(statement, ast.For)
                     and _constant_iterable_is_empty(statement.iter)
-                ):
-                    visit_statements(statement.body, dict(bindings))
-                visit_statements(statement.orelse, dict(bindings))
+                ) or (
+                    isinstance(statement, ast.While)
+                    and _constant_truth(statement.test) is False
+                )
+                if skip_body:
+                    visit_statements(statement.orelse, bindings)
+                    continue
+                before_loop = dict(bindings)
+                body_bindings = dict(bindings)
+                if isinstance(statement, (ast.For, ast.AsyncFor)):
+                    invalidate_target(statement.target, body_bindings)
+                visit_statements(statement.body, body_bindings)
+                bindings.clear()
+                bindings.update(merge_bindings(before_loop, body_bindings))
+                if isinstance(statement, (ast.For, ast.AsyncFor)):
+                    invalidate_target(statement.target, bindings)
+                visit_statements(statement.orelse, bindings)
                 continue
             if isinstance(statement, ast.Assign):
                 ExecutedExpressionVisitor(bindings).visit(statement.value)
-                if len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
-                    name = statement.targets[0].id
-                    try:
-                        bindings[name] = _static_candidate_value(statement.value, bindings)
-                    except ValueError:
-                        bindings.pop(name, None)
+                try:
+                    value = _static_candidate_value(statement.value, bindings)
+                except ValueError:
+                    for target in statement.targets:
+                        invalidate_target(target, bindings)
+                else:
+                    for target in statement.targets:
+                        bind_target(target, value, bindings)
                 continue
             if isinstance(statement, ast.AnnAssign):
                 if statement.value is not None:
                     ExecutedExpressionVisitor(bindings).visit(statement.value)
                 if isinstance(statement.target, ast.Name):
                     try:
-                        bindings[statement.target.id] = _static_candidate_value(statement.value, bindings)
+                        value = _static_candidate_value(statement.value, bindings)
                     except (TypeError, ValueError):
-                        bindings.pop(statement.target.id, None)
+                        invalidate_target(statement.target, bindings)
+                    else:
+                        bind_target(statement.target, value, bindings)
                 continue
-            if (
-                isinstance(statement, ast.Expr)
-                and isinstance(statement.value, ast.NamedExpr)
-                and isinstance(statement.value.target, ast.Name)
-            ):
-                ExecutedExpressionVisitor(bindings).visit(statement.value.value)
-                try:
-                    bindings[statement.value.target.id] = _static_candidate_value(
-                        statement.value.value, bindings
+            if isinstance(statement, ast.AugAssign):
+                visitor = ExecutedExpressionVisitor(bindings)
+                visitor.visit(statement.target)
+                visitor.visit(statement.value)
+                invalidate_target(statement.target, bindings)
+                continue
+            if isinstance(statement, ast.Delete):
+                ExecutedExpressionVisitor(bindings).visit(statement)
+                for target in statement.targets:
+                    invalidate_target(target, bindings)
+                continue
+            if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                for alias in statement.names:
+                    bindings.pop(
+                        alias.asname or alias.name.split(".", 1)[0], None
                     )
-                except ValueError:
-                    bindings.pop(statement.value.target.id, None)
+                continue
+            if isinstance(statement, (ast.With, ast.AsyncWith)):
+                visitor = ExecutedExpressionVisitor(bindings)
+                for item in statement.items:
+                    visitor.visit(item.context_expr)
+                    if item.optional_vars is not None:
+                        invalidate_target(item.optional_vars, bindings)
+                visit_statements(statement.body, bindings)
                 continue
             ExecutedExpressionVisitor(bindings).visit(statement)
 
@@ -2794,7 +3562,15 @@ def _normalize_generated_python_code(value: Any) -> str:
     authoritative. If it does not compile, accept one unambiguous Python wrapper
     whose body does compile. Multiple blocks stay untouched so we never guess.
     """
-    python_languages = {"", "py", "py3", "python", "python3"}
+    python_languages = {
+        "",
+        "py",
+        "py3",
+        "python",
+        "python-3",
+        "python3",
+        "python_3",
+    }
 
     def executable(candidate: Any) -> str | None:
         if not isinstance(candidate, str):
@@ -2836,8 +3612,32 @@ def _normalize_generated_python_code(value: Any) -> str:
                     for item in target.elts:
                         bind_target(item)
 
+            def unbind_target(target: ast.AST) -> None:
+                if isinstance(target, ast.Name):
+                    bindings.discard(target.id)
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    for item in target.elts:
+                        unbind_target(item)
+
+            class NamedExpressionBindingFinder(ast.NodeVisitor):
+                def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+                    bind_target(node.target)
+                    self.visit(node.value)
+
+                def visit_FunctionDef(self, _node: ast.FunctionDef) -> None:
+                    return
+
+                visit_AsyncFunctionDef = visit_FunctionDef
+
+                def visit_Lambda(self, _node: ast.Lambda) -> None:
+                    return
+
+                def visit_ClassDef(self, _node: ast.ClassDef) -> None:
+                    return
+
             def visit_statements(statements: list[ast.stmt]) -> None:
                 for statement in statements:
+                    NamedExpressionBindingFinder().visit(statement)
                     if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                         bindings.add(statement.name)
                     elif isinstance(statement, ast.Assign):
@@ -2845,6 +3645,9 @@ def _normalize_generated_python_code(value: Any) -> str:
                             bind_target(target)
                     elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
                         bind_target(statement.target)
+                    elif isinstance(statement, ast.Delete):
+                        for target in statement.targets:
+                            unbind_target(target)
                     elif isinstance(statement, (ast.For, ast.AsyncFor)):
                         bind_target(statement.target)
                         visit_statements(statement.body)
@@ -2865,8 +3668,6 @@ def _normalize_generated_python_code(value: Any) -> str:
                         visit_statements(statement.orelse)
                         visit_statements(statement.finalbody)
                         for handler in statement.handlers:
-                            if handler.name:
-                                bindings.add(handler.name)
                             visit_statements(handler.body)
                     elif isinstance(statement, ast.Match):
                         for case in statement.cases:
@@ -2949,7 +3750,7 @@ def _normalize_generated_python_code(value: Any) -> str:
                 if recovered is not None:
                     add(recovered)
             part_type = str(payload.get("type", "")).lower()
-            if part_type in {"text", "output_text"} and keys <= {"type", "text", *metadata_keys}:
+            if part_type in {"input_text", "output_text", "output_text_delta", "text", "text_delta"} and keys <= {"type", "text", *metadata_keys}:
                 add(payload.get("text"))
         elif isinstance(payload, list) and len(payload) <= 32:
             text_fragments: list[str] = []
@@ -2965,7 +3766,7 @@ def _normalize_generated_python_code(value: Any) -> str:
                 part_type = str(part.get("type", "")).lower()
                 text = part.get("text")
                 if (
-                    part_type not in {"text", "output_text"}
+                    part_type not in {"input_text", "output_text", "output_text_delta", "text", "text_delta"}
                     or keys - {"type", "text", *metadata_keys}
                     or not isinstance(text, str)
                 ):

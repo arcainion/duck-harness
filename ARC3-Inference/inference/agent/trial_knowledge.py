@@ -13,6 +13,33 @@ from pathlib import Path
 from typing import Any
 
 
+def _bounded_int(value: Any, default: int, *, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        return max(minimum, min(maximum, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _stored_items(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def _stored_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return False
+
+
 class TrialKnowledgeStore:
     """Accumulate compact transition evidence without retaining raw frames."""
 
@@ -23,8 +50,12 @@ class TrialKnowledgeStore:
         lesson_limit: int = 24,
         persistence_path: Path | None = None,
     ) -> None:
-        self._transition_limit = max(32, int(transition_limit))
-        self._lesson_limit = max(4, int(lesson_limit))
+        self._transition_limit = _bounded_int(
+            transition_limit, 512, minimum=32, maximum=1_000_000
+        )
+        self._lesson_limit = _bounded_int(
+            lesson_limit, 24, minimum=4, maximum=100_000
+        )
         self._lock = threading.RLock()
         self._transitions: dict[str, deque[dict[str, Any]]] = {}
         self._lessons: dict[str, deque[dict[str, Any]]] = {}
@@ -38,6 +69,9 @@ class TrialKnowledgeStore:
         resolved = Path(path)
         with self._lock:
             self._persistence_path = resolved
+            self._transitions.clear()
+            self._lessons.clear()
+            self._revision += 1
             if not resolved.exists():
                 return
             try:
@@ -51,26 +85,34 @@ class TrialKnowledgeStore:
                 except (OSError, json.JSONDecodeError):
                     return
             games = payload.get("games") if isinstance(payload, dict) else None
-            try:
-                schema_version = int(payload.get("version") or 1)
-            except (AttributeError, TypeError, ValueError):
-                schema_version = 1
+            schema_version = _bounded_int(
+                payload.get("version") if isinstance(payload, dict) else None,
+                1,
+                minimum=1,
+                maximum=3,
+            )
             if not isinstance(games, dict):
-                raise ValueError(f"Invalid trial knowledge store: {resolved}")
+                return
             for game_id, game_payload in games.items():
                 if not isinstance(game_payload, dict):
                     continue
                 loaded_transitions = []
-                for item in game_payload.get("transitions", []):
+                for item in _stored_items(game_payload.get("transitions")):
                     if not isinstance(item, dict):
                         continue
                     record = dict(item)
-                    record.setdefault(
-                        "state_context_version", 1 if schema_version < 3 else 2
+                    record["state_context_version"] = _bounded_int(
+                        record.get("state_context_version"),
+                        1 if schema_version < 3 else 2,
+                        minimum=1,
+                        maximum=2,
                     )
-                    record["legacy_state_identity"] = (
-                        int(record.get("state_context_version") or 1) < 2
-                    )
+                    record["legacy_state_identity"] = _bounded_int(
+                        record.get("state_context_version"),
+                        1,
+                        minimum=1,
+                        maximum=2,
+                    ) < 2
                     loaded_transitions.append(record)
                 self._transitions[str(game_id)] = deque(
                     loaded_transitions, maxlen=self._transition_limit
@@ -78,7 +120,7 @@ class TrialKnowledgeStore:
                 self._lessons[str(game_id)] = deque(
                     [
                         dict(item)
-                        for item in game_payload.get("lessons", [])
+                        for item in _stored_items(game_payload.get("lessons"))
                         if isinstance(item, dict)
                     ],
                     maxlen=self._lesson_limit,
@@ -140,10 +182,9 @@ class TrialKnowledgeStore:
         games = payload.get("games") if isinstance(payload, dict) else None
         if not isinstance(games, dict):
             return
-        try:
-            schema_version = int(payload.get("version") or 1)
-        except (AttributeError, TypeError, ValueError):
-            schema_version = 1
+        schema_version = _bounded_int(
+            payload.get("version"), 1, minimum=1, maximum=3
+        )
         for game_id, raw_game in games.items():
             if not isinstance(raw_game, dict):
                 continue
@@ -164,12 +205,18 @@ class TrialKnowledgeStore:
                         continue
                     record = dict(item)
                     if key == "transitions":
-                        record.setdefault(
-                            "state_context_version", 1 if schema_version < 3 else 2
+                        record["state_context_version"] = _bounded_int(
+                            record.get("state_context_version"),
+                            1 if schema_version < 3 else 2,
+                            minimum=1,
+                            maximum=2,
                         )
-                        record["legacy_state_identity"] = (
-                            int(record.get("state_context_version") or 1) < 2
-                        )
+                        record["legacy_state_identity"] = _bounded_int(
+                            record.get("state_context_version"),
+                            1,
+                            minimum=1,
+                            maximum=2,
+                        ) < 2
                     signature = json.dumps(record, sort_keys=True, default=str)
                     if signature not in seen:
                         combined.append(record)
@@ -210,7 +257,11 @@ class TrialKnowledgeStore:
         pass_index: int = 0,
         evidence_id: str = "",
     ) -> None:
-        if not game_id or not transition.get("executed"):
+        if (
+            not game_id
+            or not isinstance(transition, dict)
+            or not _stored_flag(transition.get("executed"))
+        ):
             return
         record = {
             key: transition.get(key)
@@ -236,7 +287,9 @@ class TrialKnowledgeStore:
                 "state_context_version",
             )
         }
-        record["pass_index"] = max(0, int(pass_index))
+        record["pass_index"] = _bounded_int(
+            pass_index, 0, minimum=0, maximum=1_000_000
+        )
         record["evidence_id"] = str(evidence_id or "")[:160]
         record["observed_at"] = (
             datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -247,7 +300,7 @@ class TrialKnowledgeStore:
             ).append(record)
             self._revision += 1
             if record.get("level_completed") or record.get("run_complete"):
-                plan = strategy or {}
+                plan = strategy if isinstance(strategy, dict) else {}
                 lesson = {
                     "pass_index": record["pass_index"],
                     "evidence_id": record["evidence_id"],
@@ -257,7 +310,7 @@ class TrialKnowledgeStore:
                     "goal": str(plan.get("goal") or "")[:280],
                     "hypothesis": str(plan.get("hypothesis") or "")[:280],
                     "current_subgoal": str(plan.get("current_subgoal") or "")[:200],
-                    "plan_steps": list(plan.get("plan_steps") or [])[:8],
+                    "plan_steps": _stored_items(plan.get("plan_steps"))[:8],
                 }
                 lessons = self._lessons.setdefault(
                     game_id, deque(maxlen=self._lesson_limit)
@@ -299,7 +352,7 @@ class TrialKnowledgeStore:
             if action:
                 evidence_id = str(
                     item.get("evidence_id")
-                    or f"legacy-pass:{int(item.get('pass_index') or 0)}"
+                    or f"legacy-pass:{_bounded_int(item.get('pass_index'), 0, minimum=0, maximum=1_000_000)}"
                 )
                 grouped_outcomes.setdefault(action, {}).setdefault(
                     evidence_id, Counter()
@@ -316,7 +369,7 @@ class TrialKnowledgeStore:
         evidence_ids = {
             str(
                 item.get("evidence_id")
-                or f"legacy-pass:{int(item.get('pass_index') or 0)}"
+                or f"legacy-pass:{_bounded_int(item.get('pass_index'), 0, minimum=0, maximum=1_000_000)}"
             )
             for item in transitions
         }
@@ -325,8 +378,14 @@ class TrialKnowledgeStore:
             "observations": len(transitions),
             "independent_evidence": len(evidence_ids),
             "legacy_state_identity_observations": sum(
-                bool(item.get("legacy_state_identity"))
-                or int(item.get("state_context_version") or 1) < 2
+                _stored_flag(item.get("legacy_state_identity"))
+                or _bounded_int(
+                    item.get("state_context_version"),
+                    1,
+                    minimum=1,
+                    maximum=2,
+                )
+                < 2
                 for item in transitions
             ),
             "state_action_evidence": [

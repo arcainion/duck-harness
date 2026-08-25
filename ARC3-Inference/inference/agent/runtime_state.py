@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -88,6 +89,9 @@ def normalize_grid(raw: Any) -> tuple[tuple[int, ...], ...]:
             continue
         cells: list[int] = []
         for cell in row:
+            if isinstance(cell, bool):
+                cells.append(0)
+                continue
             try:
                 cells.append(int(cell))
             except (TypeError, ValueError):
@@ -155,10 +159,17 @@ def history_entry_from_payload(payload: Any) -> HistoryEntry | None:
     if frame is None:
         return None
     raw_animation = payload.get("animation")
+    raw_reward = payload.get("reward") or 0.0
+    try:
+        reward = float(raw_reward) if not isinstance(raw_reward, bool) else 0.0
+    except (TypeError, ValueError, OverflowError):
+        reward = 0.0
+    if not math.isfinite(reward):
+        reward = 0.0
     return HistoryEntry(
         action=str(payload.get("action", "")).strip(),
         frame=frame,
-        reward=float(payload.get("reward") or 0.0),
+        reward=reward,
         animation=dict(raw_animation) if isinstance(raw_animation, dict) else {},
         outcome_class_override=str(payload.get("outcome_class_override") or "").strip(),
     )
@@ -176,10 +187,14 @@ def history_entry_to_payload(entry: HistoryEntry) -> dict[str, Any]:
 
 def _decode_runtime_state(text: str) -> tuple[Frame | None, list[HistoryEntry]]:
     payload = json.loads(text)
+    if not isinstance(payload, dict):
+        return None, []
     current_frame = frame_from_payload(payload.get("current_frame"))
+    raw_history = payload.get("history")
+    history = raw_history if isinstance(raw_history, (list, tuple)) else ()
     history_entries = [
         entry
-        for raw_entry in payload.get("history", [])
+        for raw_entry in history
         for entry in [history_entry_from_payload(raw_entry)]
         if entry is not None
     ]
@@ -208,6 +223,9 @@ def load_runtime_state(path: Path) -> tuple[Frame | None, list[HistoryEntry]]:
             final_signature = _runtime_state_signature(path)
         except FileNotFoundError:
             continue
+        except (json.JSONDecodeError, UnicodeError):
+            _invalidate_runtime_state_cache(path)
+            return None, []
         if final_signature != signature:
             continue
 

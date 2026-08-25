@@ -47,6 +47,8 @@ def _bounded_frame_crop(
     max_area: int = 256,
 ) -> dict[str, Any]:
     """Return a clipped, letter-coded crop without exposing numeric grid values."""
+    if isinstance(max_area, bool) or not isinstance(max_area, int) or max_area <= 0:
+        raise TypeError("frame.crop(...) max_area must be a positive integer.")
     coordinates = (top, left, bottom, right)
     if any(
         isinstance(value, bool) or not isinstance(value, int)
@@ -69,7 +71,7 @@ def _bounded_frame_crop(
     def color_symbol(value: Any) -> str:
         try:
             color_index = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return "?"
         if 0 <= color_index < len(color_chars):
             return color_chars[color_index]
@@ -231,12 +233,9 @@ def _bounded_frame_ray(
         )
     if not isinstance(include_start, bool):
         raise TypeError("frame.ray(..., include_start=...) expects a boolean.")
-    if isinstance(limit, bool):
+    if isinstance(limit, bool) or not isinstance(limit, int):
         raise TypeError("frame.ray(..., limit=...) expects an integer.")
-    try:
-        cell_limit = max(0, min(256, int(limit)))
-    except (TypeError, ValueError) as exc:
-        raise TypeError("frame.ray(..., limit=...) expects an integer.") from exc
+    cell_limit = max(0, min(256, limit))
 
     if stop_at is None:
         stop_symbols: list[str] = []
@@ -322,14 +321,9 @@ def _bounded_frame_find(
         raise ValueError(
             f"frame.find(symbol) expects one of the color symbols {color_chars!r}."
         )
-    if isinstance(limit, bool):
+    if isinstance(limit, bool) or not isinstance(limit, int):
         raise TypeError("frame.find(..., limit=...) expects an integer limit.")
-    try:
-        match_limit = max(0, min(256, int(limit)))
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            "frame.find(..., limit=...) expects an integer limit."
-        ) from exc
+    match_limit = max(0, min(256, limit))
 
     target = color_chars.index(symbol)
     row_count, column_count = shape
@@ -371,14 +365,9 @@ def _bounded_frame_color_summary(
     limit: int = 16,
 ) -> dict[str, Any]:
     """Summarize the frame palette without exposing raw numeric color ids."""
-    if isinstance(limit, bool):
+    if isinstance(limit, bool) or not isinstance(limit, int):
         raise TypeError("frame.color_summary(..., limit=...) expects an integer.")
-    try:
-        color_limit = max(0, min(len(color_chars), int(limit)))
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            "frame.color_summary(..., limit=...) expects an integer."
-        ) from exc
+    color_limit = max(0, min(len(color_chars), limit))
 
     row_count, column_count = shape
     total_cells = row_count * column_count
@@ -480,14 +469,9 @@ def _bounded_frame_spatial_operation(
 
     def bounded_limit(name: str, default: int, cap: int = 256) -> int:
         value = options.get(name, default)
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"frame.{operation}(..., {name}=...) expects an integer.")
-        try:
-            return max(0, min(cap, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.{operation}(..., {name}=...) expects an integer."
-            ) from exc
+        return max(0, min(cap, value))
 
     def coordinate(value: Any, name: str, *, signed: bool = False) -> tuple[int, int]:
         if not isinstance(value, (list, tuple)) or len(value) != 2:
@@ -803,14 +787,9 @@ def _bounded_frame_layout_operation(
 
     def integer(name: str, default: int, cap: int = 256, minimum: int = 0) -> int:
         value = options.get(name, default)
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"frame.{operation}(..., {name}=...) expects an integer.")
-        try:
-            return max(minimum, min(cap, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.{operation}(..., {name}=...) expects an integer."
-            ) from exc
+        return max(minimum, min(cap, value))
 
     def symbol(value: Any, name: str, *, optional: bool = False) -> str | None:
         if optional and value is None:
@@ -1116,14 +1095,9 @@ def _bounded_frame_runs(
         raise ValueError("frame.runs(..., directions=...) expects H, V, and/or D.")
 
     def bounded_integer(value: Any, name: str, minimum: int) -> int:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"frame.runs(..., {name}=...) expects an integer.")
-        try:
-            return max(minimum, min(256, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.runs(..., {name}=...) expects an integer."
-            ) from exc
+        return max(minimum, min(256, value))
 
     required_length = bounded_integer(min_length, "min_length", 1)
     run_limit = bounded_integer(limit, "limit", 0)
@@ -1229,14 +1203,9 @@ def _bounded_frame_rectangles(
     requested_kind = kind.lower()
 
     def bounded_integer(value: Any, name: str, minimum: int) -> int:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"frame.rectangles(..., {name}=...) expects an integer.")
-        try:
-            return max(minimum, min(256, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.rectangles(..., {name}=...) expects an integer."
-            ) from exc
+        return max(minimum, min(256, value))
 
     required_size = bounded_integer(min_size, "min_size", 1)
     rectangle_limit = bounded_integer(limit, "limit", 0)
@@ -1385,16 +1354,11 @@ def _bounded_frame_enclosed_regions(
         )
 
     def bounded_integer(value: Any, name: str, maximum: int) -> int:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(
                 f"frame.enclosed_regions(..., {name}=...) expects an integer."
             )
-        try:
-            return max(0, min(maximum, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.enclosed_regions(..., {name}=...) expects an integer."
-            ) from exc
+        return max(0, min(maximum, value))
 
     region_limit = bounded_integer(limit, "limit", 128)
     sample_limit = bounded_integer(cell_limit, "cell_limit", 256)
@@ -1530,14 +1494,9 @@ def _bounded_frame_components(
         raise TypeError("frame.components(..., diagonal=...) expects a boolean.")
 
     def bounded_integer(value: Any, name: str, maximum: int) -> int:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"frame.components(..., {name}=...) expects an integer.")
-        try:
-            return max(0, min(maximum, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.components(..., {name}=...) expects an integer."
-            ) from exc
+        return max(0, min(maximum, value))
 
     component_limit = bounded_integer(limit, "limit", 128)
     sample_limit = bounded_integer(cell_limit, "cell_limit", 256)
@@ -1645,14 +1604,9 @@ def _bounded_frame_objects(
         raise TypeError("frame.objects(..., diagonal=...) expects a boolean.")
 
     def bounded_integer(value: Any, name: str, maximum: int) -> int:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"frame.objects(..., {name}=...) expects an integer.")
-        try:
-            return max(0, min(maximum, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.objects(..., {name}=...) expects an integer."
-            ) from exc
+        return max(0, min(maximum, value))
 
     object_limit = bounded_integer(limit, "limit", 128)
     sample_limit = bounded_integer(cell_limit, "cell_limit", 256)
@@ -1801,16 +1755,11 @@ def _bounded_frame_object_relations(
         (object_limit, "object_limit", 64),
         (relation_limit, "relation_limit", 256),
     ):
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(
                 f"frame.object_relations(..., {name}=...) expects an integer."
             )
-        try:
-            parsed = max(0, min(maximum, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.object_relations(..., {name}=...) expects an integer."
-            ) from exc
+        parsed = max(0, min(maximum, value))
         if name == "object_limit":
             bounded_object_limit = parsed
         else:
@@ -1963,14 +1912,9 @@ def _bounded_frame_object_changes(
     """Match translation-invariant multi-color objects across two frames."""
     if not isinstance(diagonal, bool):
         raise TypeError("frame.track_objects(..., diagonal=...) expects a boolean.")
-    if isinstance(limit, bool):
+    if isinstance(limit, bool) or not isinstance(limit, int):
         raise TypeError("frame.track_objects(..., limit=...) expects an integer.")
-    try:
-        event_limit = max(0, min(256, int(limit)))
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            "frame.track_objects(..., limit=...) expects an integer."
-        ) from exc
+    event_limit = max(0, min(256, limit))
 
     inferred_background = background is None
     if inferred_background:
@@ -2270,14 +2214,9 @@ def _bounded_frame_symmetry(
     sample_limit: int = 8,
 ) -> dict[str, Any]:
     """Score exact and approximate reflection and rotational frame symmetries."""
-    if isinstance(sample_limit, bool):
+    if isinstance(sample_limit, bool) or not isinstance(sample_limit, int):
         raise TypeError("frame.symmetry(..., sample_limit=...) expects an integer.")
-    try:
-        mismatch_limit = max(0, min(32, int(sample_limit)))
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            "frame.symmetry(..., sample_limit=...) expects an integer."
-        ) from exc
+    mismatch_limit = max(0, min(32, sample_limit))
 
     row_count, column_count = shape
 
@@ -2398,14 +2337,9 @@ def _bounded_frame_periodicity(
         (candidate_limit, "candidate_limit"),
         (sample_limit, "sample_limit"),
     ):
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"frame.periodicity(..., {name}=...) expects an integer.")
-        try:
-            parsed_limits[name] = max(0, min(32, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.periodicity(..., {name}=...) expects an integer."
-            ) from exc
+        parsed_limits[name] = max(0, min(32, value))
     result_limit = parsed_limits["candidate_limit"]
     mismatch_limit = parsed_limits["sample_limit"]
     row_count, column_count = shape
@@ -2540,16 +2474,11 @@ def _bounded_frame_find_pattern(
         (mismatch_limit, "mismatch_limit", 32),
         (limit, "limit", 256),
     ):
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(
                 f"frame.find_pattern(..., {name}=...) expects an integer."
             )
-        try:
-            parsed_limits[name] = max(0, min(upper_bound, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.find_pattern(..., {name}=...) expects an integer."
-            ) from exc
+        parsed_limits[name] = max(0, min(upper_bound, value))
     allowed_mismatches = parsed_limits["max_mismatches"]
     mismatch_sample_limit = parsed_limits["mismatch_limit"]
     match_limit = parsed_limits["limit"]
@@ -2747,16 +2676,11 @@ def _bounded_reachable_region(
         )
 
     def bounded_integer(value: Any, name: str, maximum: int) -> int:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(
                 f"frame.reachable_region(..., {name}=...) expects an integer."
             )
-        try:
-            return max(0, min(maximum, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.reachable_region(..., {name}=...) expects an integer."
-            ) from exc
+        return max(0, min(maximum, value))
 
     node_limit = bounded_integer(max_nodes, "max_nodes", 16384)
     returned_cell_limit = bounded_integer(cell_limit, "cell_limit", 512)
@@ -2961,14 +2885,9 @@ def _bounded_shortest_path(
         raise TypeError("frame.shortest_path(..., diagonal=...) expects a boolean.")
 
     def bounded_integer(value: Any, name: str, default_cap: int) -> int:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"frame.shortest_path(..., {name}=...) expects an integer.")
-        try:
-            return max(0, min(default_cap, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.shortest_path(..., {name}=...) expects an integer."
-            ) from exc
+        return max(0, min(default_cap, value))
 
     node_limit = bounded_integer(max_nodes, "max_nodes", 16384)
     returned_path_limit = bounded_integer(path_limit, "path_limit", 512)
@@ -3090,16 +3009,11 @@ def _bounded_frame_color_transitions(
         )
 
     def bounded_integer(value: Any, name: str, maximum: int) -> int:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(
                 f"frame.color_transitions(..., {name}=...) expects an integer."
             )
-        try:
-            return max(0, min(maximum, int(value)))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"frame.color_transitions(..., {name}=...) expects an integer."
-            ) from exc
+        return max(0, min(maximum, value))
 
     transition_limit = bounded_integer(limit, "limit", 128)
     sample_limit = bounded_integer(cell_limit, "cell_limit", 256)
@@ -3128,7 +3042,12 @@ def _bounded_frame_color_transitions(
         return color_chars[value] if value != -1 else "?"
 
     def value_order(value: Any) -> int:
-        return -2 if value is None else int(value)
+        if value is None:
+            return -2
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return -1
 
     stats: dict[tuple[Any, Any], dict[str, Any]] = {}
     source_targets: dict[Any, dict[Any, int]] = {}
@@ -3263,10 +3182,9 @@ def _bounded_frame_diff_summary(
     limit: int = 64,
 ) -> dict[str, Any]:
     """Build the public, bounded frame-diff value used inside the sandbox."""
-    try:
-        change_limit = max(0, min(128, int(limit)))
-    except (TypeError, ValueError) as exc:
-        raise TypeError("frame.diff(..., limit=...) expects an integer limit.") from exc
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TypeError("frame.diff(..., limit=...) expects an integer limit.")
+    change_limit = max(0, min(128, limit))
 
     def cell(grid: list[list[Any]], row: int, col: int) -> Any:
         if row < 0 or row >= len(grid):
@@ -3281,7 +3199,7 @@ def _bounded_frame_diff_summary(
             return None
         try:
             color_index = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return "?"
         if 0 <= color_index < len(color_chars):
             return color_chars[color_index]

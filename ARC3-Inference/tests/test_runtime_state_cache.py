@@ -10,6 +10,8 @@ from inference.agent.runtime_state import (
     _runtime_state_cache,
     Frame,
     HistoryEntry,
+    frame_from_payload,
+    history_entry_from_payload,
     load_runtime_state,
     write_runtime_state,
 )
@@ -103,6 +105,62 @@ class RuntimeStateCacheTests(unittest.TestCase):
                 len(_runtime_state_cache),
                 _RUNTIME_STATE_CACHE_LIMIT,
             )
+
+    def test_non_object_runtime_state_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text("[]", encoding="utf-8")
+
+            current, history = load_runtime_state(path)
+
+        self.assertIsNone(current)
+        self.assertEqual(history, [])
+
+    def test_malformed_history_container_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(
+                '{"current_frame":{"grid":[[1]],"step":2},"history":{"bad":1}}',
+                encoding="utf-8",
+            )
+
+            current, history = load_runtime_state(path)
+
+        self.assertIsNotNone(current)
+        self.assertEqual(current.step, 2)
+        self.assertEqual(history, [])
+
+    def test_invalid_history_reward_defaults_without_dropping_entry(self) -> None:
+        entry = history_entry_from_payload(
+            {"action": "LEFT", "frame": {"grid": [[1]]}, "reward": "invalid"}
+        )
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.reward, 0.0)
+
+    def test_nonfinite_history_reward_is_neutralized(self) -> None:
+        entry = history_entry_from_payload(
+            {"action": "LEFT", "frame": {"grid": [[1]]}, "reward": "NaN"}
+        )
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.reward, 0.0)
+
+    def test_boolean_grid_cell_does_not_become_color_one(self) -> None:
+        frame = frame_from_payload({"grid": [[True, False, 2]]})
+
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame.grid, ((0, 0, 2),))
+
+    def test_corrupt_runtime_state_returns_empty_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text('{"current_frame":', encoding="utf-8")
+
+            current, history = load_runtime_state(path)
+
+        self.assertIsNone(current)
+        self.assertEqual(history, [])
 
 
 if __name__ == "__main__":
