@@ -97,8 +97,8 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("EXPECTED_GPU_TYPE = 'rtx-pro-6000'", command)
         self.assertIn("EXPECTED_GPU_COUNT = 1", command)
         self.assertIn("VLLM_GPU_MEMORY_UTILIZATION = 0.92", command)
-        self.assertIn("VLLM_MAX_NUM_SEQS = 32", command)
-        self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 16384", command)
+        self.assertIn("VLLM_MAX_NUM_SEQS = 16", command)
+        self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 8192", command)
 
     def test_custom_scheduler_values_are_rendered_and_capacities_are_bounded(self) -> None:
         command = duck_kaggle_setup_command(
@@ -129,6 +129,58 @@ class KaggleHardwareProfileTests(TestCase):
             )
 
         self.assertIn("ANALYZER_CONTEXT_WINDOW = 4096", command)
+
+    def test_setup_forwards_next_run_safeguards(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LOCAL_ANALYZER_CANDIDATES": "1",
+                "LOCAL_ANALYZER_MAX_OUTPUT": "4096",
+                "LOCAL_ANALYZER_GAME_TOKEN_BUDGET": "100000",
+                "LOCAL_ANALYZER_STAGNATION_WINDOW": "6",
+                "LOCAL_ANALYZER_CYCLE_WINDOW": "4",
+                "LOCAL_ANALYZER_CYCLE_STOP_LIMIT": "8",
+                "LOCAL_ANALYZER_REPEAT_ACTION_LIMIT": "2",
+                "LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_WINDOW": "16",
+                "LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_LIMIT": "12",
+                "LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STRIKE_LIMIT": "3",
+                "LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STOP_LIMIT": "8",
+                "LOCAL_ANALYZER_IGNORE_EDGE_HUD_CHANGES": "true",
+                "LOCAL_ANALYZER_PROGRESS_UTILITY": "4.0",
+                "LOCAL_ANALYZER_NOVEL_UTILITY": "0.05",
+                "LOCAL_ANALYZER_EXPLORATION_WEIGHT": "0.5",
+                "LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MULTIPLIER": "2.0",
+                "LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM": "16",
+            },
+            clear=False,
+        ):
+            command = duck_kaggle_setup_command()
+
+        self.assertIn("'LOCAL_ANALYZER_CANDIDATES': '1'", command)
+        self.assertIn("'LOCAL_ANALYZER_MAX_OUTPUT': '4096'", command)
+        self.assertIn("'LOCAL_ANALYZER_GAME_TOKEN_BUDGET': '100000'", command)
+        self.assertIn("'LOCAL_ANALYZER_STAGNATION_WINDOW': '6'", command)
+        self.assertIn("'LOCAL_ANALYZER_CYCLE_WINDOW': '4'", command)
+        self.assertIn("'LOCAL_ANALYZER_CYCLE_STOP_LIMIT': '8'", command)
+        self.assertIn("'LOCAL_ANALYZER_REPEAT_ACTION_LIMIT': '2'", command)
+        self.assertIn(
+            "'LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_WINDOW': '16'", command
+        )
+        self.assertIn(
+            "'LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_LIMIT': '12'", command
+        )
+        self.assertIn(
+            "'LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STRIKE_LIMIT': '3'", command
+        )
+        self.assertIn(
+            "'LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STOP_LIMIT': '8'", command
+        )
+        self.assertIn("'LOCAL_ANALYZER_IGNORE_EDGE_HUD_CHANGES': 'true'", command)
+        self.assertIn("'LOCAL_ANALYZER_PROGRESS_UTILITY': '4.0'", command)
+        self.assertIn("'LOCAL_ANALYZER_NOVEL_UTILITY': '0.05'", command)
+        self.assertIn("'LOCAL_ANALYZER_EXPLORATION_WEIGHT': '0.5'", command)
+        self.assertIn("'LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MULTIPLIER': '2.0'", command)
+        self.assertIn("'LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM': '16'", command)
 
     def test_setup_rejects_provider_incompatible_with_local_vllm(self) -> None:
         with mock.patch.dict(

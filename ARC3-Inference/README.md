@@ -345,10 +345,21 @@ private Kaggle notebook, and attaches the duck solver's declared model and vLLM
 wheelhouse datasets. The duck solver owns the Kaggle setup hooks, so the
 launcher only chooses the run shape.
 
-By default the target uses the 16 public games from the duck harness validation,
-`model=local`, 16 concurrent games, 75 minutes per game, and a 90-minute Kaggle
-runtime. Add `DEPLOYMENT_WAIT=true` if you want the command to block and pull
-the finished Kaggle output back into the run directory.
+By default the target uses the 25 official ARC-AGI-3 games, `model=local`, 12
+concurrent games, 132 minutes per game, and a 540-minute Kaggle runtime. The
+next-run safeguards use one candidate, six tool steps, a 4,096-token
+per-response cap, a 100,000-token per-game budget, and a per-level action
+ceiling of twice the baseline (minimum 16). The controller ignores edge-only
+HUD changes, blocks a third failed click at the same coordinate and a repeated
+inverse movement cycle, treats pure object translation as a revisit, blocks a
+direction used at least 12 times in a 16-action window without score or level
+progress, persistently blocks it after three guard strikes, stops a level after
+eight directional no-progress guards, and stops after eight consecutive
+cycle-risk actions.
+Its stagnation/cycle windows are 6/4. Add `DEPLOYMENT_WAIT=true` if you want the
+command to block and pull the finished Kaggle output back into the run directory. Set
+`KAGGLE_DUCK_DIAGNOSTIC=true` when invoking `kaggle-duck.sh` to first run the
+five-game diagnostic suite at concurrency 3 with a 180-second analyzer timeout.
 
 The equivalent direct CLI form is:
 
@@ -361,10 +372,10 @@ uv run --no-sync inference-taaf-run \
   --run-name duck-harness-20260527 \
   --kaggle-kernel-slug taaf-duck-harness-20260527 \
   --kaggle-dataset-ref driessmit1/taaf-kaggle-source-duck-harness-20260527 \
-  --max-runtime-minutes 75 \
-  --max-experiment-runtime-minutes 90 \
-  --concurrent-jobs 16 \
-  --analyzer-timeout 900
+  --max-runtime-minutes 132 \
+  --max-experiment-runtime-minutes 540 \
+  --concurrent-jobs 12 \
+  --analyzer-timeout 120
 ```
 
 ## Run Artifacts

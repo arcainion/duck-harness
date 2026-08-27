@@ -3853,7 +3853,9 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             return results
 
         @_cached_frame_analysis
-        def color_summary(self, *, limit=16):
+        def color_summary(self, limit=16):
+            # Accept the common positional spelling as well as the documented
+            # keyword form so a harmless call-style mistake does not burn a turn.
             return _bounded_frame_color_summary(
                 self._grid,
                 shape=self.shape,

@@ -935,6 +935,22 @@ class ToolAgentCodeGenerationTests(TestCase):
         issues = _generated_python_preflight_issues(over_limit)
         self.assertIn("1000001 iterations", issues[0]["message"])
 
+    def test_preflight_rejects_oversized_constant_frame_crop(self) -> None:
+        oversized = _parse_bounded_generated_python(
+            "result = current_frame.crop(0, 0, 32, 32)"
+        )
+        bounded = _parse_bounded_generated_python(
+            "result = current_frame.crop(0, 0, 16, 16)"
+        )
+
+        self.assertTrue(
+            any(
+                "exceeds 256 cells" in issue["message"]
+                for issue in _generated_python_preflight_issues(oversized)
+            )
+        )
+        self.assertFalse(_generated_python_preflight_issues(bounded))
+
     def test_preflight_handles_shifted_ranges_but_not_keyworded_range(self) -> None:
         shifted = _parse_bounded_generated_python("result = range(1 << 20)")
         keyworded = _parse_bounded_generated_python(
@@ -1258,6 +1274,27 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertFalse(payload["valid"])
         self.assertTrue(payload["dry_run"])
         self.assertIn("not currently valid", payload["error"])
+        self.assertFalse(response.step_executed)
+        agent._step_env_callback.assert_not_called()
+
+    def test_structured_mouse_without_coordinates_is_rejected_without_crashing(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._current_valid_actions = ["MOUSE"]
+        agent._step_env_callback = Mock(side_effect=AssertionError("must not execute"))
+
+        response = agent._dispatch_tool(
+            Path("unused/tool_runtime_state.json"),
+            "action",
+            {"actions": [{"action": "MOUSE"}], "dry_run": True},
+        )
+        payload = json.loads(response.content)
+
+        self.assertFalse(payload["valid"])
+        self.assertIn("requires integer `row` and `col`", payload["error"])
         self.assertFalse(response.step_executed)
         agent._step_env_callback.assert_not_called()
 

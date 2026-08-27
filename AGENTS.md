@@ -61,6 +61,9 @@
   `RUN_NAME=duck-harness-20260816 ./kaggle-duck.sh`; `KAGGLE_DRY_RUN=true`
   stages without pushing. Its status check uses the credential export
   workaround for the container's `kaggle` CLI.
+- Set `KAGGLE_DUCK_DIAGNOSTIC=true` to run the five-game diagnostic suite at
+  concurrency 3 with a 180-second analyzer timeout before committing to the public harness. Override the suite
+  with `KAGGLE_DUCK_DIAGNOSTIC_GAMES='["game-id", ...]'` when needed.
 - Prerequisites: run `make install` first (the target uses `uv run --no-sync`),
   the `kaggle` CLI must be installed and on `PATH` inside the container
   (`python -m pip install kaggle`), and credentials must resolve inside the
@@ -84,9 +87,20 @@
   bundles and metadata without calling the Kaggle API.
 - Target defaults (Makefile, not the README): `AGENT=duck-harness`,
   `MODEL=local`, `KAGGLE_DUCK_PUBLIC_HARNESS=true` (the 25 official
-  ARC-AGI-3 games), `N_PASSES=1`, `CONCURRENT_JOBS=28`,
+  ARC-AGI-3 games), `N_PASSES=1`, `CONCURRENT_JOBS=12`,
   `MAX_RUNTIME_MINUTES=132`, `MAX_EXPERIMENT_RUNTIME_MINUTES=540`,
-  `ANALYZER_TIMEOUT=900`.
+  `ANALYZER_TIMEOUT=120`, one candidate, six tool steps, a 4,096-token
+  per-response cap, a 100,000-token per-game budget, and a per-level action
+  ceiling of twice the baseline with a minimum of 16 actions. Controller
+  stagnation/cycle windows are 6/4; edge-only HUD changes are ignored, exact
+  click coordinates are blocked after two failed attempts, inverse movement
+  cycles are guarded, pure object translations are not rewarded as novel, a
+  direction used at least 12 times in a 16-action no-progress window is guarded,
+  persistently blocked after three guard strikes, and the level stops after
+  eight directional no-progress guards,
+  and eight consecutive cycle-risk actions stop the run.
+  Progress utility is 4.0, novel-state utility is 0.05, and exploration weight
+  is 0.5.
 - The notebook attaches the duck solver's declared datasets:
   `driessmit1/arc3-vllm-h100-wheelhouse-v3` (vLLM wheelhouse, installed
   offline into a temporary target dir) and

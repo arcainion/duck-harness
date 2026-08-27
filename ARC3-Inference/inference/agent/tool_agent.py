@@ -1620,6 +1620,33 @@ def _generated_python_preflight_issues(tree: ast.AST) -> list[dict[str, Any]]:
                         "hint": "Use a bounded search limit no larger than 1,000,000 iterations.",
                     }
                 )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "crop"
+                and _view_expression_kind(
+                    node.func.value, view_aliases_at(node)
+                ) == "frame"
+                and len(node.args) == 4
+                and not node.keywords
+            ):
+                coordinates = [_bounded_constant_integer(arg) for arg in node.args]
+                if all(value is not None for value in coordinates):
+                    top, left, bottom, right = coordinates
+                    assert top is not None and left is not None
+                    assert bottom is not None and right is not None
+                    if (
+                        0 <= top < bottom <= 64
+                        and 0 <= left < right <= 64
+                        and (bottom - top) * (right - left) > 256
+                    ):
+                        issues.append(
+                            {
+                                "type": "ValueError",
+                                "line": getattr(node, "lineno", None),
+                                "message": "Constant frame.crop(...) region exceeds 256 cells.",
+                                "hint": "Use a crop whose height times width is at most 256 cells.",
+                            }
+                        )
             elif (
                 range_size is None
                 and not range_shadowed
@@ -6775,6 +6802,9 @@ class ToolAgent:
         for index, item in enumerate(actions):
             name = str(item.get("action") or "")
             if name == "MOUSE":
+                if "row" not in item or "col" not in item:
+                    score -= 100
+                    continue
                 coordinate = (int(item["row"]), int(item["col"]))
                 key = f"MOUSE(ROW={coordinate[0]}, COL={coordinate[1]})"
                 score += (
@@ -7276,7 +7306,13 @@ class ToolAgent:
                         f"Action {index} ({canonical_name}) is not currently valid; "
                         f"choose one of {self._current_valid_actions}."
                     )
-                normalized.append({"action": canonical_name})
+                entry: dict[str, Any] = {"action": canonical_name}
+                if canonical_name == "MOUSE":
+                    raise ValueError(
+                        f"Action {index} (MOUSE) requires row and col coordinates; "
+                        f"use the dict form: {{\"action\": \"MOUSE\", \"row\": ..., \"col\": ...}}."
+                    )
+                normalized.append(entry)
                 continue
             if isinstance(item, dict):
                 action_name = str(item.get("action", "")).strip()
@@ -7336,6 +7372,10 @@ class ToolAgent:
         for index, action in enumerate(actions, start=1):
             if action.get("action") != "MOUSE":
                 continue
+            if "row" not in action or "col" not in action:
+                raise ValueError(
+                    f"Action {index} MOUSE is missing row and/or col coordinates."
+                )
             row = int(action["row"])
             col = int(action["col"])
             if not (0 <= row < rows and 0 <= col < cols):
@@ -7971,7 +8011,7 @@ class ToolAgent:
                     normalized = self._normalize_python_actions(actions)
                     frame = load_runtime_state(state_path)[0] if state_path.is_file() else None
                     self._validate_mouse_action_bounds(normalized, frame)
-                except (TypeError, ValueError) as exc:
+                except (KeyError, TypeError, ValueError) as exc:
                     return _ToolDispatchResult(
                         json.dumps(
                             {"error": str(exc), "dry_run": True, "valid": False},

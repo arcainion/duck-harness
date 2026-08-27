@@ -67,6 +67,162 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(config.progress_utility, 1.0)
         self.assertEqual(config.terminal_failure_utility, -2.0)
 
+    def test_level_action_limit_is_baseline_relative_with_a_floor(self) -> None:
+        config = InferenceControllerConfig(
+            level_action_limit_multiplier=2.0,
+            level_action_limit_minimum=16,
+        )
+
+        self.assertEqual(config.level_action_limit(7), 16)
+        self.assertEqual(config.level_action_limit(21), 42)
+        self.assertIsNone(config.level_action_limit(None))
+        self.assertIsNone(InferenceControllerConfig().level_action_limit(21))
+
+    def test_edge_only_hud_change_is_not_novel_when_enabled(self) -> None:
+        before = Frame(
+            grid=tuple(tuple(0 for _ in range(5)) for _ in range(5)),
+            step=0,
+            level=1,
+        )
+        grid = [list(row) for row in before.grid]
+        grid[0][2] = 1
+        after = Frame(grid=tuple(tuple(row) for row in grid), step=1, level=1)
+        config = InferenceControllerConfig(ignore_edge_hud_changes=True)
+
+        metadata = transition_metadata(
+            before,
+            after,
+            [HistoryEntry(action="", frame=before)],
+            "SPACE",
+            config,
+        )
+
+        self.assertEqual(metadata["outcome_class"], "volatile_only")
+        self.assertFalse(metadata["novel_state"])
+
+    def test_pure_object_translation_is_a_revisit_not_novelty(self) -> None:
+        def translated_frame(col: int, step: int) -> Frame:
+            grid = [[0 for _ in range(5)] for _ in range(5)]
+            grid[2][col] = 1
+            return Frame(
+                grid=tuple(tuple(row) for row in grid),
+                step=step,
+                level=1,
+            )
+
+        before = translated_frame(1, 0)
+        after = translated_frame(2, 1)
+        metadata = transition_metadata(
+            before,
+            after,
+            [HistoryEntry(action="", frame=before)],
+            "RIGHT",
+            InferenceControllerConfig(volatile_min_samples=99),
+        )
+
+        self.assertEqual(metadata["outcome_class"], "revisit")
+        self.assertFalse(metadata["novel_state"])
+
+    def test_repeat_action_guard_blocks_third_identical_mouse_coordinate(self) -> None:
+        frames = [_frame(value, step=value) for value in range(3)]
+        history = [HistoryEntry(action="", frame=frames[0])] + [
+            HistoryEntry(action="MOUSE(row=4, col=7)", frame=frame)
+            for frame in frames[1:]
+        ]
+        config = InferenceControllerConfig(repeat_action_limit=2)
+
+        reason = action_guard_reason(
+            history, frames[-1], "MOUSE(row=4, col=7)", config
+        )
+
+        self.assertIn("same parameterized action", reason or "")
+
+    def test_repeat_action_guard_blocks_second_inverse_cycle(self) -> None:
+        frames = [_frame(value, step=value) for value in range(4)]
+        history = [HistoryEntry(action="", frame=frames[0])] + [
+            HistoryEntry(action=action, frame=frame)
+            for action, frame in zip(("UP", "DOWN", "UP"), frames[1:])
+        ]
+        config = InferenceControllerConfig(repeat_action_limit=2)
+
+        reason = action_guard_reason(history, frames[-1], "DOWN", config)
+
+        self.assertIn("inverse-action cycle", reason or "")
+
+    def test_directional_watchdog_blocks_dominant_action_without_progress(self) -> None:
+        frames = [_frame(value, step=value) for value in range(17)]
+        actions = ["UP"] * 12 + ["RIGHT"] * 4
+        history = [HistoryEntry(action="", frame=frames[0])] + [
+            HistoryEntry(action=action, frame=frame)
+            for action, frame in zip(actions, frames[1:])
+        ]
+        config = InferenceControllerConfig(
+            directional_no_progress_window=16,
+            directional_no_progress_limit=12,
+            volatile_min_samples=99,
+        )
+
+        reason = action_guard_reason(history, frames[-1], "UP", config)
+        snapshot = build_experience_snapshot(
+            history, frames[-1], ["UP", "RIGHT"], config
+        )
+
+        self.assertIn("dominates the recent action window", reason or "")
+        self.assertIsNone(action_guard_reason(history, frames[-1], "RIGHT", config))
+        self.assertIn("directional_no_progress", snapshot["recovery_reasons"])
+        self.assertEqual(snapshot["directional_no_progress"]["action"], "UP")
+
+    def test_directional_watchdog_allows_action_after_score_progress(self) -> None:
+        frames = [
+            Frame(
+                grid=((value, value), (value, value)),
+                step=value,
+                level=1,
+                score=int(value == 16),
+            )
+            for value in range(17)
+        ]
+        history = [HistoryEntry(action="", frame=frames[0])] + [
+            HistoryEntry(action="UP", frame=frame) for frame in frames[1:]
+        ]
+        config = InferenceControllerConfig(
+            directional_no_progress_window=16,
+            directional_no_progress_limit=12,
+        )
+
+        self.assertIsNone(action_guard_reason(history, frames[-1], "UP", config))
+
+    def test_repeated_directional_progress_is_not_a_noisy_cycle(self) -> None:
+        frames = [_frame(value, step=value) for value in range(5)]
+        history = [HistoryEntry(action="", frame=frames[0])] + [
+            HistoryEntry(action="UP", frame=frame) for frame in frames[1:]
+        ]
+
+        snapshot = build_experience_snapshot(
+            history,
+            frames[-1],
+            ["UP", "DOWN"],
+            InferenceControllerConfig(volatile_min_samples=99),
+        )
+
+        self.assertIsNone(snapshot["cycle_period"])
+
+    def test_inverse_directional_pattern_is_detected_as_cycle(self) -> None:
+        frames = [_frame(value, step=value) for value in range(5)]
+        history = [HistoryEntry(action="", frame=frames[0])] + [
+            HistoryEntry(action=action, frame=frame)
+            for action, frame in zip(("UP", "DOWN", "UP", "DOWN"), frames[1:])
+        ]
+
+        snapshot = build_experience_snapshot(
+            history,
+            frames[-1],
+            ["UP", "DOWN"],
+            InferenceControllerConfig(volatile_min_samples=99),
+        )
+
+        self.assertEqual(snapshot["cycle_period"], 2)
+
     def test_external_transition_rejects_invalid_action(self) -> None:
         self.assertIsNone(_normalize_external_transition({}))
         self.assertIsNone(_normalize_external_transition({"action": {"bad": True}}))
@@ -465,6 +621,8 @@ class InferenceControllerTests(TestCase):
                 "LOCAL_ANALYZER_VOLATILE_WINDOW": "1",
                 "LOCAL_ANALYZER_VOLATILE_MIN_SAMPLES": "1",
                 "LOCAL_ANALYZER_VOLATILE_RATIO": "2",
+                "LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STRIKE_LIMIT": "3",
+                "LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STOP_LIMIT": "8",
             },
             clear=True,
         ):
@@ -475,6 +633,8 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(config.volatile_window, 2)
         self.assertEqual(config.volatile_min_samples, 2)
         self.assertEqual(config.volatile_ratio, 1.0)
+        self.assertEqual(config.directional_no_progress_strike_limit, 3)
+        self.assertEqual(config.directional_no_progress_stop_limit, 8)
 
     def test_two_exact_noops_guard_the_third_trial(self) -> None:
         state = _frame(1, step=0)

@@ -9,6 +9,50 @@ from pathlib import Path
 
 
 class KaggleDuckWrapperTests(unittest.TestCase):
+    def test_diagnostic_mode_selects_five_games_and_safe_concurrency(self) -> None:
+        project_dir = Path(__file__).resolve().parents[1]
+        wrapper = project_dir / "kaggle-duck.sh"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            make_log = root / "make-arguments.json"
+            fake_bin.joinpath("make").write_text(
+                "#!/bin/sh\n"
+                "python3 -c 'import json, os, sys; json.dump(sys.argv[1:], "
+                "open(os.environ[\"MAKE_LOG\"], \"w\"))' \"$@\"\n",
+                encoding="utf-8",
+            )
+            fake_bin.joinpath("make").chmod(0o755)
+            env = dict(os.environ)
+            env.update(
+                {
+                    "HOME": str(root),
+                    "MAKE_LOG": str(make_log),
+                    "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+                    "KAGGLE_DRY_RUN": "true",
+                    "KAGGLE_DUCK_DIAGNOSTIC": "true",
+                }
+            )
+
+            subprocess.run(
+                ["bash", str(wrapper)],
+                cwd=project_dir,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            arguments = json.loads(make_log.read_text(encoding="utf-8"))
+
+        self.assertIn("KAGGLE_DUCK_PUBLIC_HARNESS=false", arguments)
+        self.assertIn("CONCURRENT_JOBS=3", arguments)
+        self.assertIn("ANALYZER_TIMEOUT=180", arguments)
+        game_argument = next(item for item in arguments if item.startswith("GAME="))
+        self.assertIn("ft09-0d8bbf25", game_argument)
+        self.assertIn("r11l-495a7899", game_argument)
+
     def test_file_credentials_are_safe_and_available_before_make(self) -> None:
         project_dir = Path(__file__).resolve().parents[1]
         wrapper = project_dir / "kaggle-duck.sh"

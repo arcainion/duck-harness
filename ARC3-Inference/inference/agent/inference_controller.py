@@ -157,8 +157,15 @@ class InferenceControllerConfig:
     enabled: bool = True
     policy: str = OUTCOME_AWARE_POLICY
     same_state_noop_limit: int = 2
-    stagnation_window: int = 12
-    cycle_window: int = 8
+    stagnation_window: int = 6
+    cycle_window: int = 4
+    cycle_stop_limit: int = 0
+    repeat_action_limit: int = 0
+    directional_no_progress_window: int = 0
+    directional_no_progress_limit: int = 0
+    directional_no_progress_strike_limit: int = 0
+    directional_no_progress_stop_limit: int = 0
+    ignore_edge_hud_changes: bool = False
     recent_transition_limit: int = 8
     volatile_window: int = 8
     volatile_min_samples: int = 4
@@ -179,6 +186,8 @@ class InferenceControllerConfig:
     noop_utility: float = -0.4
     terminal_failure_utility: float = -2.0
     exploration_weight: float = 0.75
+    level_action_limit_multiplier: float = 0.0
+    level_action_limit_minimum: int = 0
 
     @property
     def outcome_aware(self) -> bool:
@@ -196,6 +205,29 @@ class InferenceControllerConfig:
             ),
             stagnation_window=max(2, _env_int("LOCAL_ANALYZER_STAGNATION_WINDOW", 12)),
             cycle_window=max(2, _env_int("LOCAL_ANALYZER_CYCLE_WINDOW", 8)),
+            cycle_stop_limit=max(
+                0, _env_int("LOCAL_ANALYZER_CYCLE_STOP_LIMIT", 0)
+            ),
+            repeat_action_limit=max(
+                0, _env_int("LOCAL_ANALYZER_REPEAT_ACTION_LIMIT", 0)
+            ),
+            directional_no_progress_window=max(
+                0, _env_int("LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_WINDOW", 0)
+            ),
+            directional_no_progress_limit=max(
+                0, _env_int("LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_LIMIT", 0)
+            ),
+            directional_no_progress_strike_limit=max(
+                0,
+                _env_int("LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STRIKE_LIMIT", 0),
+            ),
+            directional_no_progress_stop_limit=max(
+                0,
+                _env_int("LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STOP_LIMIT", 0),
+            ),
+            ignore_edge_hud_changes=_env_bool(
+                "LOCAL_ANALYZER_IGNORE_EDGE_HUD_CHANGES", False
+            ),
             recent_transition_limit=8,
             volatile_window=max(2, _env_int("LOCAL_ANALYZER_VOLATILE_WINDOW", 8)),
             volatile_min_samples=max(
@@ -247,6 +279,26 @@ class InferenceControllerConfig:
             exploration_weight=max(
                 0.0, _env_float("LOCAL_ANALYZER_EXPLORATION_WEIGHT", 0.75)
             ),
+            level_action_limit_multiplier=max(
+                0.0,
+                _env_float("LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MULTIPLIER", 0.0),
+            ),
+            level_action_limit_minimum=max(
+                0, _env_int("LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM", 0)
+            ),
+        )
+
+    def level_action_limit(self, base_actions: int | None) -> int | None:
+        """Return the baseline-relative action ceiling, or ``None`` when disabled."""
+        if (
+            self.level_action_limit_multiplier <= 0
+            or base_actions is None
+            or base_actions <= 0
+        ):
+            return None
+        return max(
+            self.level_action_limit_minimum,
+            int(math.ceil(base_actions * self.level_action_limit_multiplier)),
         )
 
     def outcome_utility(self, outcome: str) -> float:
@@ -936,9 +988,32 @@ def _plan_candidates(
     return plans[:4]
 
 
+def _edge_hud_only_change(before: Frame, after: Frame) -> bool:
+    """Return whether every changed cell is confined to a thin edge HUD band."""
+    if before.shape != after.shape or before.shape[0] <= 0 or before.shape[1] <= 0:
+        return False
+    rows, cols = before.shape
+    edge_band = max(1, min(rows, cols) // 32)
+    changed = [
+        (row, col)
+        for row, (before_row, after_row) in enumerate(zip(before.grid, after.grid))
+        for col, (before_cell, after_cell) in enumerate(zip(before_row, after_row))
+        if before_cell != after_cell
+    ]
+    return bool(changed) and all(
+        row < edge_band
+        or row >= rows - edge_band
+        or col < edge_band
+        or col >= cols - edge_band
+        for row, col in changed
+    )
+
+
 def _transitions(
     history: list[HistoryEntry],
     masked_cells: frozenset[tuple[int, int]] = frozenset(),
+    *,
+    ignore_edge_hud_changes: bool = False,
 ) -> list[dict[str, Any]]:
     transitions: list[dict[str, Any]] = []
     known_behavioral = (
@@ -971,8 +1046,14 @@ def _transitions(
             outcome = "transient_effect"
         elif before_id == after_id:
             outcome = "exact_noop"
+        elif ignore_edge_hud_changes and _edge_hud_only_change(before, entry.frame):
+            outcome = "volatile_only"
         elif behavioral_before == behavioral_after:
             outcome = "volatile_only"
+        elif object_before and object_before == object_after:
+            # Preserve position-sensitive raw/behavioral state IDs, but do not
+            # reward a pure translation of the same object layout as novelty.
+            outcome = "revisit"
         elif behavioral_after not in known_behavioral:
             outcome = "novel"
         else:
@@ -1050,26 +1131,47 @@ def _behavioral_cycle_signal(
     exact = _cycle_period(state_ids, max_period)
     if exact is not None:
         return {"kind": "exact_state", "period": exact, "confidence": 1.0}
-    signatures = [
-        (
-            str(item.get("action_family") or action_family(item.get("action") or "")),
-            str(item.get("outcome_class") or "unknown"),
+    signatures = []
+    for item in transitions:
+        normalized = normalize_action_key(str(item.get("action") or ""))
+        family = str(item.get("action_family") or action_family(normalized))
+        # Distinct click coordinates are distinct search arms. Collapsing all
+        # MOUSE actions into one family made broad coordinate exploration look
+        # like a period-one cycle.
+        signature_action = normalized if family == "MOUSE" else family
+        signatures.append(
+            (signature_action, str(item.get("outcome_class") or "unknown"))
         )
-        for item in transitions
-    ]
     for period in range(1, min(max_period, len(signatures) // 2) + 1):
         first = signatures[-2 * period : -period]
         second = signatures[-period:]
         matches = sum(left == right for left, right in zip(first, second))
         confidence = matches / period
-        if confidence >= 0.75 and not any(
+        if confidence < 0.75 or any(
             outcome == "level_progress" for _, outcome in second
         ):
-            return {
-                "kind": "action_outcome",
-                "period": period,
-                "confidence": round(confidence, 3),
+            continue
+        if any(outcome == "novel" for _, outcome in second):
+            actions = [action for action, _ in second]
+            inverse = {
+                "UP": "DOWN",
+                "DOWN": "UP",
+                "LEFT": "RIGHT",
+                "RIGHT": "LEFT",
             }
+            repeated_click = period == 1 and action_family(actions[0]) == "MOUSE"
+            inverse_cycle = (
+                period == 2
+                and len(actions) == 2
+                and inverse.get(actions[0]) == actions[1]
+            )
+            if not repeated_click and not inverse_cycle:
+                continue
+        return {
+            "kind": "action_outcome",
+            "period": period,
+            "confidence": round(confidence, 3),
+        }
     return None
 
 
@@ -1125,6 +1227,44 @@ def action_noop_trials(
     )
 
 
+def _directional_no_progress_signal(
+    history: list[HistoryEntry],
+    current_frame: Frame | None,
+    config: InferenceControllerConfig,
+) -> dict[str, int | str] | None:
+    """Detect one direction dominating a bounded window without real progress."""
+    window = config.directional_no_progress_window
+    limit = config.directional_no_progress_limit
+    if current_frame is None or window <= 0 or limit <= 0 or limit > window:
+        return None
+    if len(history) < window + 1:
+        return None
+    baseline = history[-window - 1].frame
+    recent = history[-window:]
+    if baseline.level != current_frame.level or any(
+        entry.frame.level != current_frame.level for entry in recent
+    ):
+        return None
+    if current_frame.score > baseline.score or any(
+        entry.reward > 0.0 or entry.outcome_class_override == "level_progress"
+        for entry in recent
+    ):
+        return None
+    directional = Counter(
+        family
+        for family in (action_family(entry.action) for entry in recent)
+        if family in {"UP", "DOWN", "LEFT", "RIGHT"}
+    )
+    if not directional:
+        return None
+    action, count = min(
+        directional.items(), key=lambda item: (-item[1], item[0])
+    )
+    if count < limit:
+        return None
+    return {"action": action, "count": count, "window": window}
+
+
 def action_guard_reason_code(
     history: list[HistoryEntry],
     current_frame: Frame | None,
@@ -1133,13 +1273,51 @@ def action_guard_reason_code(
 ) -> str | None:
     if not config.enabled:
         return None
+    action_key = normalize_action_key(action)
+    if config.repeat_action_limit > 0 and action_family(action_key) == "MOUSE":
+        current_level = current_frame.level if current_frame is not None else None
+        unsuccessful = [
+            normalize_action_key(entry.action)
+            for entry in history[1:]
+            if entry.reward <= 0.0
+            and (current_level is None or entry.frame.level == current_level)
+        ]
+        if unsuccessful.count(action_key) >= config.repeat_action_limit:
+            return "repeated_parameterized_action"
+    inverse = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
+    recent_families = [
+        action_family(entry.action)
+        for entry in history[1:]
+        if entry.reward <= 0.0
+        and (current_frame is None or entry.frame.level == current_frame.level)
+    ]
+    candidate_family = action_family(action_key)
+    directional_signal = _directional_no_progress_signal(
+        history, current_frame, config
+    )
+    if (
+        directional_signal is not None
+        and candidate_family == directional_signal["action"]
+    ):
+        return "directional_no_progress"
+    if (
+        config.repeat_action_limit > 0
+        and len(recent_families) >= 3
+        and inverse.get(candidate_family) == recent_families[-1]
+        and recent_families[-3:]
+        == [
+            inverse[candidate_family],
+            candidate_family,
+            inverse[candidate_family],
+        ]
+    ):
+        return "repeated_inverse_cycle"
     if (
         action_noop_trials(history, current_frame, action)
         >= config.same_state_noop_limit
     ):
         return "repeated_exact_noop"
     state_id = frame_fingerprint(current_frame)
-    action_key = normalize_action_key(action)
     local_trials = [
         transition
         for transition in _transitions(history)
@@ -1166,6 +1344,18 @@ def action_guard_reason(
         return None
     if reason_code == "known_harmful_local":
         return "exact state/action pair has decisive terminal-failure evidence"
+    if reason_code == "repeated_parameterized_action":
+        return (
+            "the same parameterized action already failed to make progress "
+            f"{config.repeat_action_limit} times"
+        )
+    if reason_code == "repeated_inverse_cycle":
+        return "the requested action would repeat an unsuccessful inverse-action cycle"
+    if reason_code == "directional_no_progress":
+        return (
+            "the requested direction dominates the recent action window without "
+            "score or level progress; try a different direction"
+        )
     trials = action_noop_trials(history, current_frame, action)
     return f"exact state/action pair already produced {trials} confirmed no-op trials"
 
@@ -1696,7 +1886,11 @@ def build_experience_snapshot(
     evidence_id: str = "",
 ) -> dict[str, Any]:
     masked_cells = _volatile_cells(history, current_frame, config)
-    transitions = _transitions(history, masked_cells)
+    transitions = _transitions(
+        history,
+        masked_cells,
+        ignore_edge_hud_changes=config.ignore_edge_hud_changes,
+    )
     if evidence_id:
         for item in transitions:
             item["evidence_id"] = evidence_id
@@ -1766,6 +1960,9 @@ def build_experience_snapshot(
         if current_frame is not None and item["level_after"] == current_frame.level
     ]
     recovery_reasons: list[str] = []
+    directional_no_progress = _directional_no_progress_signal(
+        history, current_frame, config
+    )
     active_noop_streak = (
         behavioral_no_op_streak if config.outcome_aware else no_op_streak
     )
@@ -1775,6 +1972,8 @@ def build_experience_snapshot(
         recovery_reasons.append("short_cycle")
     if stagnation >= config.stagnation_window:
         recovery_reasons.append("stagnation")
+    if directional_no_progress is not None:
+        recovery_reasons.append("directional_no_progress")
     latest_outcome = transitions[-1]["outcome_class"] if transitions else None
     if latest_outcome in {"terminal_failure", "negative_reward"}:
         recovery_reasons.append("harmful_outcome")
@@ -1935,6 +2134,7 @@ def build_experience_snapshot(
         "stagnation_actions": stagnation,
         "cycle_period": cycle_period,
         "cycle_signal": cycle_signal,
+        "directional_no_progress": directional_no_progress,
         "latest_outcome": latest_outcome,
         "recovery_reasons": recovery_reasons,
         "recovery_portfolio": recovery_portfolio,
@@ -1986,7 +2186,6 @@ def transition_metadata(
 ) -> dict[str, Any]:
     before_id = frame_fingerprint(before)
     after_id = frame_fingerprint(after)
-    known_states = {frame_fingerprint(entry.frame) for entry in prior_history}
     action_key = action_family(action)
     before_snapshot = build_experience_snapshot(
         prior_history,
@@ -2048,7 +2247,7 @@ def transition_metadata(
         "object_before_state_id": transition["object_before_state_id"],
         "object_after_state_id": transition["object_after_state_id"],
         "decision_context_changed": transition["decision_context_changed"],
-        "novel_state": after_id not in known_states,
+        "novel_state": outcome_class == "novel",
         "outcome_class": outcome_class,
         "reward": float(reward),
         "game_over": bool(game_over),

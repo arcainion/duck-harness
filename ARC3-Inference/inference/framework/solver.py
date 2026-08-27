@@ -421,6 +421,10 @@ class _HarnessGameSession:
     analysis_step: int = 0
     last_engine_action: str | None = None
     token_baseline: int = 0
+    cycle_risk_streak: int = 0
+    directional_guard_counts: dict[tuple[int, str], int] = field(default_factory=dict)
+    directional_guard_totals: dict[int, int] = field(default_factory=dict)
+    directional_blocked_actions: set[tuple[int, str]] = field(default_factory=set)
     controller_config: InferenceControllerConfig = field(
         default_factory=InferenceControllerConfig.from_env
     )
@@ -455,6 +459,86 @@ class _HarnessGameSession:
         return (
             time.monotonic() - self.started_at
         ) >= self.solver.max_runtime_s_per_game
+
+    def level_action_limit_status(self) -> tuple[int, int, int] | None:
+        """Return ``(level, used, limit)`` when the current level is capped."""
+        run = self.game.game_run
+        base_actions = getattr(run, "base_actions_per_level", None)
+        actions = getattr(run, "actions_per_level", None)
+        if run is None or not base_actions or not actions:
+            return None
+        level_index = max(
+            0, min(int(getattr(run, "levels_completed", 0)), len(actions) - 1)
+        )
+        if level_index >= len(base_actions):
+            return None
+        limit = self.controller_config.level_action_limit(base_actions[level_index])
+        if limit is None:
+            return None
+        return level_index + 1, int(actions[level_index]), limit
+
+    def level_action_limit_reached(self) -> bool:
+        status = self.level_action_limit_status()
+        return status is not None and status[1] >= status[2]
+
+    def cycle_stop_reached(self) -> bool:
+        limit = getattr(getattr(self, "controller_config", None), "cycle_stop_limit", 0)
+        return limit > 0 and getattr(self, "cycle_risk_streak", 0) >= limit
+
+    def directional_action_blocked(self, level: int, action: str) -> bool:
+        blocked = getattr(self, "directional_blocked_actions", set())
+        return (int(level), action_family(action)) in blocked
+
+    def register_directional_guard(
+        self, level: int, action: str
+    ) -> tuple[int, int, bool]:
+        family = action_family(action)
+        key = (int(level), family)
+        counts = getattr(self, "directional_guard_counts", None)
+        if counts is None:
+            counts = self.directional_guard_counts = {}
+        totals = getattr(self, "directional_guard_totals", None)
+        if totals is None:
+            totals = self.directional_guard_totals = {}
+        blocked = getattr(self, "directional_blocked_actions", None)
+        if blocked is None:
+            blocked = self.directional_blocked_actions = set()
+        counts[key] = counts.get(key, 0) + 1
+        totals[key[0]] = totals.get(key[0], 0) + 1
+        strike_limit = getattr(
+            getattr(self, "controller_config", None),
+            "directional_no_progress_strike_limit",
+            0,
+        )
+        if strike_limit > 0 and counts[key] >= strike_limit:
+            blocked.add(key)
+        return counts[key], totals[key[0]], key in blocked
+
+    def clear_directional_guards(self, level: int) -> None:
+        level = int(level)
+        counts = getattr(self, "directional_guard_counts", {})
+        blocked = getattr(self, "directional_blocked_actions", set())
+        for key in [key for key in counts if key[0] == level]:
+            counts.pop(key, None)
+        for key in [key for key in blocked if key[0] == level]:
+            blocked.discard(key)
+        getattr(self, "directional_guard_totals", {}).pop(level, None)
+
+    def directional_no_progress_stop_status(self) -> tuple[int, int, int] | None:
+        limit = getattr(
+            getattr(self, "controller_config", None),
+            "directional_no_progress_stop_limit",
+            0,
+        )
+        if limit <= 0:
+            return None
+        level = self.current_frame().level
+        total = getattr(self, "directional_guard_totals", {}).get(level, 0)
+        return level, total, limit
+
+    def directional_no_progress_stop_reached(self) -> bool:
+        status = self.directional_no_progress_stop_status()
+        return status is not None and status[1] >= status[2]
 
     def timing_payload(self) -> dict[str, float | None]:
         elapsed = max(0.0, time.monotonic() - self.started_at)
@@ -492,6 +576,12 @@ class _HarnessGameSession:
         if _is_run_complete(self.game):
             return True
         if self.runtime_limit_reached():
+            return True
+        if self.level_action_limit_reached():
+            return True
+        if self.cycle_stop_reached():
+            return True
+        if self.directional_no_progress_stop_reached():
             return True
         if (
             self.solver.max_actions_per_game is not None
@@ -563,11 +653,14 @@ class _HarnessGameSession:
                 if result.retryable_failure:
                     consecutive_failures += 1
                     if consecutive_failures >= ANALYZER_MAX_CONSECUTIVE_FAILURES:
-                        raise RuntimeError(
-                            "Analyzer circuit breaker opened after "
+                        run.solver_note = (
+                            "stopped: analyzer circuit breaker opened after "
                             f"{consecutive_failures} consecutive failures: "
-                            f"{getattr(result, 'failure_detail', '')}"
+                            f"{getattr(result, 'failure_detail', '')}; "
+                            f"tokens={_analyzer_reported_tokens(self.analyzer)}"
                         )
+                        run.state = "gave_up"
+                        break
                     retry_analysis_step = analysis_step
                     if self.should_stop():
                         break
@@ -583,16 +676,28 @@ class _HarnessGameSession:
                 retry_analysis_step = None
                 failure_category = getattr(result, "failure_category", None)
                 if failure_category in {"internal", "state_missing"}:
-                    raise RuntimeError(
-                        f"Analyzer {failure_category} failure: "
-                        f"{getattr(result, 'failure_detail', '')}"
-                    )
+                    consecutive_failures += 1
+                    if consecutive_failures >= ANALYZER_MAX_CONSECUTIVE_FAILURES:
+                        run.solver_note = (
+                            f"stopped: analyzer {failure_category} failure after "
+                            f"{consecutive_failures} attempts: "
+                            f"{getattr(result, 'failure_detail', '')}; "
+                            f"tokens={_analyzer_reported_tokens(self.analyzer)}"
+                        )
+                        run.state = "gave_up"
+                        break
+                    retry_analysis_step = analysis_step
+                    continue
                 if failure_category == "tool_step_exhausted":
                     consecutive_failures += 1
                     if consecutive_failures >= ANALYZER_MAX_CONSECUTIVE_FAILURES:
-                        raise RuntimeError(
-                            "Analyzer circuit breaker opened after repeated tool-step exhaustion."
+                        run.solver_note = (
+                            "stopped: analyzer circuit breaker opened after repeated "
+                            "tool-step exhaustion; "
+                            f"tokens={_analyzer_reported_tokens(self.analyzer)}"
                         )
+                        run.state = "gave_up"
+                        break
                     continue
                 consecutive_failures = 0
                 if getattr(result, "yielded_control", False):
@@ -612,7 +717,28 @@ class _HarnessGameSession:
         finally:
             total_tokens = _analyzer_reported_tokens(self.analyzer)
             if run.solver_note is None:
-                run.solver_note = f"tokens={total_tokens}"
+                level_limit = self.level_action_limit_status()
+                if level_limit is not None and level_limit[1] >= level_limit[2]:
+                    level, used, limit = level_limit
+                    run.solver_note = (
+                        f"stopped: level {level} action limit reached "
+                        f"({used}/{limit}); tokens={total_tokens}"
+                    )
+                elif self.cycle_stop_reached():
+                    run.solver_note = (
+                        "stopped: consecutive cycle-risk limit reached "
+                        f"({self.cycle_risk_streak}/"
+                        f"{self.controller_config.cycle_stop_limit}); "
+                        f"tokens={total_tokens}"
+                    )
+                elif self.directional_no_progress_stop_reached():
+                    level, used, limit = self.directional_no_progress_stop_status()
+                    run.solver_note = (
+                        "stopped: directional no-progress guard limit reached "
+                        f"on level {level} ({used}/{limit}); tokens={total_tokens}"
+                    )
+                else:
+                    run.solver_note = f"tokens={total_tokens}"
             self._finish_if_needed()
             self.state_path.unlink(missing_ok=True)
             self._write_analysis_html()
@@ -1055,24 +1181,45 @@ class _HarnessGameSession:
                 return self._error_payload(message)
 
             action_display = _format_action_display(action.id.name, dict(action.data))
-            guard_reason = action_guard_reason(
-                self.history_entries,
-                self.current_frame(),
-                action_display,
-                self.controller_config,
-            )
-            guard_reason_code = action_guard_reason_code(
-                self.history_entries,
-                self.current_frame(),
-                action_display,
-                self.controller_config,
-            )
+            current = self.current_frame()
+            if self.directional_action_blocked(current.level, action_display):
+                guard_reason_code = "directional_no_progress_persistent"
+                guard_reason = (
+                    "this direction is blocked for the current level after repeated "
+                    "no-progress watchdog activations"
+                )
+            else:
+                guard_reason = action_guard_reason(
+                    self.history_entries,
+                    current,
+                    action_display,
+                    self.controller_config,
+                )
+                guard_reason_code = action_guard_reason_code(
+                    self.history_entries,
+                    current,
+                    action_display,
+                    self.controller_config,
+                )
             if guard_reason is None:
                 cross_trial_harm = self._cross_trial_harm_reason(action_display)
                 if cross_trial_harm is not None:
                     guard_reason = cross_trial_harm
                     guard_reason_code = "known_harmful_cross_trial"
             if guard_reason is not None:
+                if guard_reason_code in {
+                    "directional_no_progress",
+                    "directional_no_progress_persistent",
+                }:
+                    strikes, total, persistently_blocked = (
+                        self.register_directional_guard(current.level, action_display)
+                    )
+                    guard_reason = (
+                        f"{guard_reason}; direction strikes={strikes}, "
+                        f"level guard total={total}"
+                    )
+                    if persistently_blocked:
+                        guard_reason += "; direction remains blocked until progress or reset"
                 harm_guard = guard_reason_code in {
                     "known_harmful_local",
                     "known_harmful_cross_trial",
@@ -1080,7 +1227,6 @@ class _HarnessGameSession:
                 loop_guard = not harm_guard
                 stop_reason = "loop_guard" if loop_guard else "harm_guard"
                 stop_detail = guard_reason
-                current = self.current_frame()
                 self.viewer_events.append(
                     {
                         **self._base_viewer_event(current),
@@ -1210,6 +1356,7 @@ class _HarnessGameSession:
                     "run_complete",
                     "loop_detected",
                     "cycle_risk",
+                    "cycle_risk_streak",
                     "cycle_period",
                     "controller_policy",
                     "controller_phase",
@@ -1308,6 +1455,8 @@ class _HarnessGameSession:
         reward = float(completed - previous_completed) / max(
             1.0, float(self.game.number_of_levels)
         )
+        if action.id == arcengine.GameAction.RESET or reward > 0.0:
+            self.clear_directional_guards(previous_frame.level)
         self.history_entries.append(
             HistoryEntry(
                 action=action_display,
@@ -1371,6 +1520,13 @@ class _HarnessGameSession:
                     animation=animation,
                 )
             )
+            if reward > 0.0 or level_completed or payload.get("run_complete"):
+                self.cycle_risk_streak = 0
+            elif payload.get("cycle_risk"):
+                self.cycle_risk_streak += 1
+            else:
+                self.cycle_risk_streak = 0
+            payload["cycle_risk_streak"] = self.cycle_risk_streak
         prediction_result = _evaluate_strategy_prediction(strategy_prediction, payload)
         if prediction_result is not None:
             payload["prediction_result"] = prediction_result

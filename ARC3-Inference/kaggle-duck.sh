@@ -12,6 +12,7 @@
 #   KAGGLE_ACCELERATOR=NvidiaRtxPro6000
 #   KAGGLE_DRY_RUN=false
 #   DEPLOYMENT_WAIT=false
+#   KAGGLE_DUCK_DIAGNOSTIC=false
 #
 # Override any value by exporting it first, e.g.:
 #   RUN_NAME=duck-harness-20260816 ./kaggle-duck.sh
@@ -27,6 +28,8 @@ KAGGLE_DATASET_REF="${KAGGLE_DATASET_REF:-}"
 KAGGLE_ACCELERATOR="${KAGGLE_ACCELERATOR:-NvidiaRtxPro6000}"
 KAGGLE_DRY_RUN="${KAGGLE_DRY_RUN:-false}"
 DEPLOYMENT_WAIT="${DEPLOYMENT_WAIT:-false}"
+KAGGLE_DUCK_DIAGNOSTIC="${KAGGLE_DUCK_DIAGNOSTIC:-false}"
+KAGGLE_DUCK_DIAGNOSTIC_GAMES="${KAGGLE_DUCK_DIAGNOSTIC_GAMES:-[\"ft09-0d8bbf25\",\"vc33-5430563c\",\"tr87-cd924810\",\"r11l-495a7899\",\"lp85-305b61c3\"]}"
 
 KAGGLE_CREDENTIALS_FILE="${HOME}/.kaggle/kaggle.json"
 if [ -f "${KAGGLE_CREDENTIALS_FILE}" ]; then
@@ -53,6 +56,14 @@ make_args+=(
     KAGGLE_DRY_RUN="${KAGGLE_DRY_RUN}"
     DEPLOYMENT_WAIT="${DEPLOYMENT_WAIT}"
 )
+if [ "${KAGGLE_DUCK_DIAGNOSTIC}" = "true" ]; then
+    make_args+=(
+        KAGGLE_DUCK_PUBLIC_HARNESS=false
+        GAME="${KAGGLE_DUCK_DIAGNOSTIC_GAMES}"
+        CONCURRENT_JOBS=3
+        ANALYZER_TIMEOUT=180
+    )
+fi
 
 make kaggle-duck "${make_args[@]}"
 

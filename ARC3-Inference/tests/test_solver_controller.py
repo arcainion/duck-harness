@@ -460,8 +460,67 @@ class SolverControllerTests(TestCase):
             ):
                 session.play()
 
-        self.assertEqual(run.state, "crashed")
+        self.assertEqual(run.state, "gave_up")
         self.assertIn("circuit breaker opened", run.solver_note)
+
+    def test_level_action_limit_stops_at_baseline_relative_ceiling(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.controller_config = InferenceControllerConfig(
+            level_action_limit_multiplier=2.0,
+            level_action_limit_minimum=16,
+        )
+        session.game = SimpleNamespace(
+            game_run=SimpleNamespace(
+                base_actions_per_level=[7, 20],
+                actions_per_level=[16, 0],
+                levels_completed=0,
+            )
+        )
+
+        self.assertEqual(session.level_action_limit_status(), (1, 16, 16))
+        self.assertTrue(session.level_action_limit_reached())
+
+    def test_consecutive_cycle_risk_limit_stops_session(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.controller_config = InferenceControllerConfig(cycle_stop_limit=8)
+        session.cycle_risk_streak = 8
+
+        self.assertTrue(session.cycle_stop_reached())
+
+    def test_request_timeout_honors_analyzer_configuration_above_120(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.analyzer = SimpleNamespace(_timeout=180.0)
+        session.solver = SimpleNamespace(
+            max_runtime_s_per_game=None,
+            soft_time_remaining_seconds=lambda: None,
+        )
+
+        self.assertEqual(session.request_timeout_seconds(), 180.0)
+
+    def test_directional_guards_persist_and_stop_after_bounded_strikes(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.controller_config = InferenceControllerConfig(
+            directional_no_progress_strike_limit=3,
+            directional_no_progress_stop_limit=8,
+        )
+        session.current_frame = lambda: Frame(grid=((0,),), step=0, level=1)
+
+        for _ in range(3):
+            session.register_directional_guard(1, "UP")
+
+        self.assertTrue(session.directional_action_blocked(1, "UP"))
+        self.assertFalse(session.directional_action_blocked(1, "RIGHT"))
+
+        for _ in range(5):
+            session.register_directional_guard(1, "RIGHT")
+
+        self.assertTrue(session.directional_no_progress_stop_reached())
+        self.assertEqual(session.directional_no_progress_stop_status(), (1, 8, 8))
+
+        session.clear_directional_guards(1)
+
+        self.assertFalse(session.directional_action_blocked(1, "UP"))
+        self.assertFalse(session.directional_no_progress_stop_reached())
 
     def test_action7_round_trips_through_normalize_actions(self) -> None:
         self.assertEqual(to_engine_action("ACTION7"), "ACTION7")

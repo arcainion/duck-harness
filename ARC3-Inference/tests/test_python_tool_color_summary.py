@@ -78,10 +78,11 @@ class PythonToolColorSummaryTests(unittest.TestCase):
             grid=[[0, 1, 1]],
         )
 
-        summary = frame.color_summary()
+        summary = frame.color_summary(1)
 
         self.assertEqual(summary["colors"][0]["symbol"], ARC_COLOR_CHARS[1])
         self.assertEqual(summary["colors"][0]["count"], 2)
+        self.assertEqual(len(summary["colors"]), 1)
 
 
 if __name__ == "__main__":
