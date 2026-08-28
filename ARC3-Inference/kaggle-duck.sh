@@ -61,7 +61,7 @@ if [ "${KAGGLE_DUCK_DIAGNOSTIC}" = "true" ]; then
         KAGGLE_DUCK_PUBLIC_HARNESS=false
         GAME="${KAGGLE_DUCK_DIAGNOSTIC_GAMES}"
         CONCURRENT_JOBS=3
-        ANALYZER_TIMEOUT=180
+        ANALYZER_TIMEOUT=900
     )
 fi
 

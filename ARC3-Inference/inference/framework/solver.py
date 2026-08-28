@@ -753,8 +753,17 @@ class _HarnessGameSession:
                     continue
                 consecutive_failures = 0
                 if getattr(result, "yielded_control", False):
-                    if getattr(result, "yield_reason", None) == "game_token_budget":
+                    yield_reason = getattr(result, "yield_reason", None)
+                    if yield_reason == "game_token_budget":
                         controller_only_reason = "game_token_budget"
+                        continue
+                    if yield_reason == "turn_time_budget":
+                        # This is a cooperative continuation point, commonly
+                        # reached after a long reasoning pass and an inspection
+                        # tool call.  The board is expected to be unchanged, so
+                        # counting it as a no-action failure terminates healthy
+                        # inspect-then-act workflows before the next model call.
+                        retry_analysis_step = analysis_step
                         continue
                     no_action_result = handle_no_action_turn()
                     if no_action_result == "executed":

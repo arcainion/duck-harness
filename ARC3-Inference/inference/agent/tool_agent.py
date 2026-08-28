@@ -3947,12 +3947,6 @@ _LOCAL_ANALYZER_MAX_OUTPUT = _get_env_int("LOCAL_ANALYZER_MAX_OUTPUT", 0)
 _LOCAL_ANALYZER_INITIAL_MAX_OUTPUT = _get_env_int(
     "LOCAL_ANALYZER_INITIAL_MAX_OUTPUT", 2048
 )
-_LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT = _get_env_int(
-    "LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT", 1024
-)
-_LOCAL_ANALYZER_REPAIR_MAX_OUTPUT = _get_env_int(
-    "LOCAL_ANALYZER_REPAIR_MAX_OUTPUT", 512
-)
 _LOCAL_ANALYZER_FORCE_PYTHON_TOOL = _get_env_bool(
     "LOCAL_ANALYZER_FORCE_PYTHON_TOOL", True
 )
@@ -5295,9 +5289,13 @@ class ToolAgent:
         self._max_output_tokens = (
             max(1, configured_max_output)
             if configured_max_output > 0
-            else max(1, _LOCAL_ANALYZER_INITIAL_MAX_OUTPUT)
+            else None
         )
-        self._reply_reserve_tokens = self._max_output_tokens
+        self._reply_reserve_tokens = (
+            self._max_output_tokens
+            if self._max_output_tokens is not None
+            else _REQUEST_SAFETY_MARGIN_TOKENS
+        )
         self._tool_output_tokens = max(64, _LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS)
         self._tool_output_chars = max(256, self._tool_output_tokens * 4)
         self._save_request_logs = bool(save_request_logs)
@@ -5384,20 +5382,18 @@ class ToolAgent:
 
     def _adaptive_output_limit(
         self, request_index: int, *, repair: bool = False
-    ) -> int:
-        if _LOCAL_ANALYZER_MAX_OUTPUT > 0:
-            limit = self._max_output_tokens
-        elif repair:
-            limit = max(
-                1, min(self._max_output_tokens, _LOCAL_ANALYZER_REPAIR_MAX_OUTPUT)
-            )
-        elif request_index <= 1:
-            limit = self._max_output_tokens
-        else:
-            limit = max(
-                1, min(self._max_output_tokens, _LOCAL_ANALYZER_FOLLOWUP_MAX_OUTPUT)
-            )
+    ) -> int | None:
         remaining = self._remaining_game_tokens()
+        if self._max_output_tokens is None:
+            # A non-positive LOCAL_ANALYZER_MAX_OUTPUT means the provider owns
+            # response sizing.  Do not silently turn it into the adaptive
+            # 2048/1024/512 caps: reasoning models can exhaust those limits
+            # before emitting a required tool call.  Only cap the final request
+            # when the total per-game token budget is nearly exhausted.
+            if remaining is not None and remaining < _LOCAL_ANALYZER_INITIAL_MAX_OUTPUT:
+                return max(1, remaining)
+            return None
+        limit = self._max_output_tokens
         return min(limit, max(1, remaining)) if remaining is not None else limit
 
     def _remaining_game_tokens(self) -> int | None:
@@ -5407,9 +5403,13 @@ class ToolAgent:
             0, _LOCAL_ANALYZER_GAME_TOKEN_BUDGET - self._session_generated_tokens
         )
 
-    def _adaptive_candidate_count(self, output_limit: int) -> int:
+    def _adaptive_candidate_count(self, output_limit: int | None) -> int:
         remaining = self._remaining_game_tokens()
-        if remaining is not None and remaining < max(1, output_limit) * 2:
+        if (
+            remaining is not None
+            and output_limit is not None
+            and remaining < max(1, output_limit) * 2
+        ):
             return 1
         snapshot = self._current_experience_snapshot or {}
         if not snapshot:
@@ -6899,7 +6899,11 @@ class ToolAgent:
     ) -> _ChatCompletionResult:
         force_tool = self._forced_tool_choice_supported is not False
         tool_choice = _request_tool_choice(tools, force=force_tool)
-        output_limit = max_output_tokens or self._max_output_tokens
+        output_limit = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else self._max_output_tokens
+        )
         request_tools = json.loads(json.dumps(tools)) if tools else None
         if request_tools and self._strict_tools_supported is False:
             for tool in request_tools:

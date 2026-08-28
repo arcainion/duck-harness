@@ -22,13 +22,13 @@ from inference.framework.solver import HarnessSolver
 
 
 class KaggleHardwareProfileTests(TestCase):
-    def test_default_analyzer_enables_ephemeral_thinking_for_qwen38(self) -> None:
+    def test_default_analyzer_enables_and_preserves_thinking_for_qwen38(self) -> None:
         config_path = Path(__file__).resolve().parents[1] / "configs" / "inference.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
 
         self.assertTrue(config["analyzer"]["thinking"])
         self.assertTrue(config["chat"]["thinking"])
-        self.assertFalse(
+        self.assertTrue(
             config["server"]["default_chat_template_kwargs"]["preserve_thinking"]
         )
 
@@ -115,7 +115,7 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("VLLM_MAX_NUM_SEQS = 16", command)
         self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 8192", command)
         self.assertIn("--enable-chunked-prefill", command)
-        self.assertIn('{"preserve_thinking": false}', command)
+        self.assertIn('{"preserve_thinking": true}', command)
 
     def test_rtx_pro_6000_profile_uses_single_gpu_defaults(self) -> None:
         config = duck_kaggle_vllm_config_for_accelerator("NvidiaRtxPro6000")
@@ -169,7 +169,9 @@ class KaggleHardwareProfileTests(TestCase):
             os.environ,
             {
                 "LOCAL_ANALYZER_CANDIDATES": "1",
-                "LOCAL_ANALYZER_MAX_OUTPUT": "4096",
+                "LOCAL_ANALYZER_MAX_OUTPUT": "0",
+                "LOCAL_ANALYZER_TOOL_STEPS": "0",
+                "LOCAL_ANALYZER_ENABLE_THINKING": "true",
                 "LOCAL_ANALYZER_GAME_TOKEN_BUDGET": "100000",
                 "LOCAL_ANALYZER_STAGNATION_WINDOW": "6",
                 "LOCAL_ANALYZER_CYCLE_WINDOW": "4",
@@ -192,7 +194,9 @@ class KaggleHardwareProfileTests(TestCase):
             command = duck_kaggle_setup_command()
 
         self.assertIn("'LOCAL_ANALYZER_CANDIDATES': '1'", command)
-        self.assertIn("'LOCAL_ANALYZER_MAX_OUTPUT': '4096'", command)
+        self.assertIn("'LOCAL_ANALYZER_MAX_OUTPUT': '0'", command)
+        self.assertIn("'LOCAL_ANALYZER_TOOL_STEPS': '0'", command)
+        self.assertIn("'LOCAL_ANALYZER_ENABLE_THINKING': 'true'", command)
         self.assertIn("'LOCAL_ANALYZER_GAME_TOKEN_BUDGET': '100000'", command)
         self.assertIn("'LOCAL_ANALYZER_STAGNATION_WINDOW': '6'", command)
         self.assertIn("'LOCAL_ANALYZER_CYCLE_WINDOW': '4'", command)

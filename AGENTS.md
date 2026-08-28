@@ -62,7 +62,7 @@
   stages without pushing. Its status check uses the credential export
   workaround for the container's `kaggle` CLI.
 - Set `KAGGLE_DUCK_DIAGNOSTIC=true` to run the five-game diagnostic suite at
-  concurrency 3 with a 180-second analyzer timeout before committing to the public harness. Override the suite
+  concurrency 3 with a 900-second analyzer timeout before committing to the public harness. Override the suite
   with `KAGGLE_DUCK_DIAGNOSTIC_GAMES='["game-id", ...]'` when needed.
 - Prerequisites: run `make install` first (the target uses `uv run --no-sync`),
   the `kaggle` CLI must be installed and on `PATH` inside the container
@@ -89,12 +89,13 @@
   `MODEL=local`, `KAGGLE_DUCK_PUBLIC_HARNESS=true` (the 25 official
   ARC-AGI-3 games), `N_PASSES=1`, `CONCURRENT_JOBS=12`,
   `MAX_RUNTIME_MINUTES=132`, `MAX_EXPERIMENT_RUNTIME_MINUTES=540`,
-  `ANALYZER_TIMEOUT=120`, one candidate, seven tool steps, a 4,096-token
-  per-response cap, a 100,000-token per-game budget, and a per-level action
+  `ANALYZER_TIMEOUT=900`, one candidate, unlimited tool steps, server-default
+  response sizing, thinking enabled and preserved across turns, a 100,000-token
+  per-game budget, and a per-level action
   ceiling of twice the baseline with a minimum of 20 actions, plus a 75,000-token
-  no-progress ceiling that resets after level progress. Controller
-  execution reserves the seventh tool step for a direct action, falls back to
-  the controller after two no-action analyzer turns at the same state, and
+  no-progress ceiling that resets after level progress. Cooperative 60-second
+  analyzer yields resume the same analysis step; controller execution falls
+  back after two genuine no-action analyzer turns at the same state and
   reports final no-action generated tokens in benchmark totals. Controller
   stagnation/cycle windows are 6/4; edge-only HUD changes are ignored, exact
   click coordinates are blocked after two failed attempts, inverse movement

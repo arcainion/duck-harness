@@ -457,7 +457,7 @@ def start_vllm_server() -> None:
         'vllm',
         '--enable-prefix-caching',
         '--default-chat-template-kwargs',
-        '{"preserve_thinking": false}',
+        '{"preserve_thinking": true}',
         '--reasoning-parser',
         'qwen3',
         '--max-model-len',

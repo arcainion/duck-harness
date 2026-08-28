@@ -4872,8 +4872,8 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertIsInstance(
             tool_agent_module._request_tool_choice(recovery_tools, force=True), dict
         )
-        self.assertLessEqual(
-            completion.call_args_list[1].kwargs["max_output_tokens"], 512
+        self.assertIsNone(
+            completion.call_args_list[1].kwargs["max_output_tokens"]
         )
         self.assertTrue(result.step_executed)
         self.assertIn("Commit your best action now", transcript)

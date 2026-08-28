@@ -308,7 +308,7 @@ class SolverControllerTests(TestCase):
         self.assertEqual(analyze_calls, 1)
         self.assertEqual(fallback_calls, 2)
 
-    def test_repeated_no_action_turn_uses_controller_fallback(self) -> None:
+    def test_repeated_genuine_no_action_turn_uses_controller_fallback(self) -> None:
         run = SimpleNamespace(
             state="playing",
             history=[],
@@ -321,11 +321,7 @@ class SolverControllerTests(TestCase):
         def analyze(*_args, **_kwargs) -> AnalyzerTurnResult:
             nonlocal analyze_calls
             analyze_calls += 1
-            return AnalyzerTurnResult(
-                step_executed=False,
-                yielded_control=True,
-                yield_reason="turn_time_budget",
-            )
+            return AnalyzerTurnResult(step_executed=False)
 
         fallback_reasons: list[str] = []
 
@@ -366,6 +362,69 @@ class SolverControllerTests(TestCase):
 
         self.assertEqual(analyze_calls, 2)
         self.assertEqual(fallback_reasons, ["repeated_no_action_turn"])
+
+    def test_time_budget_yields_resume_same_analysis_step_until_action(self) -> None:
+        run = SimpleNamespace(
+            state="playing",
+            history=[],
+            final_score=None,
+            solver_note=None,
+            solver_analysis_html=None,
+        )
+        analyze_calls = 0
+        analysis_steps: list[int] = []
+
+        def analyze(*_args, **kwargs) -> AnalyzerTurnResult:
+            nonlocal analyze_calls
+            analyze_calls += 1
+            analysis_steps.append(kwargs["analysis_step"])
+            if analyze_calls < 3:
+                return AnalyzerTurnResult(
+                    step_executed=False,
+                    yielded_control=True,
+                    yield_reason="turn_time_budget",
+                )
+            return AnalyzerTurnResult(step_executed=True)
+
+        fallback_reasons: list[str] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = object.__new__(_HarnessGameSession)
+            session.game = SimpleNamespace(
+                game_run=run,
+                current_state=SimpleNamespace(
+                    available_actions={arcengine.GameAction.ACTION1.value},
+                    raw=SimpleNamespace(state=arcengine.GameState.NOT_FINISHED),
+                ),
+            )
+            session.analyzer = SimpleNamespace(total_tokens=100, analyze=analyze)
+            session.transcript_path = root / "transcript.txt"
+            session.transcript_path.touch()
+            session.analysis_html_relpath = "analysis.html"
+            session.token_baseline = 0
+            session.analysis_step = 0
+            session.seed_initial_history = lambda: None
+            session.write_runtime_state = lambda: None
+            session._append_initial_viewer_event = lambda: None
+            session.write_viewer_payload = lambda: None
+            session._write_analysis_html = lambda: None
+            session._finish_if_needed = lambda: None
+            session._read_transcript_bytes = lambda: b""
+            session._transcript_delta_since = lambda _content: ""
+            session._append_analysis_viewer_event = lambda *_args: None
+            session._execute_controller_fallback = lambda reason: (
+                fallback_reasons.append(reason) or True
+            )
+            session.should_stop = lambda: analyze_calls >= 3
+            session.request_timeout_seconds = lambda: None
+            session.state_path = root / "state.json"
+
+            session.play()
+
+        self.assertEqual(analyze_calls, 3)
+        self.assertEqual(analysis_steps, [1, 1, 1])
+        self.assertEqual(fallback_reasons, [])
 
     def test_finish_reports_generated_tokens_after_last_action(self) -> None:
         session = object.__new__(_HarnessGameSession)

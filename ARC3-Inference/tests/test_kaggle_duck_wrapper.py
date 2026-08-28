@@ -48,7 +48,7 @@ class KaggleDuckWrapperTests(unittest.TestCase):
 
         self.assertIn("KAGGLE_DUCK_PUBLIC_HARNESS=false", arguments)
         self.assertIn("CONCURRENT_JOBS=3", arguments)
-        self.assertIn("ANALYZER_TIMEOUT=180", arguments)
+        self.assertIn("ANALYZER_TIMEOUT=900", arguments)
         game_argument = next(item for item in arguments if item.startswith("GAME="))
         self.assertIn("ft09-0d8bbf25", game_argument)
         self.assertIn("r11l-495a7899", game_argument)

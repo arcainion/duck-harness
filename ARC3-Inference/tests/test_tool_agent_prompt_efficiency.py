@@ -155,24 +155,35 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertLessEqual(len(shortened), agent._tool_output_chars + 80)
 
-    def test_default_output_limit_shrinks_after_initial_request(self) -> None:
-        agent = ToolAgent(model="unit-test-model")
+    def test_server_default_output_limit_is_not_adaptively_capped(self) -> None:
+        with patch(
+            "inference.agent.tool_agent._LOCAL_ANALYZER_MAX_OUTPUT", 0
+        ):
+            agent = ToolAgent(model="unit-test-model")
 
-        self.assertGreaterEqual(
-            agent._adaptive_output_limit(1),
-            agent._adaptive_output_limit(2),
+        self.assertIsNone(agent._max_output_tokens)
+        self.assertEqual(agent._reply_reserve_tokens, 512)
+        self.assertIsNone(agent._adaptive_output_limit(0))
+        self.assertIsNone(agent._adaptive_output_limit(2))
+        self.assertIsNone(agent._adaptive_output_limit(100, repair=True))
+
+    def test_server_default_output_limit_is_omitted_from_payload(self) -> None:
+        with patch(
+            "inference.agent.tool_agent._LOCAL_ANALYZER_MAX_OUTPUT", 0
+        ):
+            agent = ToolAgent(model="unit-test-model")
+        agent._http_session.post = Mock(
+            return_value=_Response(
+                200,
+                "",
+                {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+            )
         )
-        self.assertGreaterEqual(
-            agent._adaptive_output_limit(2),
-            agent._adaptive_output_limit(2, repair=True),
-        )
 
-    def test_adaptive_output_limit_treats_nonpositive_request_as_initial(self) -> None:
-        agent = ToolAgent(model="unit-test-model")
+        agent._chat_completion([{"role": "user", "content": "go"}], tools=None)
 
-        self.assertEqual(agent._adaptive_output_limit(0), agent._adaptive_output_limit(1))
-        self.assertGreaterEqual(agent._adaptive_output_limit(0), 1)
-        self.assertGreaterEqual(agent._adaptive_output_limit(100, repair=True), 1)
+        payload = agent._http_session.post.call_args.kwargs["json"]
+        self.assertNotIn("max_tokens", payload)
 
     def test_efficiency_metrics_accumulate_ints_and_floats(self) -> None:
         agent = ToolAgent(model="unit-test-model")
