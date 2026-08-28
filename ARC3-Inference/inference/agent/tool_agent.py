@@ -8330,9 +8330,12 @@ class ToolAgent:
         previous_history_messages = list(self._history_messages)
         preserve_history = True
         tools = self._tools(state_path)
+        action_only_tools = [
+            tool
+            for tool in tools
+            if str((tool.get("function") or {}).get("name") or "") == "action"
+        ]
         prewarm_sandbox()
-        tool_choice = _request_tool_choice(tools)
-        request_tools_snapshot = tools
         request_base_chars = _estimated_request_base_length(tools)
         message_length_cache: dict[int, tuple[dict[str, Any], int]] = {}
         messages: list[dict[str, Any]] = self._trim_messages_for_context(
@@ -8364,6 +8367,7 @@ class ToolAgent:
         )
         yielded_control_reason: str | None = None
         repair_next_request = False
+        action_recovery_pending = False
         queued_candidate_messages: list[dict[str, Any]] = []
         failed_code_fingerprints: set[str] = set()
         failure_counts: dict[str, int] = {}
@@ -8397,25 +8401,57 @@ class ToolAgent:
             turn_count = 0
             while self._tool_steps is None or turn_count < self._tool_steps:
                 yielded_control_reason = control_yield_reason()
-                if yielded_control_reason is not None:
+                if (
+                    yielded_control_reason is not None
+                    and not (
+                        action_recovery_pending
+                        and yielded_control_reason == "turn_time_budget"
+                    )
+                ):
                     break
                 turn_count += 1
+                final_action_step = bool(
+                    self._tool_steps is not None
+                    and turn_count >= self._tool_steps
+                    and action_only_tools
+                )
+                action_recovery_step = bool(
+                    action_recovery_pending and action_only_tools
+                )
+                active_tools = (
+                    action_only_tools
+                    if final_action_step or action_recovery_step
+                    else tools
+                )
+                active_request_base_chars = _estimated_request_base_length(active_tools)
+                if final_action_step:
+                    queued_candidate_messages.clear()
+                    final_action_prompt = (
+                        "This is the final tool step. Execute exactly one direct `action` "
+                        "tool call now. Python and inspect are no longer available."
+                    )
+                    append_transcript("USER PROMPT", final_action_prompt)
+                    messages.append({"role": "user", "content": final_action_prompt})
+                elif action_recovery_step:
+                    queued_candidate_messages.clear()
                 messages = self._trim_messages_for_context(
                     messages,
-                    tools=tools,
-                    request_base_chars=request_base_chars,
+                    tools=active_tools,
+                    request_base_chars=active_request_base_chars,
                     message_length_cache=message_length_cache,
                 )
                 latest_request_messages = list(messages)
-                latest_request_tools = request_tools_snapshot
-                latest_request_tool_choice = tool_choice
+                latest_request_tools = active_tools
+                latest_request_tool_choice = _request_tool_choice(
+                    active_tools, force=final_action_step or action_recovery_step
+                )
                 latest_request_index = turn_count
                 try:
                     request_kwargs: dict[str, Any] = {
-                        "tools": tools,
+                        "tools": active_tools,
                         "max_output_tokens": self._adaptive_output_limit(
                             turn_count,
-                            repair=repair_next_request,
+                            repair=repair_next_request or action_recovery_step,
                         ),
                     }
                     repair_next_request = False
@@ -8454,6 +8490,7 @@ class ToolAgent:
                         )
                     else:
                         result = self._chat_completion(messages, **request_kwargs)
+                    action_recovery_pending = False
                     self._record_efficiency("model_calls", result.request_attempts)
                     self._record_efficiency("model_seconds", result.latency_seconds)
                     self._record_efficiency("model_candidates", result.candidate_count)
@@ -8586,25 +8623,56 @@ class ToolAgent:
 
                     if content or reasoning:
                         messages.append(assistant_message)
-                    yielded_control_reason = control_yield_reason()
-                    if yielded_control_reason is not None:
+                    if action_recovery_step:
+                        self._record_efficiency("failed_action_commit_recoveries", 1)
+                        yielded_control_reason = (
+                            control_yield_reason() or "action_commit_recovery_failed"
+                        )
+                        append_transcript(
+                            "ANALYZER STATUS",
+                            "action_commit_recovery_failed: the forced action-only "
+                            "request returned no executable action.",
+                        )
                         break
-                    followup_prefix = "No action was executed. "
-                    if result.finish_reason == "length":
-                        followup_prefix = (
-                            "The previous generation was truncated by the output limit. "
-                            "Re-emit the complete tool call from the beginning; do not send only a suffix. "
+                    yielded_control_reason = control_yield_reason()
+                    if (
+                        yielded_control_reason is not None
+                        and yielded_control_reason != "turn_time_budget"
+                    ):
+                        break
+                    if action_only_tools:
+                        truncation_note = (
+                            " The previous generation was truncated by the output "
+                            "limit; use the decision already present in that reasoning "
+                            "and emit the complete tool call from the beginning."
+                            if result.finish_reason == "length"
+                            else ""
                         )
-                    elif tool_call_markup_in_text:
-                        followup_prefix = (
-                            "Tool markup appeared as text and was not executable. "
+                        followup_prompt = (
+                            "Commit your best action now. Do not continue analysis. "
+                            "Emit exactly one direct `action` tool call with validated "
+                            f"arguments.{truncation_note} Do not emit prose or tool-call "
+                            "markup as text."
                         )
-                    followup_prompt = (
-                        f"{followup_prefix}"
-                        "Emit exactly one parsed executable tool call now. Use `inspect` for a standard summary, "
-                        "`action` for a direct validated action batch, or `python` for custom bounded analysis. "
-                        f"{TOOL_CALL_FORMAT_GUIDANCE}"
-                    )
+                        action_recovery_pending = True
+                        self._record_efficiency("action_commit_recoveries", 1)
+                    else:
+                        followup_prefix = "No action was executed. "
+                        if result.finish_reason == "length":
+                            followup_prefix = (
+                                "The previous generation was truncated by the output limit. "
+                                "Re-emit the complete tool call from the beginning; do not send only a suffix. "
+                            )
+                        elif tool_call_markup_in_text:
+                            followup_prefix = (
+                                "Tool markup appeared as text and was not executable. "
+                            )
+                        followup_prompt = (
+                            f"{followup_prefix}"
+                            "Emit exactly one parsed executable tool call now. Use `inspect` for a standard summary, "
+                            "`action` for a direct validated action batch, or `python` for custom bounded analysis. "
+                            f"{TOOL_CALL_FORMAT_GUIDANCE}"
+                        )
                     append_transcript("USER PROMPT", followup_prompt)
                     messages.append({"role": "user", "content": followup_prompt})
                     repair_next_request = True
@@ -8649,7 +8717,20 @@ class ToolAgent:
                         rendered_tool_call
                         or (json.dumps(arguments, indent=2) if arguments else "{}"),
                     )
-                    if argument_error is not None:
+                    if final_action_step and tool_name != "action":
+                        dispatch = _ToolDispatchResult(
+                            json.dumps(
+                                {
+                                    "error": (
+                                        "Only the direct action tool is available on the "
+                                        "final tool step."
+                                    ),
+                                    "retryable": False,
+                                },
+                                separators=(",", ":"),
+                            )
+                        )
+                    elif argument_error is not None:
                         repair_next_request = True
                         dispatch = _ToolDispatchResult(
                             json.dumps(

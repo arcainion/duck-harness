@@ -145,6 +145,8 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
       sources attached to the notebook (e.g. a wheels utility script that
       a setup command then ``pip install``s from). Solvers can also expose
       ``kaggle_kernel_sources``.
+    - ``additional_model_sources``: extra Kaggle Model variations attached
+      to the notebook. Solvers can also expose ``kaggle_model_sources``.
     - ``setup_commands``: shell commands executed in the notebook before
       the benchmark pickle is loaded. Solvers can expose
       ``kaggle_setup_commands`` for solver-specific wheel/model setup.
@@ -179,6 +181,7 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
     dataset_ref: str | None = None
     additional_dataset_sources: list[str] = field(default_factory=lambda: list[str]())
     additional_kernel_sources: list[str] = field(default_factory=lambda: list[str]())
+    additional_model_sources: list[str] = field(default_factory=lambda: list[str]())
     setup_commands: list[str] = field(default_factory=lambda: list[str]())
     teardown_commands: list[str] = field(default_factory=lambda: list[str]())
     extra_source_repos: list[Path] = field(default_factory=lambda: list[Path]())
@@ -245,6 +248,14 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
             ]
             if str(value).strip()
         )
+        model_sources = _dedupe(
+            normalize_model_ref(value)
+            for value in [
+                *self.additional_model_sources,
+                *_solver_iterable_attr(solver, "kaggle_model_sources"),
+            ]
+            if str(value).strip()
+        )
         setup_commands = _dedupe(
             [
                 *self.setup_commands,
@@ -282,6 +293,7 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
             kernel_title=kernel_title,
             dataset_sources=_dedupe([dataset_ref, *dataset_sources]),
             kernel_sources=kernel_sources,
+            model_sources=model_sources,
             private=not self.public,
             enable_gpu=not self.cpu_only,
             enable_internet=self.enable_internet,
@@ -369,6 +381,20 @@ def normalize_kernel_ref(kernel_ref: str) -> str:
         text = f"{parts[1]}/{parts[2]}"
     split_dataset_ref(text)
     return text
+
+
+def normalize_model_ref(model_ref: str) -> str:
+    """Validate a Kaggle Model handle while preserving framework casing."""
+
+    parts = [part.strip() for part in str(model_ref or "").strip().split("/")]
+    if len(parts) not in (4, 5) or not all(parts):
+        raise ValueError(
+            "Kaggle model ref must be owner/model/framework/variation "
+            "or owner/model/framework/variation/version."
+        )
+    if len(parts) == 5 and not parts[4].isdigit():
+        raise ValueError("Kaggle model ref version must be numeric.")
+    return "/".join(parts)
 
 
 def _dedupe(values: Iterable[str]) -> list[str]:
@@ -552,6 +578,7 @@ def _write_kernel_bundle(
     kernel_title: str,
     dataset_sources: list[str],
     kernel_sources: list[str],
+    model_sources: list[str],
     private: bool,
     enable_gpu: bool,
     enable_internet: bool,
@@ -568,6 +595,7 @@ def _write_kernel_bundle(
             run_as_submission=run_as_submission,
             dataset_sources=dataset_sources,
             kernel_sources=kernel_sources,
+            model_sources=model_sources,
             enable_gpu=enable_gpu,
             template=template,
         ),
@@ -586,7 +614,7 @@ def _write_kernel_bundle(
         "competition_sources": [COMPETITION_SLUG],
         "dataset_sources": dataset_sources,
         "kernel_sources": kernel_sources,
-        "model_sources": [],
+        "model_sources": model_sources,
     }
     if accelerator:
         metadata["machine_shape"] = accelerator
@@ -598,6 +626,7 @@ def _render_kaggle_notebook(
     run_as_submission: bool,
     dataset_sources: Iterable[str] = (),
     kernel_sources: Iterable[str] = (),
+    model_sources: Iterable[str] = (),
     enable_gpu: bool = False,
     template: Path = _NOTEBOOK_TEMPLATE,
 ) -> str:
@@ -609,6 +638,7 @@ def _render_kaggle_notebook(
         "__TAAF_DATASET_SOURCES__": json.dumps(list(dataset_sources)),
         "__TAAF_DATASET_BUNDLE_MARKER__": json.dumps(DATASET_BUNDLE_MARKER),
         "__TAAF_KERNEL_SOURCES__": json.dumps(list(kernel_sources)),
+        "__TAAF_MODEL_SOURCES__": json.dumps(list(model_sources)),
         "__TAAF_KAGGLE_WORKING_DIR__": json.dumps(KAGGLE_WORKING_DIR),
         "__TAAF_SOFT_DEADLINE_BUFFER_S__": repr(_SOFT_DEADLINE_BUFFER_S),
     }
@@ -827,6 +857,7 @@ def run_source_bundle_locally(
             run_as_submission=False,
             dataset_sources=_target_declared_dataset_sources(target) if target is not None else (),
             kernel_sources=_target_declared_kernel_sources(target) if target is not None else (),
+            model_sources=_target_declared_model_sources(target) if target is not None else (),
             enable_gpu=False,
         )
     )
@@ -875,3 +906,7 @@ def _target_declared_dataset_sources(target: KaggleTarget) -> list[str]:
 
 def _target_declared_kernel_sources(target: KaggleTarget) -> list[str]:
     return _dedupe(normalize_kernel_ref(value) for value in target.additional_kernel_sources if str(value).strip())
+
+
+def _target_declared_model_sources(target: KaggleTarget) -> list[str]:
+    return _dedupe(normalize_model_ref(value) for value in target.additional_model_sources if str(value).strip())

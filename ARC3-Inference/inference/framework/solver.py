@@ -52,7 +52,7 @@ from inference.agent.trial_knowledge import TrialKnowledgeStore
 from inference.framework.kaggle import (
     DEFAULT_EXPECTED_GPU_COUNT,
     DEFAULT_EXPECTED_GPU_TYPE,
-    DEFAULT_QWEN_MODEL_DATASET_SOURCE,
+    DEFAULT_QWEN_MODEL_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
     DEFAULT_VLLM_GPU_MEMORY_UTILIZATION,
@@ -65,6 +65,7 @@ from inference.framework.kaggle import (
     DEFAULT_WHEELHOUSE_STAMP_TEXT,
     DuckKaggleVllmConfig,
     duck_kaggle_dataset_sources,
+    duck_kaggle_model_sources,
     duck_kaggle_setup_command,
     duck_kaggle_teardown_command,
 )
@@ -421,6 +422,7 @@ class _HarnessGameSession:
     analysis_step: int = 0
     last_engine_action: str | None = None
     token_baseline: int = 0
+    level_token_baseline: int = 0
     cycle_risk_streak: int = 0
     directional_guard_counts: dict[tuple[int, str], int] = field(default_factory=dict)
     directional_guard_totals: dict[int, int] = field(default_factory=dict)
@@ -479,6 +481,23 @@ class _HarnessGameSession:
 
     def level_action_limit_reached(self) -> bool:
         status = self.level_action_limit_status()
+        return status is not None and status[1] >= status[2]
+
+    def level_no_progress_token_status(self) -> tuple[int, int, int] | None:
+        limit = getattr(
+            getattr(self, "controller_config", None),
+            "level_no_progress_token_limit",
+            0,
+        )
+        if limit <= 0:
+            return None
+        level = self.current_frame().level
+        baseline = max(0, int(getattr(self, "level_token_baseline", 0) or 0))
+        used = max(0, _analyzer_reported_tokens(self.analyzer) - baseline)
+        return level, used, limit
+
+    def level_no_progress_token_limit_reached(self) -> bool:
+        status = self.level_no_progress_token_status()
         return status is not None and status[1] >= status[2]
 
     def cycle_stop_reached(self) -> bool:
@@ -579,6 +598,8 @@ class _HarnessGameSession:
             return True
         if self.level_action_limit_reached():
             return True
+        if self.level_no_progress_token_limit_reached():
+            return True
         if self.cycle_stop_reached():
             return True
         if self.directional_no_progress_stop_reached():
@@ -597,6 +618,7 @@ class _HarnessGameSession:
         self.transcript_path.parent.mkdir(parents=True, exist_ok=True)
         self.transcript_path.touch(exist_ok=True)
         self.token_baseline = _analyzer_reported_tokens(self.analyzer)
+        self.level_token_baseline = self.token_baseline
         self.seed_initial_history()
         self.write_runtime_state()
         self._append_initial_viewer_event()
@@ -605,6 +627,29 @@ class _HarnessGameSession:
             retry_analysis_step: int | None = None
             controller_only_reason: str | None = None
             consecutive_failures = 0
+            no_action_state_id: str | None = None
+            no_action_turns = 0
+
+            def handle_no_action_turn() -> str:
+                nonlocal no_action_state_id, no_action_turns
+                state_id = frame_fingerprint(self.current_frame())
+                if state_id == no_action_state_id:
+                    no_action_turns += 1
+                else:
+                    no_action_state_id = state_id
+                    no_action_turns = 1
+                if no_action_turns < 2:
+                    return "retry"
+                if self._execute_controller_fallback("repeated_no_action_turn"):
+                    no_action_state_id = None
+                    no_action_turns = 0
+                    return "executed"
+                run.solver_note = (
+                    "stopped: repeated analyzer turns produced no action at the same "
+                    f"state; tokens={_analyzer_reported_tokens(self.analyzer)}"
+                )
+                return "stop"
+
             while not self.should_stop():
                 if (
                     _is_engine_game_over(self.game)
@@ -689,6 +734,13 @@ class _HarnessGameSession:
                     retry_analysis_step = analysis_step
                     continue
                 if failure_category == "tool_step_exhausted":
+                    no_action_result = handle_no_action_turn()
+                    if no_action_result == "executed":
+                        retry_analysis_step = None
+                        consecutive_failures = 0
+                        continue
+                    if no_action_result == "stop":
+                        break
                     consecutive_failures += 1
                     if consecutive_failures >= ANALYZER_MAX_CONSECUTIVE_FAILURES:
                         run.solver_note = (
@@ -704,10 +756,24 @@ class _HarnessGameSession:
                     if getattr(result, "yield_reason", None) == "game_token_budget":
                         controller_only_reason = "game_token_budget"
                         continue
+                    no_action_result = handle_no_action_turn()
+                    if no_action_result == "executed":
+                        retry_analysis_step = None
+                        continue
+                    if no_action_result == "stop":
+                        break
                     retry_analysis_step = analysis_step
                     continue
                 if not result.step_executed:
+                    no_action_result = handle_no_action_turn()
+                    if no_action_result == "executed":
+                        retry_analysis_step = None
+                        continue
+                    if no_action_result == "stop":
+                        break
                     continue
+                no_action_state_id = None
+                no_action_turns = 0
         except Exception as exc:
             if run.final_score is None:
                 run.solver_note = f"error: {type(exc).__name__}: {exc}"
@@ -735,6 +801,12 @@ class _HarnessGameSession:
                     level, used, limit = self.directional_no_progress_stop_status()
                     run.solver_note = (
                         "stopped: directional no-progress guard limit reached "
+                        f"on level {level} ({used}/{limit}); tokens={total_tokens}"
+                    )
+                elif self.level_no_progress_token_limit_reached():
+                    level, used, limit = self.level_no_progress_token_status()
+                    run.solver_note = (
+                        "stopped: level no-progress analyzer token limit reached "
                         f"on level {level} ({used}/{limit}); tokens={total_tokens}"
                     )
                 else:
@@ -824,7 +896,13 @@ class _HarnessGameSession:
         if run is not None and run.final_score is None:
             if self.stop_event.is_set() and run.state == "playing":
                 run.state = "cancelled"
-            self.game.finish_game()
+            current_tokens = _analyzer_reported_tokens(self.analyzer)
+            final_generated_tokens = max(0, current_tokens - self.token_baseline)
+            self.game.finish_game(
+                generated_tokens=final_generated_tokens,
+                uncached_input_tokens=0,
+            )
+            self.token_baseline = current_tokens
 
     def _write_analysis_html(self) -> None:
         if self.solver.job_dir is None:
@@ -1457,6 +1535,7 @@ class _HarnessGameSession:
         )
         if action.id == arcengine.GameAction.RESET or reward > 0.0:
             self.clear_directional_guards(previous_frame.level)
+            self.level_token_baseline = _analyzer_reported_tokens(self.analyzer)
         self.history_entries.append(
             HistoryEntry(
                 action=action_display,
@@ -1558,8 +1637,8 @@ class HarnessSolver(Solver):
     kaggle_wheelhouse_dataset_source: str = field(
         default=DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE, repr=False
     )
-    kaggle_model_dataset_source: str = field(
-        default=DEFAULT_QWEN_MODEL_DATASET_SOURCE, repr=False
+    kaggle_model_source: str = field(
+        default=DEFAULT_QWEN_MODEL_SOURCE, repr=False
     )
     kaggle_served_model_name: str = field(default=DEFAULT_SERVED_MODEL_NAME, repr=False)
     kaggle_vllm_port: int = field(default=DEFAULT_VLLM_PORT, repr=False)
@@ -1682,6 +1761,12 @@ class HarnessSolver(Solver):
         return duck_kaggle_dataset_sources(self._kaggle_vllm_config())
 
     @property
+    def kaggle_model_sources(self) -> list[str]:
+        if not self.kaggle_enable_vllm:
+            return []
+        return duck_kaggle_model_sources(self._kaggle_vllm_config())
+
+    @property
     def kaggle_setup_commands(self) -> list[str]:
         if not self.kaggle_enable_vllm:
             return []
@@ -1696,7 +1781,7 @@ class HarnessSolver(Solver):
     def _kaggle_vllm_config(self) -> DuckKaggleVllmConfig:
         return DuckKaggleVllmConfig(
             wheelhouse_dataset_source=self.kaggle_wheelhouse_dataset_source,
-            model_dataset_source=self.kaggle_model_dataset_source,
+            model_source=self.kaggle_model_source,
             served_model_name=self.kaggle_served_model_name,
             vllm_port=self.kaggle_vllm_port,
             max_model_len=self.kaggle_vllm_max_model_len,

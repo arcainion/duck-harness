@@ -89,9 +89,13 @@
   `MODEL=local`, `KAGGLE_DUCK_PUBLIC_HARNESS=true` (the 25 official
   ARC-AGI-3 games), `N_PASSES=1`, `CONCURRENT_JOBS=12`,
   `MAX_RUNTIME_MINUTES=132`, `MAX_EXPERIMENT_RUNTIME_MINUTES=540`,
-  `ANALYZER_TIMEOUT=120`, one candidate, six tool steps, a 4,096-token
+  `ANALYZER_TIMEOUT=120`, one candidate, seven tool steps, a 4,096-token
   per-response cap, a 100,000-token per-game budget, and a per-level action
-  ceiling of twice the baseline with a minimum of 16 actions. Controller
+  ceiling of twice the baseline with a minimum of 20 actions, plus a 75,000-token
+  no-progress ceiling that resets after level progress. Controller
+  execution reserves the seventh tool step for a direct action, falls back to
+  the controller after two no-action analyzer turns at the same state, and
+  reports final no-action generated tokens in benchmark totals. Controller
   stagnation/cycle windows are 6/4; edge-only HUD changes are ignored, exact
   click coordinates are blocked after two failed attempts, inverse movement
   cycles are guarded, pure object translations are not rewarded as novel, a
@@ -103,10 +107,10 @@
   is 0.5.
 - The notebook attaches the duck solver's declared datasets:
   `driessmit1/arc3-vllm-h100-wheelhouse-v3` (vLLM wheelhouse, installed
-  offline into a temporary target dir) and
-  `driessmit1/vrfai-qwen3-6-27b-fp8-hf-snapshot` (served as
-  `vrfai/Qwen3.6-27B-FP8`). The setup asserts the expected GPU shape before
-  starting vLLM.
+  offline into a temporary target dir), plus the Kaggle Model
+  `foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/pyTorch/hf-fp8/1` (served as
+  `Qwen/Qwen3.8-27B-FP8`). The setup resolves the attached model via
+  KaggleHub and asserts the expected GPU shape before starting vLLM.
 - Accelerator defaults to `NvidiaRtxPro6000` (rtx-pro-6000 profile,
   `max_model_len=65536`, TP=1). With `KAGGLE_ACCELERATOR=NvidiaTeslaT4` the
   profile switches to `max_model_len=8192`, TP=2 across the two exposed T4s.

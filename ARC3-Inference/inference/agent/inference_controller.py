@@ -188,6 +188,7 @@ class InferenceControllerConfig:
     exploration_weight: float = 0.75
     level_action_limit_multiplier: float = 0.0
     level_action_limit_minimum: int = 0
+    level_no_progress_token_limit: int = 0
 
     @property
     def outcome_aware(self) -> bool:
@@ -285,6 +286,9 @@ class InferenceControllerConfig:
             ),
             level_action_limit_minimum=max(
                 0, _env_int("LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM", 0)
+            ),
+            level_no_progress_token_limit=max(
+                0, _env_int("LOCAL_ANALYZER_LEVEL_NO_PROGRESS_TOKEN_LIMIT", 0)
             ),
         )
 

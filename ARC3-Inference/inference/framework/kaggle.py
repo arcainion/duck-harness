@@ -8,8 +8,10 @@ from dataclasses import dataclass
 from inference.utils.openai_compat import normalize_provider
 
 DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE = "driessmit1/arc3-vllm-h100-wheelhouse-v3"
-DEFAULT_QWEN_MODEL_DATASET_SOURCE = "driessmit1/vrfai-qwen3-6-27b-fp8-hf-snapshot"
-DEFAULT_SERVED_MODEL_NAME = "vrfai/Qwen3.6-27B-FP8"
+DEFAULT_QWEN_MODEL_SOURCE = (
+    "foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/pyTorch/hf-fp8/1"
+)
+DEFAULT_SERVED_MODEL_NAME = "Qwen/Qwen3.8-27B-FP8"
 DEFAULT_VLLM_PORT = 1234
 DEFAULT_VLLM_MAX_MODEL_LEN = 65536
 DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 1
@@ -60,7 +62,7 @@ class DuckKaggleVllmConfig:
     """Kaggle-side vLLM/model configuration declared by ``HarnessSolver``."""
 
     wheelhouse_dataset_source: str = DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE
-    model_dataset_source: str = DEFAULT_QWEN_MODEL_DATASET_SOURCE
+    model_source: str = DEFAULT_QWEN_MODEL_SOURCE
     served_model_name: str = DEFAULT_SERVED_MODEL_NAME
     vllm_port: int = DEFAULT_VLLM_PORT
     max_model_len: int = DEFAULT_VLLM_MAX_MODEL_LEN
@@ -98,7 +100,14 @@ def duck_kaggle_dataset_sources(
     config: DuckKaggleVllmConfig | None = None,
 ) -> list[str]:
     cfg = config or DuckKaggleVllmConfig()
-    return [cfg.wheelhouse_dataset_source, cfg.model_dataset_source]
+    return [cfg.wheelhouse_dataset_source]
+
+
+def duck_kaggle_model_sources(
+    config: DuckKaggleVllmConfig | None = None,
+) -> list[str]:
+    cfg = config or DuckKaggleVllmConfig()
+    return [_validate_model_source(cfg.model_source)]
 
 
 def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str:
@@ -107,10 +116,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         cfg.wheelhouse_dataset_source,
         option_name="wheelhouse_dataset_source",
     )
-    model_owner, model_slug = _split_dataset_source(
-        cfg.model_dataset_source,
-        option_name="model_dataset_source",
-    )
+    model_source = _validate_model_source(cfg.model_source)
     # Base URL / model are pinned to the local vLLM server below, so reject a
     # provider that disagrees (e.g. openrouter) — it would drop vLLM-only payload
     # fields (top_k, chat_template_kwargs) against a vLLM endpoint.
@@ -123,8 +129,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
     replacements = {
         "__WHEELHOUSE_OWNER__": repr(wheelhouse_owner),
         "__WHEELHOUSE_SLUG__": repr(wheelhouse_slug),
-        "__MODEL_OWNER__": repr(model_owner),
-        "__MODEL_SLUG__": repr(model_slug),
+        "__MODEL_SOURCE__": repr(model_source),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
         "__VLLM_MAX_MODEL_LEN__": repr(int(cfg.max_model_len)),
@@ -185,6 +190,9 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM__": repr(
             os.environ.get("LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM", "0")
         ),
+        "__LOCAL_ANALYZER_LEVEL_NO_PROGRESS_TOKEN_LIMIT__": repr(
+            os.environ.get("LOCAL_ANALYZER_LEVEL_NO_PROGRESS_TOKEN_LIMIT", "0")
+        ),
         "__LOCAL_ANALYZER_YIELD_SECONDS__": repr(os.environ.get("LOCAL_ANALYZER_YIELD_SECONDS", "60")),
         "__LOCAL_ANALYZER_TEMPERATURE__": repr(os.environ.get("LOCAL_ANALYZER_TEMPERATURE", "0.6")),
         "__LOCAL_ANALYZER_TOP_P__": repr(os.environ.get("LOCAL_ANALYZER_TOP_P", "0.95")),
@@ -227,6 +235,18 @@ def _split_dataset_source(value: str, *, option_name: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+def _validate_model_source(value: str) -> str:
+    parts = str(value or "").strip().split("/")
+    if len(parts) not in (4, 5) or not all(parts):
+        raise ValueError(
+            "model_source must be a Kaggle Model handle in "
+            "owner/model/framework/variation[/version] format."
+        )
+    if len(parts) == 5 and not parts[4].isdigit():
+        raise ValueError("model_source version must be numeric.")
+    return "/".join(parts)
+
+
 _DUCK_VLLM_SETUP_SCRIPT = r"""import json
 import os
 import shutil
@@ -238,8 +258,7 @@ from pathlib import Path
 
 WHEELHOUSE_OWNER = __WHEELHOUSE_OWNER__
 WHEELHOUSE_SLUG = __WHEELHOUSE_SLUG__
-MODEL_OWNER = __MODEL_OWNER__
-MODEL_SLUG = __MODEL_SLUG__
+MODEL_SOURCE = __MODEL_SOURCE__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
 VLLM_HOST = '127.0.0.1'
 VLLM_PORT = __VLLM_PORT__
@@ -283,8 +302,16 @@ def resolve_kaggle_dataset_path(owner: str, slug: str) -> Path:
     return Path('/kaggle/input') / slug
 
 
+def resolve_kaggle_model_path(model_source: str) -> Path:
+    try:
+        import kagglehub
+    except ImportError as exc:
+        raise RuntimeError('kagglehub is required to resolve an attached Kaggle Model.') from exc
+    return Path(kagglehub.model_download(model_source))
+
+
 WHEELHOUSE = resolve_kaggle_dataset_path(WHEELHOUSE_OWNER, WHEELHOUSE_SLUG)
-MODEL_PATH = resolve_kaggle_dataset_path(MODEL_OWNER, MODEL_SLUG)
+MODEL_PATH = resolve_kaggle_model_path(MODEL_SOURCE)
 
 
 def assert_expected_cuda_gpu() -> None:
@@ -430,7 +457,7 @@ def start_vllm_server() -> None:
         'vllm',
         '--enable-prefix-caching',
         '--default-chat-template-kwargs',
-        '{"preserve_thinking": true}',
+        '{"preserve_thinking": false}',
         '--reasoning-parser',
         'qwen3',
         '--max-model-len',
@@ -474,7 +501,7 @@ print(f'Qwen model path: {MODEL_PATH}', flush=True)
 assert_expected_cuda_gpu()
 missing = [str(path) for path in (WHEELHOUSE, MODEL_PATH) if not path.exists()]
 if missing:
-    raise FileNotFoundError('Missing attached dataset path(s): ' + ', '.join(missing))
+    raise FileNotFoundError('Missing attached Kaggle input path(s): ' + ', '.join(missing))
 start_vllm_server()
 run_vllm_api_smoke_test()
 setup_env = {
@@ -517,6 +544,7 @@ setup_env = {
     'LOCAL_ANALYZER_EXPLORATION_WEIGHT': __LOCAL_ANALYZER_EXPLORATION_WEIGHT__,
     'LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MULTIPLIER': __LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MULTIPLIER__,
     'LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM': __LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM__,
+    'LOCAL_ANALYZER_LEVEL_NO_PROGRESS_TOKEN_LIMIT': __LOCAL_ANALYZER_LEVEL_NO_PROGRESS_TOKEN_LIMIT__,
     'LOCAL_ANALYZER_YIELD_SECONDS': __LOCAL_ANALYZER_YIELD_SECONDS__,
     'LOCAL_ANALYZER_TEMPERATURE': __LOCAL_ANALYZER_TEMPERATURE__,
     'LOCAL_ANALYZER_TOP_P': __LOCAL_ANALYZER_TOP_P__,

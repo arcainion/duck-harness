@@ -623,6 +623,7 @@ class InferenceControllerTests(TestCase):
                 "LOCAL_ANALYZER_VOLATILE_RATIO": "2",
                 "LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STRIKE_LIMIT": "3",
                 "LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STOP_LIMIT": "8",
+                "LOCAL_ANALYZER_LEVEL_NO_PROGRESS_TOKEN_LIMIT": "75000",
             },
             clear=True,
         ):
@@ -635,6 +636,7 @@ class InferenceControllerTests(TestCase):
         self.assertEqual(config.volatile_ratio, 1.0)
         self.assertEqual(config.directional_no_progress_strike_limit, 3)
         self.assertEqual(config.directional_no_progress_stop_limit, 8)
+        self.assertEqual(config.level_no_progress_token_limit, 75000)
 
     def test_two_exact_noops_guard_the_third_trial(self) -> None:
         state = _frame(1, step=0)

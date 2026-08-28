@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import subprocess
 import tempfile
@@ -9,8 +10,11 @@ from pathlib import Path
 from unittest import TestCase, mock
 
 from inference.framework.kaggle import (
+    DEFAULT_QWEN_MODEL_SOURCE,
+    DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
     DuckKaggleVllmConfig,
+    duck_kaggle_model_sources,
     duck_kaggle_setup_command,
     duck_kaggle_vllm_config_for_accelerator,
 )
@@ -18,6 +22,35 @@ from inference.framework.solver import HarnessSolver
 
 
 class KaggleHardwareProfileTests(TestCase):
+    def test_default_analyzer_enables_ephemeral_thinking_for_qwen38(self) -> None:
+        config_path = Path(__file__).resolve().parents[1] / "configs" / "inference.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(config["analyzer"]["thinking"])
+        self.assertTrue(config["chat"]["thinking"])
+        self.assertFalse(
+            config["server"]["default_chat_template_kwargs"]["preserve_thinking"]
+        )
+
+    def test_default_model_is_qwen38_fp8_repacked_kaggle_model(self) -> None:
+        solver = HarnessSolver()
+
+        self.assertEqual(
+            solver.kaggle_model_sources,
+            ["foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/pyTorch/hf-fp8/1"],
+        )
+        self.assertEqual(solver.kaggle_model_sources, [DEFAULT_QWEN_MODEL_SOURCE])
+        self.assertEqual(solver.kaggle_served_model_name, DEFAULT_SERVED_MODEL_NAME)
+        self.assertEqual(
+            solver.kaggle_dataset_sources,
+            ["driessmit1/arc3-vllm-h100-wheelhouse-v3"],
+        )
+
+        command = duck_kaggle_setup_command()
+        self.assertIn(f"MODEL_SOURCE = {DEFAULT_QWEN_MODEL_SOURCE!r}", command)
+        self.assertIn("kagglehub.model_download(model_source)", command)
+        self.assertIn(f"SERVED_MODEL_NAME = {DEFAULT_SERVED_MODEL_NAME!r}", command)
+
     def test_solver_propagates_expected_gpu_shape(self) -> None:
         solver = HarnessSolver(
             kaggle_expected_gpu_type="t4",
@@ -82,6 +115,7 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("VLLM_MAX_NUM_SEQS = 16", command)
         self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 8192", command)
         self.assertIn("--enable-chunked-prefill", command)
+        self.assertIn('{"preserve_thinking": false}', command)
 
     def test_rtx_pro_6000_profile_uses_single_gpu_defaults(self) -> None:
         config = duck_kaggle_vllm_config_for_accelerator("NvidiaRtxPro6000")
@@ -150,7 +184,8 @@ class KaggleHardwareProfileTests(TestCase):
                 "LOCAL_ANALYZER_NOVEL_UTILITY": "0.05",
                 "LOCAL_ANALYZER_EXPLORATION_WEIGHT": "0.5",
                 "LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MULTIPLIER": "2.0",
-                "LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM": "16",
+                "LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM": "20",
+                "LOCAL_ANALYZER_LEVEL_NO_PROGRESS_TOKEN_LIMIT": "75000",
             },
             clear=False,
         ):
@@ -180,7 +215,10 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("'LOCAL_ANALYZER_NOVEL_UTILITY': '0.05'", command)
         self.assertIn("'LOCAL_ANALYZER_EXPLORATION_WEIGHT': '0.5'", command)
         self.assertIn("'LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MULTIPLIER': '2.0'", command)
-        self.assertIn("'LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM': '16'", command)
+        self.assertIn("'LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MINIMUM': '20'", command)
+        self.assertIn(
+            "'LOCAL_ANALYZER_LEVEL_NO_PROGRESS_TOKEN_LIMIT': '75000'", command
+        )
 
     def test_setup_rejects_provider_incompatible_with_local_vllm(self) -> None:
         with mock.patch.dict(
@@ -197,6 +235,14 @@ class KaggleHardwareProfileTests(TestCase):
                 with self.assertRaisesRegex(ValueError, "owner/slug"):
                     duck_kaggle_setup_command(
                         DuckKaggleVllmConfig(wheelhouse_dataset_source=dataset_ref)
+                    )
+
+    def test_setup_rejects_malformed_model_references(self) -> None:
+        for model_ref in ("", "owner/model", "owner/model/pytorch/fp8/latest"):
+            with self.subTest(model_ref=model_ref):
+                with self.assertRaisesRegex(ValueError, "Kaggle Model handle|numeric"):
+                    duck_kaggle_model_sources(
+                        DuckKaggleVllmConfig(model_source=model_ref)
                     )
 
     def test_setup_rejects_non_numeric_context_window(self) -> None:

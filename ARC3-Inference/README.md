@@ -341,15 +341,19 @@ instead of fetching private dependencies from GitHub.
 
 `make kaggle-duck` runs through TAAF's Kaggle deployment. It packages the
 current TAAF and ARC3-Inference sources into a Kaggle source dataset, pushes a
-private Kaggle notebook, and attaches the duck solver's declared model and vLLM
-wheelhouse datasets. The duck solver owns the Kaggle setup hooks, so the
-launcher only chooses the run shape.
+private Kaggle notebook, and attaches the vLLM wheelhouse dataset plus the
+version-pinned `Qwen3.8 27B FP8 Repacked` Kaggle Model. The duck solver owns the
+Kaggle setup hooks, so the launcher only chooses the run shape.
 
 By default the target uses the 25 official ARC-AGI-3 games, `model=local`, 12
 concurrent games, 132 minutes per game, and a 540-minute Kaggle runtime. The
-next-run safeguards use one candidate, six tool steps, a 4,096-token
+next-run safeguards use one candidate, seven tool steps, a 4,096-token
 per-response cap, a 100,000-token per-game budget, and a per-level action
-ceiling of twice the baseline (minimum 16). The controller ignores edge-only
+ceiling of twice the baseline (minimum 20) and a 75,000-token per-level
+no-progress ceiling that resets after progress. The seventh and final analyzer
+tool step exposes only the direct `action` tool; two no-action turns at the same
+state trigger a controller-ranked fallback. Final no-action generated tokens are
+included in benchmark totals. The controller ignores edge-only
 HUD changes, blocks a third failed click at the same coordinate and a repeated
 inverse movement cycle, treats pure object translation as a revisit, blocks a
 direction used at least 12 times in a 16-action window without score or level

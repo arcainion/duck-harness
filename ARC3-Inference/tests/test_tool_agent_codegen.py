@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -3811,7 +3812,7 @@ class ToolAgentCodeGenerationTests(TestCase):
             provider="vllm",
             base_url="http://127.0.0.1:1/v1",
         )
-        agent._tool_steps = 1
+        agent._tool_steps = 2
         agent._chat_completion = lambda *_args, **_kwargs: _ChatCompletionResult(
             message={
                 "tool_calls": [
@@ -3873,18 +3874,29 @@ class ToolAgentCodeGenerationTests(TestCase):
             provider="vllm",
             base_url="http://127.0.0.1:1/v1",
         )
-        agent._tool_steps = 1
-        agent._chat_completion = lambda *_args, **_kwargs: _ChatCompletionResult(
-            message={
-                "tool_calls": [
-                    {
-                        "id": "direct-python",
-                        "type": "function",
-                        "function": {"name": "python", "arguments": "result = 42"},
-                    }
-                ]
-            },
-            finish_reason="tool_calls",
+        agent._tool_steps = 2
+        agent._chat_completion = Mock(
+            side_effect=[
+                _ChatCompletionResult(
+                    message={
+                        "tool_calls": [
+                            {
+                                "id": "direct-python",
+                                "type": "function",
+                                "function": {
+                                    "name": "python",
+                                    "arguments": "result = 42",
+                                },
+                            }
+                        ]
+                    },
+                    finish_reason="tool_calls",
+                ),
+                _ChatCompletionResult(
+                    message={"content": "unable to choose"},
+                    finish_reason="stop",
+                ),
+            ]
         )
 
         with TemporaryDirectory() as temp_dir:
@@ -3913,7 +3925,7 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertFalse(result.step_executed)
         self.assertIn("[TOOL RESULT: python]\n42", transcript)
         self.assertNotIn("Provide one JSON object and retry", transcript)
-        self.assertEqual(normalize_arguments.call_count, 1)
+        self.assertEqual(normalize_arguments.call_count, 2)
         self.assertEqual(build_tools.call_count, 1)
 
     def test_analyze_tries_valid_runner_up_after_side_effect_free_failure(self) -> None:
@@ -3987,7 +3999,7 @@ class ToolAgentCodeGenerationTests(TestCase):
             provider="vllm",
             base_url="http://127.0.0.1:1/v1",
         )
-        agent._tool_steps = 2
+        agent._tool_steps = 3
         agent._chat_completion = Mock(
             return_value=_ChatCompletionResult(
                 message={
@@ -4339,7 +4351,7 @@ class ToolAgentCodeGenerationTests(TestCase):
             provider="vllm",
             base_url="http://127.0.0.1:1/v1",
         )
-        agent._tool_steps = 2
+        agent._tool_steps = 3
         agent._chat_completion = Mock(
             side_effect=[
                 _ChatCompletionResult(
@@ -4365,9 +4377,22 @@ class ToolAgentCodeGenerationTests(TestCase):
                                 "function": {
                                     "name": "python",
                                     "arguments": (
-                                        '{"code":"# different candidate\\n'
-                                        'result = missing_name"}'
+                                        '{"code":"result = missing_name + 0"}'
                                     ),
+                                },
+                            }
+                        ]
+                    }
+                ),
+                _ChatCompletionResult(
+                    message={
+                        "tool_calls": [
+                            {
+                                "id": "fallback-action",
+                                "type": "function",
+                                "function": {
+                                    "name": "action",
+                                    "arguments": '{"actions":["LEFT"]}',
                                 },
                             }
                         ]
@@ -4691,3 +4716,165 @@ class ToolAgentCodeGenerationTests(TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.failure_category, "tool_step_exhausted")
         self.assertTrue(result.exhausted)
+
+    def test_analyze_reserves_final_tool_step_for_direct_action(self) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._tool_steps = 2
+        completion = Mock(
+            side_effect=[
+                _ChatCompletionResult(
+                    message={
+                        "tool_calls": [
+                            {
+                                "id": "inspect-first",
+                                "type": "function",
+                                "function": {
+                                    "name": "python",
+                                    "arguments": '{"code":"result = 42"}',
+                                },
+                            }
+                        ]
+                    },
+                    finish_reason="tool_calls",
+                ),
+                _ChatCompletionResult(
+                    message={
+                        "tool_calls": [
+                            {
+                                "id": "act-finally",
+                                "type": "function",
+                                "function": {
+                                    "name": "action",
+                                    "arguments": '{"actions":["LEFT"]}',
+                                },
+                            }
+                        ]
+                    },
+                    finish_reason="tool_calls",
+                ),
+            ]
+        )
+        agent._chat_completion = completion
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            result = agent.analyze(
+                state_path,
+                action_num=0,
+                valid_actions=["LEFT"],
+                step_env=lambda _request: {
+                    "executed": True,
+                    "action_num": 1,
+                    "action_display": "LEFT",
+                    "valid_actions": ["LEFT"],
+                },
+            )
+            transcript = state_path.with_name(
+                "tool_runtime_state_analyzer.txt"
+            ).read_text(encoding="utf-8")
+
+        first_tools = completion.call_args_list[0].kwargs["tools"]
+        final_tools = completion.call_args_list[1].kwargs["tools"]
+        self.assertEqual(
+            [tool["function"]["name"] for tool in first_tools],
+            ["python", "action", "inspect"],
+        )
+        self.assertEqual(
+            [tool["function"]["name"] for tool in final_tools], ["action"]
+        )
+        self.assertTrue(result.step_executed)
+        self.assertIn("This is the final tool step", transcript)
+
+    def test_analyze_forces_bounded_action_recovery_after_reasoning_only_response(
+        self,
+    ) -> None:
+        agent = ToolAgent(
+            model="unit-test-model",
+            provider="vllm",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        agent._tool_steps = 3
+        agent._yield_seconds = 0.05
+        responses = iter(
+            [
+                _ChatCompletionResult(
+                    message={
+                        "reasoning": "The best available move is LEFT.",
+                        "content": None,
+                    },
+                    finish_reason="length",
+                ),
+                _ChatCompletionResult(
+                    message={
+                        "tool_calls": [
+                            {
+                                "id": "commit-action",
+                                "type": "function",
+                                "function": {
+                                    "name": "action",
+                                    "arguments": '{"actions":["LEFT"]}',
+                                },
+                            }
+                        ]
+                    },
+                    finish_reason="tool_calls",
+                ),
+            ]
+        )
+
+        def complete(*_args, **_kwargs):
+            response = next(responses)
+            if response.finish_reason == "length":
+                time.sleep(0.06)
+            return response
+
+        completion = Mock(side_effect=complete)
+        agent._chat_completion = completion
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tool_runtime_state.json"
+            state_path.write_text(
+                json.dumps({"current_frame": None, "history": []}),
+                encoding="utf-8",
+            )
+            result = agent.analyze(
+                state_path,
+                action_num=0,
+                valid_actions=["LEFT"],
+                step_env=lambda _request: {
+                    "executed": True,
+                    "action_num": 1,
+                    "action_display": "LEFT",
+                    "valid_actions": ["LEFT"],
+                },
+            )
+            transcript = state_path.with_name(
+                "tool_runtime_state_analyzer.txt"
+            ).read_text(encoding="utf-8")
+
+        initial_tools = completion.call_args_list[0].kwargs["tools"]
+        recovery_tools = completion.call_args_list[1].kwargs["tools"]
+        self.assertEqual(
+            [tool["function"]["name"] for tool in initial_tools],
+            ["python", "action", "inspect"],
+        )
+        self.assertEqual(
+            [tool["function"]["name"] for tool in recovery_tools], ["action"]
+        )
+        self.assertIsInstance(
+            tool_agent_module._request_tool_choice(recovery_tools, force=True), dict
+        )
+        self.assertLessEqual(
+            completion.call_args_list[1].kwargs["max_output_tokens"], 512
+        )
+        self.assertTrue(result.step_executed)
+        self.assertIn("Commit your best action now", transcript)
+        self.assertEqual(result.efficiency_metrics["action_commit_recoveries"], 1)

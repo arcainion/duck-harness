@@ -141,7 +141,7 @@ class SolverControllerTests(TestCase):
                 yield_reason="game_token_budget",
             )
 
-        def finish_game() -> None:
+        def finish_game(**_kwargs: int) -> None:
             run.final_score = 0
 
         game = SimpleNamespace(
@@ -308,6 +308,85 @@ class SolverControllerTests(TestCase):
         self.assertEqual(analyze_calls, 1)
         self.assertEqual(fallback_calls, 2)
 
+    def test_repeated_no_action_turn_uses_controller_fallback(self) -> None:
+        run = SimpleNamespace(
+            state="playing",
+            history=[],
+            final_score=None,
+            solver_note=None,
+            solver_analysis_html=None,
+        )
+        analyze_calls = 0
+
+        def analyze(*_args, **_kwargs) -> AnalyzerTurnResult:
+            nonlocal analyze_calls
+            analyze_calls += 1
+            return AnalyzerTurnResult(
+                step_executed=False,
+                yielded_control=True,
+                yield_reason="turn_time_budget",
+            )
+
+        fallback_reasons: list[str] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = object.__new__(_HarnessGameSession)
+            session.game = SimpleNamespace(
+                game_run=run,
+                current_state=SimpleNamespace(
+                    available_actions={arcengine.GameAction.ACTION1.value},
+                    raw=SimpleNamespace(state=arcengine.GameState.NOT_FINISHED),
+                ),
+            )
+            session.analyzer = SimpleNamespace(total_tokens=100, analyze=analyze)
+            session.transcript_path = root / "transcript.txt"
+            session.transcript_path.touch()
+            session.analysis_html_relpath = "analysis.html"
+            session.token_baseline = 0
+            session.analysis_step = 0
+            session.seed_initial_history = lambda: None
+            session.write_runtime_state = lambda: None
+            session._append_initial_viewer_event = lambda: None
+            session.write_viewer_payload = lambda: None
+            session._write_analysis_html = lambda: None
+            session._finish_if_needed = lambda: None
+            session._read_transcript_bytes = lambda: b""
+            session._transcript_delta_since = lambda _content: ""
+            session._append_analysis_viewer_event = lambda *_args: None
+            session.current_frame = lambda: Frame(grid=((1,),), step=0, level=1)
+            session._execute_controller_fallback = lambda reason: (
+                fallback_reasons.append(reason) or True
+            )
+            session.should_stop = lambda: bool(fallback_reasons)
+            session.request_timeout_seconds = lambda: None
+            session.state_path = root / "state.json"
+
+            session.play()
+
+        self.assertEqual(analyze_calls, 2)
+        self.assertEqual(fallback_reasons, ["repeated_no_action_turn"])
+
+    def test_finish_reports_generated_tokens_after_last_action(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        run = SimpleNamespace(state="playing", final_score=None)
+        captured: dict[str, int] = {}
+
+        def finish_game(**kwargs: int) -> None:
+            captured.update(kwargs)
+            run.final_score = 0
+
+        session.game = SimpleNamespace(game_run=run, finish_game=finish_game)
+        session.analyzer = SimpleNamespace(generated_tokens=125)
+        session.token_baseline = 80
+        session.stop_event = threading.Event()
+
+        session._finish_if_needed()
+
+        self.assertEqual(captured["generated_tokens"], 45)
+        self.assertEqual(captured["uncached_input_tokens"], 0)
+        self.assertEqual(session.token_baseline, 125)
+
     def test_local_harm_guard_is_reported_as_harm_not_loop(self) -> None:
         session = object.__new__(_HarnessGameSession)
         session.controller_config = InferenceControllerConfig(
@@ -404,7 +483,7 @@ class SolverControllerTests(TestCase):
             available_actions={arcengine.GameAction.ACTION1.value},
         )
 
-        def finish_game() -> None:
+        def finish_game(**_kwargs: int) -> None:
             run.final_score = 0
 
         game = SimpleNamespace(
@@ -521,6 +600,26 @@ class SolverControllerTests(TestCase):
 
         self.assertFalse(session.directional_action_blocked(1, "UP"))
         self.assertFalse(session.directional_no_progress_stop_reached())
+
+    def test_level_no_progress_token_limit_resets_after_progress(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.controller_config = InferenceControllerConfig(
+            level_no_progress_token_limit=75000
+        )
+        session.current_frame = lambda: Frame(grid=((0,),), step=0, level=1)
+        session.analyzer = SimpleNamespace(generated_tokens=75000)
+        session.level_token_baseline = 0
+
+        self.assertEqual(
+            session.level_no_progress_token_status(), (1, 75000, 75000)
+        )
+        self.assertTrue(session.level_no_progress_token_limit_reached())
+
+        session.level_token_baseline = 75000
+        session.analyzer.generated_tokens = 80000
+
+        self.assertEqual(session.level_no_progress_token_status(), (1, 5000, 75000))
+        self.assertFalse(session.level_no_progress_token_limit_reached())
 
     def test_action7_round_trips_through_normalize_actions(self) -> None:
         self.assertEqual(to_engine_action("ACTION7"), "ACTION7")
