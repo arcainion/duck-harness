@@ -93,9 +93,13 @@
   response sizing, thinking enabled and preserved across turns, a 100,000-token
   per-game budget, and a per-level action
   ceiling of twice the baseline with a minimum of 20 actions, plus a 75,000-token
-  no-progress ceiling that resets after level progress. Cooperative 60-second
-  analyzer yields resume the same analysis step; controller execution falls
-  back after two genuine no-action analyzer turns at the same state and
+  no-progress ceiling that resets after level progress. Up to two cooperative
+  60-second analyzer yields resume the same analysis step; a third yield at the
+  same state uses controller fallback. An unavailable fallback is recorded and
+  rolls into a fresh analyzer step instead of terminating the game. Fallback
+  tries all safe mouse coordinates and deprioritizes an immediately repeated
+  no-progress fallback action. Controller execution also falls back
+  after two genuine no-action analyzer turns at the same state and
   reports final no-action generated tokens in benchmark totals. Controller
   stagnation/cycle windows are 6/4; edge-only HUD changes are ignored, exact
   click coordinates are blocked after two failed attempts, inverse movement

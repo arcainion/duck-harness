@@ -85,6 +85,13 @@ try:
 except ValueError:
     ANALYZER_MAX_CONSECUTIVE_FAILURES = 5
 try:
+    ANALYZER_MAX_SAME_STATE_TIME_BUDGET_YIELDS = max(
+        0,
+        int(os.environ.get("ANALYZER_MAX_SAME_STATE_TIME_BUDGET_YIELDS", "2")),
+    )
+except ValueError:
+    ANALYZER_MAX_SAME_STATE_TIME_BUDGET_YIELDS = 2
+try:
     ANALYZER_RETRY_MAX_BACKOFF_SECONDS = max(
         ANALYZER_RETRY_BACKOFF_SECONDS,
         float(os.environ.get("ANALYZER_RETRY_MAX_BACKOFF_SECONDS", "16")),
@@ -629,6 +636,8 @@ class _HarnessGameSession:
             consecutive_failures = 0
             no_action_state_id: str | None = None
             no_action_turns = 0
+            time_budget_yield_key: tuple[str, int] | None = None
+            time_budget_yields = 0
 
             def handle_no_action_turn() -> str:
                 nonlocal no_action_state_id, no_action_turns
@@ -649,6 +658,28 @@ class _HarnessGameSession:
                     f"state; tokens={_analyzer_reported_tokens(self.analyzer)}"
                 )
                 return "stop"
+
+            def handle_time_budget_yield(analysis_step: int) -> str:
+                nonlocal time_budget_yield_key, time_budget_yields
+                key = (frame_fingerprint(self.current_frame()), analysis_step)
+                if key == time_budget_yield_key:
+                    time_budget_yields += 1
+                else:
+                    time_budget_yield_key = key
+                    time_budget_yields = 1
+                if time_budget_yields <= ANALYZER_MAX_SAME_STATE_TIME_BUDGET_YIELDS:
+                    return "retry"
+                if self._execute_controller_fallback("repeated_turn_time_budget"):
+                    time_budget_yield_key = None
+                    time_budget_yields = 0
+                    return "executed"
+                # A controller rejection is not evidence that the game is
+                # unsalvageable. Start a fresh analyzer turn so it receives a
+                # new observe-plan-act prompt, while the existing no-progress
+                # token ceiling remains the terminal safeguard.
+                time_budget_yield_key = None
+                time_budget_yields = 0
+                return "rollover"
 
             while not self.should_stop():
                 if (
@@ -758,11 +789,18 @@ class _HarnessGameSession:
                         controller_only_reason = "game_token_budget"
                         continue
                     if yield_reason == "turn_time_budget":
-                        # This is a cooperative continuation point, commonly
-                        # reached after a long reasoning pass and an inspection
-                        # tool call.  The board is expected to be unchanged, so
-                        # counting it as a no-action failure terminates healthy
-                        # inspect-then-act workflows before the next model call.
+                        # Permit normal inspect-then-act continuation while
+                        # bounding same-state reasoning loops. This counter is
+                        # deliberately separate from genuine no-action turns.
+                        time_yield_result = handle_time_budget_yield(analysis_step)
+                        if time_yield_result == "executed":
+                            no_action_state_id = None
+                            no_action_turns = 0
+                            retry_analysis_step = None
+                            continue
+                        if time_yield_result == "rollover":
+                            retry_analysis_step = None
+                            continue
                         retry_analysis_step = analysis_step
                         continue
                     no_action_result = handle_no_action_turn()
@@ -783,6 +821,8 @@ class _HarnessGameSession:
                     continue
                 no_action_state_id = None
                 no_action_turns = 0
+                time_budget_yield_key = None
+                time_budget_yields = 0
         except Exception as exc:
             if run.final_score is None:
                 run.solver_note = f"error: {type(exc).__name__}: {exc}"
@@ -843,14 +883,15 @@ class _HarnessGameSession:
             if action_name == "MOUSE":
                 if not mouse_coordinates:
                     continue
-                coordinate = mouse_coordinates.pop(0)
-                candidates.append(
+                candidates.extend(
                     {
                         "action": "MOUSE",
                         "row": int(coordinate["row"]),
                         "col": int(coordinate["col"]),
                     }
+                    for coordinate in mouse_coordinates
                 )
+                mouse_coordinates.clear()
             elif action_name:
                 candidates.append({"action": action_name})
         reset_recommended = any(
@@ -859,6 +900,14 @@ class _HarnessGameSession:
         )
         if reset_recommended:
             candidates.append({"action": "RESET"})
+        recent_fallback = self._recent_no_progress_fallback_action()
+        if recent_fallback:
+            candidates.sort(
+                key=lambda candidate: (
+                    self._fallback_candidate_display(candidate) == recent_fallback
+                )
+            )
+        rejections: list[dict[str, Any]] = []
         for candidate in candidates:
             payload = self.step_env(
                 {
@@ -868,7 +917,64 @@ class _HarnessGameSession:
             )
             if payload.get("executed"):
                 return True
+            rejections.append(
+                {
+                    "action": self._fallback_candidate_display(candidate),
+                    "error": str(payload.get("error") or ""),
+                    "guarded": bool(payload.get("guarded")),
+                    "guard_reason_code": str(payload.get("guard_reason_code") or ""),
+                    "stop_reason": str(payload.get("stop_reason") or ""),
+                    "stop_detail": str(payload.get("stop_detail") or "")[:500],
+                }
+            )
+        self._record_controller_fallback_unavailable(reason, candidates, rejections)
         return False
+
+    @staticmethod
+    def _fallback_candidate_display(candidate: dict[str, Any]) -> str:
+        action = str(candidate.get("action") or "")
+        if action == "MOUSE":
+            return f"MOUSE(row={candidate.get('row')}, col={candidate.get('col')})"
+        return action
+
+    def _recent_no_progress_fallback_action(self) -> str | None:
+        for event in reversed(getattr(self, "viewer_events", ())):
+            if event.get("type") != "action":
+                continue
+            if not event.get("controller_fallback_reason"):
+                return None
+            if event.get("level_completed") or float(event.get("reward") or 0.0) > 0:
+                return None
+            return str(event.get("action_display") or "") or None
+        return None
+
+    def _record_controller_fallback_unavailable(
+        self,
+        reason: str,
+        candidates: list[dict[str, Any]],
+        rejections: list[dict[str, Any]],
+    ) -> None:
+        current = self.current_frame()
+        self.viewer_events.append(
+            {
+                **self._base_viewer_event(current),
+                "type": "controller",
+                "title": "Fallback Unavailable",
+                "action_num": self.action_count,
+                "analysis_step": self.analysis_step,
+                "controller_policy": self.controller_config.policy,
+                "controller_phase": "recover",
+                "controller_reason_codes": ["fallback_unavailable"],
+                "controller_fallback_reason": str(reason),
+                "fallback_candidate_count": len(candidates),
+                "fallback_candidates": [
+                    self._fallback_candidate_display(candidate)
+                    for candidate in candidates
+                ],
+                "fallback_rejections": rejections,
+            }
+        )
+        self.write_viewer_payload()
 
     def _controller_snapshot(self) -> dict[str, Any]:
         """Build host control state with independent prior-pass evidence."""

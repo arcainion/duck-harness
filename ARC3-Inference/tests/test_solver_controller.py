@@ -248,6 +248,98 @@ class SolverControllerTests(TestCase):
         self.assertTrue(executed)
         self.assertEqual(captured[0]["actions"], [{"action": "RIGHT"}])
 
+    def test_controller_fallback_deprioritizes_recent_no_progress_action(
+        self,
+    ) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.controller_config = InferenceControllerConfig(
+            enabled=True, policy=OUTCOME_AWARE_POLICY
+        )
+        session.should_stop = lambda: False
+        session.viewer_events = [
+            {
+                "type": "action",
+                "action_display": "UP",
+                "controller_fallback_reason": "repeated_turn_time_budget",
+                "level_completed": False,
+                "reward": 0.0,
+            }
+        ]
+        session._controller_snapshot = lambda: {
+            "ranked_actions": [
+                {"action": "UP", "harm_decisive": False},
+                {"action": "DOWN", "harm_decisive": False},
+            ],
+            "mouse_search": {},
+            "recovery_portfolio": [],
+        }
+        captured: list[dict] = []
+        session.step_env = lambda arguments: (
+            captured.append(arguments) or {"executed": True}
+        )
+
+        executed = session._execute_controller_fallback("repeated_turn_time_budget")
+
+        self.assertTrue(executed)
+        self.assertEqual(captured[0]["actions"], [{"action": "DOWN"}])
+
+    def test_controller_fallback_records_all_rejected_mouse_candidates(
+        self,
+    ) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.controller_config = InferenceControllerConfig(
+            enabled=True, policy=OUTCOME_AWARE_POLICY
+        )
+        session.should_stop = lambda: False
+        session.viewer_events = []
+        session.analysis_step = 4
+        session.game = SimpleNamespace(game_run=SimpleNamespace(history=[]))
+        session.current_frame = lambda: Frame(grid=((0,),), step=0, level=1)
+        session._base_viewer_event = lambda _frame: {}
+        session.write_viewer_payload = lambda: None
+        session._controller_snapshot = lambda: {
+            "ranked_actions": [{"action": "MOUSE", "harm_decisive": False}],
+            "mouse_search": {
+                "recommended_coordinates": [
+                    {"row": 4, "col": 5},
+                    {"row": 8, "col": 9},
+                ]
+            },
+            "recovery_portfolio": [],
+        }
+        captured: list[dict] = []
+
+        def reject(arguments: dict) -> dict:
+            captured.append(arguments)
+            return {
+                "executed": False,
+                "guarded": True,
+                "guard_reason_code": "exact_click_retry",
+                "stop_reason": "loop_guard",
+                "stop_detail": "coordinate was already exhausted",
+            }
+
+        session.step_env = reject
+
+        executed = session._execute_controller_fallback("repeated_turn_time_budget")
+
+        self.assertFalse(executed)
+        self.assertEqual(
+            [item["actions"][0] for item in captured],
+            [
+                {"action": "MOUSE", "row": 4, "col": 5},
+                {"action": "MOUSE", "row": 8, "col": 9},
+            ],
+        )
+        diagnostic = session.viewer_events[-1]
+        self.assertEqual(diagnostic["title"], "Fallback Unavailable")
+        self.assertEqual(diagnostic["fallback_candidate_count"], 2)
+        self.assertEqual(len(diagnostic["fallback_rejections"]), 2)
+        self.assertEqual(
+            diagnostic["fallback_rejections"][0]["guard_reason_code"],
+            "exact_click_retry",
+        )
+
     def test_game_token_budget_hands_off_without_reentering_analyzer(self) -> None:
         run = SimpleNamespace(
             state="playing",
@@ -413,6 +505,7 @@ class SolverControllerTests(TestCase):
             session._read_transcript_bytes = lambda: b""
             session._transcript_delta_since = lambda _content: ""
             session._append_analysis_viewer_event = lambda *_args: None
+            session.current_frame = lambda: Frame(grid=((1,),), step=0, level=1)
             session._execute_controller_fallback = lambda reason: (
                 fallback_reasons.append(reason) or True
             )
@@ -422,8 +515,189 @@ class SolverControllerTests(TestCase):
 
             session.play()
 
+        self.assertFalse(str(run.solver_note).startswith("error:"), run.solver_note)
         self.assertEqual(analyze_calls, 3)
         self.assertEqual(analysis_steps, [1, 1, 1])
+        self.assertEqual(fallback_reasons, [])
+
+    def test_third_same_state_time_budget_yield_uses_controller_fallback(
+        self,
+    ) -> None:
+        run = SimpleNamespace(
+            state="playing",
+            history=[],
+            final_score=None,
+            solver_note=None,
+            solver_analysis_html=None,
+        )
+        analysis_steps: list[int] = []
+
+        def analyze(*_args, **kwargs) -> AnalyzerTurnResult:
+            analysis_steps.append(kwargs["analysis_step"])
+            return AnalyzerTurnResult(
+                step_executed=False,
+                yielded_control=True,
+                yield_reason="turn_time_budget",
+            )
+
+        fallback_reasons: list[str] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = object.__new__(_HarnessGameSession)
+            session.game = SimpleNamespace(
+                game_run=run,
+                current_state=SimpleNamespace(
+                    available_actions={arcengine.GameAction.ACTION1.value},
+                    raw=SimpleNamespace(state=arcengine.GameState.NOT_FINISHED),
+                ),
+            )
+            session.analyzer = SimpleNamespace(total_tokens=100, analyze=analyze)
+            session.transcript_path = root / "transcript.txt"
+            session.transcript_path.touch()
+            session.analysis_html_relpath = "analysis.html"
+            session.token_baseline = 0
+            session.analysis_step = 0
+            session.seed_initial_history = lambda: None
+            session.write_runtime_state = lambda: None
+            session._append_initial_viewer_event = lambda: None
+            session.write_viewer_payload = lambda: None
+            session._write_analysis_html = lambda: None
+            session._finish_if_needed = lambda: None
+            session._read_transcript_bytes = lambda: b""
+            session._transcript_delta_since = lambda _content: ""
+            session._append_analysis_viewer_event = lambda *_args: None
+            session.current_frame = lambda: Frame(grid=((1,),), step=0, level=1)
+            session._execute_controller_fallback = lambda reason: (
+                fallback_reasons.append(reason) or True
+            )
+            session.should_stop = lambda: bool(fallback_reasons)
+            session.request_timeout_seconds = lambda: None
+            session.state_path = root / "state.json"
+
+            session.play()
+
+        self.assertEqual(analysis_steps, [1, 1, 1])
+        self.assertEqual(fallback_reasons, ["repeated_turn_time_budget"])
+
+    def test_unavailable_time_budget_fallback_rolls_to_fresh_analysis_step(
+        self,
+    ) -> None:
+        run = SimpleNamespace(
+            state="playing",
+            history=[],
+            final_score=None,
+            solver_note=None,
+            solver_analysis_html=None,
+        )
+        analysis_steps: list[int] = []
+
+        def analyze(*_args, **kwargs) -> AnalyzerTurnResult:
+            analysis_steps.append(kwargs["analysis_step"])
+            return AnalyzerTurnResult(
+                step_executed=False,
+                yielded_control=True,
+                yield_reason="turn_time_budget",
+            )
+
+        fallback_reasons: list[str] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = object.__new__(_HarnessGameSession)
+            session.game = SimpleNamespace(
+                game_run=run,
+                current_state=SimpleNamespace(
+                    available_actions={arcengine.GameAction.ACTION1.value},
+                    raw=SimpleNamespace(state=arcengine.GameState.NOT_FINISHED),
+                ),
+            )
+            session.analyzer = SimpleNamespace(total_tokens=100, analyze=analyze)
+            session.transcript_path = root / "transcript.txt"
+            session.transcript_path.touch()
+            session.analysis_html_relpath = "analysis.html"
+            session.token_baseline = 0
+            session.analysis_step = 0
+            session.seed_initial_history = lambda: None
+            session.write_runtime_state = lambda: None
+            session._append_initial_viewer_event = lambda: None
+            session.write_viewer_payload = lambda: None
+            session._write_analysis_html = lambda: None
+            session._finish_if_needed = lambda: None
+            session._read_transcript_bytes = lambda: b""
+            session._transcript_delta_since = lambda _content: ""
+            session._append_analysis_viewer_event = lambda *_args: None
+            session.current_frame = lambda: Frame(grid=((1,),), step=0, level=1)
+            session._execute_controller_fallback = lambda reason: (
+                fallback_reasons.append(reason) or False
+            )
+            session.should_stop = lambda: len(analysis_steps) >= 4
+            session.request_timeout_seconds = lambda: None
+            session.state_path = root / "state.json"
+
+            session.play()
+
+        self.assertEqual(analysis_steps, [1, 1, 1, 2])
+        self.assertEqual(fallback_reasons, ["repeated_turn_time_budget"])
+        self.assertNotIn("repeatedly exhausted", str(run.solver_note))
+
+    def test_time_budget_yield_limit_resets_after_executed_step(self) -> None:
+        run = SimpleNamespace(
+            state="playing",
+            history=[],
+            final_score=None,
+            solver_note=None,
+            solver_analysis_html=None,
+        )
+        analysis_steps: list[int] = []
+
+        def analyze(*_args, **kwargs) -> AnalyzerTurnResult:
+            analysis_steps.append(kwargs["analysis_step"])
+            step_executed = len(analysis_steps) in {3, 6}
+            return AnalyzerTurnResult(
+                step_executed=step_executed,
+                yielded_control=not step_executed,
+                yield_reason=None if step_executed else "turn_time_budget",
+            )
+
+        fallback_reasons: list[str] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = object.__new__(_HarnessGameSession)
+            session.game = SimpleNamespace(
+                game_run=run,
+                current_state=SimpleNamespace(
+                    available_actions={arcengine.GameAction.ACTION1.value},
+                    raw=SimpleNamespace(state=arcengine.GameState.NOT_FINISHED),
+                ),
+            )
+            session.analyzer = SimpleNamespace(total_tokens=100, analyze=analyze)
+            session.transcript_path = root / "transcript.txt"
+            session.transcript_path.touch()
+            session.analysis_html_relpath = "analysis.html"
+            session.token_baseline = 0
+            session.analysis_step = 0
+            session.seed_initial_history = lambda: None
+            session.write_runtime_state = lambda: None
+            session._append_initial_viewer_event = lambda: None
+            session.write_viewer_payload = lambda: None
+            session._write_analysis_html = lambda: None
+            session._finish_if_needed = lambda: None
+            session._read_transcript_bytes = lambda: b""
+            session._transcript_delta_since = lambda _content: ""
+            session._append_analysis_viewer_event = lambda *_args: None
+            session.current_frame = lambda: Frame(grid=((1,),), step=0, level=1)
+            session._execute_controller_fallback = lambda reason: (
+                fallback_reasons.append(reason) or True
+            )
+            session.should_stop = lambda: len(analysis_steps) >= 6
+            session.request_timeout_seconds = lambda: None
+            session.state_path = root / "state.json"
+
+            session.play()
+
+        self.assertEqual(analysis_steps, [1, 1, 1, 2, 2, 2])
         self.assertEqual(fallback_reasons, [])
 
     def test_finish_reports_generated_tokens_after_last_action(self) -> None:
