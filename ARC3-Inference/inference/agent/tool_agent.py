@@ -5236,6 +5236,39 @@ class _ChatCompletionResult:
     fallback_messages: list[dict[str, Any]] = dataclass_field(default_factory=list)
 
 
+class AnalyzerModelClient:
+    """Shared completion facade used by legacy and orchestrated analyzers.
+
+    The mature provider compatibility implementation remains owned by
+    ``ToolAgent`` for now; this facade gives analyzers one transport entrypoint
+    without copying its retry, thinking, streaming, or candidate logic.
+    """
+
+    def __init__(self, owner: "ToolAgent") -> None:
+        self._owner = owner
+
+    def complete(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None,
+        request_timeout_seconds: float | None = None,
+        max_output_tokens: int | None = None,
+        thinking_token_budget: int | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        request_attempt_limit: int | None = None,
+    ) -> _ChatCompletionResult:
+        return self._owner._chat_completion(
+            messages,
+            tools=tools,
+            request_timeout_seconds=request_timeout_seconds,
+            max_output_tokens=max_output_tokens,
+            thinking_token_budget=thinking_token_budget,
+            tool_choice=tool_choice,
+            request_attempt_limit=request_attempt_limit,
+        )
+
+
 class ToolAgent:
     """Direct tool-calling analyzer compatible with OpenAI-style endpoints."""
 
@@ -5334,6 +5367,7 @@ class ToolAgent:
         self._experience_snapshot_cache: _ExperienceSnapshotCache | None = None
         self._generated_tool_call_count = 0
         self._http_session = requests.Session()
+        self.model_client = AnalyzerModelClient(self)
         self._forced_tool_choice_supported: bool | None = None
         self._candidate_count_supported: bool | None = None
         self._strict_tools_supported: bool | None = None
@@ -6896,9 +6930,21 @@ class ToolAgent:
         tools: list[dict[str, Any]] | None,
         request_timeout_seconds: float | None = None,
         max_output_tokens: int | None = None,
+        thinking_token_budget: int | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        request_attempt_limit: int | None = None,
     ) -> _ChatCompletionResult:
         force_tool = self._forced_tool_choice_supported is not False
-        tool_choice = _request_tool_choice(tools, force=force_tool)
+        resolved_tool_choice = (
+            tool_choice
+            if tool_choice is not None
+            else _request_tool_choice(tools, force=force_tool)
+        )
+        max_request_attempts = (
+            max(1, int(request_attempt_limit))
+            if request_attempt_limit is not None
+            else self._http_max_attempts
+        )
         output_limit = (
             max_output_tokens
             if max_output_tokens is not None
@@ -6924,8 +6970,9 @@ class ToolAgent:
             top_p=_LOCAL_ANALYZER_TOP_P,
             top_k=_LOCAL_ANALYZER_TOP_K,
             thinking=bool(_LOCAL_ANALYZER_ENABLE_THINKING),
+            thinking_token_budget=thinking_token_budget,
             tools=request_tools,
-            tool_choice=tool_choice,
+            tool_choice=resolved_tool_choice,
             seed=_LOCAL_ANALYZER_SEED,
             candidates=(
                 self._adaptive_candidate_count(output_limit)
@@ -7012,14 +7059,14 @@ class ToolAgent:
                 try:
                     candidate = post_chat(request_payload)
                 except requests.RequestException:
-                    if request_attempts >= self._http_max_attempts or not wait_to_retry(
+                    if request_attempts >= max_request_attempts or not wait_to_retry(
                         None
                     ):
                         raise
                     continue
                 if (
                     candidate.status_code in _TRANSIENT_HTTP_STATUS_CODES
-                    and request_attempts < self._http_max_attempts
+                    and request_attempts < max_request_attempts
                 ):
                     candidate.close()
                     if wait_to_retry(candidate):
@@ -7031,13 +7078,13 @@ class ToolAgent:
         attempted_downgrades: set[str] = set()
         while (
             response.status_code in {400, 404, 422}
-            and request_attempts < self._http_max_attempts
+            and request_attempts < max_request_attempts
         ):
             detail = response.text.lower()
             fallback_payload = json.loads(json.dumps(payload))
             downgrade = ""
             if (
-                isinstance(tool_choice, dict)
+                isinstance(resolved_tool_choice, dict)
                 and "forced_tool_choice" not in attempted_downgrades
                 and (
                     "tool_choice" in detail
@@ -7079,7 +7126,7 @@ class ToolAgent:
             response.close()
             response = post_with_retry(payload)
         if (
-            isinstance(tool_choice, dict)
+            isinstance(resolved_tool_choice, dict)
             and not forced_tool_fallback
             and response.status_code < 400
         ):
@@ -8493,7 +8540,7 @@ class ToolAgent:
                             "candidate without another model request.",
                         )
                     else:
-                        result = self._chat_completion(messages, **request_kwargs)
+                        result = self.model_client.complete(messages, **request_kwargs)
                     action_recovery_pending = False
                     self._record_efficiency("model_calls", result.request_attempts)
                     self._record_efficiency("model_seconds", result.latency_seconds)

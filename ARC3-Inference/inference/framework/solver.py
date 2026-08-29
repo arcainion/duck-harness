@@ -47,6 +47,10 @@ from inference.agent.runtime_state import (
     HistoryEntry,
     write_runtime_state,
 )
+from inference.agent.orchestrated_objective_agent import (
+    OrchestratedObjectiveAgent,
+    objective_reduction_enabled,
+)
 from inference.agent.tool_agent import ToolAgent
 from inference.agent.trial_knowledge import TrialKnowledgeStore
 from inference.framework.kaggle import (
@@ -764,6 +768,16 @@ class _HarnessGameSession:
                         break
                     retry_analysis_step = analysis_step
                     continue
+                if getattr(result, "exhausted", False) and str(
+                    failure_category or ""
+                ).startswith("orchestration_"):
+                    run.solver_note = (
+                        f"stopped: {failure_category}: "
+                        f"{getattr(result, 'failure_detail', '')}; "
+                        f"tokens={_analyzer_reported_tokens(self.analyzer)}"
+                    )
+                    run.state = "gave_up"
+                    break
                 if failure_category == "tool_step_exhausted":
                     no_action_result = handle_no_action_turn()
                     if no_action_result == "executed":
@@ -784,6 +798,9 @@ class _HarnessGameSession:
                     continue
                 consecutive_failures = 0
                 if getattr(result, "yielded_control", False):
+                    if getattr(self.analyzer, "disable_controller_fallback", False):
+                        retry_analysis_step = analysis_step
+                        continue
                     yield_reason = getattr(result, "yield_reason", None)
                     if yield_reason == "game_token_budget":
                         controller_only_reason = "game_token_budget"
@@ -812,6 +829,14 @@ class _HarnessGameSession:
                     retry_analysis_step = analysis_step
                     continue
                 if not result.step_executed:
+                    if getattr(self.analyzer, "disable_controller_fallback", False):
+                        run.solver_note = (
+                            "stopped: orchestrated analyzer returned no action without "
+                            "a resumable yield; "
+                            f"tokens={_analyzer_reported_tokens(self.analyzer)}"
+                        )
+                        run.state = "gave_up"
+                        break
                     no_action_result = handle_no_action_turn()
                     if no_action_result == "executed":
                         retry_analysis_step = None
@@ -861,6 +886,10 @@ class _HarnessGameSession:
                 else:
                     run.solver_note = f"tokens={total_tokens}"
             self._finish_if_needed()
+            close_analyzer = getattr(self.analyzer, "close", None)
+            if callable(close_analyzer):
+                with contextlib.suppress(Exception):
+                    close_analyzer()
             self.state_path.unlink(missing_ok=True)
             self._write_analysis_html()
             self.write_viewer_payload()
@@ -2243,7 +2272,10 @@ class HarnessSolver(Solver):
     ) -> Any:
         if self.analyzer_factory is not None:
             return self.analyzer_factory(game, index)
-        return ToolAgent(
+        analyzer_type = (
+            OrchestratedObjectiveAgent if objective_reduction_enabled() else ToolAgent
+        )
+        return analyzer_type(
             model=self.model,
             timeout=self.analyzer_timeout,
             save_request_logs=self.save_request_logs,

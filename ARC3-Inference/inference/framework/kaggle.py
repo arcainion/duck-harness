@@ -19,6 +19,11 @@ DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.92
 DEFAULT_VLLM_MAX_NUM_SEQS = 16
 DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS = 8192
 DEFAULT_VLLM_ENABLE_CHUNKED_PREFILL = True
+DEFAULT_VLLM_REASONING_CONFIG = (
+    '{"reasoning_start_str":"<think>",'
+    '"reasoning_end_str":"I have to give the solution based on the reasoning '
+    'directly now.</think>"}'
+)
 DEFAULT_EXPECTED_GPU_TYPE = "rtx-pro-6000"
 DEFAULT_EXPECTED_GPU_COUNT = 1
 T4_VLLM_MAX_MODEL_LEN = 8192
@@ -81,7 +86,9 @@ def duck_kaggle_vllm_config_for_accelerator(
 ) -> DuckKaggleVllmConfig:
     """Return the vLLM profile matching Kaggle's accelerator allocation."""
 
-    normalized = "".join(character for character in str(accelerator or "").lower() if character.isalnum())
+    normalized = "".join(
+        character for character in str(accelerator or "").lower() if character.isalnum()
+    )
     if normalized == "nvidiateslat4":
         # Kaggle's NvidiaTeslaT4 shape exposes two 16 GiB T4s. The 27B FP8
         # model must be sharded across both, with a bounded KV-cache budget.
@@ -139,7 +146,9 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         # vllm's max-model-len. Falls back to max_model_len if unset.
         "__ANALYZER_CONTEXT_WINDOW__": repr(
             min(
-                int(os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW") or cfg.max_model_len),
+                int(
+                    os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW") or cfg.max_model_len
+                ),
                 int(cfg.max_model_len),
             )
         ),
@@ -149,20 +158,79 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         # equals the historical hardcoded literal so direct kaggle.py callers
         # outside Make are unaffected.
         "__LOCAL_ANALYZER_PROVIDER__": repr(analyzer_provider),
-        "__LOCAL_ANALYZER_APP_NAME__": repr(os.environ.get("LOCAL_ANALYZER_APP_NAME", "ARC3 Kaggle Harness")),
-        "__LOCAL_ANALYZER_MAX_OUTPUT__": repr(os.environ.get("LOCAL_ANALYZER_MAX_OUTPUT", "0")),
-        "__LOCAL_ANALYZER_TOOL_STEPS__": repr(os.environ.get("LOCAL_ANALYZER_TOOL_STEPS", "0")),
-        "__LOCAL_ANALYZER_TOOL_TIMEOUT__": repr(os.environ.get("LOCAL_ANALYZER_TOOL_TIMEOUT", "30")),
-        "__LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS__": repr(os.environ.get("LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS", "1024")),
-        "__LOCAL_ANALYZER_CANDIDATES__": repr(os.environ.get("LOCAL_ANALYZER_CANDIDATES", "2")),
-        "__LOCAL_ANALYZER_GAME_TOKEN_BUDGET__": repr(os.environ.get("LOCAL_ANALYZER_GAME_TOKEN_BUDGET", "250000")),
-        "__LOCAL_ANALYZER_STRATEGY_ENABLED__": repr(os.environ.get("LOCAL_ANALYZER_STRATEGY_ENABLED", "true")),
-        "__LOCAL_ANALYZER_STRATEGY_POLICY__": repr(os.environ.get("LOCAL_ANALYZER_STRATEGY_POLICY", "outcome_aware")),
-        "__LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT__": repr(os.environ.get("LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT", "2")),
-        "__LOCAL_ANALYZER_STAGNATION_WINDOW__": repr(os.environ.get("LOCAL_ANALYZER_STAGNATION_WINDOW", "6")),
-        "__LOCAL_ANALYZER_CYCLE_WINDOW__": repr(os.environ.get("LOCAL_ANALYZER_CYCLE_WINDOW", "4")),
-        "__LOCAL_ANALYZER_CYCLE_STOP_LIMIT__": repr(os.environ.get("LOCAL_ANALYZER_CYCLE_STOP_LIMIT", "0")),
-        "__LOCAL_ANALYZER_REPEAT_ACTION_LIMIT__": repr(os.environ.get("LOCAL_ANALYZER_REPEAT_ACTION_LIMIT", "0")),
+        "__LOCAL_ANALYZER_APP_NAME__": repr(
+            os.environ.get("LOCAL_ANALYZER_APP_NAME", "ARC3 Kaggle Harness")
+        ),
+        "__LOCAL_ANALYZER_MAX_OUTPUT__": repr(
+            os.environ.get("LOCAL_ANALYZER_MAX_OUTPUT", "0")
+        ),
+        "__LOCAL_ANALYZER_TOOL_STEPS__": repr(
+            os.environ.get("LOCAL_ANALYZER_TOOL_STEPS", "0")
+        ),
+        "__LOCAL_ANALYZER_TOOL_TIMEOUT__": repr(
+            os.environ.get("LOCAL_ANALYZER_TOOL_TIMEOUT", "30")
+        ),
+        "__LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS__": repr(
+            os.environ.get("LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS", "1024")
+        ),
+        "__LOCAL_ANALYZER_CANDIDATES__": repr(
+            os.environ.get("LOCAL_ANALYZER_CANDIDATES", "2")
+        ),
+        "__LOCAL_ANALYZER_GAME_TOKEN_BUDGET__": repr(
+            os.environ.get("LOCAL_ANALYZER_GAME_TOKEN_BUDGET", "250000")
+        ),
+        "__LOCAL_ANALYZER_OBJECTIVE_REDUCTION__": repr(
+            os.environ.get("LOCAL_ANALYZER_OBJECTIVE_REDUCTION", "false")
+        ),
+        "__LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS__": repr(
+            os.environ.get(
+                "LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS", "300"
+            )
+        ),
+        "__LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT__": repr(
+            os.environ.get("LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT", "4096")
+        ),
+        "__LOCAL_ANALYZER_ORCHESTRATION_CODER_MAX_OUTPUT__": repr(
+            os.environ.get("LOCAL_ANALYZER_ORCHESTRATION_CODER_MAX_OUTPUT", "8192")
+        ),
+        "__LOCAL_ANALYZER_ORCHESTRATION_REDUCER_THINKING_BUDGET__": repr(
+            os.environ.get(
+                "LOCAL_ANALYZER_ORCHESTRATION_REDUCER_THINKING_BUDGET", "2048"
+            )
+        ),
+        "__LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET__": repr(
+            os.environ.get("LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET", "3072")
+        ),
+        "__LOCAL_GAMEPLAY_POLICY_BACKEND__": repr(
+            os.environ.get("LOCAL_GAMEPLAY_POLICY_BACKEND", "cpu")
+        ),
+        "__LOCAL_GAMEPLAY_POLICY_CUDA_MIN_FREE_MB__": repr(
+            os.environ.get("LOCAL_GAMEPLAY_POLICY_CUDA_MIN_FREE_MB", "4096")
+        ),
+        "__LOCAL_GAMEPLAY_POLICY_DECISION_TIMEOUT_SECONDS__": repr(
+            os.environ.get("LOCAL_GAMEPLAY_POLICY_DECISION_TIMEOUT_SECONDS", "2")
+        ),
+        "__LOCAL_ANALYZER_STRATEGY_ENABLED__": repr(
+            os.environ.get("LOCAL_ANALYZER_STRATEGY_ENABLED", "true")
+        ),
+        "__LOCAL_ANALYZER_STRATEGY_POLICY__": repr(
+            os.environ.get("LOCAL_ANALYZER_STRATEGY_POLICY", "outcome_aware")
+        ),
+        "__LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT__": repr(
+            os.environ.get("LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT", "2")
+        ),
+        "__LOCAL_ANALYZER_STAGNATION_WINDOW__": repr(
+            os.environ.get("LOCAL_ANALYZER_STAGNATION_WINDOW", "6")
+        ),
+        "__LOCAL_ANALYZER_CYCLE_WINDOW__": repr(
+            os.environ.get("LOCAL_ANALYZER_CYCLE_WINDOW", "4")
+        ),
+        "__LOCAL_ANALYZER_CYCLE_STOP_LIMIT__": repr(
+            os.environ.get("LOCAL_ANALYZER_CYCLE_STOP_LIMIT", "0")
+        ),
+        "__LOCAL_ANALYZER_REPEAT_ACTION_LIMIT__": repr(
+            os.environ.get("LOCAL_ANALYZER_REPEAT_ACTION_LIMIT", "0")
+        ),
         "__LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_WINDOW__": repr(
             os.environ.get("LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_WINDOW", "0")
         ),
@@ -178,12 +246,24 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__LOCAL_ANALYZER_IGNORE_EDGE_HUD_CHANGES__": repr(
             os.environ.get("LOCAL_ANALYZER_IGNORE_EDGE_HUD_CHANGES", "false")
         ),
-        "__LOCAL_ANALYZER_VOLATILE_WINDOW__": repr(os.environ.get("LOCAL_ANALYZER_VOLATILE_WINDOW", "8")),
-        "__LOCAL_ANALYZER_VOLATILE_MIN_SAMPLES__": repr(os.environ.get("LOCAL_ANALYZER_VOLATILE_MIN_SAMPLES", "4")),
-        "__LOCAL_ANALYZER_VOLATILE_RATIO__": repr(os.environ.get("LOCAL_ANALYZER_VOLATILE_RATIO", "0.75")),
-        "__LOCAL_ANALYZER_PROGRESS_UTILITY__": repr(os.environ.get("LOCAL_ANALYZER_PROGRESS_UTILITY", "1.0")),
-        "__LOCAL_ANALYZER_NOVEL_UTILITY__": repr(os.environ.get("LOCAL_ANALYZER_NOVEL_UTILITY", "0.2")),
-        "__LOCAL_ANALYZER_EXPLORATION_WEIGHT__": repr(os.environ.get("LOCAL_ANALYZER_EXPLORATION_WEIGHT", "0.75")),
+        "__LOCAL_ANALYZER_VOLATILE_WINDOW__": repr(
+            os.environ.get("LOCAL_ANALYZER_VOLATILE_WINDOW", "8")
+        ),
+        "__LOCAL_ANALYZER_VOLATILE_MIN_SAMPLES__": repr(
+            os.environ.get("LOCAL_ANALYZER_VOLATILE_MIN_SAMPLES", "4")
+        ),
+        "__LOCAL_ANALYZER_VOLATILE_RATIO__": repr(
+            os.environ.get("LOCAL_ANALYZER_VOLATILE_RATIO", "0.75")
+        ),
+        "__LOCAL_ANALYZER_PROGRESS_UTILITY__": repr(
+            os.environ.get("LOCAL_ANALYZER_PROGRESS_UTILITY", "1.0")
+        ),
+        "__LOCAL_ANALYZER_NOVEL_UTILITY__": repr(
+            os.environ.get("LOCAL_ANALYZER_NOVEL_UTILITY", "0.2")
+        ),
+        "__LOCAL_ANALYZER_EXPLORATION_WEIGHT__": repr(
+            os.environ.get("LOCAL_ANALYZER_EXPLORATION_WEIGHT", "0.75")
+        ),
         "__LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MULTIPLIER__": repr(
             os.environ.get("LOCAL_ANALYZER_LEVEL_ACTION_LIMIT_MULTIPLIER", "0")
         ),
@@ -193,25 +273,40 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__LOCAL_ANALYZER_LEVEL_NO_PROGRESS_TOKEN_LIMIT__": repr(
             os.environ.get("LOCAL_ANALYZER_LEVEL_NO_PROGRESS_TOKEN_LIMIT", "0")
         ),
-        "__LOCAL_ANALYZER_YIELD_SECONDS__": repr(os.environ.get("LOCAL_ANALYZER_YIELD_SECONDS", "60")),
-        "__LOCAL_ANALYZER_TEMPERATURE__": repr(os.environ.get("LOCAL_ANALYZER_TEMPERATURE", "0.6")),
-        "__LOCAL_ANALYZER_TOP_P__": repr(os.environ.get("LOCAL_ANALYZER_TOP_P", "0.95")),
+        "__LOCAL_ANALYZER_YIELD_SECONDS__": repr(
+            os.environ.get("LOCAL_ANALYZER_YIELD_SECONDS", "60")
+        ),
+        "__LOCAL_ANALYZER_TEMPERATURE__": repr(
+            os.environ.get("LOCAL_ANALYZER_TEMPERATURE", "0.6")
+        ),
+        "__LOCAL_ANALYZER_TOP_P__": repr(
+            os.environ.get("LOCAL_ANALYZER_TOP_P", "0.95")
+        ),
         "__LOCAL_ANALYZER_TOP_K__": repr(os.environ.get("LOCAL_ANALYZER_TOP_K", "20")),
-        "__LOCAL_ANALYZER_ENABLE_THINKING__": repr(os.environ.get("LOCAL_ANALYZER_ENABLE_THINKING", "1")),
-        "__LOCAL_ANALYZER_STREAM__": repr(os.environ.get("LOCAL_ANALYZER_STREAM", "false")),
+        "__LOCAL_ANALYZER_ENABLE_THINKING__": repr(
+            os.environ.get("LOCAL_ANALYZER_ENABLE_THINKING", "1")
+        ),
+        "__LOCAL_ANALYZER_STREAM__": repr(
+            os.environ.get("LOCAL_ANALYZER_STREAM", "false")
+        ),
         "__LOCAL_ANALYZER_REQUIRE_OS_SANDBOX__": repr(
             os.environ.get("LOCAL_ANALYZER_REQUIRE_OS_SANDBOX", "true")
         ),
         "__LOCAL_ANALYZER_VERIFY_CANDIDATES__": repr(
             os.environ.get("LOCAL_ANALYZER_VERIFY_CANDIDATES", "true")
         ),
-        "__MULTIMODAL_CONTEXT__": repr(os.environ.get("MULTIMODAL_CONTEXT", "current_grid")),
+        "__MULTIMODAL_CONTEXT__": repr(
+            os.environ.get("MULTIMODAL_CONTEXT", "current_grid")
+        ),
         "__MULTIMODAL_UPSCALE__": repr(os.environ.get("MULTIMODAL_UPSCALE", "4")),
         "__VLLM_TENSOR_PARALLEL_SIZE__": repr(int(cfg.tensor_parallel_size)),
         "__VLLM_GPU_MEMORY_UTILIZATION__": repr(float(cfg.gpu_memory_utilization)),
         "__VLLM_MAX_NUM_SEQS__": repr(max(1, int(cfg.max_num_seqs))),
-        "__VLLM_MAX_NUM_BATCHED_TOKENS__": repr(max(1, int(cfg.max_num_batched_tokens))),
+        "__VLLM_MAX_NUM_BATCHED_TOKENS__": repr(
+            max(1, int(cfg.max_num_batched_tokens))
+        ),
         "__VLLM_ENABLE_CHUNKED_PREFILL__": repr(bool(cfg.enable_chunked_prefill)),
+        "__VLLM_REASONING_CONFIG__": repr(DEFAULT_VLLM_REASONING_CONFIG),
         "__EXPECTED_GPU_TYPE__": repr(str(cfg.expected_gpu_type)),
         "__EXPECTED_GPU_COUNT__": repr(int(cfg.expected_gpu_count)),
         "__WHEELHOUSE_STAMP_TEXT__": repr(cfg.wheelhouse_stamp_text),
@@ -460,6 +555,8 @@ def start_vllm_server() -> None:
         '{"preserve_thinking": true}',
         '--reasoning-parser',
         'qwen3',
+        '--reasoning-config',
+        __VLLM_REASONING_CONFIG__,
         '--max-model-len',
         str(VLLM_MAX_MODEL_LEN),
         '--gpu-memory-utilization',
@@ -483,16 +580,65 @@ def start_vllm_server() -> None:
 def run_vllm_api_smoke_test() -> None:
     payload = {
         'model': SERVED_MODEL_NAME,
-        'messages': [{'role': 'user', 'content': 'Answer in one short sentence: what is 2 + 2?'}],
+        'messages': [
+            {
+                'role': 'user',
+                'content': (
+                    'Use the report_smoke_result tool exactly once with answer 4. '
+                    'Do not answer in text.'
+                ),
+            }
+        ],
         'temperature': 0.0,
-        'max_tokens': 96,
-        'chat_template_kwargs': {'enable_thinking': False},
+        'max_tokens': 256,
+        'chat_template_kwargs': {'enable_thinking': True},
+        'thinking_token_budget': 64,
+        'tools': [
+            {
+                'type': 'function',
+                'function': {
+                    'name': 'report_smoke_result',
+                    'description': 'Report the result of the vLLM startup smoke test.',
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {'answer': {'type': 'integer'}},
+                        'required': ['answer'],
+                        'additionalProperties': False,
+                    },
+                },
+            }
+        ],
+        'tool_choice': 'required',
     }
-    response = request_json(f'{VLLM_BASE_URL}/chat/completions', payload=payload, timeout=120)
-    generated = response['choices'][0]['message'].get('content', '').strip()
+    try:
+        response = request_json(
+            f'{VLLM_BASE_URL}/chat/completions', payload=payload, timeout=120
+        )
+        choices = response.get('choices')
+        if not isinstance(choices, list) or not choices:
+            raise ValueError('response did not contain a choice')
+        message = choices[0].get('message')
+        if not isinstance(message, dict):
+            raise ValueError('response choice did not contain a message')
+        tool_calls = message.get('tool_calls')
+        if not isinstance(tool_calls, list) or len(tool_calls) != 1:
+            raise ValueError('response did not contain exactly one required tool call')
+        function = tool_calls[0].get('function')
+        if not isinstance(function, dict) or function.get('name') != 'report_smoke_result':
+            raise ValueError('response called the wrong smoke-test tool')
+        arguments = json.loads(function.get('arguments', ''))
+        if not isinstance(arguments, dict) or not isinstance(arguments.get('answer'), int):
+            raise ValueError('smoke-test tool arguments were not valid JSON arguments')
+    except Exception as exc:
+        raise RuntimeError(
+            server_failure_message(
+                'vLLM bounded-thinking/required-tool smoke test failed: '
+                f'{type(exc).__name__}: {exc}'
+            )
+        ) from exc
     print('\n' + '=' * 88, flush=True)
-    print('VLLM OPENAI SERVER QWEN SMOKE TEST REAL MODEL OUTPUT', flush=True)
-    print('Generated:', generated, flush=True)
+    print('VLLM OPENAI SERVER QWEN BOUNDED-THINKING TOOL SMOKE TEST', flush=True)
+    print('Tool call:', tool_calls[0], flush=True)
     print('=' * 88 + '\n', flush=True)
 
 
@@ -524,6 +670,15 @@ setup_env = {
     'LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS': __LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS__,
     'LOCAL_ANALYZER_CANDIDATES': __LOCAL_ANALYZER_CANDIDATES__,
     'LOCAL_ANALYZER_GAME_TOKEN_BUDGET': __LOCAL_ANALYZER_GAME_TOKEN_BUDGET__,
+    'LOCAL_ANALYZER_OBJECTIVE_REDUCTION': __LOCAL_ANALYZER_OBJECTIVE_REDUCTION__,
+    'LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS': __LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS__,
+    'LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT': __LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT__,
+    'LOCAL_ANALYZER_ORCHESTRATION_CODER_MAX_OUTPUT': __LOCAL_ANALYZER_ORCHESTRATION_CODER_MAX_OUTPUT__,
+    'LOCAL_ANALYZER_ORCHESTRATION_REDUCER_THINKING_BUDGET': __LOCAL_ANALYZER_ORCHESTRATION_REDUCER_THINKING_BUDGET__,
+    'LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET': __LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET__,
+    'LOCAL_GAMEPLAY_POLICY_BACKEND': __LOCAL_GAMEPLAY_POLICY_BACKEND__,
+    'LOCAL_GAMEPLAY_POLICY_CUDA_MIN_FREE_MB': __LOCAL_GAMEPLAY_POLICY_CUDA_MIN_FREE_MB__,
+    'LOCAL_GAMEPLAY_POLICY_DECISION_TIMEOUT_SECONDS': __LOCAL_GAMEPLAY_POLICY_DECISION_TIMEOUT_SECONDS__,
     'LOCAL_ANALYZER_STRATEGY_ENABLED': __LOCAL_ANALYZER_STRATEGY_ENABLED__,
     'LOCAL_ANALYZER_STRATEGY_POLICY': __LOCAL_ANALYZER_STRATEGY_POLICY__,
     'LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT': __LOCAL_ANALYZER_SAME_STATE_NOOP_LIMIT__,

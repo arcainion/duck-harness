@@ -13,6 +13,7 @@ from inference.framework.kaggle import (
     DEFAULT_QWEN_MODEL_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
+    DEFAULT_VLLM_REASONING_CONFIG,
     DuckKaggleVllmConfig,
     duck_kaggle_model_sources,
     duck_kaggle_setup_command,
@@ -134,7 +135,101 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("VLLM_MAX_NUM_SEQS = 16", command)
         self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 8192", command)
 
-    def test_custom_scheduler_values_are_rendered_and_capacities_are_bounded(self) -> None:
+    def test_setup_configures_bounded_reasoning_and_required_tool_smoke(self) -> None:
+        command = duck_kaggle_setup_command()
+
+        self.assertIn("'--reasoning-parser',\n        'qwen3'", command)
+        self.assertIn("'--reasoning-config'", command)
+        self.assertIn(repr(DEFAULT_VLLM_REASONING_CONFIG), command)
+        self.assertIn("'chat_template_kwargs': {'enable_thinking': True}", command)
+        self.assertIn("'thinking_token_budget': 64", command)
+        self.assertIn("'tool_choice': 'required'", command)
+        self.assertIn("run_vllm_api_smoke_test()", command)
+
+    def test_bounded_reasoning_smoke_accepts_one_valid_tool_call(self) -> None:
+        command = duck_kaggle_setup_command()
+        script = command.split("\n", 1)[1].rsplit("\nPYSETUP", 1)[0]
+        parsed = ast.parse(script)
+        functions = ast.Module(
+            body=[
+                node
+                for node in parsed.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "run_vllm_api_smoke_test"
+            ],
+            type_ignores=[],
+        )
+        request_json = mock.Mock(
+            return_value={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "report_smoke_result",
+                                        "arguments": '{"answer":4}',
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        namespace = {
+            "json": json,
+            "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
+            "SERVED_MODEL_NAME": "unit-test-model",
+            "request_json": request_json,
+            "server_failure_message": lambda reason: reason,
+        }
+        exec(compile(functions, "<kaggle-vllm-smoke-test>", "exec"), namespace)
+
+        namespace["run_vllm_api_smoke_test"]()
+
+        payload = request_json.call_args.kwargs["payload"]
+        self.assertEqual(64, payload["thinking_token_budget"])
+        self.assertEqual({"enable_thinking": True}, payload["chat_template_kwargs"])
+        self.assertEqual("required", payload["tool_choice"])
+        self.assertEqual("report_smoke_result", payload["tools"][0]["function"]["name"])
+
+    def test_bounded_reasoning_smoke_fails_before_benchmark_without_tool_call(
+        self,
+    ) -> None:
+        command = duck_kaggle_setup_command()
+        script = command.split("\n", 1)[1].rsplit("\nPYSETUP", 1)[0]
+        parsed = ast.parse(script)
+        functions = ast.Module(
+            body=[
+                node
+                for node in parsed.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "run_vllm_api_smoke_test"
+            ],
+            type_ignores=[],
+        )
+        namespace = {
+            "json": json,
+            "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
+            "SERVED_MODEL_NAME": "unit-test-model",
+            "request_json": mock.Mock(
+                return_value={"choices": [{"message": {"content": "4"}}]}
+            ),
+            "server_failure_message": lambda reason: reason + "\ncomplete server log",
+        }
+        exec(compile(functions, "<kaggle-vllm-smoke-test>", "exec"), namespace)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "did not contain exactly one required tool call"
+        ) as raised:
+            namespace["run_vllm_api_smoke_test"]()
+
+        self.assertIn("complete server log", str(raised.exception))
+
+    def test_custom_scheduler_values_are_rendered_and_capacities_are_bounded(
+        self,
+    ) -> None:
         command = duck_kaggle_setup_command(
             DuckKaggleVllmConfig(
                 gpu_memory_utilization=0.77,
@@ -149,7 +244,9 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 1", command)
         self.assertIn("VLLM_ENABLE_CHUNKED_PREFILL = False", command)
 
-    def test_setup_preserves_context_window_when_already_below_server_limit(self) -> None:
+    def test_setup_preserves_context_window_when_already_below_server_limit(
+        self,
+    ) -> None:
         with mock.patch.dict(
             os.environ,
             {
@@ -173,6 +270,15 @@ class KaggleHardwareProfileTests(TestCase):
                 "LOCAL_ANALYZER_TOOL_STEPS": "0",
                 "LOCAL_ANALYZER_ENABLE_THINKING": "true",
                 "LOCAL_ANALYZER_GAME_TOKEN_BUDGET": "100000",
+                "LOCAL_ANALYZER_OBJECTIVE_REDUCTION": "true",
+                "LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS": "300",
+                "LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT": "4096",
+                "LOCAL_ANALYZER_ORCHESTRATION_CODER_MAX_OUTPUT": "8192",
+                "LOCAL_ANALYZER_ORCHESTRATION_REDUCER_THINKING_BUDGET": "2048",
+                "LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET": "3072",
+                "LOCAL_GAMEPLAY_POLICY_BACKEND": "cpu",
+                "LOCAL_GAMEPLAY_POLICY_CUDA_MIN_FREE_MB": "4096",
+                "LOCAL_GAMEPLAY_POLICY_DECISION_TIMEOUT_SECONDS": "2",
                 "LOCAL_ANALYZER_STAGNATION_WINDOW": "6",
                 "LOCAL_ANALYZER_CYCLE_WINDOW": "4",
                 "LOCAL_ANALYZER_CYCLE_STOP_LIMIT": "8",
@@ -198,16 +304,36 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("'LOCAL_ANALYZER_TOOL_STEPS': '0'", command)
         self.assertIn("'LOCAL_ANALYZER_ENABLE_THINKING': 'true'", command)
         self.assertIn("'LOCAL_ANALYZER_GAME_TOKEN_BUDGET': '100000'", command)
+        self.assertIn("'LOCAL_ANALYZER_OBJECTIVE_REDUCTION': 'true'", command)
+        self.assertIn(
+            "'LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS': '300'",
+            command,
+        )
+        self.assertIn(
+            "'LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT': '4096'",
+            command,
+        )
+        self.assertIn(
+            "'LOCAL_ANALYZER_ORCHESTRATION_CODER_MAX_OUTPUT': '8192'",
+            command,
+        )
+        self.assertIn(
+            "'LOCAL_ANALYZER_ORCHESTRATION_REDUCER_THINKING_BUDGET': '2048'",
+            command,
+        )
+        self.assertIn(
+            "'LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET': '3072'",
+            command,
+        )
+        self.assertIn("'LOCAL_GAMEPLAY_POLICY_BACKEND': 'cpu'", command)
+        self.assertIn("'LOCAL_GAMEPLAY_POLICY_CUDA_MIN_FREE_MB': '4096'", command)
+        self.assertIn("'LOCAL_GAMEPLAY_POLICY_DECISION_TIMEOUT_SECONDS': '2'", command)
         self.assertIn("'LOCAL_ANALYZER_STAGNATION_WINDOW': '6'", command)
         self.assertIn("'LOCAL_ANALYZER_CYCLE_WINDOW': '4'", command)
         self.assertIn("'LOCAL_ANALYZER_CYCLE_STOP_LIMIT': '8'", command)
         self.assertIn("'LOCAL_ANALYZER_REPEAT_ACTION_LIMIT': '2'", command)
-        self.assertIn(
-            "'LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_WINDOW': '16'", command
-        )
-        self.assertIn(
-            "'LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_LIMIT': '12'", command
-        )
+        self.assertIn("'LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_WINDOW': '16'", command)
+        self.assertIn("'LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_LIMIT': '12'", command)
         self.assertIn(
             "'LOCAL_ANALYZER_DIRECTIONAL_NO_PROGRESS_STRIKE_LIMIT': '3'", command
         )
@@ -303,7 +429,9 @@ class KaggleHardwareProfileTests(TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "vllm.log"
-            log_path.write_text("earliest worker failure\nlatest engine failure\n", encoding="utf-8")
+            log_path.write_text(
+                "earliest worker failure\nlatest engine failure\n", encoding="utf-8"
+            )
             namespace = {
                 "Path": Path,
                 "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",

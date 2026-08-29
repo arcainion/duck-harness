@@ -64,6 +64,9 @@
 - Set `KAGGLE_DUCK_DIAGNOSTIC=true` to run the five-game diagnostic suite at
   concurrency 3 with a 900-second analyzer timeout before committing to the public harness. Override the suite
   with `KAGGLE_DUCK_DIAGNOSTIC_GAMES='["game-id", ...]'` when needed.
+- Set `KAGGLE_DUCK_OBJECTIVE_REDUCTION=true` to use the host-owned objective
+  tree and generated gameplay-policy runtime. Gameplay defaults to CPU; select
+  `LOCAL_GAMEPLAY_POLICY_BACKEND=auto` or `cuda` explicitly to permit CUDA.
 - Prerequisites: run `make install` first (the target uses `uv run --no-sync`),
   the `kaggle` CLI must be installed and on `PATH` inside the container
   (`python -m pip install kaggle`), and credentials must resolve inside the

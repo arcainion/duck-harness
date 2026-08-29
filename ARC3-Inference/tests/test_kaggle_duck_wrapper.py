@@ -21,7 +21,7 @@ class KaggleDuckWrapperTests(unittest.TestCase):
             fake_bin.joinpath("make").write_text(
                 "#!/bin/sh\n"
                 "python3 -c 'import json, os, sys; json.dump(sys.argv[1:], "
-                "open(os.environ[\"MAKE_LOG\"], \"w\"))' \"$@\"\n",
+                'open(os.environ["MAKE_LOG"], "w"))\' "$@"\n',
                 encoding="utf-8",
             )
             fake_bin.joinpath("make").chmod(0o755)
@@ -33,6 +33,8 @@ class KaggleDuckWrapperTests(unittest.TestCase):
                     "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
                     "KAGGLE_DRY_RUN": "true",
                     "KAGGLE_DUCK_DIAGNOSTIC": "true",
+                    "KAGGLE_DUCK_OBJECTIVE_REDUCTION": "true",
+                    "LOCAL_GAMEPLAY_POLICY_BACKEND": "cpu",
                 }
             )
 
@@ -49,6 +51,30 @@ class KaggleDuckWrapperTests(unittest.TestCase):
         self.assertIn("KAGGLE_DUCK_PUBLIC_HARNESS=false", arguments)
         self.assertIn("CONCURRENT_JOBS=3", arguments)
         self.assertIn("ANALYZER_TIMEOUT=900", arguments)
+        self.assertIn("LOCAL_ANALYZER_OBJECTIVE_REDUCTION=true", arguments)
+        self.assertIn(
+            "LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS=300",
+            arguments,
+        )
+        self.assertIn(
+            "LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT=4096",
+            arguments,
+        )
+        self.assertIn(
+            "LOCAL_ANALYZER_ORCHESTRATION_CODER_MAX_OUTPUT=8192",
+            arguments,
+        )
+        self.assertIn(
+            "LOCAL_ANALYZER_ORCHESTRATION_REDUCER_THINKING_BUDGET=2048",
+            arguments,
+        )
+        self.assertIn(
+            "LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET=3072",
+            arguments,
+        )
+        self.assertIn("LOCAL_GAMEPLAY_POLICY_BACKEND=cpu", arguments)
+        self.assertIn("LOCAL_GAMEPLAY_POLICY_CUDA_MIN_FREE_MB=4096", arguments)
+        self.assertIn("LOCAL_GAMEPLAY_POLICY_DECISION_TIMEOUT_SECONDS=2", arguments)
         game_argument = next(item for item in arguments if item.startswith("GAME="))
         self.assertIn("ft09-0d8bbf25", game_argument)
         self.assertIn("r11l-495a7899", game_argument)
@@ -80,15 +106,15 @@ class KaggleDuckWrapperTests(unittest.TestCase):
             fake_bin.joinpath("make").write_text(
                 "#!/bin/sh\n"
                 "python3 -c 'import json, os, sys; "
-                "json.dump({\"args\": sys.argv[1:], "
-                "\"username\": os.environ.get(\"KAGGLE_USERNAME\"), "
-                "\"key\": os.environ.get(\"KAGGLE_KEY\"), "
-                "\"token\": os.environ.get(\"KAGGLE_API_TOKEN\")}, "
-                "open(os.environ[\"MAKE_LOG\"], \"w\"))' \"$@\"\n",
+                'json.dump({"args": sys.argv[1:], '
+                '"username": os.environ.get("KAGGLE_USERNAME"), '
+                '"key": os.environ.get("KAGGLE_KEY"), '
+                '"token": os.environ.get("KAGGLE_API_TOKEN")}, '
+                'open(os.environ["MAKE_LOG"], "w"))\' "$@"\n',
                 encoding="utf-8",
             )
             fake_bin.joinpath("kaggle").write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$KAGGLE_LOG\"\n",
+                '#!/bin/sh\nprintf \'%s\\n\' "$*" > "$KAGGLE_LOG"\n',
                 encoding="utf-8",
             )
             fake_bin.joinpath("make").chmod(0o755)
@@ -105,7 +131,12 @@ class KaggleDuckWrapperTests(unittest.TestCase):
                     "KAGGLE_DRY_RUN": "false",
                 }
             )
-            for key in ("KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_API_TOKEN", "KAGGLE_DATASET_REF"):
+            for key in (
+                "KAGGLE_USERNAME",
+                "KAGGLE_KEY",
+                "KAGGLE_API_TOKEN",
+                "KAGGLE_DATASET_REF",
+            ):
                 env.pop(key, None)
 
             completed = subprocess.run(

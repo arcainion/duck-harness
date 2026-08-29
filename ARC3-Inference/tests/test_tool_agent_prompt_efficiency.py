@@ -273,6 +273,65 @@ class ToolAgentPromptEfficiencyTests(unittest.TestCase):
         self.assertEqual(result.request_attempts, 1)
         self.assertFalse(result.forced_tool_fallback)
 
+    def test_chat_completion_accepts_bounded_thinking_and_required_tool_choice(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        agent._http_session.post = Mock(
+            return_value=_Response(
+                200,
+                "",
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "c1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "python",
+                                            "arguments": '{"code":"result=1"}',
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                },
+            )
+        )
+        tools = [{"type": "function", "function": {"name": "python"}}]
+
+        result = agent._chat_completion(
+            [{"role": "user", "content": "go"}],
+            tools=tools,
+            thinking_token_budget=3072,
+            tool_choice="required",
+            request_attempt_limit=1,
+        )
+
+        payload = agent._http_session.post.call_args.kwargs["json"]
+        self.assertEqual(payload["thinking_token_budget"], 3072)
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertEqual(payload["tool_choice"], "required")
+        self.assertEqual(result.request_attempts, 1)
+        self.assertIsNone(agent._forced_tool_choice_supported)
+
+    def test_chat_completion_request_attempt_override_disables_transient_retry(self) -> None:
+        agent = ToolAgent(model="unit-test-model")
+        failure = _Response(500, "forced tool parser failed", {})
+        agent._http_session.post = Mock(return_value=failure)
+
+        with self.assertRaisesRegex(requests.RequestException, "forced tool parser"):
+            agent._chat_completion(
+                [{"role": "user", "content": "go"}],
+                tools=None,
+                request_attempt_limit=1,
+            )
+
+        self.assertEqual(agent._http_session.post.call_count, 1)
+        self.assertTrue(failure.closed)
+
     def test_chat_completion_downgrades_rejected_strict_schema(self) -> None:
         agent = ToolAgent(model="unit-test-model")
         agent._http_session.post = Mock(

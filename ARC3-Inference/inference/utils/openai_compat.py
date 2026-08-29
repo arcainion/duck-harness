@@ -56,6 +56,7 @@ def build_chat_payload(
     top_p: float,
     top_k: int,
     thinking: bool,
+    thinking_token_budget: int | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     seed: int | None = None,
@@ -83,6 +84,8 @@ def build_chat_payload(
         if top_k > 0:
             payload["top_k"] = top_k
         payload["chat_template_kwargs"] = {"enable_thinking": bool(thinking)}
+        if thinking and thinking_token_budget is not None and thinking_token_budget > 0:
+            payload["thinking_token_budget"] = int(thinking_token_budget)
         if seed is not None and seed >= 0:
             payload["seed"] = seed
 
@@ -183,6 +186,7 @@ def build_provider_request(
     top_p: float,
     top_k: int,
     thinking: bool,
+    thinking_token_budget: int | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     seed: int | None = None,
@@ -217,6 +221,7 @@ def build_provider_request(
             top_p=top_p,
             top_k=top_k,
             thinking=thinking,
+            thinking_token_budget=thinking_token_budget,
             tools=tools,
             tool_choice=tool_choice,
             seed=seed,

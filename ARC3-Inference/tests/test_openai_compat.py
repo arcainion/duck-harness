@@ -25,6 +25,7 @@ class OpenAICompatibilityTests(TestCase):
             top_p=0.9,
             top_k=20,
             thinking=True,
+            thinking_token_budget=64,
             seed=7,
             candidates=2,
         )
@@ -36,6 +37,7 @@ class OpenAICompatibilityTests(TestCase):
         self.assertEqual(payload["n"], 2)
         self.assertNotIn("top_k", payload)
         self.assertNotIn("chat_template_kwargs", payload)
+        self.assertNotIn("thinking_token_budget", payload)
         self.assertNotIn("seed", payload)
 
     def test_openai_compatible_default_preserves_vllm_extensions(self) -> None:
@@ -44,6 +46,7 @@ class OpenAICompatibilityTests(TestCase):
         self.assertEqual(normalize_provider("openai-compatible"), "vllm")
         self.assertEqual(payload["top_k"], 20)
         self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertEqual(payload["thinking_token_budget"], 64)
         self.assertEqual(payload["seed"], 7)
 
     def test_responses_payload_translates_tools_and_outputs(self) -> None:

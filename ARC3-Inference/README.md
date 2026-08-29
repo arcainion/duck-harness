@@ -363,7 +363,35 @@ cycle-risk actions.
 Its stagnation/cycle windows are 6/4. Add `DEPLOYMENT_WAIT=true` if you want the
 command to block and pull the finished Kaggle output back into the run directory. Set
 `KAGGLE_DUCK_DIAGNOSTIC=true` when invoking `kaggle-duck.sh` to first run the
-five-game diagnostic suite at concurrency 3 with a 180-second analyzer timeout.
+five-game diagnostic suite at concurrency 3 with a 900-second analyzer timeout.
+The host-owned Orchestrated Objective Reduction analyzer is opt-in. Enable it
+for a CPU-first diagnostic run with:
+
+```bash
+KAGGLE_DUCK_DIAGNOSTIC=true \
+KAGGLE_DUCK_OBJECTIVE_REDUCTION=true \
+LOCAL_GAMEPLAY_POLICY_BACKEND=cpu \
+./kaggle-duck.sh
+```
+
+This keeps objective reduction and policy generation on the configured local
+LLM while ordinary gameplay executes the generated policy without an LLM call.
+Reducer/coder requests have an independent 300-second model timeout, so the
+60-second cooperative analyzer yield is checked only between orchestration
+boundaries. Thinking remains enabled; reducer and coder responses are capped at
+4096 and 8192 tokens respectively, with separate reasoning budgets of 2048 and
+3072 tokens. Orchestrated roles use required structured tool calls and one HTTP
+attempt per structured attempt; three failed structured attempts exhaust the
+role visibly instead of restarting the same request through the controller.
+Override these with
+`LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS`,
+`LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT`, and
+`LOCAL_ANALYZER_ORCHESTRATION_CODER_MAX_OUTPUT`, plus
+`LOCAL_ANALYZER_ORCHESTRATION_REDUCER_THINKING_BUDGET` and
+`LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET`.
+`LOCAL_GAMEPLAY_POLICY_BACKEND=auto` permits CUDA only when the policy declares
+support and at least `LOCAL_GAMEPLAY_POLICY_CUDA_MIN_FREE_MB` (default 4096 MiB)
+is available; otherwise it falls back to CPU. Explicit `cuda` is strict.
 
 The equivalent direct CLI form is:
 
