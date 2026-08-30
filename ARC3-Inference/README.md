@@ -380,9 +380,26 @@ Reducer/coder requests have an independent 300-second model timeout, so the
 60-second cooperative analyzer yield is checked only between orchestration
 boundaries. Thinking remains enabled; reducer and coder responses are capped at
 4096 and 8192 tokens respectively, with separate reasoning budgets of 2048 and
-3072 tokens. Orchestrated roles use required structured tool calls and one HTTP
-attempt per structured attempt; three failed structured attempts exhaust the
-role visibly instead of restarting the same request through the controller.
+1024 tokens. The reducer emits JSON between strict
+`BEGIN_REDUCTION`/`END_REDUCTION` markers and the coder emits raw Python between
+strict `BEGIN_POLICY`/`END_POLICY` markers. This avoids the vLLM native tool
+grammar and prevents tool-call escaping from corrupting generated content. Each
+role uses one HTTP attempt per orchestration attempt; three rejected attempts
+exhaust the role visibly instead of restarting through the controller. Reducer,
+coder, and policy observations receive only the exact model-facing action names
+`UP`, `DOWN`, `LEFT`, `RIGHT`, `SPACE`, `MOUSE`, and `ACTION7`; conversion to
+engine aliases happens only at the controller boundary, and `MOUSE` always
+requires bounded row/column coordinates. Pre-action failure streaks are scoped
+to one tactical leaf, and a policy receives one terminal-only evaluation of the
+post-action observation when its action budget reaches zero.
+Policy transition observations include controller-owned reward, outcome class,
+novelty, cycle, no-op, stagnation, and bounded animation evidence plus a
+host-computed `meaningful_progress` flag. An identical action proposed after an
+`exact_noop`, `volatile_only`, guarded, or cyclic transition fails the tactical
+objective before another controller call. Static policy verification reports all
+detectable violations together; coder retries receive cumulative errors and the
+bounded rejected source so the model can make a minimal repair rather than
+regenerating blindly.
 Override these with
 `LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS`,
 `LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT`, and

@@ -69,7 +69,7 @@ class KaggleDuckWrapperTests(unittest.TestCase):
             arguments,
         )
         self.assertIn(
-            "LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET=3072",
+            "LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET=1024",
             arguments,
         )
         self.assertIn("LOCAL_GAMEPLAY_POLICY_BACKEND=cpu", arguments)

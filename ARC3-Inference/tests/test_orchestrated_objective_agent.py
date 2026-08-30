@@ -16,13 +16,20 @@ from inference.agent.gameplay_policy_runtime import (
     PolicyStatus,
     verify_policy_source,
 )
-from inference.agent.orchestrated_objective_agent import OrchestratedObjectiveAgent
+from inference.agent.orchestrated_objective_agent import (
+    OrchestratedObjectiveAgent,
+    _meaningful_progress,
+    _policy_source_from_message,
+    _policy_transition_payload,
+    _reduction_from_message,
+    _repeats_non_progress_action,
+)
 from inference.agent.objective_reduction import (
     ObjectiveStatus,
     ObjectiveTree,
     ReductionProposal,
 )
-from inference.agent.runtime_state import Frame, write_runtime_state
+from inference.agent.runtime_state import Frame, HistoryEntry, write_runtime_state
 from inference.agent.tool_agent import AnalyzerModelConfig
 from inference.framework.solver import HarnessSolver
 
@@ -31,17 +38,23 @@ POLICY_SOURCE = """
 POLICY_API_VERSION = 1
 SUPPORTED_BACKENDS = ("cpu",)
 def decide(observation, memory):
-    return {"status": "continue", "action": {"action": "ACTION1"}, "memory": memory}
+    return {"status": "continue", "action": {"action": "UP"}, "memory": memory}
 """
 
 
-def frame(*, level: int = 1, step: int = 0, engine_state: str = "PLAYING") -> Frame:
+def frame(
+    *,
+    level: int = 1,
+    step: int = 0,
+    engine_state: str = "PLAYING",
+    valid_actions: tuple[str, ...] = ("ACTION1",),
+) -> Frame:
     grid = tuple(tuple(0 for _ in range(64)) for _ in range(64))
     return Frame(
         grid=grid,
         step=step,
         level=level,
-        valid_actions=("ACTION1",),
+        valid_actions=valid_actions,
         engine_state=engine_state,
         score=0,
     )
@@ -92,14 +105,19 @@ class _FakeModelClient:
     def __init__(self) -> None:
         self.calls = 0
         self.call_kwargs: list[dict[str, object]] = []
+        self.tools: list[list[dict] | None] = []
 
     def complete(
-        self, _messages: list[dict], *, tools: list[dict], **_kwargs: object
+        self,
+        _messages: list[dict],
+        *,
+        tools: list[dict] | None,
+        **_kwargs: object,
     ) -> SimpleNamespace:
         self.calls += 1
         self.call_kwargs.append(dict(_kwargs))
-        name = tools[0]["function"]["name"]
-        if name == "submit_reduction":
+        self.tools.append(tools)
+        if "objective-reducer role" in _messages[0]["content"]:
             payload = {
                 "objective_id": "level:1:1",
                 "verdict": "decompose",
@@ -116,47 +134,65 @@ class _FakeModelClient:
                     }
                 ],
             }
+            message = {
+                "role": "assistant",
+                "content": (f"BEGIN_REDUCTION\n{json.dumps(payload)}\nEND_REDUCTION"),
+            }
         else:
-            payload = {
-                "objective_id": "tactical:1",
-                "source": POLICY_SOURCE,
-                "backend_capabilities": ["cpu"],
-                "self_test_notes": "deterministic",
+            message = {
+                "role": "assistant",
+                "content": f"BEGIN_POLICY\n{POLICY_SOURCE}\nEND_POLICY",
             }
         return SimpleNamespace(
-            message={
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": f"call-{self.calls}",
-                        "type": "function",
-                        "function": {"name": name, "arguments": json.dumps(payload)},
-                    }
-                ],
-            },
+            message=message,
             usage={"completion_tokens": 10, "total_tokens": 20},
             request_attempts=1,
         )
 
 
 class _ScriptedModelClient:
-    def __init__(self, responses: list[dict[str, object] | BaseException]) -> None:
+    def __init__(
+        self, responses: list[dict[str, object] | str | BaseException]
+    ) -> None:
         self.responses = list(responses)
         self.calls = 0
         self.messages: list[list[dict]] = []
         self.call_kwargs: list[dict[str, object]] = []
+        self.tools: list[list[dict] | None] = []
 
     def complete(
-        self, messages: list[dict], *, tools: list[dict], **_kwargs: object
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None,
+        **_kwargs: object,
     ) -> SimpleNamespace:
         self.calls += 1
         self.messages.append(messages)
         self.call_kwargs.append(dict(_kwargs))
+        self.tools.append(tools)
         if not self.responses:
             raise AssertionError("scripted model response queue was exhausted")
         payload = self.responses.pop(0)
         if isinstance(payload, BaseException):
             raise payload
+        if not tools:
+            if isinstance(payload, str):
+                content = payload
+            elif "objective-reducer role" in messages[0]["content"]:
+                content = f"BEGIN_REDUCTION\n{json.dumps(payload)}\nEND_REDUCTION"
+            else:
+                content = f"BEGIN_POLICY\n{payload['source']}\nEND_POLICY"
+            return SimpleNamespace(
+                message={
+                    "role": "assistant",
+                    "content": content,
+                },
+                usage={"completion_tokens": 7, "total_tokens": 11},
+                request_attempts=1,
+            )
+        if not isinstance(payload, dict):
+            raise AssertionError("tool response payload must be an object")
         name = tools[0]["function"]["name"]
         return SimpleNamespace(
             message={
@@ -194,7 +230,7 @@ class _FakeRuntime:
     def decide(self, _observation: object) -> PolicyDecision:
         return PolicyDecision(
             status=PolicyStatus.CONTINUE,
-            action={"action": "ACTION1"},
+            action={"action": "UP"},
             memory=self.memory,
             evidence="ordinary CPU policy step",
         )
@@ -216,6 +252,21 @@ class _DecisionRuntime(_FakeRuntime):
         return self._decision
 
 
+class _SequentialDecisionRuntime(_FakeRuntime):
+    def __init__(self, decisions: list[PolicyDecision]) -> None:
+        super().__init__()
+        self._decisions = list(decisions)
+        self.decide_calls = 0
+
+    def decide(self, _observation: object) -> PolicyDecision:
+        self.decide_calls += 1
+        if not self._decisions:
+            raise AssertionError("scripted runtime decision queue was exhausted")
+        decision = self._decisions.pop(0)
+        self.memory = decision.memory
+        return decision
+
+
 class _RuntimeFactory:
     def __init__(self, decisions: list[PolicyDecision]) -> None:
         self.decisions = list(decisions)
@@ -229,7 +280,178 @@ class _RuntimeFactory:
         return runtime
 
 
+class _ActivationFailureRuntime(_FakeRuntime):
+    def activate(self, source: str, *, context: dict) -> PolicyActivation:
+        del source, context
+        raise PolicyRuntimeError(
+            "generated module failed activation", category="policy_verification"
+        )
+
+
+class _ActivationRepairRuntimeFactory:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self) -> _FakeRuntime:
+        self.calls += 1
+        if self.calls == 1:
+            return _ActivationFailureRuntime()
+        return _FakeRuntime()
+
+
 class OrchestratedObjectiveAgentTests(unittest.TestCase):
+    def test_policy_transition_exposes_controller_progress_evidence(self) -> None:
+        action = {"action": "MOUSE", "row": 30, "col": 61}
+        volatile_result = {
+            "executed": True,
+            "board_changed": True,
+            "reward": 0.0,
+            "score": 0,
+            "level": 1,
+            "state": "NOT_FINISHED",
+            "outcome_class": "volatile_only",
+            "novel_state": False,
+            "decision_context_changed": False,
+            "animation": {
+                "frame_count": 1,
+                "total_changed_cells": 1,
+                "dominant_color_transitions": [{"from": "P", "to": "c"}],
+            },
+        }
+
+        transition = _policy_transition_payload(
+            action,
+            volatile_result,
+            objective_id="tactical:1",
+            policy_hash="policy-hash",
+        )
+
+        self.assertFalse(transition["meaningful_progress"])
+        self.assertEqual("volatile_only", transition["outcome_class"])
+        self.assertEqual("NOT_FINISHED", transition["engine_state"])
+        self.assertEqual(1, transition["animation_summary"]["frame_count"])
+        self.assertNotIn("dominant_color_transitions", transition["animation_summary"])
+        self.assertTrue(
+            _meaningful_progress(
+                {
+                    **volatile_result,
+                    "outcome_class": "novel",
+                    "novel_state": True,
+                }
+            )
+        )
+        self.assertTrue(
+            _meaningful_progress(
+                {**volatile_result, "outcome_class": "level_progress", "reward": 0.1}
+            )
+        )
+
+    def test_repeated_non_progress_action_is_detected_per_objective(self) -> None:
+        previous = {
+            "objective_id": "tactical:1",
+            "action": "MOUSE",
+            "row": 30,
+            "col": 61,
+            "outcome_class": "volatile_only",
+        }
+        same = {"action": "MOUSE", "row": 30, "col": 61}
+
+        self.assertTrue(
+            _repeats_non_progress_action(previous, same, objective_id="tactical:1")
+        )
+        self.assertFalse(
+            _repeats_non_progress_action(
+                previous,
+                {"action": "MOUSE", "row": 30, "col": 62},
+                objective_id="tactical:1",
+            )
+        )
+        self.assertFalse(
+            _repeats_non_progress_action(
+                {**previous, "outcome_class": "novel"},
+                same,
+                objective_id="tactical:1",
+            )
+        )
+
+    def test_raw_reduction_envelope_parses_json_object(self) -> None:
+        payload = reduction_for("level:1:1")
+
+        extracted = _reduction_from_message(
+            {
+                "role": "assistant",
+                "content": (f"BEGIN_REDUCTION\n{json.dumps(payload)}\nEND_REDUCTION"),
+            }
+        )
+
+        self.assertEqual(payload, extracted)
+
+    def test_raw_reduction_envelope_rejects_tool_calls_and_prose(self) -> None:
+        payload = json.dumps(reduction_for("level:1:1"))
+        invalid_messages = [
+            {"role": "assistant", "content": payload},
+            {
+                "role": "assistant",
+                "content": f"Here it is\nBEGIN_REDUCTION\n{payload}\nEND_REDUCTION",
+            },
+            {
+                "role": "assistant",
+                "content": f"BEGIN_REDUCTION\n{payload}\nEND_REDUCTION",
+                "tool_calls": [{"function": {"name": "submit_reduction"}}],
+            },
+        ]
+
+        for message in invalid_messages:
+            with self.subTest(message=message), self.assertRaises(ValueError):
+                _reduction_from_message(message)
+
+    def test_raw_policy_envelope_preserves_source_exactly(self) -> None:
+        source = (
+            "POLICY_API_VERSION = 1\n"
+            'SUPPORTED_BACKENDS = ("cpu",)\n'
+            "def decide(observation, memory):\n"
+            '    return {"status": "continue", "action": '
+            '{"action": "ACTION1"}, "memory": memory}'
+        )
+
+        extracted = _policy_source_from_message(
+            {
+                "role": "assistant",
+                "content": f"BEGIN_POLICY\n{source}\nEND_POLICY",
+            }
+        )
+
+        self.assertEqual(source, extracted)
+
+    def test_raw_policy_envelope_rejects_ambiguous_responses(self) -> None:
+        invalid_messages = [
+            {"role": "assistant", "content": POLICY_SOURCE},
+            {
+                "role": "assistant",
+                "content": f"Here is code\nBEGIN_POLICY\n{POLICY_SOURCE}\nEND_POLICY",
+            },
+            {
+                "role": "assistant",
+                "content": "BEGIN_POLICY\n\nEND_POLICY",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    f"BEGIN_POLICY\n{POLICY_SOURCE}\nEND_POLICY\n"
+                    f"BEGIN_POLICY\n{POLICY_SOURCE}\nEND_POLICY"
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": f"BEGIN_POLICY\n{POLICY_SOURCE}\nEND_POLICY",
+                "tool_calls": [{"function": {"name": "submit_policy"}}],
+            },
+        ]
+
+        for message in invalid_messages:
+            with self.subTest(message=message), self.assertRaises(ValueError):
+                _policy_source_from_message(message)
+
     def _agent(self) -> OrchestratedObjectiveAgent:
         config = AnalyzerModelConfig(
             provider="vllm", base_url="http://127.0.0.1:1/v1", model_id="test"
@@ -242,6 +464,41 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             mock.patch("inference.agent.tool_agent.validate_sandbox_isolation"),
         ):
             return OrchestratedObjectiveAgent(model="test", game_id="game-a")
+
+    def test_role_payloads_and_policy_observation_use_model_action_names(
+        self,
+    ) -> None:
+        current_frame = frame(
+            valid_actions=("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION6")
+        )
+        history = [HistoryEntry(action="ACTION3", frame=current_frame)]
+        agent = self._agent()
+        agent._tree = ObjectiveTree.start_game(
+            "game-a", level=1, level_action_budget=32
+        )
+        runtime = _FakeRuntime()
+        runtime.activation = PolicyActivation(
+            source_hash="test-policy",
+            backend="cpu",
+            supported_backends=("cpu",),
+        )
+        agent._policy_runtime = runtime
+
+        reducer_payload = agent._reducer_payload(current_frame, history)
+        policy_payload = agent._policy_payload(current_frame, history, "")
+        observation = agent._observation(current_frame)
+        agent.close()
+
+        expected = ["UP", "DOWN", "LEFT", "RIGHT", "MOUSE"]
+        self.assertEqual(expected, reducer_payload["observation"]["valid_actions"])
+        self.assertEqual(expected, policy_payload["observation"]["valid_actions"])
+        self.assertEqual(tuple(expected), observation.valid_actions)
+        self.assertEqual("LEFT", reducer_payload["recent_transitions"][0]["action"])
+        self.assertEqual("LEFT", policy_payload["recent_transitions"][0]["action"])
+        self.assertIn("row and col", reducer_payload["action_contract"]["MOUSE"])
+        self.assertEqual(
+            reducer_payload["action_contract"], policy_payload["action_contract"]
+        )
 
     def test_ordinary_policy_turn_does_not_call_llm(self) -> None:
         current_frame = frame()
@@ -283,21 +540,104 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual(2, calls_after_activation)
         self.assertEqual(calls_after_activation, model_client.calls)
         self.assertEqual(2, len(actions))
+        self.assertEqual(["UP", "UP"], [item["action"] for item in actions])
         self.assertEqual(
             [4096, 8192],
             [item["max_output_tokens"] for item in model_client.call_kwargs],
         )
         self.assertEqual(
-            [2048, 3072],
+            [2048, 1024],
             [item["thinking_token_budget"] for item in model_client.call_kwargs],
         )
         self.assertEqual(
-            ["required", "required"],
+            [None, None],
             [item["tool_choice"] for item in model_client.call_kwargs],
         )
+        self.assertIsNone(model_client.tools[0])
+        self.assertIsNone(model_client.tools[1])
         self.assertEqual(
             [1, 1],
             [item["request_attempt_limit"] for item in model_client.call_kwargs],
+        )
+
+    def test_repeated_volatile_action_fails_before_second_controller_call(self) -> None:
+        client = _ScriptedModelClient(
+            [reduction_for("level:1:1"), policy_for("tactical:1")]
+        )
+        runtime = _SequentialDecisionRuntime(
+            [
+                PolicyDecision(
+                    status=PolicyStatus.CONTINUE,
+                    action={"action": "UP"},
+                    memory={"phase": 1},
+                    evidence="initial probe",
+                ),
+                PolicyDecision(
+                    status=PolicyStatus.CONTINUE,
+                    action={"action": "UP"},
+                    memory={"phase": 2},
+                    evidence="incorrectly repeat volatile probe",
+                ),
+            ]
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                return_value=runtime,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+            first_step = mock.Mock(
+                return_value={
+                    "executed": True,
+                    "board_changed": True,
+                    "outcome_class": "volatile_only",
+                    "novel_state": False,
+                    "level": 1,
+                    "state": "NOT_FINISHED",
+                }
+            )
+            first = agent.analyze(state_path, 0, step_env=first_step)
+            write_runtime_state(
+                state_path,
+                current_frame=frame(step=1),
+                history=[],
+            )
+            second_step = mock.Mock()
+            second = agent.analyze(
+                state_path,
+                1,
+                step_env=second_step,
+                should_stop=lambda: True,
+            )
+            tree = agent._tree
+            events = [
+                json.loads(line)
+                for line in (Path(temp_dir) / "orchestration_events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            agent.close()
+
+        self.assertTrue(first.step_executed)
+        self.assertTrue(second.yielded_control)
+        first_step.assert_called_once()
+        second_step.assert_not_called()
+        assert tree is not None
+        self.assertEqual(ObjectiveStatus.FAILED, tree.nodes["tactical:1"].status)
+        self.assertEqual(
+            1,
+            len(
+                [
+                    event
+                    for event in events
+                    if event["type"] == "policy_non_progress_repeat_rejected"
+                ]
+            ),
         )
 
     def test_model_request_timeout_is_independent_from_cooperative_yield(self) -> None:
@@ -306,7 +646,10 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         original_complete = client.complete
 
         def delayed_complete(
-            messages: list[dict], *, tools: list[dict], **kwargs: object
+            messages: list[dict],
+            *,
+            tools: list[dict] | None,
+            **kwargs: object,
         ) -> SimpleNamespace:
             result = original_complete(messages, tools=tools, **kwargs)
             clock["now"] = 61.0
@@ -341,7 +684,7 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual(300.0, client.call_kwargs[0]["request_timeout_seconds"])
         self.assertEqual(4096, client.call_kwargs[0]["max_output_tokens"])
         self.assertEqual(2048, client.call_kwargs[0]["thinking_token_budget"])
-        self.assertEqual("required", client.call_kwargs[0]["tool_choice"])
+        self.assertIsNone(client.call_kwargs[0]["tool_choice"])
         self.assertEqual(1, client.call_kwargs[0]["request_attempt_limit"])
         self.assertIsNotNone(tree)
         assert tree is not None
@@ -442,7 +785,10 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             [
                 reduction_for("level:wrong:1"),
                 reduction_for("level:1:1"),
-                policy_for("tactical:wrong"),
+                policy_for(
+                    "tactical:wrong",
+                    source='POLICY_API_VERSION = 1\nSUPPORTED_BACKENDS = ("cpu",)\n',
+                ),
                 policy_for("tactical:1"),
             ]
         )
@@ -469,12 +815,8 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             agent.close()
         self.assertTrue(result.step_executed)
         self.assertEqual(4, client.calls)
-        self.assertIn(
-            "Previous response was rejected", client.messages[1][-1]["content"]
-        )
-        self.assertIn(
-            "Previous response was rejected", client.messages[3][-1]["content"]
-        )
+        self.assertIn("Previous validation errors", client.messages[1][-1]["content"])
+        self.assertIn("Previous validation errors", client.messages[3][-1]["content"])
         self.assertEqual(2, len(reducer_history))
         self.assertEqual(2, len(coder_history))
         self.assertEqual(2, metrics["reducer_calls"])
@@ -483,6 +825,201 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual(2, metrics["coder_attempts"])
         self.assertEqual(14, metrics["reducer_generated_tokens"])
         self.assertEqual(14, metrics["coder_generated_tokens"])
+
+    def test_missing_decide_stays_in_coder_loop_and_saves_rejected_source(
+        self,
+    ) -> None:
+        rejected_source = 'POLICY_API_VERSION = 1\nSUPPORTED_BACKENDS = ("cpu",)'
+        client = _ScriptedModelClient(
+            [
+                reduction_for("level:1:1"),
+                policy_for("tactical:1", source=rejected_source),
+                policy_for("tactical:1"),
+            ]
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                _FakeRuntime,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+            result = agent.analyze(
+                state_path,
+                0,
+                valid_actions=["ACTION1"],
+                step_env=lambda _payload: {
+                    "executed": True,
+                    "board_changed": True,
+                },
+            )
+            metrics = dict(agent._orchestration_metrics)
+            rejected_artifacts = list(
+                (Path(temp_dir) / "policies" / "rejected").glob("*.py")
+            )
+            rejected_artifact_text = rejected_artifacts[0].read_text(encoding="utf-8")
+            events = [
+                json.loads(line)
+                for line in (Path(temp_dir) / "orchestration_events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            agent.close()
+
+        self.assertTrue(result.step_executed)
+        self.assertEqual(3, client.calls)
+        self.assertEqual(1, metrics["reducer_calls"])
+        self.assertEqual(2, metrics["coder_calls"])
+        self.assertIn("must define decide", client.messages[2][-1]["content"])
+        self.assertIn("<REJECTED_POLICY_SOURCE>", client.messages[2][-1]["content"])
+        self.assertIn(rejected_source, client.messages[2][-1]["content"])
+        self.assertIn("every item must be fixed", client.messages[2][-1]["content"])
+        coder_prompt = client.messages[1][0]["content"]
+        self.assertIn("PolicyObservation is an immutable object", coder_prompt)
+        self.assertIn("observation.valid_actions[0]", coder_prompt)
+        self.assertIn("Never call observation.get()", coder_prompt)
+        self.assertIn("shortest_path(passable, start, goal", coder_prompt)
+        self.assertIn("next_path_action(path, observation.valid_actions)", coder_prompt)
+        self.assertIn("find_cells(observation.board, VALUES", coder_prompt)
+        self.assertIn("distance_map(passable, starts", coder_prompt)
+        self.assertIn("weighted_shortest_path(passable, costs", coder_prompt)
+        self.assertIn("clearance_mask(passable, radius=1)", coder_prompt)
+        self.assertIn("line_of_sight(passable, start, goal)", coder_prompt)
+        self.assertIn("component_boxes(mask, min_size=1)", coder_prompt)
+        self.assertIn("shortest_approach_path(passable, start, targets", coder_prompt)
+        self.assertIn("path_is_valid(passable, suffix)", coder_prompt)
+        self.assertIn("continue_decision(", coder_prompt)
+        self.assertIn("transition_outcome(last_transition)", coder_prompt)
+        self.assertIn("transition_repeats_nonprogress_action", coder_prompt)
+        self.assertIn("board_digest(observation.board)", coder_prompt)
+        self.assertIn("memory_push(memory, key, value", coder_prompt)
+        self.assertIn("least_tried_action(observation.valid_actions", coder_prompt)
+        self.assertEqual(1, len(rejected_artifacts))
+        self.assertEqual(rejected_source, rejected_artifact_text)
+        rejected_events = [
+            event for event in events if event["type"] == "policy_candidate_rejected"
+        ]
+        self.assertEqual(1, len(rejected_events))
+        self.assertEqual("raw_content_validation", rejected_events[0]["phase"])
+        self.assertEqual(1, rejected_events[0]["structured_attempt"])
+        self.assertNotIn("source", rejected_events[0])
+
+    def test_coder_repair_prompt_accumulates_validation_errors(self) -> None:
+        missing_decide = 'POLICY_API_VERSION = 1\nSUPPORTED_BACKENDS = ("cpu",)'
+        forbidden_getattr = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    valid = getattr(observation, "valid_actions", ())
+    return {"status": "continue", "action": {"action": valid[0]}, "memory": memory}
+"""
+        client = _ScriptedModelClient(
+            [
+                reduction_for("level:1:1"),
+                policy_for("tactical:1", source=missing_decide),
+                policy_for("tactical:1", source=forbidden_getattr),
+                policy_for("tactical:1"),
+            ]
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                _FakeRuntime,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+            result = agent.analyze(
+                state_path,
+                0,
+                step_env=lambda _payload: {
+                    "executed": True,
+                    "board_changed": True,
+                    "outcome_class": "novel",
+                    "novel_state": True,
+                },
+            )
+            agent.close()
+
+        self.assertTrue(result.step_executed)
+        self.assertEqual(4, client.calls)
+        final_repair_prompt = client.messages[3][-1]["content"]
+        self.assertIn("must define decide", final_repair_prompt)
+        self.assertIn("call 'getattr' is not permitted", final_repair_prompt)
+        self.assertIn(forbidden_getattr.strip(), final_repair_prompt)
+
+    def test_activation_failure_repairs_with_coder_without_reducing_again(
+        self,
+    ) -> None:
+        client = _ScriptedModelClient(
+            [
+                reduction_for("level:1:1"),
+                policy_for("tactical:1"),
+                policy_for("tactical:1"),
+            ]
+        )
+        runtime_factory = _ActivationRepairRuntimeFactory()
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                runtime_factory,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+            result = agent.analyze(
+                state_path,
+                0,
+                valid_actions=["ACTION1"],
+                step_env=lambda _payload: {
+                    "executed": True,
+                    "board_changed": True,
+                },
+            )
+            metrics = dict(agent._orchestration_metrics)
+            events = [
+                json.loads(line)
+                for line in (Path(temp_dir) / "orchestration_events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            rejected_artifacts = list(
+                (Path(temp_dir) / "policies" / "rejected").glob("*.py")
+            )
+            rejected_artifact_text = rejected_artifacts[0].read_text(encoding="utf-8")
+            agent.close()
+
+        self.assertTrue(result.step_executed)
+        self.assertEqual(3, client.calls)
+        self.assertEqual(2, runtime_factory.calls)
+        self.assertEqual(1, metrics["reducer_calls"])
+        self.assertEqual(2, metrics["coder_calls"])
+        self.assertEqual(1, metrics["policy_repairs"])
+        policy_failures = [
+            event for event in events if event["type"] == "policy_failed"
+        ]
+        self.assertEqual(1, len(policy_failures))
+        self.assertEqual("coder", policy_failures[0]["repair_route"])
+        rejected_events = [
+            event for event in events if event["type"] == "policy_candidate_rejected"
+        ]
+        self.assertEqual(1, len(rejected_events))
+        self.assertEqual("activation", rejected_events[0]["phase"])
+        self.assertEqual(1, len(rejected_artifacts))
+        self.assertEqual(
+            POLICY_SOURCE.strip(),
+            rejected_artifact_text.strip(),
+        )
 
     def test_reducer_exhaustion_is_visible_after_three_attempts(self) -> None:
         client = _ScriptedModelClient(
@@ -503,11 +1040,41 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual("orchestration_reducer_exhausted", result.failure_category)
         self.assertEqual(3, client.calls)
 
+    def test_host_objective_repair_explicitly_requires_decomposition(self) -> None:
+        client = _ScriptedModelClient(
+            [
+                reduction_for("level:1:1", verdict="continue"),
+                reduction_for("level:1:1"),
+                policy_for("tactical:1"),
+            ]
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                _FakeRuntime,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+            result = agent.analyze(
+                state_path,
+                0,
+                step_env=lambda _payload: {"executed": True, "board_changed": True},
+            )
+            agent.close()
+        self.assertTrue(result.step_executed)
+        repair_prompt = client.messages[1][-1]["content"]
+        self.assertIn('use verdict="decompose"', repair_prompt)
+        self.assertIn("Do not return continue, complete, or fail", repair_prompt)
+
     def test_coder_exhaustion_is_visible_after_three_attempts(self) -> None:
         client = _ScriptedModelClient(
             [
                 reduction_for("level:1:1"),
-                *[policy_for("tactical:wrong") for _ in range(3)],
+                *["POLICY_API_VERSION = 1" for _ in range(3)],
             ]
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -621,7 +1188,6 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             [
                 reduction_for("level:1:1"),
                 policy_for("tactical:1"),
-                reduction_for("tactical:1", verdict="continue"),
                 policy_for("tactical:1"),
             ]
         )
@@ -646,21 +1212,30 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             result = agent.analyze(state_path, 0, step_env=step_env)
             repairs = dict(agent._policy_repairs)
             metrics = dict(agent._orchestration_metrics)
+            events = [
+                json.loads(line)
+                for line in (Path(temp_dir) / "orchestration_events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
             agent.close()
         self.assertTrue(result.step_executed)
         self.assertEqual(2, step_env.call_count)
-        self.assertEqual(4, client.calls)
+        self.assertEqual(3, client.calls)
         self.assertEqual(1, repairs["tactical:1"])
         self.assertEqual(1, metrics["policy_repairs"])
         self.assertEqual(1, metrics["policy_steps"])
+        policy_failures = [
+            event for event in events if event["type"] == "policy_failed"
+        ]
+        self.assertEqual("coder", policy_failures[0]["repair_route"])
 
-    def test_subgoal_completion_reduces_and_acts_in_same_turn(self) -> None:
+    def test_premature_subgoal_completion_repairs_policy_without_reducing(self) -> None:
         client = _ScriptedModelClient(
             [
                 reduction_for("level:1:1"),
                 policy_for("tactical:1"),
-                reduction_for("level:1:1", title="Second probe"),
-                policy_for("tactical:2"),
+                policy_for("tactical:1"),
             ]
         )
         runtime_factory = _RuntimeFactory(
@@ -697,11 +1272,114 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             agent.close()
         self.assertTrue(result.step_executed)
         self.assertEqual(1, step_env.call_count)
-        self.assertEqual(4, client.calls)
+        self.assertEqual(3, client.calls)
+        assert tree is not None
+        self.assertEqual(ObjectiveStatus.ACTIVE, tree.nodes["tactical:1"].status)
+        self.assertEqual("tactical:1", tree.active_id)
+        self.assertEqual(0, metrics["objectives_completed"])
+        self.assertEqual(1, metrics["objective_completion_rejections"])
+        self.assertEqual(1, metrics["policy_repairs"])
+
+    def test_exhausted_action_budget_allows_one_terminal_policy_evaluation(
+        self,
+    ) -> None:
+        reduction = reduction_for("level:1:1")
+        subgoals = reduction["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0]["action_budget"] = 1
+        client = _ScriptedModelClient([reduction, policy_for("tactical:1")])
+        runtime = _SequentialDecisionRuntime(
+            [
+                PolicyDecision(
+                    status=PolicyStatus.CONTINUE,
+                    action={"action": "ACTION1"},
+                    memory={"phase": "acted"},
+                    evidence="perform the single probe",
+                ),
+                PolicyDecision(
+                    status=PolicyStatus.SUBGOAL_SUCCEEDED,
+                    action=None,
+                    memory={"phase": "observed"},
+                    evidence="post-action observation resolved the probe",
+                ),
+            ]
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                return_value=runtime,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+            first_step = mock.Mock(
+                return_value={"executed": True, "board_changed": True}
+            )
+            first = agent.analyze(state_path, 0, step_env=first_step)
+            write_runtime_state(
+                state_path,
+                current_frame=frame(step=1),
+                history=[],
+            )
+            second_step = mock.Mock()
+            second = agent.analyze(
+                state_path,
+                1,
+                step_env=second_step,
+                should_stop=lambda: True,
+            )
+            tree = agent._tree
+            metrics = dict(agent._orchestration_metrics)
+            agent.close()
+
+        self.assertTrue(first.step_executed)
+        self.assertTrue(second.yielded_control)
+        self.assertEqual(2, runtime.decide_calls)
+        second_step.assert_not_called()
+        self.assertEqual(2, client.calls)
         assert tree is not None
         self.assertEqual(ObjectiveStatus.COMPLETED, tree.nodes["tactical:1"].status)
-        self.assertEqual("tactical:2", tree.active_id)
         self.assertEqual(1, metrics["objectives_completed"])
+
+    def test_completion_gate_requires_persistence_and_rejects_volatile_evidence(
+        self,
+    ) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_for("level:1:1")),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+        transition = {
+            "objective_id": "tactical:1",
+            "executed": True,
+            "outcome_class": "novel",
+            "level_completed": False,
+            "run_complete": False,
+        }
+        tree.record_action()
+        agent._last_transition = dict(transition)
+        agent._recent_transitions = [dict(transition)]
+        allowed, reason = agent._tactical_completion_evidence()
+        self.assertFalse(allowed)
+        self.assertIn("1 of 4", reason)
+
+        for _ in range(3):
+            tree.record_action()
+            agent._recent_transitions.append(dict(transition))
+        allowed, _ = agent._tactical_completion_evidence()
+        self.assertTrue(allowed)
+
+        agent._last_transition = {**transition, "outcome_class": "volatile_only"}
+        agent._recent_transitions[-1] = dict(agent._last_transition)
+        allowed, reason = agent._tactical_completion_evidence()
+        self.assertFalse(allowed)
+        self.assertIn("volatile_only", reason)
+        agent.close()
 
     def test_policy_artifact_and_memory_resume_without_llm(self) -> None:
         with (
@@ -807,11 +1485,40 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         agent._tree = tree
         failure = PolicyRuntimeError("broken", category="policy_runtime")
         agent._policy_failure(failure)
+        self.assertFalse(agent._reduction_required)
         agent._policy_failure(failure)
+        self.assertFalse(agent._reduction_required)
         with self.assertRaisesRegex(
             RuntimeError, "initial policy and two replacements"
         ):
             agent._policy_failure(failure)
+        self.assertTrue(agent._reduction_required)
+        agent.close()
+
+    def test_policy_failure_streak_resets_for_a_new_tactical_leaf(self) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_for("level:1:1")),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+        failure = PolicyRuntimeError("broken", category="policy_runtime")
+        agent._policy_failure(failure)
+        agent._policy_failure(failure)
+        tree.fail_active_tactical("replace the tactical leaf")
+        tree.apply_proposal(
+            ReductionProposal.from_payload(
+                reduction_for("level:1:1", title="Replacement probe")
+            ),
+            remaining_level_actions=20,
+        )
+
+        agent._policy_failure(failure)
+
+        self.assertEqual("tactical:2", tree.active_id)
+        self.assertEqual("tactical:2", agent._failure_streak_objective_id)
+        self.assertEqual(1, agent._consecutive_activation_failures)
         agent.close()
 
 

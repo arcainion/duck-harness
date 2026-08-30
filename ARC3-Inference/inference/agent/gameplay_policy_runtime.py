@@ -14,6 +14,9 @@ from typing import Any, Literal
 
 import numpy as np
 
+from inference.agent.policy_codegen_helpers import POLICY_CODEGEN_GLOBALS
+from inference.agent.policy_pathfinding import POLICY_PATHFINDING_GLOBALS
+
 
 POLICY_API_VERSION = 1
 MAX_POLICY_SOURCE_BYTES = 65_536
@@ -68,6 +71,16 @@ FORBIDDEN_NODES = (
     ast.Yield,
     ast.YieldFrom,
 )
+POLICY_OBSERVATION_ATTRIBUTES = {
+    "backend",
+    "board",
+    "level",
+    "last_transition",
+    "objective",
+    "recent_transitions",
+    "step",
+    "valid_actions",
+}
 
 
 class PolicyRuntimeError(RuntimeError):
@@ -218,6 +231,25 @@ def _ensure_json(value: Any, label: str) -> None:
         ) from exc
 
 
+def _is_observation_board(node: ast.AST, aliases: set[str]) -> bool:
+    return (isinstance(node, ast.Name) and node.id in aliases) or (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "observation"
+        and node.attr == "board"
+    )
+
+
+def _truth_tests_board(node: ast.AST, aliases: set[str]) -> bool:
+    if _is_observation_board(node, aliases):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _truth_tests_board(node.operand, aliases)
+    if isinstance(node, ast.BoolOp):
+        return any(_truth_tests_board(value, aliases) for value in node.values)
+    return False
+
+
 def _normalize_action(
     payload: dict[str, Any], valid_actions: tuple[str, ...]
 ) -> dict[str, Any]:
@@ -228,17 +260,19 @@ def _normalize_action(
             category="invalid_action",
         )
     action: dict[str, Any] = {"action": raw_name}
-    if raw_name == "MOUSE":
+    has_coordinates = "row" in payload or "col" in payload
+    if raw_name == "MOUSE" or has_coordinates:
         try:
             row = int(payload["row"])
             col = int(payload["col"])
         except (KeyError, TypeError, ValueError) as exc:
             raise PolicyRuntimeError(
-                "MOUSE requires integer row and col", category="invalid_action"
+                f"{raw_name} coordinates require integer row and col",
+                category="invalid_action",
             ) from exc
         if not 0 <= row <= 63 or not 0 <= col <= 63:
             raise PolicyRuntimeError(
-                "MOUSE row and col must be between 0 and 63",
+                f"{raw_name} row and col must be between 0 and 63",
                 category="invalid_action",
             )
         action.update(row=row, col=col)
@@ -265,6 +299,23 @@ def verify_policy_source(source: str) -> str:
         raise PolicyRuntimeError(
             "policy AST is too large", category="policy_verification"
         )
+    errors: list[str] = []
+
+    def reject(message: str) -> None:
+        if message not in errors:
+            errors.append(message)
+
+    board_aliases: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if value is None or not _is_observation_board(value, board_aliases):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        board_aliases.update(
+            target.id for target in targets if isinstance(target, ast.Name)
+        )
     for statement in tree.body:
         if not isinstance(
             statement,
@@ -277,16 +328,10 @@ def verify_policy_source(source: str) -> str:
                 ast.ImportFrom,
             ),
         ):
-            raise PolicyRuntimeError(
-                f"top-level {type(statement).__name__} is not permitted",
-                category="policy_verification",
-            )
+            reject(f"top-level {type(statement).__name__} is not permitted")
     for node in nodes:
         if isinstance(node, FORBIDDEN_NODES):
-            raise PolicyRuntimeError(
-                f"{type(node).__name__} is not permitted in policy code",
-                category="policy_verification",
-            )
+            reject(f"{type(node).__name__} is not permitted in policy code")
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             names = (
                 [alias.name for alias in node.names]
@@ -296,27 +341,83 @@ def verify_policy_source(source: str) -> str:
             for name in names:
                 root = name.split(".", 1)[0]
                 if root not in ALLOWED_IMPORTS:
-                    raise PolicyRuntimeError(
-                        f"import {name!r} is not permitted",
-                        category="policy_verification",
-                    )
+                    reject(f"import {name!r} is not permitted")
         if isinstance(node, ast.Name) and node.id.startswith("__"):
-            raise PolicyRuntimeError(
-                f"dunder name {node.id!r} is not permitted",
-                category="policy_verification",
-            )
+            reject(f"dunder name {node.id!r} is not permitted")
         if isinstance(node, ast.Attribute):
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "observation"
+                and node.attr not in POLICY_OBSERVATION_ATTRIBUTES
+            ):
+                reject(f"PolicyObservation has no attribute {node.attr!r}")
             if node.attr.startswith("_") or node.attr in FORBIDDEN_ATTRIBUTES:
-                raise PolicyRuntimeError(
-                    f"attribute {node.attr!r} is not permitted",
-                    category="policy_verification",
+                reject(f"attribute {node.attr!r} is not permitted")
+        if isinstance(node, (ast.If, ast.While, ast.IfExp)) and _truth_tests_board(
+            node.test, board_aliases
+        ):
+            reject(
+                "observation.board cannot be used as a boolean; use board.size or "
+                "an explicit NumPy reduction"
+            )
+        if isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+            if any(_is_observation_board(item, board_aliases) for item in operands):
+                reject(
+                    "observation.board cannot be compared directly; use np.array_equal "
+                    "or compare a finite scalar digest"
                 )
+        if isinstance(node, ast.Dict):
+            for value in node.values:
+                if _is_observation_board(value, board_aliases):
+                    reject(
+                        "observation.board cannot be stored in a mapping; policy memory "
+                        "must contain finite JSON data"
+                    )
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in FORBIDDEN_CALLS:
-                raise PolicyRuntimeError(
-                    f"call {node.func.id!r} is not permitted",
-                    category="policy_verification",
-                )
+                reject(f"call {node.func.id!r} is not permitted")
+    top_level_functions = {
+        statement.name: statement
+        for statement in tree.body
+        if isinstance(statement, ast.FunctionDef)
+    }
+    decide = top_level_functions.get("decide")
+    if decide is None:
+        reject("policy must define decide(observation, memory) as a top-level function")
+    else:
+        decide_arguments = [*decide.args.posonlyargs, *decide.args.args]
+        if (
+            [argument.arg for argument in decide_arguments] != ["observation", "memory"]
+            or decide.args.vararg is not None
+            or decide.args.kwarg is not None
+            or decide.args.kwonlyargs
+            or decide.args.defaults
+            or decide.args.kw_defaults
+        ):
+            reject(
+                "policy decide signature must be exactly decide(observation, memory)"
+            )
+    initialize = top_level_functions.get("initialize")
+    if initialize is not None:
+        initialize_arguments = [
+            *initialize.args.posonlyargs,
+            *initialize.args.args,
+        ]
+        if (
+            [argument.arg for argument in initialize_arguments] != ["context"]
+            or initialize.args.vararg is not None
+            or initialize.args.kwarg is not None
+            or initialize.args.kwonlyargs
+            or initialize.args.defaults
+            or initialize.args.kw_defaults
+        ):
+            reject("policy initialize signature must be exactly initialize(context)")
+    if errors:
+        raise PolicyRuntimeError(
+            "policy verification failed:\n- " + "\n- ".join(errors),
+            category="policy_verification",
+        )
     material = ast.dump(tree, annotate_fields=True, include_attributes=False)
     return hashlib.blake2b(material.encode("utf-8"), digest_size=16).hexdigest()
 
@@ -418,6 +519,7 @@ def _safe_builtins(allow_torch: bool) -> dict[str, Any]:
         "max": max,
         "min": min,
         "next": next,
+        "ord": ord,
         "range": range,
         "reversed": reversed,
         "round": round,
@@ -465,6 +567,8 @@ def _policy_worker_main(connection: Connection) -> None:
                     "PolicyObservation": PolicyObservation,
                     "np": np,
                 }
+                namespace.update(POLICY_CODEGEN_GLOBALS)
+                namespace.update(POLICY_PATHFINDING_GLOBALS)
                 exec(compile(source, "<generated-gameplay-policy>", "exec"), namespace)
                 if namespace.get("POLICY_API_VERSION") != POLICY_API_VERSION:
                     raise PolicyRuntimeError(

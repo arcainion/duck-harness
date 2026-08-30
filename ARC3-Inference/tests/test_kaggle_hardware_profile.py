@@ -135,7 +135,7 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("VLLM_MAX_NUM_SEQS = 16", command)
         self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 8192", command)
 
-    def test_setup_configures_bounded_reasoning_and_required_tool_smoke(self) -> None:
+    def test_setup_configures_bounded_reasoning_and_raw_transport_smoke(self) -> None:
         command = duck_kaggle_setup_command()
 
         self.assertIn("'--reasoning-parser',\n        'qwen3'", command)
@@ -143,10 +143,14 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn(repr(DEFAULT_VLLM_REASONING_CONFIG), command)
         self.assertIn("'chat_template_kwargs': {'enable_thinking': True}", command)
         self.assertIn("'thinking_token_budget': 64", command)
-        self.assertIn("'tool_choice': 'required'", command)
+        self.assertNotIn("'tool_choice': 'required'", command)
+        self.assertIn("BEGIN_REDUCTION", command)
+        self.assertIn("BEGIN_POLICY", command)
+        self.assertIn("Raw reduction JSON fidelity: passed", command)
+        self.assertIn("Raw policy source fidelity: passed", command)
         self.assertIn("run_vllm_api_smoke_test()", command)
 
-    def test_bounded_reasoning_smoke_accepts_one_valid_tool_call(self) -> None:
+    def test_bounded_reasoning_smoke_accepts_raw_orchestration_envelopes(self) -> None:
         command = duck_kaggle_setup_command()
         script = command.split("\n", 1)[1].rsplit("\nPYSETUP", 1)[0]
         parsed = ast.parse(script)
@@ -159,23 +163,48 @@ class KaggleHardwareProfileTests(TestCase):
             ],
             type_ignores=[],
         )
+        reduction_fixture = (
+            "BEGIN_REDUCTION\n"
+            "{\n"
+            '  "objective_id": "level:1:1",\n'
+            '  "verdict": "continue",\n'
+            '  "evidence": "board unchanged",\n'
+            '  "rationale": "continue the active probe",\n'
+            '  "selected_index": 0,\n'
+            '  "subgoals": []\n'
+            "}\n"
+            "END_REDUCTION"
+        )
+        policy_fixture = (
+            "BEGIN_POLICY\n"
+            "POLICY_API_VERSION = 1\n"
+            'SUPPORTED_BACKENDS = ("cpu",)\n'
+            "def decide(observation, memory):\n"
+            '    return {"status": "continue", "action": '
+            '{"action": "ACTION6"}, "memory": memory}\n'
+            "END_POLICY"
+        )
         request_json = mock.Mock(
-            return_value={
-                "choices": [
-                    {
-                        "message": {
-                            "tool_calls": [
-                                {
-                                    "function": {
-                                        "name": "report_smoke_result",
-                                        "arguments": '{"answer":4}',
-                                    }
-                                }
-                            ]
+            side_effect=[
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": reduction_fixture,
+                            }
                         }
-                    }
-                ]
-            }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": policy_fixture,
+                            }
+                        }
+                    ]
+                },
+            ]
         )
         namespace = {
             "json": json,
@@ -188,13 +217,22 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        payload = request_json.call_args.kwargs["payload"]
-        self.assertEqual(64, payload["thinking_token_budget"])
-        self.assertEqual({"enable_thinking": True}, payload["chat_template_kwargs"])
-        self.assertEqual("required", payload["tool_choice"])
-        self.assertEqual("report_smoke_result", payload["tools"][0]["function"]["name"])
+        self.assertEqual(2, request_json.call_count)
+        reduction_payload = request_json.call_args_list[0].kwargs["payload"]
+        self.assertEqual(64, reduction_payload["thinking_token_budget"])
+        self.assertEqual(
+            {"enable_thinking": True}, reduction_payload["chat_template_kwargs"]
+        )
+        self.assertNotIn("tools", reduction_payload)
+        self.assertNotIn("tool_choice", reduction_payload)
+        self.assertIn(reduction_fixture, reduction_payload["messages"][0]["content"])
+        raw_payload = request_json.call_args_list[1].kwargs["payload"]
+        self.assertEqual(64, raw_payload["thinking_token_budget"])
+        self.assertNotIn("tools", raw_payload)
+        self.assertNotIn("tool_choice", raw_payload)
+        self.assertIn(policy_fixture, raw_payload["messages"][0]["content"])
 
-    def test_bounded_reasoning_smoke_fails_before_benchmark_without_tool_call(
+    def test_bounded_reasoning_smoke_fails_on_raw_reduction_corruption(
         self,
     ) -> None:
         command = duck_kaggle_setup_command()
@@ -221,7 +259,69 @@ class KaggleHardwareProfileTests(TestCase):
         exec(compile(functions, "<kaggle-vllm-smoke-test>", "exec"), namespace)
 
         with self.assertRaisesRegex(
-            RuntimeError, "did not contain exactly one required tool call"
+            RuntimeError, "raw-reduction fidelity check"
+        ) as raised:
+            namespace["run_vllm_api_smoke_test"]()
+
+        self.assertIn("complete server log", str(raised.exception))
+
+    def test_bounded_reasoning_smoke_fails_on_raw_policy_corruption(self) -> None:
+        command = duck_kaggle_setup_command()
+        script = command.split("\n", 1)[1].rsplit("\nPYSETUP", 1)[0]
+        parsed = ast.parse(script)
+        functions = ast.Module(
+            body=[
+                node
+                for node in parsed.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "run_vllm_api_smoke_test"
+            ],
+            type_ignores=[],
+        )
+        request_json = mock.Mock(
+            side_effect=[
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    "BEGIN_REDUCTION\n"
+                                    "{\n"
+                                    '  "objective_id": "level:1:1",\n'
+                                    '  "verdict": "continue",\n'
+                                    '  "evidence": "board unchanged",\n'
+                                    '  "rationale": "continue the active probe",\n'
+                                    '  "selected_index": 0,\n'
+                                    '  "subgoals": []\n'
+                                    "}\n"
+                                    "END_REDUCTION"
+                                ),
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "BEGIN_POLICY POLICY_API_VERSION = 1 END_POLICY"
+                            }
+                        }
+                    ]
+                },
+            ]
+        )
+        namespace = {
+            "json": json,
+            "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
+            "SERVED_MODEL_NAME": "unit-test-model",
+            "request_json": request_json,
+            "server_failure_message": lambda reason: reason + "\ncomplete server log",
+        }
+        exec(compile(functions, "<kaggle-vllm-smoke-test>", "exec"), namespace)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "raw-policy fidelity check"
         ) as raised:
             namespace["run_vllm_api_smoke_test"]()
 

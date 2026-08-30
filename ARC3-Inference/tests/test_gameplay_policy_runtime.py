@@ -35,9 +35,13 @@ def decide(observation, memory):
 """
 
 
-def observation(*, valid_actions: tuple[str, ...] = ("ACTION1",)) -> PolicyObservation:
+def observation(
+    *,
+    valid_actions: tuple[str, ...] = ("ACTION1",),
+    board: np.ndarray | None = None,
+) -> PolicyObservation:
     return PolicyObservation(
-        board=np.zeros((64, 64), dtype=np.uint8),
+        board=(np.zeros((64, 64), dtype=np.uint8) if board is None else board),
         level=1,
         step=0,
         valid_actions=valid_actions,
@@ -120,7 +124,218 @@ class GameplayPolicyRuntimeTests(unittest.TestCase):
             decision = runtime.decide(observation())
             self.assertEqual(PolicyStatus.CONTINUE, decision.status)
             self.assertEqual({"action": "ACTION1"}, decision.action)
-            self.assertEqual({"calls": 1}, runtime.memory)
+        self.assertEqual({"calls": 1}, runtime.memory)
+
+    def test_policy_can_use_safe_ord_and_standalone_history_push(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    history = history_push(memory.get("values", []), ord("b"), limit=2)
+    return continue_decision(
+        observation.valid_actions[0], {"values": history}, "recorded cell value"
+    )
+"""
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(source, context={})
+            decision = runtime.decide(observation(valid_actions=("UP",)))
+        self.assertEqual({"values": [98]}, decision.memory)
+
+    def test_policy_can_use_host_pathfinding_helpers_without_imports(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    starts = find_cells(observation.board, 1)
+    goals = find_cells(observation.board, 2)
+    passable = np.isin(observation.board, (0, 1, 2))
+    path = shortest_path(passable, starts[0], goals[0])
+    distances = distance_map(passable, starts)
+    action_name = next_path_action(path, observation.valid_actions)
+    return {
+        "status": "continue",
+        "action": {"action": action_name},
+        "memory": {
+            "path_length": len(path),
+            "goal_distance": int(distances[goals[0]]),
+        },
+        "evidence": "host BFS selected a valid cardinal step",
+    }
+"""
+        board = np.zeros((64, 64), dtype=np.uint8)
+        board[1, 1] = 1
+        board[1, 3] = 2
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(source, context={})
+            decision = runtime.decide(
+                observation(valid_actions=("RIGHT",), board=board)
+            )
+        self.assertEqual({"action": "RIGHT"}, decision.action)
+        self.assertEqual({"path_length": 3, "goal_distance": 2}, decision.memory)
+
+    def test_policy_can_use_weighted_clearance_and_projection_helpers(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    passable = np.ones((64, 64), dtype=bool)
+    costs = np.ones((64, 64), dtype=float)
+    costs[2, 2] = 20.0
+    safe = clearance_mask(passable, 1)
+    path = weighted_shortest_path(safe, costs, (2, 1), (2, 3))
+    action_name = next_path_action(path, observation.valid_actions)
+    projected = action_destination((2, 1), action_name)
+    visible = line_of_sight(passable, (2, 1), (2, 3))
+    return {
+        "status": "continue",
+        "action": {"action": action_name},
+        "memory": {
+            "projected": list(projected),
+            "visible": bool(visible),
+            "cost": float(path_cost(costs, path)),
+        },
+    }
+"""
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(source, context={})
+            decision = runtime.decide(observation(valid_actions=("UP", "RIGHT")))
+        self.assertEqual({"action": "UP"}, decision.action)
+        self.assertEqual(
+            {"projected": [1, 1], "visible": True, "cost": 4.0},
+            decision.memory,
+        )
+
+    def test_policy_can_use_component_approach_and_route_reuse_helpers(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    targets = value_mask(observation.board, 2)
+    passable = value_mask(observation.board, (0, 1))
+    target_points = find_cells(observation.board, 2)
+    path = shortest_approach_path(passable, (2, 1), target_points, 1)
+    suffix = path_suffix(path, (2, 1))
+    action_name = next_path_action(suffix, observation.valid_actions)
+    return {
+        "status": "continue",
+        "action": {"action": action_name},
+        "memory": {
+            "api": PATHFINDING_API_VERSION,
+            "box": list(component_boxes(targets)[0]),
+            "center": list(component_centers(targets)[0]),
+            "route_valid": bool(path_is_valid(passable, suffix)),
+        },
+    }
+"""
+        board = np.zeros((64, 64), dtype=np.uint8)
+        board[2, 1] = 1
+        board[2, 3:5] = 2
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(source, context={})
+            decision = runtime.decide(
+                observation(valid_actions=("RIGHT",), board=board)
+            )
+        self.assertEqual({"action": "RIGHT"}, decision.action)
+        self.assertEqual(
+            {
+                "api": 1,
+                "box": [2, 3, 2, 4, 2],
+                "center": [2, 3],
+                "route_valid": True,
+            },
+            decision.memory,
+        )
+
+    def test_policy_can_use_decision_and_transition_contract_helpers(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    outcome = transition_outcome(observation.last_transition)
+    if transition_repeats_nonprogress_action(observation.last_transition, "LEFT"):
+        return subgoal_failed({"outcome": outcome}, "do not repeat blocked action")
+    path = ((1, 1), (1, 2))
+    return path_decision(
+        path,
+        observation.valid_actions,
+        {"api": POLICY_CODEGEN_API_VERSION, "outcome": outcome},
+        "follow safe route",
+    )
+"""
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(source, context={})
+            first = runtime.decide(observation(valid_actions=("RIGHT",)))
+            blocked_observation = observation(valid_actions=("RIGHT",))
+            blocked_observation = PolicyObservation(
+                board=blocked_observation.board,
+                level=1,
+                step=1,
+                valid_actions=("RIGHT",),
+                last_transition={
+                    "action": "LEFT",
+                    "executed": True,
+                    "board_changed": False,
+                },
+                objective=blocked_observation.objective,
+                recent_transitions=(),
+                backend="cpu",
+            )
+            second = runtime.decide(blocked_observation)
+        self.assertEqual(PolicyStatus.CONTINUE, first.status)
+        self.assertEqual({"action": "RIGHT"}, first.action)
+        self.assertEqual({"api": 1, "outcome": "unknown"}, first.memory)
+        self.assertEqual(PolicyStatus.SUBGOAL_FAILED, second.status)
+        self.assertIsNone(second.action)
+        self.assertEqual({"outcome": "no_progress"}, second.memory)
+
+    def test_policy_can_use_digest_bounded_memory_and_exploration_helpers(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    digest = board_digest(observation.board)
+    memory = memory_push(memory, "digests", digest, limit=2)
+    memory = memory_increment(memory, "calls", maximum=10)
+    memory = memory_update(
+        memory,
+        {"outcomes": recent_outcome_counts(observation.recent_transitions)},
+    )
+    action_name = least_tried_action(
+        observation.valid_actions, observation.recent_transitions
+    )
+    return continue_decision(action_name, memory, "bounded exploration")
+"""
+        first_observation = observation(valid_actions=("UP", "RIGHT"))
+        second_observation = PolicyObservation(
+            board=first_observation.board,
+            level=1,
+            step=1,
+            valid_actions=("UP", "RIGHT"),
+            last_transition={
+                "action": "UP",
+                "executed": True,
+                "board_changed": False,
+            },
+            objective=first_observation.objective,
+            recent_transitions=(
+                {
+                    "action": "UP",
+                    "executed": True,
+                    "board_changed": False,
+                },
+            ),
+            backend="cpu",
+        )
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(source, context={})
+            first = runtime.decide(first_observation)
+            second = runtime.decide(second_observation)
+        self.assertEqual({"action": "UP"}, first.action)
+        self.assertEqual({"action": "RIGHT"}, second.action)
+        self.assertEqual(2, second.memory["calls"])
+        self.assertEqual({"no_progress": 1}, second.memory["outcomes"])
+        self.assertEqual(2, len(second.memory["digests"]))
+        self.assertEqual(second.memory["digests"][0], second.memory["digests"][1])
 
     def test_invalid_policy_action_is_rejected(self) -> None:
         source = GOOD_POLICY.replace("observation.valid_actions[0]", '"ACTION4"')
@@ -216,6 +431,46 @@ def decide(observation, memory):
                     )
                 self.assertEqual("invalid_action", captured.exception.category)
 
+    def test_mouse_alias_preserves_bounded_coordinates(self) -> None:
+        accepted = PolicyDecision.from_payload(
+            {
+                "status": "continue",
+                "action": {"action": "ACTION6", "row": "47", "col": 18},
+                "memory": {},
+            },
+            valid_actions=("ACTION6",),
+        )
+        self.assertEqual({"action": "ACTION6", "row": 47, "col": 18}, accepted.action)
+        with self.assertRaisesRegex(PolicyRuntimeError, "ACTION6 coordinates"):
+            PolicyDecision.from_payload(
+                {
+                    "status": "continue",
+                    "action": {"action": "ACTION6", "row": 47},
+                    "memory": {},
+                },
+                valid_actions=("ACTION6",),
+            )
+
+    def test_model_facing_action_contract_rejects_engine_aliases(self) -> None:
+        accepted = PolicyDecision.from_payload(
+            {
+                "status": "continue",
+                "action": {"action": "MOUSE", "row": 11, "col": 29},
+                "memory": {},
+            },
+            valid_actions=("UP", "MOUSE"),
+        )
+        self.assertEqual({"action": "MOUSE", "row": 11, "col": 29}, accepted.action)
+        with self.assertRaisesRegex(PolicyRuntimeError, "not currently valid"):
+            PolicyDecision.from_payload(
+                {
+                    "status": "continue",
+                    "action": {"action": "ACTION6", "row": 11, "col": 29},
+                    "memory": {},
+                },
+                valid_actions=("UP", "MOUSE"),
+            )
+
     def test_forbidden_import_is_rejected_before_worker_start(self) -> None:
         with self.assertRaisesRegex(PolicyRuntimeError, "not permitted"):
             verify_policy_source(
@@ -250,6 +505,102 @@ def decide(observation, memory):
                 with self.assertRaisesRegex(PolicyRuntimeError, message) as captured:
                     verify_policy_source(source)
                 self.assertEqual("policy_verification", captured.exception.category)
+
+    def test_source_verifier_requires_exact_policy_entrypoint_signatures(self) -> None:
+        cases = (
+            (
+                "POLICY_API_VERSION=1\nSUPPORTED_BACKENDS=('cpu',)\n",
+                r"must define decide\(observation, memory\)",
+            ),
+            (
+                "POLICY_API_VERSION=1\nSUPPORTED_BACKENDS=('cpu',)\n"
+                "def wrapper():\n"
+                "    def decide(observation, memory):\n"
+                "        return {}\n",
+                r"must define decide\(observation, memory\)",
+            ),
+            (
+                GOOD_POLICY.replace(
+                    "def decide(observation, memory):",
+                    "def decide(observation):",
+                ),
+                "decide signature must be exactly",
+            ),
+            (
+                GOOD_POLICY.replace(
+                    "def decide(observation, memory):",
+                    "def decide(observation, memory, extra=None):",
+                ),
+                "decide signature must be exactly",
+            ),
+            (
+                GOOD_POLICY.replace(
+                    "def initialize(context):",
+                    "def initialize(context, extra):",
+                ),
+                "initialize signature must be exactly",
+            ),
+        )
+        for source, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(PolicyRuntimeError, message) as captured:
+                    verify_policy_source(source)
+                self.assertEqual("policy_verification", captured.exception.category)
+
+    def test_source_verifier_rejects_invalid_observation_contract_usage(self) -> None:
+        cases = (
+            (
+                "engine_state = observation.engine_state",
+                "has no attribute 'engine_state'",
+            ),
+            (
+                "rows = observation.board_hex_rows",
+                "has no attribute 'board_hex_rows'",
+            ),
+            (
+                "board = observation.board\n    if not board:\n        return {}",
+                "cannot be used as a boolean",
+            ),
+            (
+                "board = observation.board\n    changed = board != memory.get('board')",
+                "cannot be compared directly",
+            ),
+            (
+                "board = observation.board\n    memory = {'board': board}",
+                "cannot be stored in a mapping",
+            ),
+        )
+        for body, message in cases:
+            source = (
+                "POLICY_API_VERSION = 1\n"
+                'SUPPORTED_BACKENDS = ("cpu",)\n'
+                "def decide(observation, memory):\n"
+                f"    {body}\n"
+                "    return {'status': 'subgoal_failed', 'memory': {}}\n"
+            )
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(PolicyRuntimeError, message):
+                    verify_policy_source(source)
+
+    def test_source_verifier_reports_all_detectable_static_violations(self) -> None:
+        source = """
+import hashlib
+import json
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    actions = getattr(observation, "valid_actions", ())
+    state = observation.engine_state
+    return {"status": "continue", "action": {"action": actions[0]}, "memory": memory}
+"""
+        with self.assertRaises(PolicyRuntimeError) as captured:
+            verify_policy_source(source)
+
+        detail = str(captured.exception)
+        self.assertIn("import 'hashlib' is not permitted", detail)
+        self.assertIn("import 'json' is not permitted", detail)
+        self.assertIn("call 'getattr' is not permitted", detail)
+        self.assertIn("PolicyObservation has no attribute 'engine_state'", detail)
 
     def test_source_fingerprint_is_semantic(self) -> None:
         formatted = "\n# harmless comment\n" + GOOD_POLICY.replace(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from typing import Any, Callable
 import numpy as np
 import requests
 
+from inference.agent.action_names import to_model_action, to_model_actions
 from inference.agent.gameplay_policy_runtime import (
     GameplayPolicyRuntime,
     PolicyDecision,
@@ -34,7 +36,6 @@ from inference.agent.tool_agent import (
     ToolAgent,
     _extract_reasoning_text,
     _normalize_message_content,
-    _recover_tool_calls_from_markup,
 )
 
 
@@ -50,8 +51,38 @@ _DEFAULT_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS = 300.0
 _DEFAULT_REDUCER_MAX_OUTPUT = 4096
 _DEFAULT_CODER_MAX_OUTPUT = 8192
 _DEFAULT_REDUCER_THINKING_BUDGET = 2048
-_DEFAULT_CODER_THINKING_BUDGET = 3072
-_ORCHESTRATION_TOOL_CHOICE = "required"
+_DEFAULT_CODER_THINKING_BUDGET = 1024
+_REDUCTION_BEGIN_MARKER = "BEGIN_REDUCTION"
+_REDUCTION_END_MARKER = "END_REDUCTION"
+_POLICY_BEGIN_MARKER = "BEGIN_POLICY"
+_POLICY_END_MARKER = "END_POLICY"
+_MAX_REJECTED_POLICY_REPAIR_CHARS = 24000
+_MIN_TACTICAL_PERSISTENCE_ACTIONS = 4
+
+_NON_PROGRESS_OUTCOME_CLASSES = frozenset(
+    {
+        "exact_noop",
+        "behavioral_noop",
+        "volatile_only",
+        "cycle",
+        "cycle_risk",
+        "guarded",
+        "invalid_action",
+    }
+)
+_PROGRESS_OUTCOME_CLASSES = frozenset(
+    {"novel", "progress", "reward", "level_progress", "game_progress"}
+)
+
+_MODEL_ACTION_CONTRACT = {
+    "UP": "move up",
+    "DOWN": "move down",
+    "LEFT": "move left",
+    "RIGHT": "move right",
+    "SPACE": "press space",
+    "MOUSE": "click one board cell; integer row and col from 0 through 63 are required",
+    "ACTION7": "engine-defined seventh action",
+}
 
 
 class OrchestrationFailure(RuntimeError):
@@ -86,6 +117,7 @@ def _empty_orchestration_metrics() -> dict[str, int | float]:
         "cuda_policy_seconds": 0.0,
         "objectives_completed": 0,
         "objectives_failed": 0,
+        "objective_completion_rejections": 0,
     }
 
 
@@ -120,118 +152,154 @@ def objective_reduction_enabled() -> bool:
     }
 
 
-def _tool_schema(
-    name: str, description: str, parameters: dict[str, Any]
-) -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "strict": True,
-            "parameters": {**parameters, "additionalProperties": False},
-        },
-    }
-
-
-_REDUCTION_TOOL = _tool_schema(
-    "submit_reduction",
-    "Submit one validated objective-tree transition.",
-    {
-        "type": "object",
-        "properties": {
-            "objective_id": {"type": "string", "maxLength": 200},
-            "verdict": {
-                "type": "string",
-                "enum": ["continue", "complete", "fail", "decompose"],
-            },
-            "evidence": {"type": "string", "maxLength": 2400},
-            "rationale": {"type": "string", "maxLength": 2400},
-            "selected_index": {"type": "integer", "minimum": 0, "maximum": 5},
-            "subgoals": {
-                "type": "array",
-                "maxItems": 6,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string", "maxLength": 200},
-                        "success_criteria": {"type": "string", "maxLength": 1200},
-                        "failure_criteria": {"type": "string", "maxLength": 1200},
-                        "expected_evidence": {"type": "string", "maxLength": 1200},
-                        "action_budget": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 32,
-                        },
-                    },
-                    "required": [
-                        "title",
-                        "success_criteria",
-                        "failure_criteria",
-                        "expected_evidence",
-                        "action_budget",
-                    ],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "required": [
-            "objective_id",
-            "verdict",
-            "evidence",
-            "rationale",
-            "selected_index",
-            "subgoals",
-        ],
-    },
-)
-
-_POLICY_TOOL = _tool_schema(
-    "submit_policy",
-    "Submit one complete versioned gameplay policy module.",
-    {
-        "type": "object",
-        "properties": {
-            "objective_id": {"type": "string", "maxLength": 200},
-            "source": {"type": "string", "maxLength": 65536},
-            "backend_capabilities": {
-                "type": "array",
-                "items": {"type": "string", "enum": ["cpu", "cuda"]},
-                "minItems": 1,
-                "maxItems": 2,
-            },
-            "self_test_notes": {"type": "string", "maxLength": 2000},
-        },
-        "required": [
-            "objective_id",
-            "source",
-            "backend_capabilities",
-            "self_test_notes",
-        ],
-    },
-)
-
 _REDUCER_SYSTEM_PROMPT = """You are the objective-reducer role for an ARC-AGI-3 game.
-Think carefully, then call submit_reduction exactly once. The host owns all IDs,
+Think carefully. After thinking, your visible answer must be exactly one JSON object
+between BEGIN_REDUCTION and END_REDUCTION lines. Do not use a tool call, Markdown,
+or prose outside the markers. The object must contain objective_id, verdict, evidence,
+rationale, selected_index, and subgoals. verdict is continue, complete, fail, or
+decompose. Each subgoal contains title, success_criteria, failure_criteria,
+expected_evidence, and an integer action_budget from 1 to 32. The host owns all IDs,
 tree invariants, budgets, and game/level completion. You may complete or fail only
-the active tactical objective. A game or level objective must be decomposed into
-one to six falsifiable tactical subgoals. Prefer one selected subgoal whose result
-will maximally reduce uncertainty. Keep reasoning compact and reserve response
-space for the required tool call. Do not emit actions or Python code."""
+the active tactical objective. A game or level objective must be decomposed into one
+to six falsifiable tactical subgoals. Prefer the selected subgoal whose result will
+maximally reduce uncertainty. Copy objective_id exactly from
+active_objective.objective_id in the user payload; the example below illustrates only
+the response shape. Normally give a tactical policy at least four actions so it can
+observe and adapt without another LLM call. Use action_budget=1 only when one action
+plus its following observation conclusively resolves the subgoal. Use valid JSON with
+double-quoted keys and strings. Keep reasoning compact and reserve response space for
+the complete JSON object. All valid action names are already model-facing: UP, DOWN,
+LEFT, RIGHT, SPACE, MOUSE, or ACTION7. These meanings are exact, not hypotheses.
+MOUSE always requires integer row and col coordinates from 0 through 63. Never invent
+or reason about hidden ACTION1 through ACTION6 aliases. A mere board change is not
+necessarily progress: volatile_only and exact_noop outcomes are negative evidence.
+
+BEGIN_REDUCTION
+{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"probe one legal action","selected_index":0,"subgoals":[{"title":"Probe a legal action","success_criteria":"observe a useful transition","failure_criteria":"action is rejected or unchanged","expected_evidence":"one host transition","action_budget":4}]}
+END_REDUCTION"""
 
 _CODER_SYSTEM_PROMPT = """You are the gameplay-policy coder role for an ARC-AGI-3 game.
-Think carefully, then call submit_policy exactly once with a complete Python module.
-The module must define POLICY_API_VERSION = 1, SUPPORTED_BACKENDS containing cpu,
-optional initialize(context), and decide(observation, memory). decide returns a
-PolicyDecision or equivalent mapping. A continue decision must contain exactly one
-currently-valid action. subgoal_succeeded/subgoal_failed contain no action. The
-observation has immutable uint8 board[64,64], level, step, valid_actions,
-last_transition, objective, recent_transitions, and backend. Allowed imports are
-math/statistics/collections/itertools/functools/heapq/bisect/numpy and optional
-lazy torch. No files, network, subprocesses, reflection, engine calls, or hidden
-state. Keep all persistent state finite and JSON-serializable. CPU is mandatory;
-CUDA may only be an optional optimization. Keep reasoning compact and reserve
-response space for the complete policy and required tool call."""
+Think about the gameplay logic compactly. After thinking, your visible answer must be
+exactly one complete Python module between BEGIN_POLICY and END_POLICY lines. Do not
+use a tool call, JSON, Markdown fences, prose, placeholders, or truncated functions.
+The host owns and associates the active objective; do not emit objective metadata.
+Preserve all Python quotes, newlines, spaces, and indentation exactly.
+
+PolicyObservation is an immutable object, not a mapping. Read its public attributes:
+observation.board, observation.level, observation.step, observation.valid_actions,
+observation.last_transition, observation.objective, observation.recent_transitions,
+and observation.backend. Never call observation.get(). Return mappings with the exact
+PolicyDecision wire contract. Start from this runnable envelope and place decide before
+all helper functions so the required entrypoint cannot be truncated:
+
+BEGIN_POLICY
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+
+def initialize(context):
+    return {}
+
+def decide(observation, memory):
+    action_name = observation.valid_actions[0]
+    return continue_decision(
+        action_name, memory, "why this action advances the active objective"
+    )
+END_POLICY
+
+All observation.valid_actions names are already model-facing and have exact meanings:
+UP, DOWN, LEFT, RIGHT, SPACE, MOUSE, or ACTION7. Never emit or reason about hidden
+ACTION1 through ACTION6 aliases. For MOUSE, action is
+{"action": "MOUSE", "row": row, "col": col}; integer row and col coordinates from
+0 through 63 are always required. A terminal
+decision is {"status": "subgoal_succeeded" or "subgoal_failed", "action": None,
+"memory": JSON_VALUE, "evidence": TEXT}. Keep memory finite JSON data. Optional
+helpers may follow decide. Allowed imports are math/statistics/collections/itertools/
+functools/heapq/bisect/numpy and optional lazy torch. No files, network, subprocesses,
+reflection, engine calls, or hidden state. CPU support is mandatory; CUDA is optional.
+Keep the complete source small. BEGIN_POLICY and END_POLICY must each appear exactly
+once on their own lines and are not part of the Python module.
+
+Trusted pathfinding helpers are already available as globals; do not import or redefine
+them. A passable grid is any non-empty 2D boolean-like array with at most 4096 cells;
+True cells are traversable; for example, use np.equal(observation.board, FLOOR_VALUE)
+to build one without a forbidden direct board comparison.
+cardinal_neighbors(passable, point) returns traversable
+(row, col) neighbors. shortest_path(passable, start, goal, max_expansions=4096) and
+shortest_path_to_any(passable, start, goals, max_expansions=4096) return a tuple path
+including both endpoints, or () when unreachable. Start and goal cells may be false in
+the passable mask, but intermediate cells may not. path_to_actions(path) returns exact
+UP/RIGHT/DOWN/LEFT action names. next_path_action(path, observation.valid_actions)
+returns the first currently valid action or None. All searches use deterministic
+four-way movement ordered UP, RIGHT, DOWN, LEFT and have a hard 4096-expansion ceiling.
+Use find_cells(observation.board, VALUES, max_results=4096) for deterministic row-major
+object coordinates (VALUES accepts at most 256 distinct candidates). distance_map(passable, starts, max_expansions=4096) returns a
+read-only int16 array with -1 for unreachable cells; never place it in policy memory.
+reachable_points(passable, start, max_distance=None, max_expansions=4096) returns a
+row-major tuple. connected_components(passable, min_size=1) returns passable regions
+largest-first. shortest_path_through(passable, start, ordered_waypoints,
+max_expansions_per_leg=4096) joins routes through at most 32 targets, or returns ().
+When hazards have different penalties, use weighted_shortest_path(passable, costs,
+start, goal, max_expansions=4096) or weighted_shortest_path_to_any(...); costs must be
+finite and non-negative, and path_cost(costs, path) excludes the starting cell.
+clearance_mask(passable, radius=1) makes paths respect a square actor footprint (radius
+0-8). grid_line(start, goal, shape=(64, 64)) returns a deterministic ray, while
+line_of_sight(passable, start, goal) requires its intermediate cells to be passable.
+action_destination(point, action, shape=(64, 64)) projects UP/RIGHT/DOWN/LEFT and
+returns None at an edge. Helper arrays are read-only and must never enter JSON memory.
+For multi-cell objects, value_mask(board, VALUES) creates a read-only mask;
+component_boxes(mask, min_size=1) returns (top,left,bottom,right,size), and
+component_centers(mask, min_size=1) returns a real cell nearest each box center.
+approach_points(passable, targets, distance=1) finds safe interaction cells, while
+shortest_approach_path(passable, start, targets, distance=1, max_expansions=4096)
+routes to one without stepping onto the target. Before reusing a JSON-stored route,
+call path_suffix(path, current), then path_is_valid(passable, suffix); replan if false.
+PATHFINDING_API_VERSION is 1. These globals are host-owned; do not redefine them.
+
+Prefer host decision builders over handwritten contract mappings. continue_decision(
+action, memory, evidence="", prediction=None, point=None) canonicalizes one action;
+mouse_decision(point, memory, ...) validates click coordinates. path_decision(path,
+observation.valid_actions, memory, ...) continues or returns subgoal_failed when no next
+action is valid. subgoal_succeeded(memory, evidence) and subgoal_failed(memory, evidence)
+build action-free terminal decisions. transition_outcome(last_transition) returns one of
+terminal/progress/guarded/failed/no_progress/unknown; transition_has_progress(...) and
+transition_requires_replan(..., replan_on_no_progress=True) implement host semantics.
+Before retrying, transition_repeats_nonprogress_action(last_transition, action, point=None)
+detects the exact action/coordinate repeat. POLICY_CODEGEN_API_VERSION is 1.
+Use board_digest(observation.board) for a compact stable state fingerprint; never store
+the board itself. memory_update(memory, updates), memory_push(memory, key, value,
+limit=16), and memory_increment(memory, key, amount=1, minimum=None, maximum=None)
+return new finite JSON memory with 64-key, 32-KiB, and rolling-history limits. For a
+standalone list use history_push(history, value, limit=16), then store the returned list;
+do not call memory_push with a list as its first argument. ord is available for a
+one-character string, though numeric cell values and find_cells are usually clearer.
+recent_outcome_counts(observation.recent_transitions), consecutive_outcome_count(...),
+and recent_action_counts(..., only_nonprogress=False) summarize at most 64 transitions.
+least_tried_action(observation.valid_actions, observation.recent_transitions, exclude=(),
+include_mouse=False) provides deterministic exploration without emitting an unlocated
+MOUSE action. All memory/state helpers are host-owned and bounded.
+
+observation.board is a NumPy uint8 array. Never use it directly as a boolean or compare
+it with == or !=; use board.size, np.array_equal, or a finite Python integer digest.
+Never store the board, a NumPy array, or a NumPy scalar in memory; memory must contain
+only finite JSON values. engine_state and board_hex_rows are not observation fields.
+Transition mappings expose action, row, col, executed, board_changed, reward, score,
+level, engine_state, outcome_class, novel_state, decision_context_changed,
+meaningful_progress, loop_detected, cycle_risk, no_op_streak, stagnation_actions,
+level_completed, run_complete, game_over, stop_reason, error, objective_id, and a
+bounded animation_summary. Read them with mapping.get(), never getattr().
+
+After issuing an action, the next decide call must inspect the resulting
+last_transition for the active objective. Issuing an action is never evidence that the
+subgoal succeeded. exact_noop, behavioral_noop, volatile_only, guarded, and cyclic
+outcomes are not meaningful progress. A one-shot probe must return
+subgoal_succeeded/subgoal_failed after inspecting its post-action transition; it must
+not repeat the same non-progress action. Use a finite rolling integer digest when a
+board digest is needed; hashlib/json imports, getattr, and observation.engine_state are
+not permitted. Unless action_budget is one or the engine reports level/run completion,
+the host requires up to four executed post-action observations before accepting tactical
+success. Do not return subgoal_succeeded merely for board_changed, novel_state, or
+meaningful_progress; continue gathering evidence until the complete declared success
+criteria are satisfied. volatile_only can never prove tactical success."""
 
 
 def _compact_board(frame: Frame) -> list[str]:
@@ -248,7 +316,7 @@ def _recent_transition_payload(
     for entry in history[-max(1, limit) :]:
         payload.append(
             {
-                "action": entry.action,
+                "action": to_model_action(entry.action),
                 "reward": float(entry.reward),
                 "level": entry.frame.level,
                 "step": entry.frame.step,
@@ -259,38 +327,184 @@ def _recent_transition_payload(
     return payload
 
 
-def _json_object_from_message(
-    agent: ToolAgent, message: dict[str, Any]
-) -> dict[str, Any]:
-    raw_calls = json.loads(json.dumps(message.get("tool_calls") or []))
-    calls = agent._normalize_response_tool_calls(raw_calls)
-    if not calls:
-        content = _normalize_message_content(message.get("content", ""))
-        calls = agent._normalize_response_tool_calls(
-            _recover_tool_calls_from_markup(_extract_reasoning_text(message), content)
+def _model_transition_payload(value: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(value)
+    if "action" in payload:
+        payload["action"] = to_model_action(payload.get("action"))
+    return payload
+
+
+def _finite_float(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if np.isfinite(parsed) else 0.0
+
+
+def _bounded_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _animation_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value[key]
+        for key in (
+            "frame_count",
+            "changed_frame_count",
+            "total_changed_cells",
+            "peak_changed_cells",
+            "final_changed_cells",
+            "transient_changed_cells",
+            "motion_direction",
+            "temporally_reversible",
         )
-    if calls:
-        function = calls[0].get("function") or {}
-        arguments = function.get("arguments")
-        if isinstance(arguments, dict):
-            return dict(arguments)
-        if isinstance(arguments, str):
-            decoded = json.loads(arguments)
-            if isinstance(decoded, dict):
-                return decoded
+        if key in value
+    }
+
+
+def _meaningful_progress(result: dict[str, Any]) -> bool:
+    if not result.get("executed") or result.get("error"):
+        return False
+    outcome = str(result.get("outcome_class") or "").strip().lower()
+    if (
+        result.get("loop_detected")
+        or result.get("cycle_risk")
+        or outcome in _NON_PROGRESS_OUTCOME_CLASSES
+    ):
+        return False
+    if (
+        result.get("level_completed")
+        or result.get("run_complete")
+        or _finite_float(result.get("reward")) > 0
+        or outcome in _PROGRESS_OUTCOME_CLASSES
+    ):
+        return True
+    return bool(result.get("novel_state") or result.get("decision_context_changed"))
+
+
+def _policy_transition_payload(
+    action_payload: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    objective_id: str,
+    policy_hash: str,
+) -> dict[str, Any]:
+    return {
+        "action": action_payload.get("action"),
+        "row": action_payload.get("row"),
+        "col": action_payload.get("col"),
+        "executed": bool(result.get("executed")),
+        "post_action_observed": True,
+        "board_changed": bool(result.get("board_changed")),
+        "reward": _finite_float(result.get("reward")),
+        "score": _bounded_int(result.get("score")),
+        "level": _bounded_int(result.get("level")),
+        "engine_state": str(result.get("state") or result.get("engine_state") or ""),
+        "outcome_class": str(result.get("outcome_class") or ""),
+        "novel_state": bool(result.get("novel_state")),
+        "decision_context_changed": bool(result.get("decision_context_changed")),
+        "meaningful_progress": _meaningful_progress(result),
+        "loop_detected": bool(result.get("loop_detected")),
+        "cycle_risk": bool(result.get("cycle_risk")),
+        "cycle_period": result.get("cycle_period"),
+        "no_op_streak": _bounded_int(
+            result.get("behavioral_no_op_streak", result.get("no_op_streak"))
+        ),
+        "stagnation_actions": _bounded_int(result.get("stagnation_actions")),
+        "animation_summary": _animation_summary(result.get("animation")),
+        "level_completed": bool(result.get("level_completed")),
+        "run_complete": bool(result.get("run_complete")),
+        "game_over": bool(result.get("game_over")),
+        "stop_reason": str(result.get("stop_reason") or ""),
+        "error": str(result.get("error") or ""),
+        "objective_id": objective_id,
+        "policy_hash": policy_hash,
+    }
+
+
+def _action_signature(value: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return (value.get("action"), value.get("row"), value.get("col"))
+
+
+def _repeats_non_progress_action(
+    previous: dict[str, Any] | None,
+    action: dict[str, Any],
+    *,
+    objective_id: str,
+) -> bool:
+    if not isinstance(previous, dict) or previous.get("objective_id") != objective_id:
+        return False
+    outcome = str(previous.get("outcome_class") or "").strip().lower()
+    non_progress = (
+        outcome in _NON_PROGRESS_OUTCOME_CLASSES
+        or bool(previous.get("loop_detected"))
+        or bool(previous.get("cycle_risk"))
+    )
+    return non_progress and _action_signature(previous) == _action_signature(action)
+
+
+def _content_between_markers(
+    message: dict[str, Any], *, begin: str, end: str, label: str
+) -> str:
+    if message.get("tool_calls"):
+        raise ValueError(f"{label} must return raw content, not a tool call")
     content = _normalize_message_content(message.get("content", "")).strip()
-    if content.startswith("```"):
-        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I | re.S)
-    decoded = json.loads(content)
+    if content.count(begin) != 1:
+        raise ValueError(f"{label} response must contain exactly one {begin} marker")
+    if content.count(end) != 1:
+        raise ValueError(f"{label} response must contain exactly one {end} marker")
+    for newline in ("\r\n", "\n"):
+        prefix = f"{begin}{newline}"
+        suffix = f"{newline}{end}"
+        if content.startswith(prefix) and content.endswith(suffix):
+            body = content[len(prefix) : -len(suffix)]
+            if not body.strip():
+                raise ValueError(f"{label} response contained an empty body")
+            return body
+    raise ValueError(
+        f"{label} response must contain only {begin}, a newline, the body, "
+        f"a newline, and {end}"
+    )
+
+
+def _reduction_from_message(message: dict[str, Any]) -> dict[str, Any]:
+    body = _content_between_markers(
+        message,
+        begin=_REDUCTION_BEGIN_MARKER,
+        end=_REDUCTION_END_MARKER,
+        label="reducer",
+    )
+    decoded = json.loads(body)
     if not isinstance(decoded, dict):
-        raise ValueError("structured response is not an object")
+        raise ValueError("reducer response body must be a JSON object")
     return decoded
+
+
+def _policy_source_from_message(message: dict[str, Any]) -> str:
+    return _content_between_markers(
+        message,
+        begin=_POLICY_BEGIN_MARKER,
+        end=_POLICY_END_MARKER,
+        label="coder",
+    )
 
 
 def _without_policy_source(entry: dict[str, Any]) -> dict[str, Any]:
     sanitized = dict(entry)
     content = sanitized.get("content")
     if not isinstance(content, str):
+        return sanitized
+    if (
+        content.count(_POLICY_BEGIN_MARKER) == 1
+        and content.count(_POLICY_END_MARKER) == 1
+    ):
+        sanitized["content"] = "<policy source stored as a hashed artifact>"
         return sanitized
     try:
         payload = json.loads(content)
@@ -329,6 +543,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._last_transition: dict[str, Any] | None = None
         self._recent_transitions: list[dict[str, Any]] = []
         self._consecutive_activation_failures = 0
+        self._failure_streak_objective_id = ""
         self._last_reduction_step = 0
         self._orchestration_metrics = _empty_orchestration_metrics()
         self._current_transcript_path: Path | None = None
@@ -385,6 +600,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._last_transition = None
         self._recent_transitions = []
         self._consecutive_activation_failures = 0
+        self._failure_streak_objective_id = ""
         self._last_reduction_step = 0
         self._orchestration_metrics = _empty_orchestration_metrics()
 
@@ -426,17 +642,20 @@ class OrchestratedObjectiveAgent(ToolAgent):
             self._boundary_reason = str(payload.get("boundary_reason") or "resume")
             self._reduction_required = bool(payload.get("reduction_required", False))
             self._last_transition = (
-                dict(payload["last_transition"])
+                _model_transition_payload(payload["last_transition"])
                 if isinstance(payload.get("last_transition"), dict)
                 else None
             )
             self._recent_transitions = [
-                dict(item)
+                _model_transition_payload(item)
                 for item in payload.get("recent_transitions") or []
                 if isinstance(item, dict)
             ][-8:]
             self._consecutive_activation_failures = max(
                 0, int(payload.get("consecutive_activation_failures", 0) or 0)
+            )
+            self._failure_streak_objective_id = str(
+                payload.get("failure_streak_objective_id") or ""
             )
             self._last_reduction_step = max(
                 0, int(payload.get("last_reduction_step", 0) or 0)
@@ -493,6 +712,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "last_transition": self._last_transition,
             "recent_transitions": self._recent_transitions[-8:],
             "consecutive_activation_failures": self._consecutive_activation_failures,
+            "failure_streak_objective_id": self._failure_streak_objective_id,
             "last_reduction_step": self._last_reduction_step,
             "metrics": self._orchestration_metrics,
             "total_tokens": self._session_total_tokens,
@@ -571,9 +791,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         ]
         return min(limits) if limits else None
 
-    def _role_thinking_budget(
-        self, role: str, output_limit: int | None
-    ) -> int | None:
+    def _role_thinking_budget(self, role: str, output_limit: int | None) -> int | None:
         budget = self._orchestration_role_thinking_budget.get(role)
         if budget is None or budget <= 0:
             return None
@@ -589,13 +807,13 @@ class OrchestratedObjectiveAgent(ToolAgent):
         role: str,
         system_prompt: str,
         user_payload: dict[str, Any],
-        tool: dict[str, Any],
         validator: Callable[[dict[str, Any]], Any],
         request_deadline: float | None,
         should_stop: Callable[[], bool] | None,
     ) -> Any:
         history = self._role_histories[role]
-        correction = ""
+        corrections: list[str] = []
+        rejected_policy_source = ""
         last_error = ""
         for attempt in range(1, _MAX_STRUCTURED_ATTEMPTS + 1):
             if should_stop is not None and should_stop():
@@ -609,8 +827,46 @@ class OrchestratedObjectiveAgent(ToolAgent):
             user_text = json.dumps(
                 user_payload, ensure_ascii=False, separators=(",", ":")
             )
-            if correction:
-                user_text += f"\nPrevious response was rejected: {correction}\nReturn a corrected tool call."
+            if corrections:
+                reducer_requires_decomposition = role == "reducer" and any(
+                    "game and level objectives must be decomposed" in item.lower()
+                    for item in corrections
+                )
+                response_instruction = (
+                    (
+                        "The active objective is host-controlled. Copy its objective_id "
+                        'exactly, use verdict="decompose", provide one to six tactical '
+                        "subgoals, and select one. Do not return continue, complete, or fail."
+                        if reducer_requires_decomposition
+                        else "Return a corrected raw BEGIN_REDUCTION/END_REDUCTION JSON object."
+                    )
+                    if role == "reducer"
+                    else (
+                        "Minimally repair the rejected module and return one complete "
+                        "raw BEGIN_POLICY/END_POLICY module. Fix every listed error; "
+                        "do not introduce reflection or undocumented observation fields."
+                    )
+                )
+                user_text += (
+                    "\nPrevious validation errors; every item must be fixed:\n- "
+                    + "\n- ".join(corrections)
+                    + "\n"
+                    f"{response_instruction}"
+                )
+                if role == "coder" and rejected_policy_source:
+                    bounded_source = rejected_policy_source[
+                        :_MAX_REJECTED_POLICY_REPAIR_CHARS
+                    ]
+                    truncation = (
+                        "\n[rejected source truncated by host]"
+                        if len(rejected_policy_source) > len(bounded_source)
+                        else ""
+                    )
+                    user_text += (
+                        "\n<REJECTED_POLICY_SOURCE>\n"
+                        f"{bounded_source}{truncation}\n"
+                        "</REJECTED_POLICY_SOURCE>"
+                    )
             messages = [
                 {"role": "system", "content": system_prompt},
                 *history[-_MAX_ROLE_HISTORY:],
@@ -631,16 +887,17 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 request_timeout_seconds=request_timeout,
                 max_output_tokens=output_limit,
                 thinking_token_budget=thinking_budget,
-                tool_choice=_ORCHESTRATION_TOOL_CHOICE,
+                tool_choice=None,
+                response_mode="raw_reduction" if role == "reducer" else "raw_policy",
             )
             try:
                 result = self.model_client.complete(
                     messages,
-                    tools=[tool],
+                    tools=None,
                     request_timeout_seconds=request_timeout,
                     max_output_tokens=output_limit,
                     thinking_token_budget=thinking_budget,
-                    tool_choice=_ORCHESTRATION_TOOL_CHOICE,
+                    tool_choice=None,
                     request_attempt_limit=1,
                 )
             except requests.RequestException as exc:
@@ -703,8 +960,14 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 finish_reason=str(getattr(result, "finish_reason", "") or ""),
             )
             reasoning = _extract_reasoning_text(result.message)
+            raw: dict[str, Any] | None = None
             try:
-                raw = _json_object_from_message(self, result.message)
+                if role == "coder":
+                    raw = {"source": _policy_source_from_message(result.message)}
+                elif role == "reducer":
+                    raw = _reduction_from_message(result.message)
+                else:
+                    raise ValueError(f"unsupported orchestration role {role!r}")
                 value = validator(raw)
             except (
                 KeyError,
@@ -715,12 +978,37 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 PolicyRuntimeError,
             ) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
-                correction = last_error[:2000]
-                self._append_transcript(f"{role.upper()} REJECTED", correction)
+                correction = last_error[:4000]
+                if correction not in corrections:
+                    corrections.append(correction)
+                if role == "coder" and isinstance(raw, dict):
+                    rejected_source = raw.get("source")
+                    if isinstance(rejected_source, str) and rejected_source.strip():
+                        rejected_policy_source = rejected_source
+                        self._record_rejected_policy_candidate(
+                            rejected_source,
+                            phase="raw_content_validation",
+                            detail=str(exc),
+                            category=str(getattr(exc, "category", "structured_output")),
+                            structured_attempt=attempt,
+                        )
+                self._append_transcript(
+                    f"{role.upper()} REJECTED",
+                    {"current_error": correction, "all_errors": corrections},
+                )
                 continue
+            if role == "coder":
+                assistant_content = (
+                    f"{_POLICY_BEGIN_MARKER}\n{raw['source']}\n{_POLICY_END_MARKER}"
+                )
+            else:
+                encoded = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+                assistant_content = (
+                    f"{_REDUCTION_BEGIN_MARKER}\n{encoded}\n{_REDUCTION_END_MARKER}"
+                )
             assistant_entry: dict[str, Any] = {
                 "role": "assistant",
-                "content": json.dumps(raw, ensure_ascii=False, separators=(",", ":")),
+                "content": assistant_content,
             }
             if reasoning:
                 assistant_entry["reasoning_content"] = reasoning[-6000:]
@@ -756,9 +1044,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 "level": frame.level,
                 "step": frame.step,
                 "engine_state": frame.engine_state,
-                "valid_actions": list(frame.valid_actions),
+                "valid_actions": to_model_actions(frame.valid_actions),
                 "board_hex_rows": _compact_board(frame),
             },
+            "action_contract": dict(_MODEL_ACTION_CONTRACT),
             "recent_transitions": _recent_transition_payload(history),
             "policy_repairs_for_active": self._policy_repairs.get(
                 self._tree.active_id, 0
@@ -785,7 +1074,6 @@ class OrchestratedObjectiveAgent(ToolAgent):
             role="reducer",
             system_prompt=_REDUCER_SYSTEM_PROMPT,
             user_payload=self._reducer_payload(frame, history),
-            tool=_REDUCTION_TOOL,
             validator=validate_reduction,
             request_deadline=request_deadline,
             should_stop=should_stop,
@@ -820,9 +1108,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 "level": frame.level,
                 "step": frame.step,
                 "engine_state": frame.engine_state,
-                "valid_actions": list(frame.valid_actions),
+                "valid_actions": to_model_actions(frame.valid_actions),
                 "board_hex_rows": _compact_board(frame),
             },
+            "action_contract": dict(_MODEL_ACTION_CONTRACT),
             "recent_transitions": _recent_transition_payload(history),
             "requested_backend": os.environ.get("LOCAL_GAMEPLAY_POLICY_BACKEND", "cpu"),
             "repair_reason": repair,
@@ -831,30 +1120,13 @@ class OrchestratedObjectiveAgent(ToolAgent):
     def _policy_validator(self, raw: dict[str, Any]) -> dict[str, Any]:
         if self._tree is None:
             raise PolicyRuntimeError("objective tree is unavailable")
-        objective_id = str(raw.get("objective_id") or "")
-        if objective_id != self._tree.active_id:
-            raise PolicyRuntimeError(
-                f"policy targets {objective_id!r}; active objective is {self._tree.active_id!r}",
-                category="policy_verification",
-            )
         source = str(raw.get("source") or "")
         source_hash = verify_policy_source(source)
-        capabilities = raw.get("backend_capabilities")
-        normalized_capabilities = (
-            [str(item).strip().lower() for item in capabilities]
-            if isinstance(capabilities, list)
-            else []
-        )
-        if (
-            "cpu" not in normalized_capabilities
-            or len(normalized_capabilities) != len(set(normalized_capabilities))
-            or any(item not in {"cpu", "cuda"} for item in normalized_capabilities)
-        ):
-            raise PolicyRuntimeError(
-                "backend_capabilities must contain cpu and optional cuda once each",
-                category="policy_verification",
-            )
-        return {**raw, "source": source, "source_hash": source_hash}
+        return {
+            "objective_id": self._tree.active_id,
+            "source": source,
+            "source_hash": source_hash,
+        }
 
     def _save_policy_artifact(self, source: str, source_hash: str) -> str:
         runtime_path = getattr(self, "_session_runtime_dir", None)
@@ -867,6 +1139,46 @@ class OrchestratedObjectiveAgent(ToolAgent):
         if not path.exists():
             path.write_text(source, encoding="utf-8")
         return str(path.relative_to(runtime_path.parent))
+
+    def _save_rejected_policy_artifact(self, source: str) -> tuple[str, str]:
+        content_hash = hashlib.blake2b(
+            source.encode("utf-8"), digest_size=16
+        ).hexdigest()
+        runtime_path = getattr(self, "_session_runtime_dir", None)
+        if runtime_path is None:
+            return "", content_hash
+        objective_id = self._tree.active_id if self._tree is not None else "unknown"
+        safe_objective = re.sub(r"[^A-Za-z0-9_.-]+", "_", objective_id)
+        directory = runtime_path.parent / "policies" / "rejected"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{safe_objective}-{content_hash}.py"
+        if not path.exists():
+            path.write_text(source, encoding="utf-8")
+        return str(path.relative_to(runtime_path.parent)), content_hash
+
+    def _record_rejected_policy_candidate(
+        self,
+        source: str,
+        *,
+        phase: str,
+        detail: str,
+        category: str,
+        structured_attempt: int | None = None,
+        semantic_hash: str = "",
+    ) -> None:
+        artifact, content_hash = self._save_rejected_policy_artifact(source)
+        self._emit_event(
+            "policy_candidate_rejected",
+            objective_id=self._tree.active_id if self._tree is not None else "",
+            phase=phase,
+            category=category,
+            detail=detail[:2000],
+            structured_attempt=structured_attempt,
+            content_hash=content_hash,
+            semantic_hash=semantic_hash,
+            source_bytes=len(source.encode("utf-8")),
+            artifact=artifact,
+        )
 
     def _activate_policy(
         self,
@@ -886,7 +1198,6 @@ class OrchestratedObjectiveAgent(ToolAgent):
             role="coder",
             system_prompt=_CODER_SYSTEM_PROMPT,
             user_payload=self._policy_payload(frame, history, repair_reason),
-            tool=_POLICY_TOOL,
             validator=self._policy_validator,
             request_deadline=request_deadline,
             should_stop=should_stop,
@@ -902,11 +1213,25 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     "objective": self._tree.active.to_dict(),
                 },
             )
-        except PolicyRuntimeError:
+        except PolicyRuntimeError as exc:
             runtime.close()
+            self._record_rejected_policy_candidate(
+                source,
+                phase="activation",
+                detail=str(exc),
+                category=exc.category,
+                semantic_hash=source_hash,
+            )
             raise
         if activation.source_hash != source_hash:
             runtime.close()
+            self._record_rejected_policy_candidate(
+                source,
+                phase="activation_fingerprint",
+                detail="activated policy fingerprint does not match verified source",
+                category="policy_protocol",
+                semantic_hash=source_hash,
+            )
             raise PolicyRuntimeError(
                 "activated policy fingerprint does not match verified source",
                 category="policy_protocol",
@@ -998,7 +1323,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             board=np.asarray(frame.grid, dtype=np.uint8),
             level=frame.level,
             step=frame.step,
-            valid_actions=tuple(frame.valid_actions),
+            valid_actions=tuple(to_model_actions(frame.valid_actions)),
             last_transition=self._last_transition,
             objective=self._tree.active.to_dict(),
             recent_transitions=tuple(self._recent_transitions[-8:]),
@@ -1036,10 +1361,17 @@ class OrchestratedObjectiveAgent(ToolAgent):
 
     def _policy_failure(self, exc: PolicyRuntimeError) -> None:
         assert self._tree is not None
-        self._consecutive_activation_failures += 1
         objective_id = self._tree.active_id
+        if self._failure_streak_objective_id != objective_id:
+            self._failure_streak_objective_id = objective_id
+            self._consecutive_activation_failures = 0
+        self._consecutive_activation_failures += 1
         repairs = self._policy_repairs.get(objective_id, 0) + 1
         self._policy_repairs[objective_id] = repairs
+        # A controller guard means this policy must choose a different action,
+        # not that the host-owned objective decomposition is invalid. Give the
+        # coder its bounded repairs before paying for another reducer call.
+        require_reduction = False
         self._orchestration_metrics["policy_repairs"] = (
             int(self._orchestration_metrics.get("policy_repairs", 0)) + 1
         )
@@ -1049,20 +1381,65 @@ class OrchestratedObjectiveAgent(ToolAgent):
             category=exc.category,
             detail=str(exc),
             repair=repairs,
+            repair_route="reducer" if require_reduction else "coder",
         )
-        self._invalidate_policy(f"{exc.category}: {exc}")
-        self._reduction_required = True
+        self._invalidate_policy(
+            f"{exc.category}: {exc}", require_reduction=require_reduction
+        )
+        self._reduction_required = require_reduction
         if repairs > _MAX_POLICY_REPAIRS:
             self._tree.fail_active_tactical(str(exc))
             self._orchestration_metrics["objectives_failed"] = (
                 int(self._orchestration_metrics.get("objectives_failed", 0)) + 1
             )
             self._boundary_reason = f"policy_repairs_exhausted:{objective_id}"
+            self._reduction_required = True
         if self._consecutive_activation_failures >= _MAX_CONSECUTIVE_POLICY_FAILURES:
             raise OrchestrationFailure(
                 "the initial policy and two replacements failed before executing an action",
                 category="orchestration_policy_activation_exhausted",
             ) from exc
+
+    def _tactical_completion_evidence(self) -> tuple[bool, str]:
+        """Decide whether host evidence is strong enough to resolve a tactical leaf."""
+
+        assert self._tree is not None
+        active = self._tree.active
+        required_actions = min(
+            _MIN_TACTICAL_PERSISTENCE_ACTIONS,
+            max(1, active.action_budget),
+        )
+        transition = self._last_transition
+        if not isinstance(transition, dict):
+            return False, "no post-action transition has been observed"
+        if str(transition.get("objective_id") or "") != active.objective_id:
+            return False, "the latest transition belongs to another objective"
+        if not bool(transition.get("executed")):
+            return False, "the latest proposed action was not executed"
+        if bool(transition.get("level_completed")) or bool(
+            transition.get("run_complete")
+        ):
+            return True, "engine terminal progress confirms completion"
+        outcome_class = str(transition.get("outcome_class") or "").strip().lower()
+        if outcome_class in _NON_PROGRESS_OUTCOME_CLASSES:
+            return False, f"latest transition is non-progress outcome {outcome_class}"
+        if active.actions_used < required_actions:
+            return False, (
+                f"only {active.actions_used} of {required_actions} required exploratory "
+                "actions have post-action evidence"
+            )
+        relevant = [
+            item
+            for item in self._recent_transitions
+            if str(item.get("objective_id") or "") == active.objective_id
+            and bool(item.get("executed"))
+        ]
+        if len(relevant) < required_actions:
+            return False, (
+                f"only {len(relevant)} of {required_actions} required transition "
+                "observations are retained"
+            )
+        return True, "host persistence and transition evidence requirements are met"
 
     def analyze(
         self,
@@ -1177,9 +1554,26 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     )
                     no_action_boundaries += 1
                     continue
-                if self._tree.active.remaining_actions <= 0:
-                    self._tree.fail_active_tactical("tactical action budget exhausted")
+                budget_exhausted = self._tree.active.remaining_actions <= 0
+                if budget_exhausted and (
+                    self._policy_runtime is None
+                    or self._policy_objective_id != self._tree.active_id
+                ):
+                    objective_id = self._tree.active_id
+                    evidence = (
+                        "tactical action budget exhausted before a final policy "
+                        "evaluation was available"
+                    )
+                    self._tree.fail_active_tactical(evidence)
+                    self._orchestration_metrics["objectives_failed"] = (
+                        int(self._orchestration_metrics.get("objectives_failed", 0)) + 1
+                    )
                     self._invalidate_policy("tactical_action_budget_exhausted")
+                    self._emit_event(
+                        "objective_failed",
+                        objective_id=objective_id,
+                        evidence=evidence,
+                    )
                     no_action_boundaries += 1
                     continue
                 if (
@@ -1227,6 +1621,45 @@ class OrchestratedObjectiveAgent(ToolAgent):
 
                 if decision.status is PolicyStatus.SUBGOAL_SUCCEEDED:
                     objective_id = self._tree.active_id
+                    completion_allowed, completion_reason = (
+                        self._tactical_completion_evidence()
+                    )
+                    if not completion_allowed:
+                        self._orchestration_metrics[
+                            "objective_completion_rejections"
+                        ] = (
+                            int(
+                                self._orchestration_metrics.get(
+                                    "objective_completion_rejections", 0
+                                )
+                            )
+                            + 1
+                        )
+                        self._emit_event(
+                            "objective_completion_rejected",
+                            objective_id=objective_id,
+                            evidence=decision.evidence,
+                            reason=completion_reason,
+                            actions_used=self._tree.active.actions_used,
+                            action_budget=self._tree.active.action_budget,
+                            latest_outcome_class=(
+                                self._last_transition.get("outcome_class")
+                                if self._last_transition is not None
+                                else None
+                            ),
+                        )
+                        self._policy_failure(
+                            PolicyRuntimeError(
+                                "premature subgoal_succeeded rejected by host: "
+                                f"{completion_reason}; continue the same tactical objective "
+                                "and satisfy its full success criteria",
+                                category="premature_subgoal_success",
+                            )
+                        )
+                        no_action_boundaries += 1
+                        continue
+                    self._consecutive_activation_failures = 0
+                    self._failure_streak_objective_id = ""
                     self._tree.complete_active_tactical(decision.evidence)
                     self._orchestration_metrics["objectives_completed"] = (
                         int(self._orchestration_metrics.get("objectives_completed", 0))
@@ -1242,6 +1675,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     continue
                 if decision.status is PolicyStatus.SUBGOAL_FAILED:
                     objective_id = self._tree.active_id
+                    self._consecutive_activation_failures = 0
+                    self._failure_streak_objective_id = ""
                     self._tree.fail_active_tactical(decision.evidence)
                     self._orchestration_metrics["objectives_failed"] = (
                         int(self._orchestration_metrics.get("objectives_failed", 0)) + 1
@@ -1251,6 +1686,27 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         "objective_failed",
                         objective_id=objective_id,
                         evidence=decision.evidence,
+                    )
+                    no_action_boundaries += 1
+                    continue
+
+                if budget_exhausted:
+                    objective_id = self._tree.active_id
+                    evidence = (
+                        "policy requested another action during the final post-budget "
+                        "evaluation"
+                    )
+                    if decision.evidence:
+                        evidence += f": {decision.evidence}"
+                    self._tree.fail_active_tactical(evidence)
+                    self._orchestration_metrics["objectives_failed"] = (
+                        int(self._orchestration_metrics.get("objectives_failed", 0)) + 1
+                    )
+                    self._invalidate_policy("tactical_action_budget_exhausted")
+                    self._emit_event(
+                        "objective_failed",
+                        objective_id=objective_id,
+                        evidence=evidence,
                     )
                     no_action_boundaries += 1
                     continue
@@ -1266,21 +1722,46 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     "evidence": decision.evidence,
                     **(decision.prediction or {}),
                 }
+                if _repeats_non_progress_action(
+                    self._last_transition,
+                    action_payload,
+                    objective_id=self._tree.active_id,
+                ):
+                    objective_id = self._tree.active_id
+                    evidence = (
+                        "policy repeated the same action after a non-progress "
+                        f"{self._last_transition.get('outcome_class') or 'guarded'} "
+                        "transition instead of evaluating the post-action evidence"
+                    )
+                    self._tree.fail_active_tactical(evidence)
+                    self._orchestration_metrics["objectives_failed"] = (
+                        int(self._orchestration_metrics.get("objectives_failed", 0)) + 1
+                    )
+                    self._invalidate_policy("repeated_non_progress_action")
+                    self._emit_event(
+                        "policy_non_progress_repeat_rejected",
+                        objective_id=objective_id,
+                        action=action_payload.get("action"),
+                        row=action_payload.get("row"),
+                        col=action_payload.get("col"),
+                        previous_outcome_class=self._last_transition.get(
+                            "outcome_class"
+                        ),
+                    )
+                    self._emit_event(
+                        "objective_failed",
+                        objective_id=objective_id,
+                        evidence=evidence,
+                    )
+                    no_action_boundaries += 1
+                    continue
                 result = step_env(action_payload)
-                transition = {
-                    "action": action_payload.get("action"),
-                    "row": action_payload.get("row"),
-                    "col": action_payload.get("col"),
-                    "executed": bool(result.get("executed")),
-                    "board_changed": bool(result.get("board_changed")),
-                    "level_completed": bool(result.get("level_completed")),
-                    "run_complete": bool(result.get("run_complete")),
-                    "game_over": bool(result.get("game_over")),
-                    "stop_reason": str(result.get("stop_reason") or ""),
-                    "error": str(result.get("error") or ""),
-                    "objective_id": self._tree.active_id,
-                    "policy_hash": self._policy_source_hash,
-                }
+                transition = _policy_transition_payload(
+                    action_payload,
+                    result,
+                    objective_id=self._tree.active_id,
+                    policy_hash=self._policy_source_hash,
+                )
                 self._last_transition = transition
                 self._recent_transitions.append(transition)
                 del self._recent_transitions[:-8]
@@ -1288,6 +1769,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 if result.get("executed"):
                     self._tree.record_action()
                     self._consecutive_activation_failures = 0
+                    self._failure_streak_objective_id = ""
                     self._orchestration_metrics["policy_steps"] = (
                         int(self._orchestration_metrics.get("policy_steps", 0)) + 1
                     )

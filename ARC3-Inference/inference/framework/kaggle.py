@@ -199,7 +199,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
             )
         ),
         "__LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET__": repr(
-            os.environ.get("LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET", "3072")
+            os.environ.get("LOCAL_ANALYZER_ORCHESTRATION_CODER_THINKING_BUDGET", "1024")
         ),
         "__LOCAL_GAMEPLAY_POLICY_BACKEND__": repr(
             os.environ.get("LOCAL_GAMEPLAY_POLICY_BACKEND", "cpu")
@@ -578,67 +578,75 @@ def start_vllm_server() -> None:
 
 
 def run_vllm_api_smoke_test() -> None:
-    payload = {
-        'model': SERVED_MODEL_NAME,
-        'messages': [
-            {
-                'role': 'user',
-                'content': (
-                    'Use the report_smoke_result tool exactly once with answer 4. '
-                    'Do not answer in text.'
-                ),
-            }
-        ],
-        'temperature': 0.0,
-        'max_tokens': 256,
-        'chat_template_kwargs': {'enable_thinking': True},
-        'thinking_token_budget': 64,
-        'tools': [
-            {
-                'type': 'function',
-                'function': {
-                    'name': 'report_smoke_result',
-                    'description': 'Report the result of the vLLM startup smoke test.',
-                    'parameters': {
-                        'type': 'object',
-                        'properties': {'answer': {'type': 'integer'}},
-                        'required': ['answer'],
-                        'additionalProperties': False,
-                    },
-                },
-            }
-        ],
-        'tool_choice': 'required',
-    }
-    try:
+    def assert_raw_fidelity(label: str, fixture: str, max_tokens: int) -> None:
         response = request_json(
-            f'{VLLM_BASE_URL}/chat/completions', payload=payload, timeout=120
+            f'{VLLM_BASE_URL}/chat/completions',
+            payload={
+                'model': SERVED_MODEL_NAME,
+                'messages': [
+                    {
+                        'role': 'user',
+                        'content': (
+                            f'Copy the following {label} envelope exactly. Preserve every '
+                            'quote, newline, space, and indentation character. Output no '
+                            'other text.\n\n' + fixture
+                        ),
+                    }
+                ],
+                'temperature': 0.0,
+                'max_tokens': max_tokens,
+                'chat_template_kwargs': {'enable_thinking': True},
+                'thinking_token_budget': 64,
+            },
+            timeout=120,
         )
         choices = response.get('choices')
         if not isinstance(choices, list) or not choices:
-            raise ValueError('response did not contain a choice')
+            raise ValueError(f'raw-{label} response did not contain a choice')
         message = choices[0].get('message')
         if not isinstance(message, dict):
-            raise ValueError('response choice did not contain a message')
-        tool_calls = message.get('tool_calls')
-        if not isinstance(tool_calls, list) or len(tool_calls) != 1:
-            raise ValueError('response did not contain exactly one required tool call')
-        function = tool_calls[0].get('function')
-        if not isinstance(function, dict) or function.get('name') != 'report_smoke_result':
-            raise ValueError('response called the wrong smoke-test tool')
-        arguments = json.loads(function.get('arguments', ''))
-        if not isinstance(arguments, dict) or not isinstance(arguments.get('answer'), int):
-            raise ValueError('smoke-test tool arguments were not valid JSON arguments')
+            raise ValueError(f'raw-{label} response did not contain a message')
+        content = message.get('content')
+        if not isinstance(content, str) or content.strip() != fixture:
+            raise ValueError(
+                f'raw-{label} fidelity check changed quotes, newlines, or indentation'
+            )
+
+    reduction_fixture = (
+        'BEGIN_REDUCTION\n'
+        '{\n'
+        '  "objective_id": "level:1:1",\n'
+        '  "verdict": "continue",\n'
+        '  "evidence": "board unchanged",\n'
+        '  "rationale": "continue the active probe",\n'
+        '  "selected_index": 0,\n'
+        '  "subgoals": []\n'
+        '}\n'
+        'END_REDUCTION'
+    )
+    policy_fixture = (
+        'BEGIN_POLICY\n'
+        'POLICY_API_VERSION = 1\n'
+        'SUPPORTED_BACKENDS = ("cpu",)\n'
+        'def decide(observation, memory):\n'
+        '    return {"status": "continue", "action": '
+        '{"action": "ACTION6"}, "memory": memory}\n'
+        'END_POLICY'
+    )
+    try:
+        assert_raw_fidelity('reduction', reduction_fixture, 512)
+        assert_raw_fidelity('policy', policy_fixture, 512)
     except Exception as exc:
         raise RuntimeError(
             server_failure_message(
-                'vLLM bounded-thinking/required-tool smoke test failed: '
+                'vLLM bounded-thinking/raw-orchestration smoke test failed: '
                 f'{type(exc).__name__}: {exc}'
             )
         ) from exc
     print('\n' + '=' * 88, flush=True)
-    print('VLLM OPENAI SERVER QWEN BOUNDED-THINKING TOOL SMOKE TEST', flush=True)
-    print('Tool call:', tool_calls[0], flush=True)
+    print('VLLM OPENAI SERVER QWEN BOUNDED-THINKING TRANSPORT SMOKE TEST', flush=True)
+    print('Raw reduction JSON fidelity: passed', flush=True)
+    print('Raw policy source fidelity: passed', flush=True)
     print('=' * 88 + '\n', flush=True)
 
 
