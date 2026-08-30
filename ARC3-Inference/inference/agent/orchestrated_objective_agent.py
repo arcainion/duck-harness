@@ -64,6 +64,7 @@ _NON_PROGRESS_OUTCOME_CLASSES = frozenset(
         "exact_noop",
         "behavioral_noop",
         "volatile_only",
+        "transient_effect",
         "cycle",
         "cycle_risk",
         "guarded",
@@ -118,6 +119,7 @@ def _empty_orchestration_metrics() -> dict[str, int | float]:
         "objectives_completed": 0,
         "objectives_failed": 0,
         "objective_completion_rejections": 0,
+        "objective_completion_reinterpretations": 0,
     }
 
 
@@ -299,7 +301,11 @@ not permitted. Unless action_budget is one or the engine reports level/run compl
 the host requires up to four executed post-action observations before accepting tactical
 success. Do not return subgoal_succeeded merely for board_changed, novel_state, or
 meaningful_progress; continue gathering evidence until the complete declared success
-criteria are satisfied. volatile_only can never prove tactical success."""
+criteria are satisfied. volatile_only and transient_effect can never prove tactical
+success. Runtime transition history is objective-scoped: at entry to a new tactical
+objective observation.last_transition is None, and recent_transitions contains only
+transitions from that objective. Never evaluate post-action evidence until
+last_transition is a mapping produced by this objective."""
 
 
 def _compact_board(frame: Frame) -> list[str]:
@@ -538,6 +544,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_artifact = ""
         self._policy_memory: Any = {}
         self._policy_repairs: dict[str, int] = {}
+        self._premature_completion_repairs: dict[str, int] = {}
+        self._policy_executed_action = False
         self._boundary_reason = "game_start"
         self._reduction_required = True
         self._last_transition: dict[str, Any] | None = None
@@ -595,6 +603,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_artifact = ""
         self._policy_memory = {}
         self._policy_repairs = {}
+        self._premature_completion_repairs = {}
+        self._policy_executed_action = False
         self._boundary_reason = "game_start"
         self._reduction_required = True
         self._last_transition = None
@@ -639,6 +649,15 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 str(key): max(0, int(value or 0))
                 for key, value in (payload.get("policy_repairs") or {}).items()
             }
+            self._premature_completion_repairs = {
+                str(key): max(0, int(value or 0))
+                for key, value in (
+                    payload.get("premature_completion_repairs") or {}
+                ).items()
+            }
+            self._policy_executed_action = bool(
+                payload.get("policy_executed_action", False)
+            )
             self._boundary_reason = str(payload.get("boundary_reason") or "resume")
             self._reduction_required = bool(payload.get("reduction_required", False))
             self._last_transition = (
@@ -707,6 +726,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "policy_artifact": self._policy_artifact,
             "policy_memory": self._policy_memory,
             "policy_repairs": self._policy_repairs,
+            "premature_completion_repairs": self._premature_completion_repairs,
+            "policy_executed_action": self._policy_executed_action,
             "boundary_reason": self._boundary_reason,
             "reduction_required": self._reduction_required,
             "last_transition": self._last_transition,
@@ -1049,6 +1070,11 @@ class OrchestratedObjectiveAgent(ToolAgent):
             },
             "action_contract": dict(_MODEL_ACTION_CONTRACT),
             "recent_transitions": _recent_transition_payload(history),
+            "runtime_transition_scope": (
+                "PolicyObservation.last_transition and recent_transitions contain only "
+                "transitions whose objective_id matches active_objective. At objective "
+                "entry last_transition is None until this policy executes an action."
+            ),
             "policy_repairs_for_active": self._policy_repairs.get(
                 self._tree.active_id, 0
             ),
@@ -1243,6 +1269,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_source_hash = source_hash
         self._policy_artifact = self._save_policy_artifact(source, source_hash)
         self._policy_memory = runtime.memory
+        self._policy_executed_action = False
         self._orchestration_metrics["policy_activations"] = (
             int(self._orchestration_metrics.get("policy_activations", 0)) + 1
         )
@@ -1267,6 +1294,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             self._policy_runtime.close()
         self._policy_runtime = None
         self._policy_objective_id = ""
+        self._policy_executed_action = False
         self._boundary_reason = reason
         self._reduction_required = self._reduction_required or require_reduction
 
@@ -1319,14 +1347,26 @@ class OrchestratedObjectiveAgent(ToolAgent):
             raise PolicyRuntimeError(
                 "policy observation requested without active runtime"
             )
+        active_id = self._tree.active_id
+        active_transitions = tuple(
+            item
+            for item in self._recent_transitions
+            if str(item.get("objective_id") or "") == active_id
+        )[-8:]
+        last_transition = (
+            self._last_transition
+            if isinstance(self._last_transition, dict)
+            and str(self._last_transition.get("objective_id") or "") == active_id
+            else None
+        )
         return PolicyObservation(
             board=np.asarray(frame.grid, dtype=np.uint8),
             level=frame.level,
             step=frame.step,
             valid_actions=tuple(to_model_actions(frame.valid_actions)),
-            last_transition=self._last_transition,
+            last_transition=last_transition,
             objective=self._tree.active.to_dict(),
-            recent_transitions=tuple(self._recent_transitions[-8:]),
+            recent_transitions=active_transitions,
             backend=self._policy_runtime.activation.backend,
         )
 
@@ -1359,19 +1399,22 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 level=frame.level,
             )
 
-    def _policy_failure(self, exc: PolicyRuntimeError) -> None:
+    def _policy_failure(
+        self,
+        exc: PolicyRuntimeError,
+        *,
+        counts_activation_failure: bool = True,
+    ) -> None:
         assert self._tree is not None
         objective_id = self._tree.active_id
-        if self._failure_streak_objective_id != objective_id:
-            self._failure_streak_objective_id = objective_id
-            self._consecutive_activation_failures = 0
-        self._consecutive_activation_failures += 1
+        if counts_activation_failure:
+            if self._failure_streak_objective_id != objective_id:
+                self._failure_streak_objective_id = objective_id
+                self._consecutive_activation_failures = 0
+            self._consecutive_activation_failures += 1
         repairs = self._policy_repairs.get(objective_id, 0) + 1
         self._policy_repairs[objective_id] = repairs
-        # A controller guard means this policy must choose a different action,
-        # not that the host-owned objective decomposition is invalid. Give the
-        # coder its bounded repairs before paying for another reducer call.
-        require_reduction = False
+        require_reduction = repairs > _MAX_POLICY_REPAIRS
         self._orchestration_metrics["policy_repairs"] = (
             int(self._orchestration_metrics.get("policy_repairs", 0)) + 1
         )
@@ -1382,19 +1425,30 @@ class OrchestratedObjectiveAgent(ToolAgent):
             detail=str(exc),
             repair=repairs,
             repair_route="reducer" if require_reduction else "coder",
+            counts_activation_failure=counts_activation_failure,
         )
         self._invalidate_policy(
             f"{exc.category}: {exc}", require_reduction=require_reduction
         )
         self._reduction_required = require_reduction
         if repairs > _MAX_POLICY_REPAIRS:
-            self._tree.fail_active_tactical(str(exc))
+            evidence = f"policy repairs exhausted: {exc}"
+            self._tree.fail_active_tactical(evidence)
             self._orchestration_metrics["objectives_failed"] = (
                 int(self._orchestration_metrics.get("objectives_failed", 0)) + 1
             )
             self._boundary_reason = f"policy_repairs_exhausted:{objective_id}"
             self._reduction_required = True
-        if self._consecutive_activation_failures >= _MAX_CONSECUTIVE_POLICY_FAILURES:
+            self._emit_event(
+                "objective_failed",
+                objective_id=objective_id,
+                evidence=evidence,
+            )
+        if (
+            counts_activation_failure
+            and self._consecutive_activation_failures
+            >= _MAX_CONSECUTIVE_POLICY_FAILURES
+        ):
             raise OrchestrationFailure(
                 "the initial policy and two replacements failed before executing an action",
                 category="orchestration_policy_activation_exhausted",
@@ -1440,6 +1494,77 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 "observations are retained"
             )
         return True, "host persistence and transition evidence requirements are met"
+
+    def _adjudicate_rejected_completion(
+        self,
+        *,
+        policy_evidence: str,
+        completion_reason: str,
+    ) -> None:
+        """Repair one early positive claim, but fail non-progress or repeated claims."""
+
+        assert self._tree is not None
+        objective_id = self._tree.active_id
+        transition = self._last_transition
+        outcome_class = (
+            str(transition.get("outcome_class") or "").strip().lower()
+            if isinstance(transition, dict)
+            and str(transition.get("objective_id") or "") == objective_id
+            else ""
+        )
+        previous_repairs = self._premature_completion_repairs.get(objective_id, 0)
+        fail_tactical = (
+            outcome_class in _NON_PROGRESS_OUTCOME_CLASSES or previous_repairs >= 1
+        )
+        if not fail_tactical:
+            self._premature_completion_repairs[objective_id] = previous_repairs + 1
+            self._policy_failure(
+                PolicyRuntimeError(
+                    "premature subgoal_succeeded rejected by host: "
+                    f"{completion_reason}; continue the same tactical objective and "
+                    "satisfy its full success criteria",
+                    category="premature_subgoal_success",
+                ),
+                counts_activation_failure=False,
+            )
+            return
+
+        evidence = (
+            "host reinterpreted rejected subgoal success as tactical failure: "
+            f"{completion_reason}"
+        )
+        if policy_evidence:
+            evidence += f"; policy evidence: {policy_evidence}"
+        self._tree.fail_active_tactical(evidence)
+        self._orchestration_metrics["objectives_failed"] = (
+            int(self._orchestration_metrics.get("objectives_failed", 0)) + 1
+        )
+        self._orchestration_metrics["objective_completion_reinterpretations"] = (
+            int(
+                self._orchestration_metrics.get(
+                    "objective_completion_reinterpretations", 0
+                )
+            )
+            + 1
+        )
+        self._consecutive_activation_failures = 0
+        self._failure_streak_objective_id = ""
+        self._invalidate_policy(
+            f"rejected_subgoal_success:{objective_id}", require_reduction=True
+        )
+        self._emit_event(
+            "objective_completion_reinterpreted",
+            objective_id=objective_id,
+            adjudication="failed",
+            reason=completion_reason,
+            outcome_class=outcome_class or None,
+            prior_completion_repairs=previous_repairs,
+        )
+        self._emit_event(
+            "objective_failed",
+            objective_id=objective_id,
+            evidence=evidence,
+        )
 
     def analyze(
         self,
@@ -1590,7 +1715,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                             repair_reason=repair_reason,
                         )
                     except PolicyRuntimeError as exc:
-                        self._policy_failure(exc)
+                        self._policy_failure(exc, counts_activation_failure=True)
                         no_action_boundaries += 1
                         continue
                     remaining = self._remaining_seconds(turn_deadline)
@@ -1615,7 +1740,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     )
                     self._policy_memory = self._policy_runtime.memory
                 except PolicyRuntimeError as exc:
-                    self._policy_failure(exc)
+                    self._policy_failure(
+                        exc,
+                        counts_activation_failure=not self._policy_executed_action,
+                    )
                     no_action_boundaries += 1
                     continue
 
@@ -1648,13 +1776,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
                                 else None
                             ),
                         )
-                        self._policy_failure(
-                            PolicyRuntimeError(
-                                "premature subgoal_succeeded rejected by host: "
-                                f"{completion_reason}; continue the same tactical objective "
-                                "and satisfy its full success criteria",
-                                category="premature_subgoal_success",
-                            )
+                        self._adjudicate_rejected_completion(
+                            policy_evidence=decision.evidence,
+                            completion_reason=completion_reason,
                         )
                         no_action_boundaries += 1
                         continue
@@ -1768,6 +1892,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 self._emit_event("gameplay_decision", **transition)
                 if result.get("executed"):
                     self._tree.record_action()
+                    self._policy_executed_action = True
                     self._consecutive_activation_failures = 0
                     self._failure_streak_objective_id = ""
                     self._orchestration_metrics["policy_steps"] = (
@@ -1797,7 +1922,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         or transition["stop_reason"]
                         or "guarded action was not executed",
                         category="guarded_action",
-                    )
+                    ),
+                    counts_activation_failure=False,
                 )
                 no_action_boundaries += 1
 

@@ -1379,6 +1379,113 @@ def decide(observation, memory):
         allowed, reason = agent._tactical_completion_evidence()
         self.assertFalse(allowed)
         self.assertIn("volatile_only", reason)
+
+        agent._last_transition = {**transition, "outcome_class": "transient_effect"}
+        agent._recent_transitions[-1] = dict(agent._last_transition)
+        allowed, reason = agent._tactical_completion_evidence()
+        self.assertFalse(allowed)
+        self.assertIn("transient_effect", reason)
+        agent.close()
+
+    def test_policy_observation_filters_transitions_from_previous_objective(
+        self,
+    ) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_for("level:1:1")),
+            remaining_level_actions=20,
+        )
+        tree.fail_active_tactical("replace first probe")
+        tree.apply_proposal(
+            ReductionProposal.from_payload(
+                reduction_for("level:1:1", title="Second probe")
+            ),
+            remaining_level_actions=20,
+        )
+        runtime = _FakeRuntime()
+        runtime.activate(POLICY_SOURCE, context={})
+        agent._tree = tree
+        agent._policy_runtime = runtime
+        agent._policy_objective_id = "tactical:2"
+        previous = {
+            "objective_id": "tactical:1",
+            "executed": True,
+            "outcome_class": "novel",
+        }
+        current = {
+            "objective_id": "tactical:2",
+            "executed": True,
+            "outcome_class": "novel",
+        }
+        agent._last_transition = previous
+        agent._recent_transitions = [previous]
+        scoped = agent._observation(frame())
+        self.assertIsNone(scoped.last_transition)
+        self.assertEqual((), scoped.recent_transitions)
+
+        agent._last_transition = current
+        agent._recent_transitions.append(current)
+        scoped = agent._observation(frame(step=1))
+        self.assertEqual(current, scoped.last_transition)
+        self.assertEqual((current,), scoped.recent_transitions)
+        agent.close()
+
+    def test_nonprogress_success_is_failed_without_coder_repair(self) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_for("level:1:1")),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+        agent._last_transition = {
+            "objective_id": "tactical:1",
+            "executed": True,
+            "outcome_class": "exact_noop",
+        }
+        agent._adjudicate_rejected_completion(
+            policy_evidence="incorrectly claimed success",
+            completion_reason="latest transition is non-progress outcome exact_noop",
+        )
+        self.assertEqual(ObjectiveStatus.FAILED, tree.nodes["tactical:1"].status)
+        self.assertTrue(agent._reduction_required)
+        self.assertEqual({}, agent._policy_repairs)
+        self.assertEqual(0, agent._consecutive_activation_failures)
+        self.assertEqual(
+            1,
+            agent._orchestration_metrics["objective_completion_reinterpretations"],
+        )
+        agent.close()
+
+    def test_repeated_early_positive_success_fails_leaf_not_game(self) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_for("level:1:1")),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+        agent._last_transition = {
+            "objective_id": "tactical:1",
+            "executed": True,
+            "outcome_class": "novel",
+        }
+        agent._adjudicate_rejected_completion(
+            policy_evidence="one novel transition",
+            completion_reason="only 1 of 4 required exploratory actions",
+        )
+        self.assertEqual(ObjectiveStatus.ACTIVE, tree.nodes["tactical:1"].status)
+        self.assertEqual(1, agent._policy_repairs["tactical:1"])
+        self.assertEqual(0, agent._consecutive_activation_failures)
+
+        agent._adjudicate_rejected_completion(
+            policy_evidence="same early claim",
+            completion_reason="only 1 of 4 required exploratory actions",
+        )
+        self.assertEqual(ObjectiveStatus.FAILED, tree.nodes["tactical:1"].status)
+        self.assertTrue(agent._reduction_required)
+        self.assertEqual(0, agent._consecutive_activation_failures)
         agent.close()
 
     def test_policy_artifact_and_memory_resume_without_llm(self) -> None:
@@ -1492,6 +1599,26 @@ def decide(observation, memory):
             RuntimeError, "initial policy and two replacements"
         ):
             agent._policy_failure(failure)
+        self.assertTrue(agent._reduction_required)
+        agent.close()
+
+    def test_post_action_failures_exhaust_leaf_without_activation_exhaustion(
+        self,
+    ) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_for("level:1:1")),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+        failure = PolicyRuntimeError(
+            "bad post-action decision", category="policy_runtime"
+        )
+        for _ in range(3):
+            agent._policy_failure(failure, counts_activation_failure=False)
+        self.assertEqual(ObjectiveStatus.FAILED, tree.nodes["tactical:1"].status)
+        self.assertEqual(0, agent._consecutive_activation_failures)
         self.assertTrue(agent._reduction_required)
         agent.close()
 
