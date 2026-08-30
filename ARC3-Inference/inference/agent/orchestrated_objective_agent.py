@@ -120,6 +120,7 @@ def _empty_orchestration_metrics() -> dict[str, int | float]:
         "objectives_failed": 0,
         "objective_completion_rejections": 0,
         "objective_completion_reinterpretations": 0,
+        "objective_failure_rejections": 0,
     }
 
 
@@ -282,6 +283,8 @@ MOUSE action. All memory/state helpers are host-owned and bounded.
 
 observation.board is a NumPy uint8 array. Never use it directly as a boolean or compare
 it with == or !=; use board.size, np.array_equal, or a finite Python integer digest.
+It is always non-None with shape (64, 64): never check board is None and never call
+hasattr(board, "shape"); read board.shape and board.size directly.
 Never store the board, a NumPy array, or a NumPy scalar in memory; memory must contain
 only finite JSON values. engine_state and board_hex_rows are not observation fields.
 Transition mappings expose action, row, col, executed, board_changed, reward, score,
@@ -305,7 +308,11 @@ criteria are satisfied. volatile_only and transient_effect can never prove tacti
 success. Runtime transition history is objective-scoped: at entry to a new tactical
 objective observation.last_transition is None, and recent_transitions contains only
 transitions from that objective. Never evaluate post-action evidence until
-last_transition is a mapping produced by this objective."""
+last_transition is a mapping produced by this objective. The host preflights a new
+policy against up to four synthetic exact_noop observations: it must keep selecting a
+different valid probe rather than repeat or terminate early. Unless game_over or the
+action budget is exhausted, do not return subgoal_failed before the same minimum
+evidence count required for success."""
 
 
 def _compact_board(frame: Frame) -> list[str]:
@@ -480,6 +487,19 @@ def _content_between_markers(
 
 
 def _reduction_from_message(message: dict[str, Any]) -> dict[str, Any]:
+    if message.get("tool_calls"):
+        raise ValueError("reducer must return raw content, not a tool call")
+    content = _normalize_message_content(message.get("content", "")).strip()
+    if _REDUCTION_BEGIN_MARKER not in content and _REDUCTION_END_MARKER not in content:
+        decoder = json.JSONDecoder()
+        decoded, end_index = decoder.raw_decode(content)
+        if content[end_index:].strip():
+            raise ValueError(
+                "bare reducer JSON fallback may not contain surrounding prose"
+            )
+        if not isinstance(decoded, dict):
+            raise ValueError("bare reducer response must be a JSON object")
+        return decoded
     body = _content_between_markers(
         message,
         begin=_REDUCTION_BEGIN_MARKER,
@@ -545,6 +565,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_memory: Any = {}
         self._policy_repairs: dict[str, int] = {}
         self._premature_completion_repairs: dict[str, int] = {}
+        self._premature_failure_repairs: dict[str, int] = {}
         self._policy_executed_action = False
         self._boundary_reason = "game_start"
         self._reduction_required = True
@@ -604,6 +625,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_memory = {}
         self._policy_repairs = {}
         self._premature_completion_repairs = {}
+        self._premature_failure_repairs = {}
         self._policy_executed_action = False
         self._boundary_reason = "game_start"
         self._reduction_required = True
@@ -653,6 +675,12 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 str(key): max(0, int(value or 0))
                 for key, value in (
                     payload.get("premature_completion_repairs") or {}
+                ).items()
+            }
+            self._premature_failure_repairs = {
+                str(key): max(0, int(value or 0))
+                for key, value in (
+                    payload.get("premature_failure_repairs") or {}
                 ).items()
             }
             self._policy_executed_action = bool(
@@ -727,6 +755,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "policy_memory": self._policy_memory,
             "policy_repairs": self._policy_repairs,
             "premature_completion_repairs": self._premature_completion_repairs,
+            "premature_failure_repairs": self._premature_failure_repairs,
             "policy_executed_action": self._policy_executed_action,
             "boundary_reason": self._boundary_reason,
             "reduction_required": self._reduction_required,
@@ -812,10 +841,15 @@ class OrchestratedObjectiveAgent(ToolAgent):
         ]
         return min(limits) if limits else None
 
-    def _role_thinking_budget(self, role: str, output_limit: int | None) -> int | None:
+    def _role_thinking_budget(
+        self, role: str, output_limit: int | None, *, attempt: int = 1
+    ) -> int | None:
         budget = self._orchestration_role_thinking_budget.get(role)
         if budget is None or budget <= 0:
             return None
+        # Keep thinking enabled on repair attempts while progressively reserving
+        # more visible-output room for the required raw envelope.
+        budget = max(64, budget // (2 ** max(0, attempt - 1)))
         if output_limit is None:
             return budget
         # Preserve room for the required structured result even if deployment
@@ -895,7 +929,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
             ]
             self._should_stop_callback = should_stop
             output_limit = self._role_output_limit(role, attempt)
-            thinking_budget = self._role_thinking_budget(role, output_limit)
+            thinking_budget = self._role_thinking_budget(
+                role, output_limit, attempt=attempt
+            )
             attempt_metric = f"{role}_attempts"
             self._orchestration_metrics[attempt_metric] = (
                 int(self._orchestration_metrics.get(attempt_metric, 0)) + 1
@@ -1013,6 +1049,13 @@ class OrchestratedObjectiveAgent(ToolAgent):
                             category=str(getattr(exc, "category", "structured_output")),
                             structured_attempt=attempt,
                         )
+                if role == "reducer":
+                    self._record_rejected_structured_response(
+                        role=role,
+                        message=result.message,
+                        detail=str(exc),
+                        structured_attempt=attempt,
+                    )
                 self._append_transcript(
                     f"{role.upper()} REJECTED",
                     {"current_error": correction, "all_errors": corrections},
@@ -1206,6 +1249,47 @@ class OrchestratedObjectiveAgent(ToolAgent):
             artifact=artifact,
         )
 
+    def _record_rejected_structured_response(
+        self,
+        *,
+        role: str,
+        message: dict[str, Any],
+        detail: str,
+        structured_attempt: int,
+    ) -> None:
+        content = _normalize_message_content(message.get("content", ""))
+        reasoning = _extract_reasoning_text(message)
+        payload = {
+            "role": role,
+            "structured_attempt": structured_attempt,
+            "detail": detail[:4000],
+            "content": content,
+            "reasoning_content": reasoning,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+        content_hash = hashlib.blake2b(
+            encoded.encode("utf-8"), digest_size=16
+        ).hexdigest()
+        runtime_path = getattr(self, "_session_runtime_dir", None)
+        artifact = ""
+        if runtime_path is not None:
+            directory = runtime_path.parent / "structured_rejected"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"{role}-{content_hash}.json"
+            if not path.exists():
+                path.write_text(encoded, encoding="utf-8")
+            artifact = str(path.relative_to(runtime_path.parent))
+        self._emit_event(
+            "structured_candidate_rejected",
+            role=role,
+            structured_attempt=structured_attempt,
+            detail=detail[:2000],
+            content_hash=content_hash,
+            content_bytes=len(content.encode("utf-8")),
+            reasoning_bytes=len(reasoning.encode("utf-8")),
+            artifact=artifact,
+        )
+
     def _activate_policy(
         self,
         frame: Frame,
@@ -1239,11 +1323,32 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     "objective": self._tree.active.to_dict(),
                 },
             )
+            if self._tree.active.actions_used == 0:
+                runtime.preflight(
+                    PolicyObservation(
+                        board=np.asarray(frame.grid, dtype=np.uint8),
+                        level=frame.level,
+                        step=frame.step,
+                        valid_actions=tuple(to_model_actions(frame.valid_actions)),
+                        last_transition=None,
+                        objective=self._tree.active.to_dict(),
+                        recent_transitions=(),
+                        backend=activation.backend,
+                    ),
+                    minimum_actions=min(
+                        _MIN_TACTICAL_PERSISTENCE_ACTIONS,
+                        max(1, self._tree.active.action_budget),
+                    ),
+                )
+                assert runtime.activation is not None
+                activation = runtime.activation
         except PolicyRuntimeError as exc:
             runtime.close()
             self._record_rejected_policy_candidate(
                 source,
-                phase="activation",
+                phase=(
+                    "preflight" if exc.category == "policy_preflight" else "activation"
+                ),
                 detail=str(exc),
                 category=exc.category,
                 semantic_hash=source_hash,
@@ -1494,6 +1599,62 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 "observations are retained"
             )
         return True, "host persistence and transition evidence requirements are met"
+
+    def _tactical_failure_evidence(self) -> tuple[bool, str]:
+        """Require bounded evidence before accepting an action-free failure claim."""
+
+        assert self._tree is not None
+        active = self._tree.active
+        required_actions = min(
+            _MIN_TACTICAL_PERSISTENCE_ACTIONS,
+            max(1, active.action_budget),
+        )
+        transition = self._last_transition
+        if (
+            not isinstance(transition, dict)
+            or str(transition.get("objective_id") or "") != active.objective_id
+        ):
+            return False, "no post-action evidence exists for this objective"
+        if bool(transition.get("game_over")):
+            return True, "engine game-over evidence confirms tactical failure"
+        if active.remaining_actions <= 0 or active.actions_used >= required_actions:
+            return True, "minimum failure evidence or tactical budget is exhausted"
+        return False, (
+            f"only {active.actions_used} of {required_actions} required exploratory "
+            "actions have post-action evidence"
+        )
+
+    def _repair_premature_failure(
+        self, *, policy_evidence: str, failure_reason: str
+    ) -> bool:
+        """Return True after scheduling one coder repair, False on repeated failure."""
+
+        assert self._tree is not None
+        objective_id = self._tree.active_id
+        repairs = self._premature_failure_repairs.get(objective_id, 0)
+        if repairs >= 1:
+            return False
+        self._premature_failure_repairs[objective_id] = repairs + 1
+        self._orchestration_metrics["objective_failure_rejections"] = (
+            int(self._orchestration_metrics.get("objective_failure_rejections", 0)) + 1
+        )
+        self._emit_event(
+            "objective_failure_rejected",
+            objective_id=objective_id,
+            evidence=policy_evidence,
+            reason=failure_reason,
+            actions_used=self._tree.active.actions_used,
+            action_budget=self._tree.active.action_budget,
+        )
+        self._policy_failure(
+            PolicyRuntimeError(
+                "premature subgoal_failed rejected by host: "
+                f"{failure_reason}; continue with a different valid probe",
+                category="premature_subgoal_failure",
+            ),
+            counts_activation_failure=False,
+        )
+        return True
 
     def _adjudicate_rejected_completion(
         self,
@@ -1799,9 +1960,23 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     continue
                 if decision.status is PolicyStatus.SUBGOAL_FAILED:
                     objective_id = self._tree.active_id
+                    failure_allowed, failure_reason = self._tactical_failure_evidence()
+                    if not failure_allowed and self._repair_premature_failure(
+                        policy_evidence=decision.evidence,
+                        failure_reason=failure_reason,
+                    ):
+                        no_action_boundaries += 1
+                        continue
                     self._consecutive_activation_failures = 0
                     self._failure_streak_objective_id = ""
-                    self._tree.fail_active_tactical(decision.evidence)
+                    evidence = decision.evidence
+                    if not failure_allowed:
+                        evidence = (
+                            "repeated premature subgoal failure accepted as tactical "
+                            f"failure after one coder repair: {failure_reason}; "
+                            f"policy evidence: {decision.evidence}"
+                        )
+                    self._tree.fail_active_tactical(evidence)
                     self._orchestration_metrics["objectives_failed"] = (
                         int(self._orchestration_metrics.get("objectives_failed", 0)) + 1
                     )
@@ -1809,7 +1984,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     self._emit_event(
                         "objective_failed",
                         objective_id=objective_id,
-                        evidence=decision.evidence,
+                        evidence=evidence,
                     )
                     no_action_boundaries += 1
                     continue

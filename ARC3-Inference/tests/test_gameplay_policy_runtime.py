@@ -126,6 +126,69 @@ class GameplayPolicyRuntimeTests(unittest.TestCase):
             self.assertEqual({"action": "ACTION1"}, decision.action)
         self.assertEqual({"calls": 1}, runtime.memory)
 
+    def test_preflight_requires_distinct_persistent_noop_probes(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    action = least_tried_action(
+        observation.valid_actions, observation.recent_transitions
+    )
+    return continue_decision(action, memory, "bounded distinct probe")
+"""
+        initial = observation(valid_actions=("UP", "RIGHT", "DOWN", "LEFT"))
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(source, context={})
+            runtime.preflight(initial, minimum_actions=4)
+            decision = runtime.decide(initial)
+        self.assertEqual({"action": "UP"}, decision.action)
+        self.assertEqual({}, decision.memory)
+
+    def test_preflight_rejects_early_terminal_and_repeated_noop_action(self) -> None:
+        early = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    if observation.last_transition is not None:
+        return subgoal_failed(memory, "one noop is enough")
+    return continue_decision("UP", memory)
+"""
+        repeated = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    return continue_decision("UP", memory)
+"""
+        initial = observation(valid_actions=("UP", "RIGHT", "DOWN", "LEFT"))
+        for source, message in (
+            (early, "terminated after only 1"),
+            (repeated, "repeated the same action"),
+        ):
+            with (
+                self.subTest(message=message),
+                GameplayPolicyRuntime(requested_backend="cpu") as runtime,
+            ):
+                runtime.activate(source, context={})
+                with self.assertRaisesRegex(PolicyRuntimeError, message) as raised:
+                    runtime.preflight(initial, minimum_actions=4)
+                self.assertEqual("policy_preflight", raised.exception.category)
+
+    def test_verifier_reports_concrete_nonnull_board_rewrite(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    board = observation.board
+    if board is None or not hasattr(board, "shape"):
+        return subgoal_failed(memory, "missing board")
+    return continue_decision(observation.valid_actions[0], memory)
+"""
+        with self.assertRaises(PolicyRuntimeError) as raised:
+            verify_policy_source(source)
+        detail = str(raised.exception)
+        self.assertIn("always a non-None uint8[64,64]", detail)
+        self.assertIn("call 'hasattr' is not permitted", detail)
+
     def test_policy_can_use_safe_ord_and_standalone_history_push(self) -> None:
         source = """
 POLICY_API_VERSION = 1

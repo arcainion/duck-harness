@@ -235,6 +235,9 @@ class _FakeRuntime:
             evidence="ordinary CPU policy step",
         )
 
+    def preflight(self, _observation: object, *, minimum_actions: int = 4) -> None:
+        del minimum_actions
+
     def set_memory(self, value: object) -> None:
         self.memory = value
 
@@ -386,10 +389,14 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
 
         self.assertEqual(payload, extracted)
 
-    def test_raw_reduction_envelope_rejects_tool_calls_and_prose(self) -> None:
+    def test_raw_reduction_accepts_one_bare_object_but_rejects_prose(self) -> None:
         payload = json.dumps(reduction_for("level:1:1"))
+        self.assertEqual(
+            json.loads(payload),
+            _reduction_from_message({"role": "assistant", "content": payload}),
+        )
         invalid_messages = [
-            {"role": "assistant", "content": payload},
+            {"role": "assistant", "content": payload + " trailing prose"},
             {
                 "role": "assistant",
                 "content": f"Here it is\nBEGIN_REDUCTION\n{payload}\nEND_REDUCTION",
@@ -732,6 +739,7 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         agent = self._agent()
         agent._orchestration_role_thinking_budget["coder"] = 9000
         self.assertEqual(8191, agent._role_thinking_budget("coder", 8192))
+        self.assertEqual(2250, agent._role_thinking_budget("coder", 8192, attempt=3))
         agent.close()
 
     def test_solver_factory_preserves_legacy_and_selects_flagged_agent(self) -> None:
@@ -1486,6 +1494,37 @@ def decide(observation, memory):
         self.assertEqual(ObjectiveStatus.FAILED, tree.nodes["tactical:1"].status)
         self.assertTrue(agent._reduction_required)
         self.assertEqual(0, agent._consecutive_activation_failures)
+        agent.close()
+
+    def test_premature_failure_gets_one_repair_then_fails_leaf(self) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_for("level:1:1")),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+        tree.record_action()
+        agent._last_transition = {
+            "objective_id": "tactical:1",
+            "executed": True,
+            "outcome_class": "exact_noop",
+            "game_over": False,
+        }
+        allowed, reason = agent._tactical_failure_evidence()
+        self.assertFalse(allowed)
+        self.assertIn("1 of 4", reason)
+        self.assertTrue(
+            agent._repair_premature_failure(
+                policy_evidence="one probe failed", failure_reason=reason
+            )
+        )
+        self.assertEqual(0, agent._consecutive_activation_failures)
+        self.assertFalse(
+            agent._repair_premature_failure(
+                policy_evidence="same early failure", failure_reason=reason
+            )
+        )
         agent.close()
 
     def test_policy_artifact_and_memory_resume_without_llm(self) -> None:

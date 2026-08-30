@@ -39,6 +39,7 @@ FORBIDDEN_CALLS = {
     "exec",
     "getattr",
     "globals",
+    "hasattr",
     "input",
     "locals",
     "open",
@@ -363,10 +364,20 @@ def verify_policy_source(source: str) -> str:
         if isinstance(node, ast.Compare):
             operands = [node.left, *node.comparators]
             if any(_is_observation_board(item, board_aliases) for item in operands):
-                reject(
-                    "observation.board cannot be compared directly; use np.array_equal "
-                    "or compare a finite scalar digest"
-                )
+                if any(
+                    isinstance(item, ast.Constant) and item.value is None
+                    for item in operands
+                ):
+                    reject(
+                        "PolicyObservation.board is always a non-None uint8[64,64] "
+                        "NumPy array; delete board is None / board is not None checks "
+                        "and use board.shape or board.size directly"
+                    )
+                else:
+                    reject(
+                        "observation.board cannot be compared directly; use "
+                        "np.array_equal or compare a finite scalar digest"
+                    )
         if isinstance(node, ast.Dict):
             for value in node.values:
                 if _is_observation_board(value, board_aliases):
@@ -802,6 +813,94 @@ class GameplayPolicyRuntime:
             backend_fallback_reason=str(response.get("backend_fallback_reason") or ""),
         )
         return self.activation
+
+    def preflight(
+        self,
+        observation: PolicyObservation,
+        *,
+        minimum_actions: int = 4,
+    ) -> None:
+        """Exercise bounded no-progress handling, then restore a fresh activation."""
+
+        if self.activation is None:
+            raise PolicyRuntimeError("no active policy", category="policy_preflight")
+        required = max(1, min(4, int(minimum_actions)))
+        source = self._source
+        context = dict(self._context)
+        recent: list[dict[str, Any]] = []
+
+        def signature(decision: PolicyDecision) -> tuple[Any, Any, Any]:
+            action = decision.action or {}
+            return action.get("action"), action.get("row"), action.get("col")
+
+        try:
+            decision = self.decide(observation)
+            if decision.status is not PolicyStatus.CONTINUE:
+                raise PolicyRuntimeError(
+                    "policy preflight terminated before proposing its first action",
+                    category="policy_preflight",
+                )
+            previous_signature = signature(decision)
+            for evidence_count in range(1, required):
+                action = dict(decision.action or {})
+                transition = {
+                    "action": action.get("action"),
+                    "row": action.get("row"),
+                    "col": action.get("col"),
+                    "executed": True,
+                    "post_action_observed": True,
+                    "board_changed": False,
+                    "reward": 0.0,
+                    "score": 0,
+                    "level": observation.level,
+                    "engine_state": "NOT_FINISHED",
+                    "outcome_class": "exact_noop",
+                    "novel_state": False,
+                    "decision_context_changed": False,
+                    "meaningful_progress": False,
+                    "loop_detected": False,
+                    "cycle_risk": False,
+                    "level_completed": False,
+                    "run_complete": False,
+                    "game_over": False,
+                    "stop_reason": "",
+                    "error": "",
+                    "objective_id": str(
+                        observation.objective.get("objective_id") or ""
+                    ),
+                }
+                recent.append(transition)
+                synthetic = PolicyObservation(
+                    board=observation.board,
+                    level=observation.level,
+                    step=observation.step + evidence_count,
+                    valid_actions=observation.valid_actions,
+                    last_transition=transition,
+                    objective=observation.objective,
+                    recent_transitions=tuple(recent),
+                    backend=observation.backend,
+                )
+                decision = self.decide(synthetic)
+                if decision.status is not PolicyStatus.CONTINUE:
+                    raise PolicyRuntimeError(
+                        "policy preflight terminated after only "
+                        f"{evidence_count} inconclusive action(s); the objective "
+                        f"requires {required}",
+                        category="policy_preflight",
+                    )
+                current_signature = signature(decision)
+                if current_signature == previous_signature:
+                    raise PolicyRuntimeError(
+                        "policy preflight repeated the same action after exact_noop "
+                        "instead of selecting another valid probe",
+                        category="policy_preflight",
+                    )
+                previous_signature = current_signature
+        except BaseException:
+            self.close()
+            raise
+        # Preflight decisions must not leak memory or module globals into gameplay.
+        self.activate(source, context=context)
 
     def decide(self, observation: PolicyObservation) -> PolicyDecision:
         if self.activation is None:
