@@ -25,6 +25,8 @@ def reduction_payload(**overrides: object) -> dict[str, object]:
                 "failure_criteria": "north is blocked",
                 "expected_evidence": "changed player coordinates",
                 "action_budget": 12,
+                "minimum_evidence_actions": 4,
+                "single_step": False,
             }
         ],
     }
@@ -44,6 +46,34 @@ class ObjectiveTreeTests(unittest.TestCase):
         self.assertEqual(7, tactical.action_budget)
         self.assertEqual(ObjectiveStatus.ACTIVE, tactical.status)
         tree.validate()
+
+    def test_host_expands_short_non_single_step_to_macro_horizon(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        subgoal = dict(reduction_payload()["subgoals"][0])  # type: ignore[index,arg-type]
+        subgoal["action_budget"] = 4
+        tactical = tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_payload(subgoals=[subgoal])),
+            remaining_level_actions=20,
+        )
+        self.assertEqual(8, tactical.action_budget)
+        self.assertEqual(4, tactical.minimum_evidence_actions)
+        self.assertFalse(tactical.single_step)
+
+    def test_explicit_single_step_preserves_one_action_contract(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        subgoal = dict(reduction_payload()["subgoals"][0])  # type: ignore[index,arg-type]
+        subgoal.update(
+            action_budget=1,
+            minimum_evidence_actions=1,
+            single_step=True,
+        )
+        tactical = tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_payload(subgoals=[subgoal])),
+            remaining_level_actions=20,
+        )
+        self.assertEqual(1, tactical.action_budget)
+        self.assertEqual(1, tactical.minimum_evidence_actions)
+        self.assertTrue(tactical.single_step)
 
     def test_model_cannot_complete_engine_owned_level(self) -> None:
         tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
@@ -138,6 +168,21 @@ class ObjectiveTreeTests(unittest.TestCase):
             with self.subTest(field=field):
                 malformed = {**base, field: "  "}
                 with self.assertRaisesRegex(ObjectiveError, field):
+                    ReductionProposal.from_payload(
+                        reduction_payload(subgoals=[malformed])
+                    )
+
+        for value in (0, 5, 1.5, "4", True, None):
+            with self.subTest(minimum_evidence_actions=value):
+                malformed = {**base, "minimum_evidence_actions": value}
+                with self.assertRaisesRegex(ObjectiveError, "minimum_evidence_actions"):
+                    ReductionProposal.from_payload(
+                        reduction_payload(subgoals=[malformed])
+                    )
+        for value in (0, 1, "false", None):
+            with self.subTest(single_step=value):
+                malformed = {**base, "single_step": value}
+                with self.assertRaisesRegex(ObjectiveError, "single_step"):
                     ReductionProposal.from_payload(
                         reduction_payload(subgoals=[malformed])
                     )
@@ -239,6 +284,8 @@ class ObjectiveTreeTests(unittest.TestCase):
                         {
                             **reduction_payload()["subgoals"][0],  # type: ignore[index, dict-item]
                             "action_budget": 1,
+                            "minimum_evidence_actions": 1,
+                            "single_step": True,
                         }
                     ]
                 )

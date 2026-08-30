@@ -48,6 +48,46 @@ def _point(value: Any) -> tuple[int, int]:
     return checked
 
 
+def _grid(value: Any) -> np.ndarray:
+    board = np.asarray(value)
+    if board.ndim != 2 or not board.shape[0] or not board.shape[1]:
+        raise ValueError("grid must be a non-empty two-dimensional array")
+    if int(board.size) > 64 * 64 or int(board.nbytes) > 65_536:
+        raise ValueError("grid exceeds the 4096-cell or 65536-byte limit")
+    if board.dtype.hasobject:
+        raise ValueError("grid may not contain object values")
+    return board
+
+
+def _matching_mask(board: np.ndarray, values: Any) -> np.ndarray:
+    if np.isscalar(values):
+        requested = (values,)
+    else:
+        if isinstance(values, (str, bytes)):
+            requested = (values,)
+        else:
+            try:
+                iterator = iter(values)
+            except TypeError as exc:
+                raise ValueError("values must be a scalar or iterable") from exc
+            collected: list[Any] = []
+            for position, value in enumerate(iterator):
+                if position >= 256:
+                    raise ValueError("values may contain at most 256 entries")
+                collected.append(value)
+            requested = tuple(collected)
+    if not requested:
+        return np.zeros(board.shape, dtype=bool)
+    return np.isin(board, requested)
+
+
+def _checked_grid_point(value: Any, shape: tuple[int, int]) -> tuple[int, int]:
+    point = _point(value)
+    if point[0] >= shape[0] or point[1] >= shape[1]:
+        raise ValueError(f"point {point!r} is outside grid shape {shape!r}")
+    return point
+
+
 def _json_clone(value: Any, label: str) -> Any:
     try:
         encoded = json.dumps(
@@ -241,6 +281,93 @@ def transition_has_progress(transition: Any) -> bool:
     return transition_outcome(transition) in {"progress", "terminal"}
 
 
+def transition_facts(transition: Any) -> dict[str, Any]:
+    """Return a bounded JSON snapshot using the host's transition semantics."""
+
+    if not isinstance(transition, Mapping):
+        return {
+            "outcome": "unknown",
+            "action": "",
+            "point": None,
+            "executed": None,
+            "post_action_observed": None,
+            "board_changed": None,
+            "meaningful_progress": False,
+            "level_completed": False,
+            "run_complete": False,
+            "game_over": False,
+            "error": "",
+        }
+
+    action = str(transition.get("action") or "").strip().upper()
+    if action not in POLICY_ACTIONS:
+        action = ""
+    point: list[int] | None = None
+    if action == "MOUSE" and "row" in transition and "col" in transition:
+        try:
+            point = list(_point((transition.get("row"), transition.get("col"))))
+        except ValueError:
+            point = None
+
+    def optional_bool(key: str) -> bool | None:
+        value = transition.get(key)
+        return value if isinstance(value, bool) else None
+
+    return {
+        "outcome": transition_outcome(transition),
+        "action": action,
+        "point": point,
+        "executed": optional_bool("executed"),
+        "post_action_observed": optional_bool("post_action_observed"),
+        "board_changed": optional_bool("board_changed"),
+        "meaningful_progress": transition_has_progress(transition),
+        "level_completed": bool(transition.get("level_completed")),
+        "run_complete": bool(transition.get("run_complete")),
+        "game_over": bool(transition.get("game_over")),
+        "error": str(transition.get("error") or "")[:512],
+    }
+
+
+def objective_evidence_ready(objective: Any, transitions: Any) -> bool:
+    """Return whether the objective has its requested post-action evidence count."""
+
+    if not isinstance(objective, Mapping):
+        raise ValueError("objective must be a mapping")
+    required = objective.get("minimum_evidence_actions", 1)
+    if isinstance(required, bool):
+        raise ValueError("minimum_evidence_actions must be an integer from 0 through 32")
+    try:
+        required_count = index(required)
+    except TypeError as exc:
+        raise ValueError(
+            "minimum_evidence_actions must be an integer from 0 through 32"
+        ) from exc
+    if not 0 <= required_count <= 32:
+        raise ValueError("minimum_evidence_actions must be an integer from 0 through 32")
+    if required_count == 0:
+        return True
+    objective_id = str(objective.get("objective_id") or objective.get("id") or "")
+    evidence_count = 0
+    for transition in _recent_items(transitions):
+        transition_objective_id = str(transition.get("objective_id") or "")
+        if objective_id and transition_objective_id and transition_objective_id != objective_id:
+            continue
+        if transition.get("executed") is not True:
+            continue
+        if transition.get("post_action_observed") is False:
+            continue
+        classified = transition.get("post_action_observed") is True or any(
+            key in transition
+            for key in ("outcome_class", "board_changed", "meaningful_progress")
+        )
+        if not classified:
+            continue
+        evidence_count += 1
+        if evidence_count >= required_count:
+            return True
+    return False
+
+
 def transition_requires_replan(
     transition: Any, replan_on_no_progress: bool = True
 ) -> bool:
@@ -295,6 +422,187 @@ def board_digest(grid: Any) -> str:
     return digest.hexdigest()
 
 
+def region_digest(grid: Any, bounds: Any) -> str:
+    """Digest an inclusive ``(top, left, bottom, right)`` board rectangle."""
+
+    board = _grid(grid)
+    if isinstance(bounds, (str, bytes)):
+        raise ValueError("bounds must be (top, left, bottom, right)")
+    try:
+        raw = tuple(bounds)
+    except TypeError as exc:
+        raise ValueError("bounds must be (top, left, bottom, right)") from exc
+    if len(raw) != 4 or any(isinstance(value, bool) for value in raw):
+        raise ValueError("bounds must be (top, left, bottom, right) integers")
+    try:
+        top, left, bottom, right = (index(value) for value in raw)
+    except TypeError as exc:
+        raise ValueError("bounds must be (top, left, bottom, right) integers") from exc
+    if not (0 <= top <= bottom < board.shape[0]) or not (
+        0 <= left <= right < board.shape[1]
+    ):
+        raise ValueError(f"bounds {raw!r} are outside grid shape {board.shape!r}")
+    return board_digest(board[top : bottom + 1, left : right + 1])
+
+
+def cells_digest(grid: Any, cells: Any) -> str:
+    """Digest values at a bounded, order-independent set of board coordinates."""
+
+    board = _grid(grid)
+    try:
+        iterator = iter(cells)
+    except TypeError as exc:
+        raise ValueError("cells must be an iterable of (row, col) pairs") from exc
+    points: list[tuple[int, int]] = []
+    for position, value in enumerate(iterator):
+        if position >= 64 * 64:
+            raise ValueError("cells may contain at most 4096 points")
+        points.append(_checked_grid_point(value, board.shape))
+    unique = tuple(sorted(set(points)))
+    digest = hashlib.blake2b(digest_size=8)
+    digest.update(f"{board.shape!r}|{board.dtype.str}|".encode("ascii"))
+    if unique:
+        digest.update(np.asarray(unique, dtype="<i2").tobytes(order="C"))
+        values = np.ascontiguousarray(np.asarray([board[point] for point in unique]))
+        digest.update(values.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def first_matching_cell(grid: Any, values: Any) -> tuple[int, int] | None:
+    """Return the first matching board coordinate in row-major order."""
+
+    board = _grid(grid)
+    matches = np.argwhere(_matching_mask(board, values))
+    if not len(matches):
+        return None
+    return int(matches[0, 0]), int(matches[0, 1])
+
+
+def nearest_matching_cell(
+    grid: Any, values: Any, origin: Any
+) -> tuple[int, int] | None:
+    """Return the Manhattan-nearest matching cell with row-major tie breaking."""
+
+    board = _grid(grid)
+    start = _checked_grid_point(origin, board.shape)
+    matches = np.argwhere(_matching_mask(board, values))
+    if not len(matches):
+        return None
+    return min(
+        ((int(row), int(col)) for row, col in matches),
+        key=lambda point: (
+            abs(point[0] - start[0]) + abs(point[1] - start[1]),
+            point[0],
+            point[1],
+        ),
+    )
+
+
+def matching_region_center(grid: Any, values: Any) -> tuple[int, int] | None:
+    """Return the matching cell nearest the matches' bounding-box center."""
+
+    board = _grid(grid)
+    matches = np.argwhere(_matching_mask(board, values))
+    if not len(matches):
+        return None
+    top, left = np.min(matches, axis=0)
+    bottom, right = np.max(matches, axis=0)
+    center_row_twice = int(top) + int(bottom)
+    center_col_twice = int(left) + int(right)
+    return min(
+        ((int(row), int(col)) for row, col in matches),
+        key=lambda point: (
+            abs(2 * point[0] - center_row_twice)
+            + abs(2 * point[1] - center_col_twice),
+            point[0],
+            point[1],
+        ),
+    )
+
+
+def _line(grid: Any, axis: Any, line_index: Any) -> np.ndarray:
+    board = _grid(grid)
+    normalized = str(axis).strip().lower()
+    if normalized in {"0", "row", "rows"}:
+        size = board.shape[0]
+        row_axis = True
+    elif normalized in {"1", "column", "columns", "col", "cols"}:
+        size = board.shape[1]
+        row_axis = False
+    else:
+        raise ValueError("axis must be row/0 or column/1")
+    if isinstance(line_index, bool):
+        raise ValueError("line index must be an integer")
+    try:
+        checked_index = index(line_index)
+    except TypeError as exc:
+        raise ValueError("line index must be an integer") from exc
+    if not 0 <= checked_index < size:
+        raise ValueError(f"line index must be between 0 and {size - 1}")
+    return board[checked_index, :] if row_axis else board[:, checked_index]
+
+
+def line_value_count(grid: Any, values: Any, axis: Any, line_index: Any) -> int:
+    """Count matching cells in one row or column."""
+
+    line = _line(grid, axis, line_index)
+    return int(np.count_nonzero(_matching_mask(line.reshape(1, -1), values)))
+
+
+def line_run_length(
+    grid: Any,
+    values: Any,
+    axis: Any,
+    line_index: Any,
+    from_end: bool = False,
+) -> int:
+    """Count consecutive matching cells from either end of a row or column."""
+
+    if not isinstance(from_end, bool):
+        raise ValueError("from_end must be a boolean")
+    line = _line(grid, axis, line_index)
+    mask = _matching_mask(line.reshape(1, -1), values).reshape(-1)
+    sequence = mask[::-1] if from_end else mask
+    count = 0
+    for matched in sequence:
+        if not bool(matched):
+            break
+        count += 1
+    return count
+
+
+def edge_value_count(grid: Any, values: Any, edge: Any) -> int:
+    """Count matching cells along the named top/bottom/left/right edge."""
+
+    board = _grid(grid)
+    normalized = str(edge).strip().lower()
+    if normalized == "top":
+        return line_value_count(board, values, "row", 0)
+    if normalized == "bottom":
+        return line_value_count(board, values, "row", board.shape[0] - 1)
+    if normalized == "left":
+        return line_value_count(board, values, "column", 0)
+    if normalized == "right":
+        return line_value_count(board, values, "column", board.shape[1] - 1)
+    raise ValueError("edge must be top, bottom, left, or right")
+
+
+def edge_run_length(grid: Any, values: Any, edge: Any, offset: Any) -> int:
+    """Count matching cells inward from an edge at its row/column offset."""
+
+    board = _grid(grid)
+    normalized = str(edge).strip().lower()
+    if normalized == "top":
+        return line_run_length(board, values, "column", offset)
+    if normalized == "bottom":
+        return line_run_length(board, values, "column", offset, from_end=True)
+    if normalized == "left":
+        return line_run_length(board, values, "row", offset)
+    if normalized == "right":
+        return line_run_length(board, values, "row", offset, from_end=True)
+    raise ValueError("edge must be top, bottom, left, or right")
+
+
 def memory_update(memory: Any, updates: Any) -> dict[str, Any]:
     """Return new bounded JSON memory after applying a mapping of updates."""
 
@@ -304,6 +612,20 @@ def memory_update(memory: Any, updates: Any) -> dict[str, Any]:
     if any(not isinstance(key, str) or not key for key in updates):
         raise ValueError("memory update keys must be non-empty strings")
     result.update(dict(updates))
+    if len(result) > MAX_HELPER_MEMORY_KEYS:
+        raise ValueError(f"memory may contain at most {MAX_HELPER_MEMORY_KEYS} keys")
+    return _json_clone(result, "memory")
+
+
+def memory_with_defaults(memory: Any, defaults: Any) -> dict[str, Any]:
+    """Fill missing memory fields from bounded JSON defaults without mutation."""
+
+    if not isinstance(defaults, Mapping):
+        raise ValueError("memory defaults must be a mapping")
+    if any(not isinstance(key, str) or not key for key in defaults):
+        raise ValueError("memory default keys must be non-empty strings")
+    result = _json_clone(dict(defaults), "memory defaults")
+    result.update(_memory_mapping(memory))
     if len(result) > MAX_HELPER_MEMORY_KEYS:
         raise ValueError(f"memory may contain at most {MAX_HELPER_MEMORY_KEYS} keys")
     return _json_clone(result, "memory")
@@ -322,6 +644,17 @@ def memory_push(memory: Any, key: Any, value: Any, limit: int = 16) -> dict[str,
         raise ValueError(f"memory value for {key!r} must be a list")
     history = [*existing, _json_clone(value, "memory history value")][-limit:]
     return memory_update(result, {key: history})
+
+
+def accumulate_transition_evidence(
+    memory: Any,
+    transition: Any,
+    key: Any = "transition_evidence",
+    limit: int = 16,
+) -> dict[str, Any]:
+    """Append one normalized transition snapshot to bounded JSON memory."""
+
+    return memory_push(memory, key, transition_facts(transition), limit=limit)
 
 
 def history_push(history: Any, value: Any, limit: int = 16) -> list[Any]:
@@ -437,6 +770,70 @@ def recent_action_counts(
     return counts
 
 
+def recent_mouse_point_counts(
+    transitions: Any, only_nonprogress: bool = False
+) -> dict[str, int]:
+    """Count valid MOUSE coordinates using JSON-safe ``"row,col"`` keys."""
+
+    counts: dict[str, int] = {}
+    for transition in _recent_items(transitions):
+        if str(transition.get("action") or "").strip().upper() != "MOUSE":
+            continue
+        if only_nonprogress and transition_outcome(transition) not in {
+            "failed",
+            "guarded",
+            "no_progress",
+        }:
+            continue
+        try:
+            row, col = _point((transition.get("row"), transition.get("col")))
+        except ValueError:
+            continue
+        key = f"{row},{col}"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def least_tried_mouse_point(
+    candidates: Any,
+    transitions: Any,
+    exclude: Any = (),
+    only_nonprogress: bool = False,
+) -> tuple[int, int] | None:
+    """Choose the least attempted candidate coordinate with stable tie ordering."""
+
+    try:
+        candidate_iterator = iter(candidates)
+        exclude_iterator = iter(exclude)
+    except TypeError as exc:
+        raise ValueError("candidates and exclude must be point iterables") from exc
+    checked_candidates: list[tuple[int, int]] = []
+    for position, value in enumerate(candidate_iterator):
+        if position >= 64 * 64:
+            raise ValueError("candidates may contain at most 4096 points")
+        point = _point(value)
+        if point not in checked_candidates:
+            checked_candidates.append(point)
+    excluded: set[tuple[int, int]] = set()
+    for position, value in enumerate(exclude_iterator):
+        if position >= 64 * 64:
+            raise ValueError("exclude may contain at most 4096 points")
+        excluded.add(_point(value))
+    available = [point for point in checked_candidates if point not in excluded]
+    if not available:
+        return None
+    counts = recent_mouse_point_counts(
+        transitions, only_nonprogress=only_nonprogress
+    )
+    return min(
+        available,
+        key=lambda point: (
+            counts.get(f"{point[0]},{point[1]}", 0),
+            checked_candidates.index(point),
+        ),
+    )
+
+
 def least_tried_action(
     valid_actions: Any,
     transitions: Any,
@@ -475,21 +872,36 @@ POLICY_CODEGEN_GLOBALS = MappingProxyType(
     {
         "POLICY_CODEGEN_API_VERSION": POLICY_CODEGEN_API_VERSION,
         "POLICY_ACTIONS": POLICY_ACTIONS,
+        "accumulate_transition_evidence": accumulate_transition_evidence,
         "action_payload": action_payload,
         "board_digest": board_digest,
+        "cells_digest": cells_digest,
         "consecutive_outcome_count": consecutive_outcome_count,
         "continue_decision": continue_decision,
+        "edge_run_length": edge_run_length,
+        "edge_value_count": edge_value_count,
+        "first_matching_cell": first_matching_cell,
         "history_push": history_push,
         "least_tried_action": least_tried_action,
+        "least_tried_mouse_point": least_tried_mouse_point,
+        "line_run_length": line_run_length,
+        "line_value_count": line_value_count,
+        "matching_region_center": matching_region_center,
         "memory_increment": memory_increment,
         "memory_push": memory_push,
         "memory_update": memory_update,
+        "memory_with_defaults": memory_with_defaults,
         "mouse_decision": mouse_decision,
+        "nearest_matching_cell": nearest_matching_cell,
+        "objective_evidence_ready": objective_evidence_ready,
         "path_decision": path_decision,
+        "region_digest": region_digest,
         "subgoal_failed": subgoal_failed,
         "subgoal_succeeded": subgoal_succeeded,
         "recent_action_counts": recent_action_counts,
+        "recent_mouse_point_counts": recent_mouse_point_counts,
         "recent_outcome_counts": recent_outcome_counts,
+        "transition_facts": transition_facts,
         "transition_has_progress": transition_has_progress,
         "transition_outcome": transition_outcome,
         "transition_repeats_nonprogress_action": transition_repeats_nonprogress_action,

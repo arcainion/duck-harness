@@ -400,6 +400,41 @@ def decide(observation, memory):
         self.assertEqual(2, len(second.memory["digests"]))
         self.assertEqual(second.memory["digests"][0], second.memory["digests"][1])
 
+    def test_policy_can_use_coordinate_evidence_and_board_summary_helpers(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    memory = memory_with_defaults(memory, {"phase": "probe"})
+    memory = accumulate_transition_evidence(memory, observation.last_transition, limit=2)
+    point = least_tried_mouse_point(
+        ((1, 1), (2, 2)), observation.recent_transitions
+    )
+    marker = first_matching_cell(observation.board, 0)
+    memory = memory_update(memory, {
+        "region": region_digest(observation.board, (0, 0, 1, 1)),
+        "cells": cells_digest(observation.board, ((0, 0), (1, 1))),
+        "marker": marker,
+        "center": matching_region_center(observation.board, 0),
+        "edge_count": edge_value_count(observation.board, 0, "top"),
+        "edge_run": edge_run_length(observation.board, 0, "left", 0),
+        "evidence_ready": objective_evidence_ready(
+            observation.objective, observation.recent_transitions
+        ),
+    })
+    return mouse_decision(point, memory, "coordinate-aware probe")
+"""
+        probe_observation = observation(valid_actions=("MOUSE",))
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(source, context={})
+            decision = runtime.decide(probe_observation)
+        self.assertEqual({"action": "MOUSE", "row": 1, "col": 1}, decision.action)
+        self.assertEqual("probe", decision.memory["phase"])
+        self.assertEqual([0, 0], decision.memory["marker"])
+        self.assertEqual(64, decision.memory["edge_count"])
+        self.assertEqual(64, decision.memory["edge_run"])
+        self.assertFalse(decision.memory["evidence_ready"])
+
     def test_invalid_policy_action_is_rejected(self) -> None:
         source = GOOD_POLICY.replace("observation.valid_actions[0]", '"ACTION4"')
         with GameplayPolicyRuntime(requested_backend="cpu") as runtime:

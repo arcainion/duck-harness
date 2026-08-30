@@ -45,6 +45,8 @@ class SubgoalSpec:
     failure_criteria: str
     expected_evidence: str
     action_budget: int
+    minimum_evidence_actions: int = 4
+    single_step: bool = False
 
     @classmethod
     def from_payload(cls, payload: Any) -> "SubgoalSpec":
@@ -65,12 +67,35 @@ class SubgoalSpec:
         action_budget = raw_action_budget
         if not 1 <= action_budget <= 32:
             raise ObjectiveError("subgoal action_budget must be between 1 and 32")
+        raw_minimum_evidence = payload.get(
+            "minimum_evidence_actions", min(4, action_budget)
+        )
+        if not isinstance(raw_minimum_evidence, int) or isinstance(
+            raw_minimum_evidence, bool
+        ):
+            raise ObjectiveError("subgoal minimum_evidence_actions must be an integer")
+        if not 1 <= raw_minimum_evidence <= min(4, action_budget):
+            raise ObjectiveError(
+                "subgoal minimum_evidence_actions must be between 1 and "
+                "min(4, action_budget)"
+            )
+        raw_single_step = payload.get("single_step", action_budget == 1)
+        if not isinstance(raw_single_step, bool):
+            raise ObjectiveError("subgoal single_step must be a boolean")
+        if raw_single_step and action_budget != 1:
+            raise ObjectiveError("single-step subgoals must request action_budget=1")
+        if not raw_single_step and action_budget == 1:
+            raise ObjectiveError(
+                "action_budget=1 is reserved for explicitly single-step subgoals"
+            )
         return cls(
             title=required_text("title", 200),
             success_criteria=required_text("success_criteria"),
             failure_criteria=required_text("failure_criteria"),
             expected_evidence=required_text("expected_evidence"),
             action_budget=action_budget,
+            minimum_evidence_actions=raw_minimum_evidence,
+            single_step=raw_single_step,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -80,6 +105,8 @@ class SubgoalSpec:
             "failure_criteria": self.failure_criteria,
             "expected_evidence": self.expected_evidence,
             "action_budget": self.action_budget,
+            "minimum_evidence_actions": self.minimum_evidence_actions,
+            "single_step": self.single_step,
         }
 
 
@@ -142,6 +169,8 @@ class ObjectiveNode:
     failure_criteria: str
     expected_evidence: str
     action_budget: int
+    minimum_evidence_actions: int = 1
+    single_step: bool = False
     status: ObjectiveStatus = ObjectiveStatus.PENDING
     attempts: int = 0
     actions_used: int = 0
@@ -162,6 +191,8 @@ class ObjectiveNode:
             "failure_criteria": self.failure_criteria,
             "expected_evidence": self.expected_evidence,
             "action_budget": self.action_budget,
+            "minimum_evidence_actions": self.minimum_evidence_actions,
+            "single_step": self.single_step,
             "status": self.status.value,
             "attempts": self.attempts,
             "actions_used": self.actions_used,
@@ -184,6 +215,17 @@ class ObjectiveNode:
             failure_criteria=str(payload.get("failure_criteria") or ""),
             expected_evidence=str(payload.get("expected_evidence") or ""),
             action_budget=max(0, int(payload.get("action_budget", 0) or 0)),
+            minimum_evidence_actions=max(
+                1,
+                int(
+                    payload.get(
+                        "minimum_evidence_actions",
+                        min(4, int(payload.get("action_budget", 0) or 0)),
+                    )
+                    or 1
+                ),
+            ),
+            single_step=bool(payload.get("single_step", False)),
             status=ObjectiveStatus(str(payload.get("status") or "pending")),
             attempts=max(0, int(payload.get("attempts", 0) or 0)),
             actions_used=max(0, int(payload.get("actions_used", 0) or 0)),
@@ -290,6 +332,14 @@ class ObjectiveTree:
                 raise ObjectiveError("objective node ID does not match its map key")
             if node.action_budget < 1:
                 raise ObjectiveError("objective action budgets must be positive")
+            if not 1 <= node.minimum_evidence_actions <= min(4, node.action_budget):
+                raise ObjectiveError(
+                    "objective minimum evidence actions must fit its action budget"
+                )
+            if node.single_step and node.action_budget != 1:
+                raise ObjectiveError(
+                    "single-step objective must have action budget one"
+                )
             if node.actions_used > node.action_budget:
                 raise ObjectiveError("objective action budget was exceeded")
             if len(node.children) != len(set(node.children)):
@@ -421,6 +471,10 @@ class ObjectiveTree:
         for spec in proposal.subgoals:
             objective_id = f"tactical:{self.next_tactical_id}"
             self.next_tactical_id += 1
+            requested_budget = (
+                spec.action_budget if spec.single_step else max(8, spec.action_budget)
+            )
+            effective_budget = min(requested_budget, available)
             child = ObjectiveNode(
                 objective_id=objective_id,
                 parent_id=node.objective_id,
@@ -429,7 +483,11 @@ class ObjectiveTree:
                 success_criteria=spec.success_criteria,
                 failure_criteria=spec.failure_criteria,
                 expected_evidence=spec.expected_evidence,
-                action_budget=min(spec.action_budget, available),
+                action_budget=effective_budget,
+                minimum_evidence_actions=min(
+                    spec.minimum_evidence_actions, effective_budget
+                ),
+                single_step=spec.single_step and effective_budget == 1,
                 status=ObjectiveStatus.PENDING,
             )
             self.nodes[objective_id] = child

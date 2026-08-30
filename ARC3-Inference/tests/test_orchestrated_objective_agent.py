@@ -20,6 +20,7 @@ from inference.agent.orchestrated_objective_agent import (
     OrchestratedObjectiveAgent,
     _meaningful_progress,
     _policy_source_from_message,
+    _policy_reuse_scope_from_source,
     _policy_transition_payload,
     _reduction_from_message,
     _repeats_non_progress_action,
@@ -40,6 +41,11 @@ SUPPORTED_BACKENDS = ("cpu",)
 def decide(observation, memory):
     return {"status": "continue", "action": {"action": "UP"}, "memory": memory}
 """
+
+REUSABLE_POLICY_SOURCE = POLICY_SOURCE.replace(
+    'SUPPORTED_BACKENDS = ("cpu",)',
+    'SUPPORTED_BACKENDS = ("cpu",)\nPOLICY_REUSE_SCOPE = "tactical"',
+)
 
 
 def frame(
@@ -75,6 +81,8 @@ def reduction_for(
                 "failure_criteria": "action is guarded or unchanged",
                 "expected_evidence": "one transition",
                 "action_budget": 4,
+                "minimum_evidence_actions": 4,
+                "single_step": False,
             }
         ]
     return {
@@ -131,6 +139,8 @@ class _FakeModelClient:
                         "failure_criteria": "action is guarded or unchanged",
                         "expected_evidence": "one transition",
                         "action_budget": 4,
+                        "minimum_evidence_actions": 4,
+                        "single_step": False,
                     }
                 ],
             }
@@ -303,6 +313,79 @@ class _ActivationRepairRuntimeFactory:
 
 
 class OrchestratedObjectiveAgentTests(unittest.TestCase):
+    def test_policy_reuse_scope_requires_a_literal_opt_in(self) -> None:
+        self.assertEqual(
+            "tactical", _policy_reuse_scope_from_source(REUSABLE_POLICY_SOURCE)
+        )
+        self.assertEqual("none", _policy_reuse_scope_from_source(POLICY_SOURCE))
+        self.assertEqual(
+            "none",
+            _policy_reuse_scope_from_source(
+                'POLICY_REUSE_SCOPE = "tactical" if True else "none"'
+            ),
+        )
+
+    def test_successful_same_level_policy_is_reused_with_fresh_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_path = root / "runtime_state.json"
+            runtime_path.touch()
+            policy_dir = root / "policies"
+            policy_dir.mkdir()
+            source_hash = verify_policy_source(REUSABLE_POLICY_SOURCE)
+            artifact = policy_dir / f"tactical_1-{source_hash}.py"
+            artifact.write_text(REUSABLE_POLICY_SOURCE, encoding="utf-8")
+
+            agent = self._agent()
+            agent._knowledge_game_id = "game-a"
+            agent._session_runtime_dir = runtime_path
+            agent._tree = ObjectiveTree.start_game(
+                "game-a", level=1, level_action_budget=32
+            )
+            origin = agent._tree.apply_proposal(
+                ReductionProposal.from_payload(reduction_for("level:1:1")),
+                remaining_level_actions=32,
+            )
+            active_runtime = _FakeRuntime()
+            active_runtime.activate(REUSABLE_POLICY_SOURCE, context={})
+            agent._policy_runtime = active_runtime
+            agent._policy_objective_id = origin.objective_id
+            agent._policy_source_hash = source_hash
+            agent._policy_artifact = str(artifact.relative_to(root))
+            agent._active_policy_reuse_scope = "tactical"
+            agent._policy_executed_action = True
+            agent._tree.record_action()
+            agent._tree.complete_active_tactical("contract satisfied")
+            agent._invalidate_policy(f"subgoal_succeeded:{origin.objective_id}")
+
+            replacement = agent._tree.apply_proposal(
+                ReductionProposal.from_payload(reduction_for("level:1:1")),
+                remaining_level_actions=31,
+            )
+            agent.model_client.complete = mock.Mock(
+                side_effect=AssertionError("coder must not run on successful reuse")
+            )
+            with mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                _FakeRuntime,
+            ):
+                agent._activate_policy(
+                    frame(),
+                    [],
+                    request_deadline=None,
+                    should_stop=None,
+                    repair_reason=f"subgoal_succeeded:{origin.objective_id}",
+                )
+
+            self.assertEqual(replacement.objective_id, agent._policy_objective_id)
+            self.assertEqual(1, agent._orchestration_metrics["policy_reuses"])
+            agent.model_client.complete.assert_not_called()
+            self.assertEqual({}, agent._policy_memory)
+            self.assertEqual(
+                origin.objective_id, agent._reusable_policies[0]["origin_objective_id"]
+            )
+            agent.close()
+
     def test_policy_transition_exposes_controller_progress_evidence(self) -> None:
         action = {"action": "MOUSE", "row": 30, "col": 61}
         volatile_result = {
@@ -567,9 +650,15 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             [item["request_attempt_limit"] for item in model_client.call_kwargs],
         )
 
-    def test_repeated_volatile_action_fails_before_second_controller_call(self) -> None:
+    def test_repeated_volatile_action_gets_one_same_leaf_repair_then_fails(
+        self,
+    ) -> None:
         client = _ScriptedModelClient(
-            [reduction_for("level:1:1"), policy_for("tactical:1")]
+            [
+                reduction_for("level:1:1"),
+                policy_for("tactical:1"),
+                policy_for("tactical:1"),
+            ]
         )
         runtime = _SequentialDecisionRuntime(
             [
@@ -584,6 +673,18 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
                     action={"action": "UP"},
                     memory={"phase": 2},
                     evidence="incorrectly repeat volatile probe",
+                ),
+                PolicyDecision(
+                    status=PolicyStatus.CONTINUE,
+                    action={"action": "RIGHT"},
+                    memory={"phase": 3},
+                    evidence="replacement chooses a distinct probe",
+                ),
+                PolicyDecision(
+                    status=PolicyStatus.CONTINUE,
+                    action={"action": "RIGHT"},
+                    memory={"phase": 4},
+                    evidence="replacement repeats too",
                 ),
             ]
         )
@@ -614,11 +715,31 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
                 current_frame=frame(step=1),
                 history=[],
             )
-            second_step = mock.Mock()
+            second_step = mock.Mock(
+                return_value={
+                    "executed": True,
+                    "board_changed": True,
+                    "outcome_class": "volatile_only",
+                    "novel_state": False,
+                    "level": 1,
+                    "state": "NOT_FINISHED",
+                }
+            )
             second = agent.analyze(
                 state_path,
                 1,
                 step_env=second_step,
+            )
+            write_runtime_state(
+                state_path,
+                current_frame=frame(step=2),
+                history=[],
+            )
+            third_step = mock.Mock()
+            third = agent.analyze(
+                state_path,
+                2,
+                step_env=third_step,
                 should_stop=lambda: True,
             )
             tree = agent._tree
@@ -631,11 +752,24 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             agent.close()
 
         self.assertTrue(first.step_executed)
-        self.assertTrue(second.yielded_control)
+        self.assertTrue(second.step_executed)
+        self.assertTrue(third.yielded_control)
         first_step.assert_called_once()
-        second_step.assert_not_called()
+        second_step.assert_called_once()
+        third_step.assert_not_called()
         assert tree is not None
         self.assertEqual(ObjectiveStatus.FAILED, tree.nodes["tactical:1"].status)
+        self.assertEqual(3, client.calls)
+        self.assertEqual(
+            1,
+            len(
+                [
+                    event
+                    for event in events
+                    if event["type"] == "policy_non_progress_repeat_repair"
+                ]
+            ),
+        )
         self.assertEqual(
             1,
             len(
@@ -904,8 +1038,14 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertIn("transition_outcome(last_transition)", coder_prompt)
         self.assertIn("transition_repeats_nonprogress_action", coder_prompt)
         self.assertIn("board_digest(observation.board)", coder_prompt)
+        self.assertIn("region_digest(board, (top,left,bottom,right))", coder_prompt)
+        self.assertIn("memory_with_defaults(memory, defaults)", coder_prompt)
+        self.assertIn("accumulate_transition_evidence(memory, last_transition", coder_prompt)
         self.assertIn("memory_push(memory, key, value", coder_prompt)
         self.assertIn("least_tried_action(observation.valid_actions", coder_prompt)
+        self.assertIn("least_tried_mouse_point(candidates", coder_prompt)
+        self.assertIn("first_matching_cell(board, values)", coder_prompt)
+        self.assertIn("line_value_count(board, values, axis, index)", coder_prompt)
         self.assertEqual(1, len(rejected_artifacts))
         self.assertEqual(rejected_source, rejected_artifact_text)
         rejected_events = [
@@ -1295,6 +1435,8 @@ def decide(observation, memory):
         subgoals = reduction["subgoals"]
         assert isinstance(subgoals, list)
         subgoals[0]["action_budget"] = 1
+        subgoals[0]["minimum_evidence_actions"] = 1
+        subgoals[0]["single_step"] = True
         client = _ScriptedModelClient([reduction, policy_for("tactical:1")])
         runtime = _SequentialDecisionRuntime(
             [

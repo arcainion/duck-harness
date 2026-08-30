@@ -26,6 +26,7 @@ from inference.agent.trial_knowledge import TrialKnowledgeStore
 from inference.framework.solver import (
     _HarnessGameSession,
     _evaluate_strategy_prediction,
+    _next_cycle_risk_streak,
     _summarize_animation,
 )
 
@@ -899,6 +900,26 @@ class SolverControllerTests(TestCase):
 
         self.assertTrue(session.cycle_stop_reached())
 
+    def test_untried_mouse_coordinate_resets_cycle_risk_streak(self) -> None:
+        self.assertEqual(
+            0,
+            _next_cycle_risk_streak(
+                7,
+                cycle_risk=True,
+                made_progress=False,
+                untried_mouse_coordinate=True,
+            ),
+        )
+        self.assertEqual(
+            8,
+            _next_cycle_risk_streak(
+                7,
+                cycle_risk=True,
+                made_progress=False,
+                untried_mouse_coordinate=False,
+            ),
+        )
+
     def test_request_timeout_honors_analyzer_configuration_above_120(self) -> None:
         session = object.__new__(_HarnessGameSession)
         session.analyzer = SimpleNamespace(_timeout=180.0)
@@ -943,9 +964,7 @@ class SolverControllerTests(TestCase):
         session.analyzer = SimpleNamespace(generated_tokens=75000)
         session.level_token_baseline = 0
 
-        self.assertEqual(
-            session.level_no_progress_token_status(), (1, 75000, 75000)
-        )
+        self.assertEqual(session.level_no_progress_token_status(), (1, 75000, 75000))
         self.assertTrue(session.level_no_progress_token_limit_reached())
 
         session.level_token_baseline = 75000

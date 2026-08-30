@@ -348,6 +348,20 @@ def _format_action_display(
     return to_model_action(action_name)
 
 
+def _next_cycle_risk_streak(
+    current: int,
+    *,
+    cycle_risk: bool,
+    made_progress: bool,
+    untried_mouse_coordinate: bool,
+) -> int:
+    """Count genuine repeated cycles without penalizing new click probes."""
+
+    if made_progress or untried_mouse_coordinate or not cycle_risk:
+        return 0
+    return max(0, int(current)) + 1
+
+
 def _evaluate_strategy_prediction(
     prediction: dict[str, Any] | None, payload: dict[str, Any]
 ) -> dict[str, str] | None:
@@ -1441,7 +1455,9 @@ class _HarnessGameSession:
                         f"level guard total={total}"
                     )
                     if persistently_blocked:
-                        guard_reason += "; direction remains blocked until progress or reset"
+                        guard_reason += (
+                            "; direction remains blocked until progress or reset"
+                        )
                 harm_guard = guard_reason_code in {
                     "known_harmful_local",
                     "known_harmful_cross_trial",
@@ -1743,13 +1759,20 @@ class _HarnessGameSession:
                     animation=animation,
                 )
             )
-            if reward > 0.0 or level_completed or payload.get("run_complete"):
-                self.cycle_risk_streak = 0
-            elif payload.get("cycle_risk"):
-                self.cycle_risk_streak += 1
-            else:
-                self.cycle_risk_streak = 0
+            untried_mouse_coordinate = (
+                action.id == arcengine.GameAction.ACTION6
+                and all(entry.action != action_display for entry in prior_history)
+            )
+            self.cycle_risk_streak = _next_cycle_risk_streak(
+                self.cycle_risk_streak,
+                cycle_risk=bool(payload.get("cycle_risk")),
+                made_progress=bool(
+                    reward > 0.0 or level_completed or payload.get("run_complete")
+                ),
+                untried_mouse_coordinate=untried_mouse_coordinate,
+            )
             payload["cycle_risk_streak"] = self.cycle_risk_streak
+            payload["untried_mouse_coordinate"] = untried_mouse_coordinate
         prediction_result = _evaluate_strategy_prediction(strategy_prediction, payload)
         if prediction_result is not None:
             payload["prediction_result"] = prediction_result
@@ -1781,9 +1804,7 @@ class HarnessSolver(Solver):
     kaggle_wheelhouse_dataset_source: str = field(
         default=DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE, repr=False
     )
-    kaggle_model_source: str = field(
-        default=DEFAULT_QWEN_MODEL_SOURCE, repr=False
-    )
+    kaggle_model_source: str = field(default=DEFAULT_QWEN_MODEL_SOURCE, repr=False)
     kaggle_served_model_name: str = field(default=DEFAULT_SERVED_MODEL_NAME, repr=False)
     kaggle_vllm_port: int = field(default=DEFAULT_VLLM_PORT, repr=False)
     kaggle_vllm_max_model_len: int = field(

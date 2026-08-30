@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import json
@@ -57,8 +58,6 @@ _REDUCTION_END_MARKER = "END_REDUCTION"
 _POLICY_BEGIN_MARKER = "BEGIN_POLICY"
 _POLICY_END_MARKER = "END_POLICY"
 _MAX_REJECTED_POLICY_REPAIR_CHARS = 24000
-_MIN_TACTICAL_PERSISTENCE_ACTIONS = 4
-
 _NON_PROGRESS_OUTCOME_CLASSES = frozenset(
     {
         "exact_noop",
@@ -111,6 +110,8 @@ def _empty_orchestration_metrics() -> dict[str, int | float]:
         "reducer_generated_tokens": 0,
         "coder_generated_tokens": 0,
         "policy_activations": 0,
+        "policy_reuses": 0,
+        "policy_reuse_rejections": 0,
         "policy_repairs": 0,
         "policy_steps": 0,
         "cuda_fallbacks": 0,
@@ -121,6 +122,7 @@ def _empty_orchestration_metrics() -> dict[str, int | float]:
         "objective_completion_rejections": 0,
         "objective_completion_reinterpretations": 0,
         "objective_failure_rejections": 0,
+        "repeated_action_repairs": 0,
     }
 
 
@@ -161,15 +163,23 @@ between BEGIN_REDUCTION and END_REDUCTION lines. Do not use a tool call, Markdow
 or prose outside the markers. The object must contain objective_id, verdict, evidence,
 rationale, selected_index, and subgoals. verdict is continue, complete, fail, or
 decompose. Each subgoal contains title, success_criteria, failure_criteria,
-expected_evidence, and an integer action_budget from 1 to 32. The host owns all IDs,
+expected_evidence, an integer action_budget from 1 to 32, an integer
+minimum_evidence_actions from 1 through min(4, action_budget), and a boolean
+single_step. The host owns all IDs,
 tree invariants, budgets, and game/level completion. You may complete or fail only
 the active tactical objective. A game or level objective must be decomposed into one
 to six falsifiable tactical subgoals. Prefer the selected subgoal whose result will
 maximally reduce uncertainty. Copy objective_id exactly from
 active_objective.objective_id in the user payload; the example below illustrates only
-the response shape. Normally give a tactical policy at least four actions so it can
-observe and adapt without another LLM call. Use action_budget=1 only when one action
-plus its following observation conclusively resolves the subgoal. Use valid JSON with
+the response shape. The selected tactical subgoal should normally be one coherent
+macro objective with an 8-16 action horizon: include alternative probes, adaptation
+after negative evidence, and an execution sequence so gameplay can continue without
+another LLM call. The host expands non-single-step horizons shorter than eight when
+level budget remains. Set single_step=true and action_budget=1 only when one action plus
+its following observation conclusively resolves the entire subgoal; otherwise set
+single_step=false. Set minimum_evidence_actions to the number of real post-action
+observations needed to prove the declared criteria, normally 4 for exploration and 1
+only for conclusive evidence. Use valid JSON with
 double-quoted keys and strings. Keep reasoning compact and reserve response space for
 the complete JSON object. All valid action names are already model-facing: UP, DOWN,
 LEFT, RIGHT, SPACE, MOUSE, or ACTION7. These meanings are exact, not hypotheses.
@@ -178,7 +188,7 @@ or reason about hidden ACTION1 through ACTION6 aliases. A mere board change is n
 necessarily progress: volatile_only and exact_noop outcomes are negative evidence.
 
 BEGIN_REDUCTION
-{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"probe one legal action","selected_index":0,"subgoals":[{"title":"Probe a legal action","success_criteria":"observe a useful transition","failure_criteria":"action is rejected or unchanged","expected_evidence":"one host transition","action_budget":4}]}
+{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"run a bounded adaptive probe sequence","selected_index":0,"subgoals":[{"title":"Map legal actions and execute the best discovered route","success_criteria":"establish a repeatable transition rule and use it toward level progress","failure_criteria":"eight distinct adaptive probes produce no usable rule","expected_evidence":"four or more host transitions comparing distinct actions and outcomes","action_budget":8,"minimum_evidence_actions":4,"single_step":false}]}
 END_REDUCTION"""
 
 _CODER_SYSTEM_PROMPT = """You are the gameplay-policy coder role for an ARC-AGI-3 game.
@@ -198,6 +208,7 @@ all helper functions so the required entrypoint cannot be truncated:
 BEGIN_POLICY
 POLICY_API_VERSION = 1
 SUPPORTED_BACKENDS = ("cpu",)
+POLICY_REUSE_SCOPE = "none"
 
 def initialize(context):
     return {}
@@ -221,6 +232,16 @@ functools/heapq/bisect/numpy and optional lazy torch. No files, network, subproc
 reflection, engine calls, or hidden state. CPU support is mandatory; CUDA is optional.
 Keep the complete source small. BEGIN_POLICY and END_POLICY must each appear exactly
 once on their own lines and are not part of the Python module.
+
+Declare POLICY_REUSE_SCOPE = "tactical" only when the module is genuinely generic
+across tactical objectives in the same level: it must derive actions and terminal
+criteria from observation.objective, observation.board, valid_actions, and transition
+evidence rather than embedding the current objective's title, fixed route, target
+coordinates, or success threshold. Prefer reusable board-driven exploration and
+pathfinding policies when they can honor different tactical contracts. Otherwise
+declare POLICY_REUSE_SCOPE = "none". The host always supplies fresh memory/context and
+preflights a reused policy against the new objective; reuse never crosses a game or
+level boundary.
 
 Trusted pathfinding helpers are already available as globals; do not import or redefine
 them. A passable grid is any non-empty 2D boolean-like array with at most 4096 cells;
@@ -268,18 +289,32 @@ terminal/progress/guarded/failed/no_progress/unknown; transition_has_progress(..
 transition_requires_replan(..., replan_on_no_progress=True) implement host semantics.
 Before retrying, transition_repeats_nonprogress_action(last_transition, action, point=None)
 detects the exact action/coordinate repeat. POLICY_CODEGEN_API_VERSION is 1.
-Use board_digest(observation.board) for a compact stable state fingerprint; never store
-the board itself. memory_update(memory, updates), memory_push(memory, key, value,
-limit=16), and memory_increment(memory, key, amount=1, minimum=None, maximum=None)
-return new finite JSON memory with 64-key, 32-KiB, and rolling-history limits. For a
-standalone list use history_push(history, value, limit=16), then store the returned list;
-do not call memory_push with a list as its first argument. ord is available for a
-one-character string, though numeric cell values and find_cells are usually clearer.
+transition_facts(last_transition) provides one bounded JSON snapshot, while
+accumulate_transition_evidence(memory, last_transition, key="transition_evidence",
+limit=16) stores a rolling history. objective_evidence_ready(observation.objective,
+observation.recent_transitions) checks the host-requested minimum evidence count.
+Use board_digest(observation.board) for a compact stable state fingerprint;
+region_digest(board, (top,left,bottom,right)) uses inclusive bounds and
+cells_digest(board, cells) fingerprints an order-independent coordinate set. Never
+store the board itself. memory_with_defaults(memory, defaults) fills missing fields;
+memory_update(memory, updates), memory_push(memory, key, value, limit=16), and
+memory_increment(memory, key, amount=1, minimum=None, maximum=None) return new finite
+JSON memory with 64-key, 32-KiB, and rolling-history limits. For a standalone list use
+history_push(history, value, limit=16), then store the returned list; do not call
+memory_push with a list as its first argument.
 recent_outcome_counts(observation.recent_transitions), consecutive_outcome_count(...),
 and recent_action_counts(..., only_nonprogress=False) summarize at most 64 transitions.
 least_tried_action(observation.valid_actions, observation.recent_transitions, exclude=(),
 include_mouse=False) provides deterministic exploration without emitting an unlocated
-MOUSE action. All memory/state helpers are host-owned and bounded.
+MOUSE action. For clicks, use least_tried_mouse_point(candidates,
+observation.recent_transitions, exclude=(), only_nonprogress=False), then pass its result
+to mouse_decision; recent_mouse_point_counts(...) exposes JSON-safe "row,col" counts.
+Use first_matching_cell(board, values), nearest_matching_cell(board, values, origin), or
+matching_region_center(board, values) instead of rewriting marker scans. Use
+line_value_count(board, values, axis, index), line_run_length(..., from_end=False),
+edge_value_count(board, values, edge), and edge_run_length(board, values, edge, offset)
+for rows, columns, progress bars, and inward edge runs. All helpers are host-owned and
+bounded. ord is available for a one-character string, though numeric values are clearer.
 
 observation.board is a NumPy uint8 array. Never use it directly as a boolean or compare
 it with == or !=; use board.size, np.array_equal, or a finite Python integer digest.
@@ -300,9 +335,10 @@ outcomes are not meaningful progress. A one-shot probe must return
 subgoal_succeeded/subgoal_failed after inspecting its post-action transition; it must
 not repeat the same non-progress action. Use a finite rolling integer digest when a
 board digest is needed; hashlib/json imports, getattr, and observation.engine_state are
-not permitted. Unless action_budget is one or the engine reports level/run completion,
-the host requires up to four executed post-action observations before accepting tactical
-success. Do not return subgoal_succeeded merely for board_changed, novel_state, or
+not permitted. The active objective exposes minimum_evidence_actions and single_step.
+Unless the engine reports level/run completion, the host requires exactly that many
+executed post-action observations before accepting tactical success or failure. Do not
+return subgoal_succeeded merely for board_changed, novel_state, or
 meaningful_progress; continue gathering evidence until the complete declared success
 criteria are satisfied. volatile_only and transient_effect can never prove tactical
 success. Runtime transition history is objective-scoped: at entry to a new tactical
@@ -311,8 +347,8 @@ transitions from that objective. Never evaluate post-action evidence until
 last_transition is a mapping produced by this objective. The host preflights a new
 policy against up to four synthetic exact_noop observations: it must keep selecting a
 different valid probe rather than repeat or terminate early. Unless game_over or the
-action budget is exhausted, do not return subgoal_failed before the same minimum
-evidence count required for success."""
+action budget is exhausted, do not return subgoal_failed before
+observation.objective["minimum_evidence_actions"] observations."""
 
 
 def _compact_board(frame: Frame) -> list[str]:
@@ -521,6 +557,34 @@ def _policy_source_from_message(message: dict[str, Any]) -> str:
     )
 
 
+def _policy_reuse_scope_from_source(source: str) -> str:
+    """Read the opt-in reuse declaration without executing generated code."""
+
+    try:
+        module = ast.parse(source)
+    except (SyntaxError, TypeError, ValueError):
+        return "none"
+    for statement in module.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else []
+        if isinstance(statement, ast.AnnAssign):
+            targets = [statement.target]
+        if not any(
+            isinstance(target, ast.Name) and target.id == "POLICY_REUSE_SCOPE"
+            for target in targets
+        ):
+            continue
+        value_node = statement.value
+        if isinstance(value_node, ast.Constant) and value_node.value in {
+            "none",
+            "tactical",
+        }:
+            return str(value_node.value)
+        return "none"
+    return "none"
+
+
 def _without_policy_source(entry: dict[str, Any]) -> dict[str, Any]:
     sanitized = dict(entry)
     content = sanitized.get("content")
@@ -562,10 +626,13 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_objective_id = ""
         self._policy_source_hash = ""
         self._policy_artifact = ""
+        self._active_policy_reuse_scope = "none"
+        self._reusable_policies: list[dict[str, Any]] = []
         self._policy_memory: Any = {}
         self._policy_repairs: dict[str, int] = {}
         self._premature_completion_repairs: dict[str, int] = {}
         self._premature_failure_repairs: dict[str, int] = {}
+        self._repeated_action_repairs: dict[str, int] = {}
         self._policy_executed_action = False
         self._boundary_reason = "game_start"
         self._reduction_required = True
@@ -622,10 +689,13 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_objective_id = ""
         self._policy_source_hash = ""
         self._policy_artifact = ""
+        self._active_policy_reuse_scope = "none"
+        self._reusable_policies = []
         self._policy_memory = {}
         self._policy_repairs = {}
         self._premature_completion_repairs = {}
         self._premature_failure_repairs = {}
+        self._repeated_action_repairs = {}
         self._policy_executed_action = False
         self._boundary_reason = "game_start"
         self._reduction_required = True
@@ -666,6 +736,17 @@ class OrchestratedObjectiveAgent(ToolAgent):
             self._policy_objective_id = str(payload.get("policy_objective_id") or "")
             self._policy_source_hash = str(payload.get("policy_source_hash") or "")
             self._policy_artifact = str(payload.get("policy_artifact") or "")
+            self._active_policy_reuse_scope = str(
+                payload.get("active_policy_reuse_scope") or "none"
+            )
+            raw_reusable = payload.get("reusable_policies")
+            if isinstance(raw_reusable, list):
+                self._reusable_policies = [
+                    dict(item)
+                    for item in raw_reusable[-4:]
+                    if isinstance(item, dict)
+                    and str(item.get("game_id") or "") == self._knowledge_game_id
+                ]
             self._policy_memory = payload.get("policy_memory", {})
             self._policy_repairs = {
                 str(key): max(0, int(value or 0))
@@ -682,6 +763,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 for key, value in (
                     payload.get("premature_failure_repairs") or {}
                 ).items()
+            }
+            self._repeated_action_repairs = {
+                str(key): max(0, int(value or 0))
+                for key, value in (payload.get("repeated_action_repairs") or {}).items()
             }
             self._policy_executed_action = bool(
                 payload.get("policy_executed_action", False)
@@ -752,10 +837,13 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "policy_objective_id": self._policy_objective_id,
             "policy_source_hash": self._policy_source_hash,
             "policy_artifact": self._policy_artifact,
+            "active_policy_reuse_scope": self._active_policy_reuse_scope,
+            "reusable_policies": self._reusable_policies[-4:],
             "policy_memory": self._policy_memory,
             "policy_repairs": self._policy_repairs,
             "premature_completion_repairs": self._premature_completion_repairs,
             "premature_failure_repairs": self._premature_failure_repairs,
+            "repeated_action_repairs": self._repeated_action_repairs,
             "policy_executed_action": self._policy_executed_action,
             "boundary_reason": self._boundary_reason,
             "reduction_required": self._reduction_required,
@@ -1290,6 +1378,155 @@ class OrchestratedObjectiveAgent(ToolAgent):
             artifact=artifact,
         )
 
+    def _policy_artifact_source(
+        self, artifact_name: str, expected_hash: str
+    ) -> str | None:
+        runtime_path = getattr(self, "_session_runtime_dir", None)
+        if runtime_path is None or not artifact_name or not expected_hash:
+            return None
+        artifact = (runtime_path.parent / artifact_name).resolve()
+        policy_root = (runtime_path.parent / "policies").resolve()
+        try:
+            artifact.relative_to(policy_root)
+        except ValueError:
+            return None
+        try:
+            if not artifact.is_file():
+                return None
+            source = artifact.read_text(encoding="utf-8")
+            if verify_policy_source(source) != expected_hash:
+                return None
+        except (OSError, PolicyRuntimeError, ValueError):
+            return None
+        return source
+
+    def _cache_current_policy_for_reuse(self, reason: str) -> None:
+        if (
+            self._tree is None
+            or self._active_policy_reuse_scope != "tactical"
+            or not self._policy_executed_action
+            or not reason.startswith("subgoal_succeeded:")
+            or not self._policy_source_hash
+            or not self._policy_artifact
+        ):
+            return
+        origin = self._tree.nodes.get(self._policy_objective_id)
+        if origin is None or origin.kind is not ObjectiveKind.TACTICAL:
+            return
+        entry = {
+            "game_id": self._knowledge_game_id,
+            "level": self._tree.current_level,
+            "source_hash": self._policy_source_hash,
+            "artifact": self._policy_artifact,
+            "origin_objective_id": self._policy_objective_id,
+        }
+        self._reusable_policies = [
+            item
+            for item in self._reusable_policies
+            if not (
+                item.get("source_hash") == entry["source_hash"]
+                and item.get("level") == entry["level"]
+            )
+        ]
+        self._reusable_policies.append(entry)
+        del self._reusable_policies[:-4]
+        self._emit_event("policy_reuse_cached", **entry)
+
+    def _try_reuse_policy(self, frame: Frame) -> bool:
+        assert self._tree is not None
+        objective = self._tree.active
+        if objective.kind is not ObjectiveKind.TACTICAL:
+            return False
+        for entry in reversed(self._reusable_policies):
+            try:
+                entry_level = int(entry.get("level") or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                str(entry.get("game_id") or "") != self._knowledge_game_id
+                or entry_level != self._tree.current_level
+            ):
+                continue
+            source_hash = str(entry.get("source_hash") or "")
+            artifact = str(entry.get("artifact") or "")
+            source = self._policy_artifact_source(artifact, source_hash)
+            if source is None or _policy_reuse_scope_from_source(source) != "tactical":
+                continue
+            runtime = GameplayPolicyRuntime()
+            try:
+                activation = runtime.activate(
+                    source,
+                    context={
+                        "game_id": self._knowledge_game_id,
+                        "objective": objective.to_dict(),
+                    },
+                )
+                runtime.preflight(
+                    PolicyObservation(
+                        board=np.asarray(frame.grid, dtype=np.uint8),
+                        level=frame.level,
+                        step=frame.step,
+                        valid_actions=tuple(to_model_actions(frame.valid_actions)),
+                        last_transition=None,
+                        objective=objective.to_dict(),
+                        recent_transitions=(),
+                        backend=activation.backend,
+                    ),
+                    minimum_actions=objective.minimum_evidence_actions,
+                )
+                assert runtime.activation is not None
+                activation = runtime.activation
+                if activation.source_hash != source_hash:
+                    raise PolicyRuntimeError(
+                        "reused policy fingerprint mismatch",
+                        category="policy_protocol",
+                    )
+            except (OSError, PolicyRuntimeError, ValueError) as exc:
+                runtime.close()
+                self._orchestration_metrics["policy_reuse_rejections"] = (
+                    int(self._orchestration_metrics.get("policy_reuse_rejections", 0))
+                    + 1
+                )
+                self._emit_event(
+                    "policy_reuse_rejected",
+                    objective_id=objective.objective_id,
+                    origin_objective_id=entry.get("origin_objective_id"),
+                    source_hash=source_hash,
+                    category=getattr(exc, "category", "policy_reuse"),
+                    detail=str(exc),
+                )
+                continue
+            if self._policy_runtime is not None:
+                self._policy_runtime.close()
+            self._policy_runtime = runtime
+            self._policy_objective_id = objective.objective_id
+            self._policy_source_hash = source_hash
+            self._policy_artifact = artifact
+            self._active_policy_reuse_scope = "tactical"
+            self._policy_memory = runtime.memory
+            self._policy_executed_action = False
+            self._orchestration_metrics["policy_activations"] = (
+                int(self._orchestration_metrics.get("policy_activations", 0)) + 1
+            )
+            self._orchestration_metrics["policy_reuses"] = (
+                int(self._orchestration_metrics.get("policy_reuses", 0)) + 1
+            )
+            if activation.backend_fallback_reason:
+                self._orchestration_metrics["cuda_fallbacks"] = (
+                    int(self._orchestration_metrics.get("cuda_fallbacks", 0)) + 1
+                )
+            self._emit_event(
+                "policy_reused",
+                objective_id=objective.objective_id,
+                origin_objective_id=entry.get("origin_objective_id"),
+                source_hash=source_hash,
+                artifact=artifact,
+                backend=activation.backend,
+                backend_fallback_reason=activation.backend_fallback_reason,
+            )
+            return True
+        return False
+
     def _activate_policy(
         self,
         frame: Frame,
@@ -1304,6 +1541,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
             raise ObjectiveError(
                 "a gameplay policy requires an active tactical objective"
             )
+        if repair_reason.startswith("subgoal_succeeded:") and self._try_reuse_policy(
+            frame
+        ):
+            return
         raw = self._structured_role_call(
             role="coder",
             system_prompt=_CODER_SYSTEM_PROMPT,
@@ -1335,10 +1576,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         recent_transitions=(),
                         backend=activation.backend,
                     ),
-                    minimum_actions=min(
-                        _MIN_TACTICAL_PERSISTENCE_ACTIONS,
-                        max(1, self._tree.active.action_budget),
-                    ),
+                    minimum_actions=self._tree.active.minimum_evidence_actions,
                 )
                 assert runtime.activation is not None
                 activation = runtime.activation
@@ -1373,6 +1611,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_objective_id = self._tree.active_id
         self._policy_source_hash = source_hash
         self._policy_artifact = self._save_policy_artifact(source, source_hash)
+        self._active_policy_reuse_scope = _policy_reuse_scope_from_source(source)
         self._policy_memory = runtime.memory
         self._policy_executed_action = False
         self._orchestration_metrics["policy_activations"] = (
@@ -1394,11 +1633,13 @@ class OrchestratedObjectiveAgent(ToolAgent):
     def _invalidate_policy(
         self, reason: str, *, require_reduction: bool = False
     ) -> None:
+        self._cache_current_policy_for_reuse(reason)
         if self._policy_runtime is not None:
             self._policy_memory = self._policy_runtime.memory
             self._policy_runtime.close()
         self._policy_runtime = None
         self._policy_objective_id = ""
+        self._active_policy_reuse_scope = "none"
         self._policy_executed_action = False
         self._boundary_reason = reason
         self._reduction_required = self._reduction_required or require_reduction
@@ -1425,6 +1666,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         source = artifact.read_text(encoding="utf-8")
         if verify_policy_source(source) != self._policy_source_hash:
             return False
+        self._active_policy_reuse_scope = _policy_reuse_scope_from_source(source)
         runtime = GameplayPolicyRuntime()
         activation = runtime.activate(
             source,
@@ -1564,10 +1806,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
 
         assert self._tree is not None
         active = self._tree.active
-        required_actions = min(
-            _MIN_TACTICAL_PERSISTENCE_ACTIONS,
-            max(1, active.action_budget),
-        )
+        required_actions = active.minimum_evidence_actions
         transition = self._last_transition
         if not isinstance(transition, dict):
             return False, "no post-action transition has been observed"
@@ -1605,10 +1844,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
 
         assert self._tree is not None
         active = self._tree.active
-        required_actions = min(
-            _MIN_TACTICAL_PERSISTENCE_ACTIONS,
-            max(1, active.action_budget),
-        )
+        required_actions = active.minimum_evidence_actions
         transition = self._last_transition
         if (
             not isinstance(transition, dict)
@@ -1651,6 +1887,43 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 "premature subgoal_failed rejected by host: "
                 f"{failure_reason}; continue with a different valid probe",
                 category="premature_subgoal_failure",
+            ),
+            counts_activation_failure=False,
+        )
+        return True
+
+    def _repair_repeated_action(
+        self,
+        *,
+        action_payload: dict[str, Any],
+        previous_outcome_class: str,
+    ) -> bool:
+        """Give one replacement policy the same leaf and remaining action budget."""
+
+        assert self._tree is not None
+        objective_id = self._tree.active_id
+        repairs = self._repeated_action_repairs.get(objective_id, 0)
+        if repairs >= 1:
+            return False
+        self._repeated_action_repairs[objective_id] = repairs + 1
+        self._orchestration_metrics["repeated_action_repairs"] = (
+            int(self._orchestration_metrics.get("repeated_action_repairs", 0)) + 1
+        )
+        self._emit_event(
+            "policy_non_progress_repeat_repair",
+            objective_id=objective_id,
+            action=action_payload.get("action"),
+            row=action_payload.get("row"),
+            col=action_payload.get("col"),
+            previous_outcome_class=previous_outcome_class,
+            remaining_actions=self._tree.active.remaining_actions,
+        )
+        self._policy_failure(
+            PolicyRuntimeError(
+                "repeated non-progress action rejected by host; keep the same "
+                "objective and remaining budget, inspect the latest transition, "
+                "and choose a distinct valid action or coordinate",
+                category="repeated_non_progress_action",
             ),
             counts_activation_failure=False,
         )
@@ -2032,6 +2305,15 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         f"{self._last_transition.get('outcome_class') or 'guarded'} "
                         "transition instead of evaluating the post-action evidence"
                     )
+                    previous_outcome_class = str(
+                        self._last_transition.get("outcome_class") or "guarded"
+                    )
+                    if self._repair_repeated_action(
+                        action_payload=action_payload,
+                        previous_outcome_class=previous_outcome_class,
+                    ):
+                        no_action_boundaries += 1
+                        continue
                     self._tree.fail_active_tactical(evidence)
                     self._orchestration_metrics["objectives_failed"] = (
                         int(self._orchestration_metrics.get("objectives_failed", 0)) + 1
@@ -2043,9 +2325,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         action=action_payload.get("action"),
                         row=action_payload.get("row"),
                         col=action_payload.get("col"),
-                        previous_outcome_class=self._last_transition.get(
-                            "outcome_class"
-                        ),
+                        previous_outcome_class=previous_outcome_class,
                     )
                     self._emit_event(
                         "objective_failed",
