@@ -445,6 +445,21 @@ class PolicyCodegenHelperTests(unittest.TestCase):
         self.assertEqual(
             (2, 2), least_tried_mouse_point(candidates, transitions, exclude=((3, 3),))
         )
+        counts = recent_mouse_point_counts(transitions)
+        self.assertEqual(
+            (3, 3),
+            least_tried_mouse_point(
+                ((1, 1), (2, 2), (3, 3)), (), exclude=counts.keys()
+            ),
+        )
+        self.assertEqual(
+            (3, 3),
+            least_tried_mouse_point(
+                ((2, 2), (3, 3)),
+                (),
+                exclude=("2,2", [2, 2], (2, 2)),
+            ),
+        )
         self.assertIsNone(least_tried_mouse_point(((1, 1),), (), exclude=((1, 1),)))
         self.assertIsNone(least_tried_mouse_point(((0, 10), (63, 10)), ()))
         self.assertEqual(
@@ -455,6 +470,12 @@ class PolicyCodegenHelperTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "allow_edge_hud"):
             least_tried_mouse_point(((2, 2),), (), allow_edge_hud=1)
+        with self.assertRaisesRegex(ValueError, "point must be"):
+            least_tried_mouse_point(("2,2",), ())
+        for malformed in ("2", "2,3,4", "x,3", " 2,3", "02,3", b"2,3"):
+            with self.subTest(malformed=malformed):
+                with self.assertRaisesRegex(ValueError, "excluded mouse point"):
+                    least_tried_mouse_point(((2, 2),), (), exclude=(malformed,))
 
 
 if __name__ == "__main__":

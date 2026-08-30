@@ -107,6 +107,9 @@
   Override the destination with `--path /path/to/dest`, or the kernel with
   `--kernel owner/slug`. The equivalent environment variables are
   `KAGGLE_OUTPUT_DIR` and `KAGGLE_KERNEL_REF`.
+  Before downloading, the wrapper removes all existing contents from the resolved
+  destination after the kernel status check succeeds. It refuses broad destinations
+  including `/`, the workspace root, script directory, current directory, and home.
 
   For the repository-mounted analysis directory, use
   `/workspace/duck-harness/results` as the destination. The command requires

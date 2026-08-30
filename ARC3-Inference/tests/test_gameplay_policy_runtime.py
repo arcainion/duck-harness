@@ -435,6 +435,36 @@ def decide(observation, memory):
         self.assertEqual(64, decision.memory["edge_run"])
         self.assertFalse(decision.memory["evidence_ready"])
 
+    def test_policy_can_reuse_json_mouse_count_keys_as_exclusions(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    clicked_keys = tuple(memory.get("clicked_keys", []))
+    point = least_tried_mouse_point(
+        ((2, 2), (3, 3)), observation.recent_transitions, exclude=clicked_keys
+    )
+    if point is None:
+        return subgoal_failed(memory, "all candidate points tried")
+    key = str(point[0]) + "," + str(point[1])
+    memory = memory_update(memory, {
+        "clicked_keys": history_push(
+            list(memory.get("clicked_keys", [])), key, limit=8
+        )
+    })
+    return mouse_decision(point, memory, "try next unvisited point")
+"""
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(source, context={})
+            first = runtime.decide(observation(valid_actions=("MOUSE",)))
+            second = runtime.decide(observation(valid_actions=("MOUSE",)))
+            third = runtime.decide(observation(valid_actions=("MOUSE",)))
+        self.assertEqual({"action": "MOUSE", "row": 2, "col": 2}, first.action)
+        self.assertEqual({"action": "MOUSE", "row": 3, "col": 3}, second.action)
+        self.assertEqual(PolicyStatus.SUBGOAL_FAILED, third.status)
+        self.assertIsNone(third.action)
+        self.assertEqual(["2,2", "3,3"], third.memory["clicked_keys"])
+
     def test_invalid_policy_action_is_rejected(self) -> None:
         source = GOOD_POLICY.replace("observation.valid_actions[0]", '"ACTION4"')
         with GameplayPolicyRuntime(requested_backend="cpu") as runtime:

@@ -331,8 +331,10 @@ include_mouse=False) provides deterministic exploration without emitting an unlo
 MOUSE action. For clicks, use least_tried_mouse_point(candidates,
 observation.recent_transitions, exclude=(), only_nonprogress=False,
 allow_edge_hud=False), then pass its result to mouse_decision;
-recent_mouse_point_counts(...) exposes JSON-safe "row,col" counts. The two-cell outer
-HUD band is excluded by default. Set allow_edge_hud=True only after persistent interior
+recent_mouse_point_counts(...) exposes JSON-safe "row,col" counts. Exclude accepts
+point pairs or those canonical keys, so exclude=recent_mouse_point_counts(...).keys()
+is safe. The two-cell outer HUD band is excluded by default. Set allow_edge_hud=True
+only after persistent interior
 evidence specifically identifies an edge control as relevant. The helper returns None
 when no safe candidate remains; never pass None to mouse_decision—choose a safe
 non-mouse action or return subgoal_failed instead.

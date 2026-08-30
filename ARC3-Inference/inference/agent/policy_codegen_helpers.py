@@ -48,6 +48,32 @@ def _point(value: Any) -> tuple[int, int]:
     return checked
 
 
+def _mouse_point_exclusion(value: Any) -> tuple[int, int]:
+    """Normalize a point pair or a canonical JSON-safe ``"row,col"`` key."""
+
+    if isinstance(value, str):
+        parts = value.split(",")
+        if (
+            len(parts) != 2
+            or any(
+                not part
+                or not part.isascii()
+                or not part.isdigit()
+                or str(int(part)) != part
+                for part in parts
+            )
+        ):
+            raise ValueError(
+                'excluded mouse point must be a (row, col) pair or canonical "row,col" key'
+            )
+        return _point((int(parts[0]), int(parts[1])))
+    if isinstance(value, bytes):
+        raise ValueError(
+            'excluded mouse point must be a (row, col) pair or canonical "row,col" key'
+        )
+    return _point(value)
+
+
 def _grid(value: Any) -> np.ndarray:
     board = np.asarray(value)
     if board.ndim != 2 or not board.shape[0] or not board.shape[1]:
@@ -801,7 +827,12 @@ def least_tried_mouse_point(
     only_nonprogress: bool = False,
     allow_edge_hud: bool = False,
 ) -> tuple[int, int] | None:
-    """Choose a least-attempted click, excluding the thin HUD edge by default."""
+    """Choose a least-attempted click, excluding the thin HUD edge by default.
+
+    Candidate values remain strict point pairs. Exclusions additionally accept the
+    canonical ``"row,col"`` keys returned by :func:`recent_mouse_point_counts` so
+    JSON policy memory can round-trip those coordinates without reparsing them.
+    """
 
     if not isinstance(allow_edge_hud, bool):
         raise ValueError("allow_edge_hud must be a boolean")
@@ -822,7 +853,7 @@ def least_tried_mouse_point(
     for position, value in enumerate(exclude_iterator):
         if position >= 64 * 64:
             raise ValueError("exclude may contain at most 4096 points")
-        excluded.add(_point(value))
+        excluded.add(_mouse_point_exclusion(value))
     edge_band = 2
     available = [
         point

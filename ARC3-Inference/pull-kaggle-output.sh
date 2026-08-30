@@ -20,6 +20,10 @@ Options:
 Environment overrides:
   KAGGLE_KERNEL_REF  Default: arcainionprime/taaf-duck-harness-kaggle
   KAGGLE_OUTPUT_DIR  Default: /workspace/duck-harness/results
+
+The destination contents are removed after a successful status check and immediately
+before the output download. The filesystem root, workspace root, script directory,
+current directory, and home directory are rejected as destinations.
 EOF
 }
 
@@ -68,6 +72,19 @@ if [ -n "${KAGGLE_KEY:-}" ]; then
 fi
 export KAGGLE_USERNAME KAGGLE_KEY KAGGLE_API_TOKEN
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CURRENT_DIR="$(pwd -P)"
+HOME_DIR="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${HOME}")"
+KAGGLE_OUTPUT_DIR="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${KAGGLE_OUTPUT_DIR}")"
+
+case "${KAGGLE_OUTPUT_DIR}" in
+    ""|/|"${WORKSPACE_DIR}"|"${SCRIPT_DIR}"|"${CURRENT_DIR}"|"${HOME_DIR}")
+        echo "error: refusing to clean unsafe output destination: ${KAGGLE_OUTPUT_DIR:-<empty>}" >&2
+        exit 2
+        ;;
+esac
+
 mkdir -p -- "${KAGGLE_OUTPUT_DIR}"
 
 if [ "${CHECK_STATUS}" = true ]; then
@@ -78,6 +95,9 @@ if [ "${CHECK_STATUS}" = true ]; then
     fi
     echo
 fi
+
+echo "Cleaning previous Kaggle output: ${KAGGLE_OUTPUT_DIR}"
+find "${KAGGLE_OUTPUT_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 
 echo "Pulling Kaggle output: ${KAGGLE_KERNEL_REF}"
 echo "Destination: ${KAGGLE_OUTPUT_DIR}"
