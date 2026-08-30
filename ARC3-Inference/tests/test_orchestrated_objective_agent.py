@@ -19,6 +19,7 @@ from inference.agent.gameplay_policy_runtime import (
 from inference.agent.orchestrated_objective_agent import (
     OrchestratedObjectiveAgent,
     _meaningful_progress,
+    _objective_contract_hash,
     _policy_source_from_message,
     _policy_reuse_scope_from_source,
     _policy_transition_payload,
@@ -354,6 +355,7 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             agent._policy_artifact = str(artifact.relative_to(root))
             agent._active_policy_reuse_scope = "tactical"
             agent._policy_executed_action = True
+            agent._policy_observed_host_progress = True
             agent._tree.record_action()
             agent._tree.complete_active_tactical("contract satisfied")
             agent._invalidate_policy(f"subgoal_succeeded:{origin.objective_id}")
@@ -384,7 +386,95 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             self.assertEqual(
                 origin.objective_id, agent._reusable_policies[0]["origin_objective_id"]
             )
+            self.assertEqual("proven", agent._reusable_policies[0]["qualification"])
             agent.close()
+
+    def test_provisional_policy_reuses_only_matching_contract_then_is_evicted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_path = root / "runtime_state.json"
+            runtime_path.touch()
+            policy_dir = root / "policies"
+            policy_dir.mkdir()
+            source_hash = verify_policy_source(REUSABLE_POLICY_SOURCE)
+            artifact = policy_dir / f"tactical_1-{source_hash}.py"
+            artifact.write_text(REUSABLE_POLICY_SOURCE, encoding="utf-8")
+
+            agent = self._agent()
+            agent._knowledge_game_id = "game-a"
+            agent._session_runtime_dir = runtime_path
+            agent._tree = ObjectiveTree.start_game(
+                "game-a", level=1, level_action_budget=32
+            )
+            origin = agent._tree.apply_proposal(
+                ReductionProposal.from_payload(reduction_for("level:1:1")),
+                remaining_level_actions=32,
+            )
+            agent._policy_objective_id = origin.objective_id
+            agent._policy_source_hash = source_hash
+            agent._policy_artifact = str(artifact.relative_to(root))
+            agent._active_policy_reuse_scope = "tactical"
+            agent._policy_executed_action = True
+            agent._tree.record_action()
+            agent._tree.complete_active_tactical("mapping evidence collected")
+            agent._invalidate_policy(f"subgoal_succeeded:{origin.objective_id}")
+
+            cached = agent._reusable_policies[0]
+            self.assertEqual("provisional", cached["qualification"])
+            self.assertEqual(_objective_contract_hash(origin), cached["contract_hash"])
+
+            replacement = agent._tree.apply_proposal(
+                ReductionProposal.from_payload(reduction_for("level:1:1")),
+                remaining_level_actions=31,
+            )
+            with mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                _FakeRuntime,
+            ):
+                self.assertTrue(agent._try_reuse_policy(frame()))
+            self.assertEqual(replacement.objective_id, agent._policy_objective_id)
+            self.assertTrue(agent._policy_was_reused)
+
+            agent._policy_executed_action = True
+            agent._tree.record_action()
+            agent._tree.complete_active_tactical("same unproductive local evidence")
+            agent._invalidate_policy(f"subgoal_succeeded:{replacement.objective_id}")
+            self.assertEqual([], agent._reusable_policies)
+            self.assertEqual(1, agent._orchestration_metrics["policy_reuse_evictions"])
+            agent.close()
+
+    def test_provisional_policy_does_not_cross_tactical_contracts(self) -> None:
+        agent = self._agent()
+        agent._knowledge_game_id = "game-a"
+        agent._tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=32)
+        origin = agent._tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_for("level:1:1")),
+            remaining_level_actions=32,
+        )
+        agent._reusable_policies = [
+            {
+                "game_id": "game-a",
+                "level": 1,
+                "source_hash": "hash",
+                "artifact": "policies/missing.py",
+                "origin_objective_id": origin.objective_id,
+                "contract_hash": _objective_contract_hash(origin),
+                "qualification": "provisional",
+            }
+        ]
+        agent._tree.complete_active_tactical("done")
+        replacement = agent._tree.apply_proposal(
+            ReductionProposal.from_payload(
+                reduction_for("level:1:1", title="Inspect a different mechanism")
+            ),
+            remaining_level_actions=32,
+        )
+        self.assertNotEqual(
+            agent._reusable_policies[0]["contract_hash"],
+            _objective_contract_hash(replacement),
+        )
+        self.assertFalse(agent._try_reuse_policy(frame()))
+        agent.close()
 
     def test_policy_transition_exposes_controller_progress_evidence(self) -> None:
         action = {"action": "MOUSE", "row": 30, "col": 61}
@@ -423,6 +513,16 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
                     **volatile_result,
                     "outcome_class": "novel",
                     "novel_state": True,
+                }
+            )
+        )
+        self.assertFalse(
+            _meaningful_progress(
+                {
+                    **volatile_result,
+                    "outcome_class": "novel",
+                    "novel_state": True,
+                    "meaningful_progress": False,
                 }
             )
         )
@@ -1285,6 +1385,61 @@ def decide(observation, memory):
         self.assertEqual(3, metrics["reducer_timeouts"])
         self.assertEqual(3, metrics["reducer_transport_failures"])
         self.assertEqual(0, metrics["reducer_calls"])
+
+    def test_context_error_compacts_history_and_reduces_output_before_retry(self) -> None:
+        context_error = requests.HTTPError(
+            "400 Client Error: This model's maximum context length is 65536 tokens. "
+            "However, you requested 4096 output tokens and your prompt contains at "
+            "least 61441 input tokens, for a total of at least 65537 tokens. Please "
+            "reduce the length of the input prompt. (parameter=input_tokens)"
+        )
+        client = _ScriptedModelClient(
+            [
+                context_error,
+                reduction_for("level:1:1"),
+                policy_for("tactical:1"),
+            ]
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                _FakeRuntime,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+            agent._ensure_session(state_path)
+            agent._role_histories["reducer"] = [
+                {"role": "user" if index % 2 == 0 else "assistant", "content": "x" * 100}
+                for index in range(6)
+            ]
+            result = agent.analyze(
+                state_path,
+                0,
+                step_env=lambda _payload: {
+                    "executed": True,
+                    "board_changed": False,
+                    "meaningful_progress": False,
+                    "outcome_class": "exact_noop",
+                    "state": "PLAYING",
+                    "level": 1,
+                },
+            )
+            metrics = dict(agent._orchestration_metrics)
+            agent.close()
+
+        self.assertTrue(result.step_executed)
+        self.assertEqual(3, client.calls)
+        self.assertEqual(8, len(client.messages[0]))
+        self.assertEqual(4, len(client.messages[1]))
+        self.assertEqual(4096, client.call_kwargs[0]["max_output_tokens"])
+        self.assertEqual(3839, client.call_kwargs[1]["max_output_tokens"])
+        self.assertEqual(1, metrics["role_context_adjustments"])
+        self.assertEqual(1, metrics["reducer_transport_failures"])
+        self.assertEqual(1, metrics["reducer_calls"])
 
     def test_engine_terminal_states_resolve_host_game_without_llm(self) -> None:
         for engine_state, expected_status in (

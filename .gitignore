@@ -9,6 +9,7 @@ __pycache__/
 # Runtime caches (created by `make`/`make view`)
 .cache/
 .kaggle-deploy/
+/results/
 
 # Node (figure tooling, if reintroduced)
 node_modules/

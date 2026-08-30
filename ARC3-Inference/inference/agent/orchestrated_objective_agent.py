@@ -36,6 +36,7 @@ from inference.agent.tool_agent import (
     AnalyzerTurnResult,
     ToolAgent,
     _extract_reasoning_text,
+    _is_context_length_error,
     _normalize_message_content,
 )
 
@@ -58,6 +59,11 @@ _REDUCTION_END_MARKER = "END_REDUCTION"
 _POLICY_BEGIN_MARKER = "BEGIN_POLICY"
 _POLICY_END_MARKER = "END_POLICY"
 _MAX_REJECTED_POLICY_REPAIR_CHARS = 24000
+_CONTEXT_RE = re.compile(
+    r"maximum context length is\s+(\d+)\s+tokens.*?requested\s+(\d+)\s+"
+    r"output tokens.*?prompt contains at least\s+(\d+)\s+input tokens",
+    re.IGNORECASE | re.DOTALL,
+)
 _NON_PROGRESS_OUTCOME_CLASSES = frozenset(
     {
         "exact_noop",
@@ -112,6 +118,10 @@ def _empty_orchestration_metrics() -> dict[str, int | float]:
         "policy_activations": 0,
         "policy_reuses": 0,
         "policy_reuse_rejections": 0,
+        "policy_reuse_evictions": 0,
+        "policy_reuse_promotions": 0,
+        "policy_provisional_caches": 0,
+        "role_context_adjustments": 0,
         "policy_repairs": 0,
         "policy_steps": 0,
         "cuda_fallbacks": 0,
@@ -238,10 +248,14 @@ across tactical objectives in the same level: it must derive actions and termina
 criteria from observation.objective, observation.board, valid_actions, and transition
 evidence rather than embedding the current objective's title, fixed route, target
 coordinates, or success threshold. Prefer reusable board-driven exploration and
-pathfinding policies when they can honor different tactical contracts. Otherwise
-declare POLICY_REUSE_SCOPE = "none". The host always supplies fresh memory/context and
-preflights a reused policy against the new objective; reuse never crosses a game or
-level boundary.
+pathfinding policies when they can honor different tactical contracts. A local board
+change, novelty, adjacency, digest change, or inferred feature merge is not sufficient
+to make a reusable policy claim success: require the active contract plus explicit host
+transition evidence such as meaningful_progress, reward, level_completed, or
+run_complete. Default to POLICY_REUSE_SCOPE = "none" when uncertain. The declaration is
+only a reuse candidate; the host qualifies, limits, and may evict it. The host always
+supplies fresh memory/context and preflights a reused policy against the new objective;
+reuse never crosses a game or level boundary.
 
 Trusted pathfinding helpers are already available as globals; do not import or redefine
 them. A passable grid is any non-empty 2D boolean-like array with at most 4096 cells;
@@ -431,10 +445,46 @@ def _meaningful_progress(result: dict[str, Any]) -> bool:
         result.get("level_completed")
         or result.get("run_complete")
         or _finite_float(result.get("reward")) > 0
-        or outcome in _PROGRESS_OUTCOME_CLASSES
     ):
         return True
+    # The controller owns progress classification. In particular, a novel board
+    # state can still be an unproductive translation or animation. Only infer from
+    # outcome metadata for older controllers that omit the explicit field.
+    explicit = result.get("meaningful_progress")
+    if isinstance(explicit, bool):
+        return explicit
+    if outcome in _PROGRESS_OUTCOME_CLASSES:
+        return True
     return bool(result.get("novel_state") or result.get("decision_context_changed"))
+
+
+def _objective_contract_hash(objective: Any) -> str:
+    """Return a stable hash of the tactical contract, excluding runtime counters."""
+
+    payload = objective.to_dict() if hasattr(objective, "to_dict") else objective
+    if not isinstance(payload, dict):
+        return ""
+    material = {
+        key: re.sub(r"\s+", " ", str(payload.get(key) or "")).strip().lower()
+        for key in (
+            "title",
+            "success_criteria",
+            "failure_criteria",
+            "expected_evidence",
+        )
+    }
+    material["single_step"] = bool(payload.get("single_step"))
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return hashlib.blake2b(encoded.encode("utf-8"), digest_size=12).hexdigest()
+
+
+def _context_error_limits(exc: BaseException) -> tuple[int, int, int] | None:
+    """Extract server context, requested output, and measured input token counts."""
+
+    match = _CONTEXT_RE.search(str(exc))
+    if match is None:
+        return None
+    return tuple(int(value) for value in match.groups())  # type: ignore[return-value]
 
 
 def _policy_transition_payload(
@@ -634,6 +684,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._premature_failure_repairs: dict[str, int] = {}
         self._repeated_action_repairs: dict[str, int] = {}
         self._policy_executed_action = False
+        self._policy_observed_host_progress = False
+        self._policy_was_reused = False
         self._boundary_reason = "game_start"
         self._reduction_required = True
         self._last_transition: dict[str, Any] | None = None
@@ -697,6 +749,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._premature_failure_repairs = {}
         self._repeated_action_repairs = {}
         self._policy_executed_action = False
+        self._policy_observed_host_progress = False
+        self._policy_was_reused = False
         self._boundary_reason = "game_start"
         self._reduction_required = True
         self._last_transition = None
@@ -771,6 +825,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
             self._policy_executed_action = bool(
                 payload.get("policy_executed_action", False)
             )
+            self._policy_observed_host_progress = bool(
+                payload.get("policy_observed_host_progress", False)
+            )
+            self._policy_was_reused = bool(payload.get("policy_was_reused", False))
             self._boundary_reason = str(payload.get("boundary_reason") or "resume")
             self._reduction_required = bool(payload.get("reduction_required", False))
             self._last_transition = (
@@ -845,6 +903,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "premature_failure_repairs": self._premature_failure_repairs,
             "repeated_action_repairs": self._repeated_action_repairs,
             "policy_executed_action": self._policy_executed_action,
+            "policy_observed_host_progress": self._policy_observed_host_progress,
+            "policy_was_reused": self._policy_was_reused,
             "boundary_reason": self._boundary_reason,
             "reduction_required": self._reduction_required,
             "last_transition": self._last_transition,
@@ -958,6 +1018,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         corrections: list[str] = []
         rejected_policy_source = ""
         last_error = ""
+        context_output_limit: int | None = None
+        context_adjustments = 0
         for attempt in range(1, _MAX_STRUCTURED_ATTEMPTS + 1):
             if should_stop is not None and should_stop():
                 raise OrchestrationYield("stop requested")
@@ -1017,6 +1079,12 @@ class OrchestratedObjectiveAgent(ToolAgent):
             ]
             self._should_stop_callback = should_stop
             output_limit = self._role_output_limit(role, attempt)
+            if context_output_limit is not None:
+                output_limit = (
+                    min(output_limit, context_output_limit)
+                    if output_limit is not None
+                    else context_output_limit
+                )
             thinking_budget = self._role_thinking_budget(
                 role, output_limit, attempt=attempt
             )
@@ -1067,6 +1135,37 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 last_error = f"{type(exc).__name__}: {exc}"
                 if should_stop is not None and should_stop():
                     raise OrchestrationYield("stop requested") from exc
+                if _is_context_length_error(exc) and attempt < _MAX_STRUCTURED_ATTEMPTS:
+                    context_adjustments += 1
+                    limits = _context_error_limits(exc)
+                    previous_output_limit = output_limit
+                    if limits is not None:
+                        context_window, requested_output, input_tokens = limits
+                        available_output = max(256, context_window - input_tokens - 256)
+                        context_output_limit = min(requested_output, available_output)
+                    elif output_limit is not None:
+                        context_output_limit = max(256, output_limit // 2)
+                    else:
+                        context_output_limit = 2048
+                    history_before = len(history)
+                    if context_adjustments == 1 and len(history) > 2:
+                        del history[:-2]
+                    else:
+                        history.clear()
+                    self._orchestration_metrics["role_context_adjustments"] = int(
+                        self._orchestration_metrics.get("role_context_adjustments", 0)
+                    ) + 1
+                    self._emit_event(
+                        "role_context_adjusted",
+                        role=role,
+                        structured_attempt=attempt,
+                        previous_max_output_tokens=previous_output_limit,
+                        adjusted_max_output_tokens=context_output_limit,
+                        history_messages_removed=history_before - len(history),
+                        server_context_tokens=limits[0] if limits is not None else None,
+                        measured_input_tokens=limits[2] if limits is not None else None,
+                    )
+                    continue
                 if attempt < _MAX_STRUCTURED_ATTEMPTS:
                     continue
                 raise OrchestrationFailure(
@@ -1400,25 +1499,75 @@ class OrchestratedObjectiveAgent(ToolAgent):
             return None
         return source
 
+    def _evict_reusable_policy(self, source_hash: str, reason: str) -> None:
+        before = len(self._reusable_policies)
+        self._reusable_policies = [
+            item
+            for item in self._reusable_policies
+            if str(item.get("source_hash") or "") != source_hash
+        ]
+        if len(self._reusable_policies) == before:
+            return
+        self._orchestration_metrics["policy_reuse_evictions"] = int(
+            self._orchestration_metrics.get("policy_reuse_evictions", 0)
+        ) + 1
+        self._emit_event(
+            "policy_reuse_evicted",
+            source_hash=source_hash,
+            objective_id=self._policy_objective_id,
+            reason=reason,
+            host_progress=self._policy_observed_host_progress,
+        )
+
     def _cache_current_policy_for_reuse(self, reason: str) -> None:
+        if self._tree is None or not self._policy_source_hash:
+            return
+        successful = reason.startswith("subgoal_succeeded:")
+        if self._policy_was_reused:
+            if successful and self._policy_observed_host_progress:
+                promoted = False
+                for item in self._reusable_policies:
+                    if str(item.get("source_hash") or "") == self._policy_source_hash:
+                        if item.get("qualification") != "proven":
+                            item["qualification"] = "proven"
+                            promoted = True
+                        item["last_progress_objective_id"] = self._policy_objective_id
+                if promoted:
+                    self._orchestration_metrics["policy_reuse_promotions"] = int(
+                        self._orchestration_metrics.get("policy_reuse_promotions", 0)
+                    ) + 1
+                    self._emit_event(
+                        "policy_reuse_promoted",
+                        source_hash=self._policy_source_hash,
+                        objective_id=self._policy_objective_id,
+                    )
+                return
+            self._evict_reusable_policy(
+                self._policy_source_hash,
+                "reused policy ended without host-confirmed progress: " + reason,
+            )
+            return
         if (
-            self._tree is None
-            or self._active_policy_reuse_scope != "tactical"
+            self._active_policy_reuse_scope != "tactical"
             or not self._policy_executed_action
-            or not reason.startswith("subgoal_succeeded:")
-            or not self._policy_source_hash
+            or not successful
             or not self._policy_artifact
         ):
             return
         origin = self._tree.nodes.get(self._policy_objective_id)
         if origin is None or origin.kind is not ObjectiveKind.TACTICAL:
             return
+        qualification = (
+            "proven" if self._policy_observed_host_progress else "provisional"
+        )
         entry = {
             "game_id": self._knowledge_game_id,
             "level": self._tree.current_level,
             "source_hash": self._policy_source_hash,
             "artifact": self._policy_artifact,
             "origin_objective_id": self._policy_objective_id,
+            "contract_hash": _objective_contract_hash(origin),
+            "qualification": qualification,
         }
         self._reusable_policies = [
             item
@@ -1430,6 +1579,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
         ]
         self._reusable_policies.append(entry)
         del self._reusable_policies[:-4]
+        if qualification == "provisional":
+            self._orchestration_metrics["policy_provisional_caches"] = int(
+                self._orchestration_metrics.get("policy_provisional_caches", 0)
+            ) + 1
         self._emit_event("policy_reuse_cached", **entry)
 
     def _try_reuse_policy(self, frame: Frame) -> bool:
@@ -1437,6 +1590,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         objective = self._tree.active
         if objective.kind is not ObjectiveKind.TACTICAL:
             return False
+        contract_hash = _objective_contract_hash(objective)
         for entry in reversed(self._reusable_policies):
             try:
                 entry_level = int(entry.get("level") or 0)
@@ -1446,6 +1600,13 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 str(entry.get("game_id") or "") != self._knowledge_game_id
                 or entry_level != self._tree.current_level
             ):
+                continue
+            qualification = str(entry.get("qualification") or "provisional")
+            if qualification not in {"proven", "provisional"}:
+                continue
+            if qualification == "provisional" and str(
+                entry.get("contract_hash") or ""
+            ) != contract_hash:
                 continue
             source_hash = str(entry.get("source_hash") or "")
             artifact = str(entry.get("artifact") or "")
@@ -1505,6 +1666,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
             self._active_policy_reuse_scope = "tactical"
             self._policy_memory = runtime.memory
             self._policy_executed_action = False
+            self._policy_observed_host_progress = False
+            self._policy_was_reused = True
             self._orchestration_metrics["policy_activations"] = (
                 int(self._orchestration_metrics.get("policy_activations", 0)) + 1
             )
@@ -1521,6 +1684,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 origin_objective_id=entry.get("origin_objective_id"),
                 source_hash=source_hash,
                 artifact=artifact,
+                qualification=qualification,
+                contract_hash=contract_hash,
                 backend=activation.backend,
                 backend_fallback_reason=activation.backend_fallback_reason,
             )
@@ -1614,6 +1779,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._active_policy_reuse_scope = _policy_reuse_scope_from_source(source)
         self._policy_memory = runtime.memory
         self._policy_executed_action = False
+        self._policy_observed_host_progress = False
+        self._policy_was_reused = False
         self._orchestration_metrics["policy_activations"] = (
             int(self._orchestration_metrics.get("policy_activations", 0)) + 1
         )
@@ -1641,6 +1808,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_objective_id = ""
         self._active_policy_reuse_scope = "none"
         self._policy_executed_action = False
+        self._policy_observed_host_progress = False
+        self._policy_was_reused = False
         self._boundary_reason = reason
         self._reduction_required = self._reduction_required or require_reduction
 
@@ -2344,6 +2513,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 self._last_transition = transition
                 self._recent_transitions.append(transition)
                 del self._recent_transitions[:-8]
+                if bool(transition.get("meaningful_progress")):
+                    self._policy_observed_host_progress = True
                 self._emit_event("gameplay_decision", **transition)
                 if result.get("executed"):
                     self._tree.record_action()

@@ -88,6 +88,31 @@
   `DEPLOYMENT_WAIT=true` to block until the notebook finishes and pull the
   output back into the run directory, and `KAGGLE_DRY_RUN=true` to stage the
   bundles and metadata without calling the Kaggle API.
+- To pull the latest completed notebook output explicitly for analysis, run
+  the following inside `duck-kaggle-dev`, replacing the destination with an
+  existing or desired directory:
+
+  ```bash
+  kaggle kernels output arcainionprime/taaf-duck-harness-kaggle -p /path/to/dest
+  ```
+
+  The repository wrapper performs the status check, credential export, directory
+  creation, and download with these defaults:
+
+  ```bash
+  cd /workspace/duck-harness/ARC3-Inference
+  bash ./pull-kaggle-output.sh
+  ```
+
+  Override the destination with `--path /path/to/dest`, or the kernel with
+  `--kernel owner/slug`. The equivalent environment variables are
+  `KAGGLE_OUTPUT_DIR` and `KAGGLE_KERNEL_REF`.
+
+  For the repository-mounted analysis directory, use
+  `/workspace/duck-harness/results` as the destination. The command requires
+  working Kaggle credentials in the container and downloads the kernel's
+  current published output, so check `kaggle kernels status
+  arcainionprime/taaf-duck-harness-kaggle` first when a run may still be active.
 - Target defaults (Makefile, not the README): `AGENT=duck-harness`,
   `MODEL=local`, `KAGGLE_DUCK_PUBLIC_HARNESS=true` (the 25 official
   ARC-AGI-3 games), `N_PASSES=1`, `CONCURRENT_JOBS=12`,
