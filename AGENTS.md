@@ -61,8 +61,8 @@
   `RUN_NAME=duck-harness-20260816 ./kaggle-duck.sh`; `KAGGLE_DRY_RUN=true`
   stages without pushing. Its status check uses the credential export
   workaround for the container's `kaggle` CLI.
-- Set `KAGGLE_DUCK_DIAGNOSTIC=true` to run the five-game diagnostic suite at
-  concurrency 3 with a 900-second analyzer timeout before committing to the public harness. Override the suite
+- Set `KAGGLE_DUCK_DIAGNOSTIC=true` to run one `ar25-0c556536` diagnostic game at
+  concurrency 1 with a 900-second analyzer timeout before committing to the public harness. Override the game list
   with `KAGGLE_DUCK_DIAGNOSTIC_GAMES='["game-id", ...]'` when needed.
 - Set `KAGGLE_DUCK_OBJECTIVE_REDUCTION=true` to use the host-owned objective
   tree and generated gameplay-policy runtime. Gameplay defaults to CPU; select

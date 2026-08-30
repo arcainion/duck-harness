@@ -2253,6 +2253,12 @@ def transition_metadata(
         "decision_context_changed": transition["decision_context_changed"],
         "novel_state": outcome_class == "novel",
         "outcome_class": outcome_class,
+        # Novelty is exploration evidence, not objective progress. Keep this
+        # host-owned signal narrow so animations, translations, and arbitrary
+        # unseen states cannot complete objectives or qualify policy reuse.
+        "meaningful_progress": bool(
+            run_complete or reward > 0.0 or outcome_class == "level_progress"
+        ),
         "reward": float(reward),
         "game_over": bool(game_over),
         "run_complete": bool(run_complete),

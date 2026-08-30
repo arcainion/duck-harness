@@ -363,7 +363,7 @@ cycle-risk actions.
 Its stagnation/cycle windows are 6/4. Add `DEPLOYMENT_WAIT=true` if you want the
 command to block and pull the finished Kaggle output back into the run directory. Set
 `KAGGLE_DUCK_DIAGNOSTIC=true` when invoking `kaggle-duck.sh` to first run the
-five-game diagnostic suite at concurrency 3 with a 900-second analyzer timeout.
+single-game `ar25-0c556536` diagnostic run at concurrency 1 with a 900-second analyzer timeout.
 The host-owned Orchestrated Objective Reduction analyzer is opt-in. Enable it
 for a CPU-first diagnostic run with:
 

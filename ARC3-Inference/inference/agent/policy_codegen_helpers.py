@@ -799,8 +799,12 @@ def least_tried_mouse_point(
     transitions: Any,
     exclude: Any = (),
     only_nonprogress: bool = False,
+    allow_edge_hud: bool = False,
 ) -> tuple[int, int] | None:
-    """Choose the least attempted candidate coordinate with stable tie ordering."""
+    """Choose a least-attempted click, excluding the thin HUD edge by default."""
+
+    if not isinstance(allow_edge_hud, bool):
+        raise ValueError("allow_edge_hud must be a boolean")
 
     try:
         candidate_iterator = iter(candidates)
@@ -819,7 +823,19 @@ def least_tried_mouse_point(
         if position >= 64 * 64:
             raise ValueError("exclude may contain at most 4096 points")
         excluded.add(_point(value))
-    available = [point for point in checked_candidates if point not in excluded]
+    edge_band = 2
+    available = [
+        point
+        for point in checked_candidates
+        if point not in excluded
+        and (
+            allow_edge_hud
+            or (
+                edge_band <= point[0] < 64 - edge_band
+                and edge_band <= point[1] < 64 - edge_band
+            )
+        )
+    ]
     if not available:
         return None
     counts = recent_mouse_point_counts(

@@ -738,8 +738,19 @@ class InferenceControllerTests(TestCase):
         metadata = transition_metadata(before, after, history, "RIGHT", self.config)
 
         self.assertTrue(metadata["novel_state"])
+        self.assertFalse(metadata["meaningful_progress"])
         self.assertNotEqual(metadata["before_state_id"], metadata["after_state_id"])
         self.assertEqual(metadata["controller_phase"], "explore")
+
+        progressed = transition_metadata(
+            before,
+            after,
+            history,
+            "RIGHT",
+            self.config,
+            reward=0.25,
+        )
+        self.assertTrue(progressed["meaningful_progress"])
 
     def test_transition_metadata_reports_executed_actions_actual_rank(self) -> None:
         config = InferenceControllerConfig(enabled=True, policy=OUTCOME_AWARE_POLICY)

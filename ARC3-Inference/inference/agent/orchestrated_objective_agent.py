@@ -28,8 +28,11 @@ from inference.agent.gameplay_policy_runtime import (
 from inference.agent.objective_reduction import (
     ObjectiveError,
     ObjectiveKind,
+    ObjectiveNode,
     ObjectiveTree,
     ReductionProposal,
+    ReductionVerdict,
+    SubgoalSpec,
 )
 from inference.agent.runtime_state import Frame, HistoryEntry, load_runtime_state
 from inference.agent.tool_agent import (
@@ -76,10 +79,6 @@ _NON_PROGRESS_OUTCOME_CLASSES = frozenset(
         "invalid_action",
     }
 )
-_PROGRESS_OUTCOME_CLASSES = frozenset(
-    {"novel", "progress", "reward", "level_progress", "game_progress"}
-)
-
 _MODEL_ACTION_CONTRACT = {
     "UP": "move up",
     "DOWN": "move down",
@@ -196,6 +195,13 @@ LEFT, RIGHT, SPACE, MOUSE, or ACTION7. These meanings are exact, not hypotheses.
 MOUSE always requires integer row and col coordinates from 0 through 63. Never invent
 or reason about hidden ACTION1 through ACTION6 aliases. A mere board change is not
 necessarily progress: volatile_only and exact_noop outcomes are negative evidence.
+Novel states are exploration evidence, not host-confirmed progress. Do not repeat a
+tactical contract already present in objective_tree; use its resolution evidence and
+select a materially different falsifiable objective.
+The host accepts tactical success only after controller-confirmed meaningful_progress,
+reward, level_completed, or run_complete. Frame pure exploration so useful observations
+without that progress satisfy failure_criteria and drive a materially different next
+reduction instead of claiming completion.
 
 BEGIN_REDUCTION
 {"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"run a bounded adaptive probe sequence","selected_index":0,"subgoals":[{"title":"Map legal actions and execute the best discovered route","success_criteria":"establish a repeatable transition rule and use it toward level progress","failure_criteria":"eight distinct adaptive probes produce no usable rule","expected_evidence":"four or more host transitions comparing distinct actions and outcomes","action_budget":8,"minimum_evidence_actions":4,"single_step":false}]}
@@ -250,9 +256,11 @@ evidence rather than embedding the current objective's title, fixed route, targe
 coordinates, or success threshold. Prefer reusable board-driven exploration and
 pathfinding policies when they can honor different tactical contracts. A local board
 change, novelty, adjacency, digest change, or inferred feature merge is not sufficient
-to make a reusable policy claim success: require the active contract plus explicit host
+to claim tactical success: require the active contract plus explicit host
 transition evidence such as meaningful_progress, reward, level_completed, or
-run_complete. Default to POLICY_REUSE_SCOPE = "none" when uncertain. The declaration is
+run_complete. If bounded exploration produces useful evidence but no host-confirmed
+progress, return subgoal_failed with that evidence so the reducer can choose a different
+contract. Default to POLICY_REUSE_SCOPE = "none" when uncertain. The declaration is
 only a reuse candidate; the host qualifies, limits, and may evict it. The host always
 supplies fresh memory/context and preflights a reused policy against the new objective;
 reuse never crosses a game or level boundary.
@@ -321,8 +329,13 @@ and recent_action_counts(..., only_nonprogress=False) summarize at most 64 trans
 least_tried_action(observation.valid_actions, observation.recent_transitions, exclude=(),
 include_mouse=False) provides deterministic exploration without emitting an unlocated
 MOUSE action. For clicks, use least_tried_mouse_point(candidates,
-observation.recent_transitions, exclude=(), only_nonprogress=False), then pass its result
-to mouse_decision; recent_mouse_point_counts(...) exposes JSON-safe "row,col" counts.
+observation.recent_transitions, exclude=(), only_nonprogress=False,
+allow_edge_hud=False), then pass its result to mouse_decision;
+recent_mouse_point_counts(...) exposes JSON-safe "row,col" counts. The two-cell outer
+HUD band is excluded by default. Set allow_edge_hud=True only after persistent interior
+evidence specifically identifies an edge control as relevant. The helper returns None
+when no safe candidate remains; never pass None to mouse_decision—choose a safe
+non-mouse action or return subgoal_failed instead.
 Use first_matching_cell(board, values), nearest_matching_cell(board, values, origin), or
 matching_region_center(board, values) instead of rewriting marker scans. Use
 line_value_count(board, values, axis, index), line_run_length(..., from_end=False),
@@ -448,14 +461,92 @@ def _meaningful_progress(result: dict[str, Any]) -> bool:
     ):
         return True
     # The controller owns progress classification. In particular, a novel board
-    # state can still be an unproductive translation or animation. Only infer from
-    # outcome metadata for older controllers that omit the explicit field.
+    # state can still be an unproductive translation or animation. Older
+    # controllers that omit the explicit field are treated conservatively; the
+    # engine-owned terminal/reward checks above remain sufficient for real progress.
     explicit = result.get("meaningful_progress")
     if isinstance(explicit, bool):
         return explicit
-    if outcome in _PROGRESS_OUTCOME_CLASSES:
-        return True
-    return bool(result.get("novel_state") or result.get("decision_context_changed"))
+    return False
+
+
+_TACTICAL_CONTRACT_STOPWORDS = frozenset(
+    {
+        "a",
+        "after",
+        "and",
+        "at",
+        "before",
+        "by",
+        "for",
+        "from",
+        "if",
+        "in",
+        "into",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "then",
+        "to",
+        "until",
+        "using",
+        "while",
+        "with",
+        "within",
+    }
+)
+
+
+def _tactical_contract_terms(value: Any) -> frozenset[str]:
+    """Return deterministic salient terms for host-side anti-churn checks."""
+
+    if isinstance(value, SubgoalSpec):
+        text = " ".join(
+            (value.title, value.success_criteria, value.expected_evidence)
+        )
+    else:
+        text = " ".join(
+            str(getattr(value, name, "") or "")
+            for name in ("title", "success_criteria", "expected_evidence")
+        )
+    return frozenset(
+        token
+        for token in re.findall(r"[a-z]+|\d+", text.lower())
+        if len(token) > 1 and token not in _TACTICAL_CONTRACT_STOPWORDS
+    )
+
+
+def _tactical_contract_similarity(left: Any, right: Any) -> float:
+    """Measure salient-term containment for deterministic paraphrase detection."""
+
+    left_terms = _tactical_contract_terms(left)
+    right_terms = _tactical_contract_terms(right)
+    if not left_terms or not right_terms:
+        return 0.0
+    overlap = len(left_terms & right_terms)
+    if overlap < 6:
+        return 0.0
+    return overlap / min(len(left_terms), len(right_terms))
+
+
+def _equivalent_attempted_tactical(
+    tree: ObjectiveTree, spec: SubgoalSpec, *, threshold: float = 0.72
+) -> ObjectiveNode | None:
+    """Find an already-attempted sibling with an equivalent tactical contract."""
+
+    parent_id = tree.active_id
+    for node in tree.nodes.values():
+        if (
+            node.kind is not ObjectiveKind.TACTICAL
+            or node.parent_id != parent_id
+            or (node.attempts <= 0 and node.actions_used <= 0)
+        ):
+            continue
+        if _tactical_contract_similarity(node, spec) >= threshold:
+            return node
+    return None
 
 
 def _objective_contract_hash(objective: Any) -> str:
@@ -1322,6 +1413,15 @@ class OrchestratedObjectiveAgent(ToolAgent):
 
         def validate_reduction(raw: dict[str, Any]) -> ReductionProposal:
             proposal = ReductionProposal.from_payload(raw)
+            if proposal.verdict is ReductionVerdict.DECOMPOSE:
+                selected = proposal.subgoals[proposal.selected_index]
+                repeated = _equivalent_attempted_tactical(self._tree, selected)
+                if repeated is not None:
+                    raise ObjectiveError(
+                        "selected subgoal repeats already-attempted tactical contract "
+                        f"{repeated.objective_id!r}; select a materially different "
+                        "objective and use its resolution evidence"
+                    )
             probe = ObjectiveTree.from_dict(self._tree.to_dict())
             probe.apply_proposal(proposal, remaining_level_actions=32)
             return proposal
@@ -2006,7 +2106,12 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 f"only {len(relevant)} of {required_actions} required transition "
                 "observations are retained"
             )
-        return True, "host persistence and transition evidence requirements are met"
+        if not any(bool(item.get("meaningful_progress")) for item in relevant):
+            return False, (
+                "novel or changed states alone do not prove tactical completion; "
+                "no controller-confirmed meaningful progress was observed"
+            )
+        return True, "host persistence and meaningful-progress requirements are met"
 
     def _tactical_failure_evidence(self) -> tuple[bool, str]:
         """Require bounded evidence before accepting an action-free failure claim."""

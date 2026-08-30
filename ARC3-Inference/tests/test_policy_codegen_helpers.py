@@ -446,6 +446,15 @@ class PolicyCodegenHelperTests(unittest.TestCase):
             (2, 2), least_tried_mouse_point(candidates, transitions, exclude=((3, 3),))
         )
         self.assertIsNone(least_tried_mouse_point(((1, 1),), (), exclude=((1, 1),)))
+        self.assertIsNone(least_tried_mouse_point(((0, 10), (63, 10)), ()))
+        self.assertEqual(
+            (0, 10),
+            least_tried_mouse_point(
+                ((0, 10), (63, 10)), (), allow_edge_hud=True
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "allow_edge_hud"):
+            least_tried_mouse_point(((2, 2),), (), allow_edge_hud=1)
 
 
 if __name__ == "__main__":

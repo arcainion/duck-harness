@@ -428,7 +428,7 @@ def decide(observation, memory):
         with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
             runtime.activate(source, context={})
             decision = runtime.decide(probe_observation)
-        self.assertEqual({"action": "MOUSE", "row": 1, "col": 1}, decision.action)
+        self.assertEqual({"action": "MOUSE", "row": 2, "col": 2}, decision.action)
         self.assertEqual("probe", decision.memory["phase"])
         self.assertEqual([0, 0], decision.memory["marker"])
         self.assertEqual(64, decision.memory["edge_count"])

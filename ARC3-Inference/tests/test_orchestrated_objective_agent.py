@@ -18,6 +18,7 @@ from inference.agent.gameplay_policy_runtime import (
 )
 from inference.agent.orchestrated_objective_agent import (
     OrchestratedObjectiveAgent,
+    _equivalent_attempted_tactical,
     _meaningful_progress,
     _objective_contract_hash,
     _policy_source_from_message,
@@ -25,6 +26,7 @@ from inference.agent.orchestrated_objective_agent import (
     _policy_transition_payload,
     _reduction_from_message,
     _repeats_non_progress_action,
+    _tactical_contract_similarity,
 )
 from inference.agent.objective_reduction import (
     ObjectiveStatus,
@@ -507,7 +509,7 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual("NOT_FINISHED", transition["engine_state"])
         self.assertEqual(1, transition["animation_summary"]["frame_count"])
         self.assertNotIn("dominant_color_transitions", transition["animation_summary"])
-        self.assertTrue(
+        self.assertFalse(
             _meaningful_progress(
                 {
                     **volatile_result,
@@ -559,6 +561,66 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
                 objective_id="tactical:1",
             )
         )
+
+    def test_attempted_tactical_contract_paraphrase_is_detected(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        first = ReductionProposal.from_payload(
+            {
+                **reduction_for("level:1:1"),
+                "subgoals": [
+                    {
+                        "title": "Calibrate UP against row 63 segment growth",
+                        "success_criteria": (
+                            "repeat UP and establish whether the row 63 segment grows "
+                            "toward level completion"
+                        ),
+                        "failure_criteria": "UP produces no repeatable segment change",
+                        "expected_evidence": (
+                            "four transitions comparing UP with row 63 segment length"
+                        ),
+                        "action_budget": 8,
+                        "minimum_evidence_actions": 4,
+                        "single_step": False,
+                    }
+                ],
+            }
+        )
+        tree.apply_proposal(first, remaining_level_actions=20)
+        tree.record_action()
+        tree.fail_active_tactical("UP did not advance the level")
+
+        repeated = ReductionProposal.from_payload(
+            {
+                **reduction_for("level:1:1"),
+                "subgoals": [
+                    {
+                        "title": "Repeat UP to grow the row 63 segment",
+                        "success_criteria": (
+                            "establish row 63 segment growth by repeating UP toward "
+                            "level completion"
+                        ),
+                        "failure_criteria": "no repeatable growth is observed",
+                        "expected_evidence": (
+                            "four UP transitions measuring row 63 segment length"
+                        ),
+                        "action_budget": 8,
+                        "minimum_evidence_actions": 4,
+                        "single_step": False,
+                    }
+                ],
+            }
+        ).subgoals[0]
+        original = tree.nodes["tactical:1"]
+
+        self.assertGreaterEqual(
+            _tactical_contract_similarity(original, repeated), 0.72
+        )
+        self.assertIs(original, _equivalent_attempted_tactical(tree, repeated))
+
+        distinct = ReductionProposal.from_payload(
+            reduction_for("level:1:1", title="Probe a central mouse target")
+        ).subgoals[0]
+        self.assertIsNone(_equivalent_attempted_tactical(tree, distinct))
 
     def test_raw_reduction_envelope_parses_json_object(self) -> None:
         payload = reduction_for("level:1:1")
@@ -1621,7 +1683,11 @@ def decide(observation, memory):
             agent = self._agent()
             agent.model_client = client
             first_step = mock.Mock(
-                return_value={"executed": True, "board_changed": True}
+                return_value={
+                    "executed": True,
+                    "board_changed": True,
+                    "meaningful_progress": True,
+                }
             )
             first = agent.analyze(state_path, 0, step_env=first_step)
             write_runtime_state(
@@ -1665,6 +1731,7 @@ def decide(observation, memory):
             "outcome_class": "novel",
             "level_completed": False,
             "run_complete": False,
+            "meaningful_progress": False,
         }
         tree.record_action()
         agent._last_transition = dict(transition)
@@ -1676,6 +1743,12 @@ def decide(observation, memory):
         for _ in range(3):
             tree.record_action()
             agent._recent_transitions.append(dict(transition))
+        allowed, reason = agent._tactical_completion_evidence()
+        self.assertFalse(allowed)
+        self.assertIn("novel or changed states alone", reason)
+
+        agent._last_transition = {**transition, "meaningful_progress": True}
+        agent._recent_transitions[-1] = dict(agent._last_transition)
         allowed, _ = agent._tactical_completion_evidence()
         self.assertTrue(allowed)
 

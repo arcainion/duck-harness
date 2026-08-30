@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 class KaggleDuckWrapperTests(unittest.TestCase):
-    def test_diagnostic_mode_selects_five_games_and_safe_concurrency(self) -> None:
+    def test_diagnostic_mode_selects_one_ar25_game(self) -> None:
         project_dir = Path(__file__).resolve().parents[1]
         wrapper = project_dir / "kaggle-duck.sh"
 
@@ -49,7 +49,7 @@ class KaggleDuckWrapperTests(unittest.TestCase):
             arguments = json.loads(make_log.read_text(encoding="utf-8"))
 
         self.assertIn("KAGGLE_DUCK_PUBLIC_HARNESS=false", arguments)
-        self.assertIn("CONCURRENT_JOBS=3", arguments)
+        self.assertIn("CONCURRENT_JOBS=1", arguments)
         self.assertIn("ANALYZER_TIMEOUT=900", arguments)
         self.assertIn("LOCAL_ANALYZER_OBJECTIVE_REDUCTION=true", arguments)
         self.assertIn(
@@ -76,8 +76,7 @@ class KaggleDuckWrapperTests(unittest.TestCase):
         self.assertIn("LOCAL_GAMEPLAY_POLICY_CUDA_MIN_FREE_MB=4096", arguments)
         self.assertIn("LOCAL_GAMEPLAY_POLICY_DECISION_TIMEOUT_SECONDS=2", arguments)
         game_argument = next(item for item in arguments if item.startswith("GAME="))
-        self.assertIn("ft09-0d8bbf25", game_argument)
-        self.assertIn("r11l-495a7899", game_argument)
+        self.assertEqual('GAME=["ar25-0c556536"]', game_argument)
 
     def test_file_credentials_are_safe_and_available_before_make(self) -> None:
         project_dir = Path(__file__).resolve().parents[1]
