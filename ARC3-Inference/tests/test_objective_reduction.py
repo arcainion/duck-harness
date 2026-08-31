@@ -64,6 +64,48 @@ class ObjectiveTreeTests(unittest.TestCase):
         )
         self.assertEqual(tactical.evidence_mode, restored.active.evidence_mode)
 
+    def test_contrastive_transition_evidence_mode_round_trips(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        subgoal = dict(reduction_payload()["subgoals"][0])  # type: ignore[index,arg-type]
+        subgoal["evidence_mode"] = "contrastive_transition"
+        tactical = tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_payload(subgoals=[subgoal])),
+            remaining_level_actions=20,
+        )
+        restored = ObjectiveTree.from_dict(tree.to_dict())
+        self.assertEqual(
+            ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION,
+            tactical.evidence_mode,
+        )
+        self.assertEqual(tactical.evidence_mode, restored.active.evidence_mode)
+
+    def test_contrastive_transition_requires_resolvable_evidence_budget(self) -> None:
+        for action_budget, minimum_evidence, single_step in (
+            (2, 2, False),
+            (8, 2, False),
+            (1, 1, True),
+        ):
+            with self.subTest(
+                action_budget=action_budget,
+                minimum_evidence=minimum_evidence,
+                single_step=single_step,
+            ):
+                subgoal = dict(reduction_payload()["subgoals"][0])  # type: ignore[index,arg-type]
+                subgoal.update(
+                    {
+                        "evidence_mode": "contrastive_transition",
+                        "action_budget": action_budget,
+                        "minimum_evidence_actions": minimum_evidence,
+                        "single_step": single_step,
+                    }
+                )
+                with self.assertRaisesRegex(
+                    ObjectiveError, "contrastive_transition"
+                ):
+                    ReductionProposal.from_payload(
+                        reduction_payload(subgoals=[subgoal])
+                    )
+
     def test_invalid_evidence_mode_is_rejected(self) -> None:
         subgoal = dict(reduction_payload()["subgoals"][0])  # type: ignore[index,arg-type]
         subgoal["evidence_mode"] = "board_changed"

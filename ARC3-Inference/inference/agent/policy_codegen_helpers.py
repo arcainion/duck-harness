@@ -455,6 +455,12 @@ def stable_transition_evidence_status(
 
     if not isinstance(objective, Mapping):
         raise ValueError("objective must be a mapping")
+    evidence_mode = str(objective.get("evidence_mode") or "stable_transition")
+    if evidence_mode != "stable_transition":
+        return False, (
+            "stable-transition evidence cannot resolve "
+            f"{evidence_mode or 'unknown'} objectives"
+        )
     required = objective.get("minimum_evidence_actions", 1)
     if isinstance(required, bool):
         raise ValueError("minimum_evidence_actions must be an integer from 0 through 32")
@@ -518,6 +524,113 @@ def stable_transition_evidence_ready(objective: Any, transitions: Any) -> bool:
     """Return whether host-verifiable stable tactical evidence is ready."""
 
     return stable_transition_evidence_status(objective, transitions)[0]
+
+
+def contrastive_transition_evidence_status(
+    objective: Any, transitions: Any
+) -> tuple[bool, str]:
+    """Validate causal evidence using repeated positive and distinct negative probes."""
+
+    if not isinstance(objective, Mapping):
+        raise ValueError("objective must be a mapping")
+    evidence_mode = str(objective.get("evidence_mode") or "contrastive_transition")
+    if evidence_mode != "contrastive_transition":
+        return False, (
+            "contrastive evidence cannot resolve "
+            f"{evidence_mode or 'unknown'} objectives"
+        )
+    required = objective.get("minimum_evidence_actions", 1)
+    if isinstance(required, bool):
+        raise ValueError("minimum_evidence_actions must be an integer from 0 through 32")
+    try:
+        required_count = index(required)
+    except TypeError as exc:
+        raise ValueError(
+            "minimum_evidence_actions must be an integer from 0 through 32"
+        ) from exc
+    if not 0 <= required_count <= 32:
+        raise ValueError("minimum_evidence_actions must be an integer from 0 through 32")
+
+    objective_id = str(objective.get("objective_id") or objective.get("id") or "")
+    relevant: list[Mapping[str, Any]] = []
+    for transition in _recent_items(transitions):
+        transition_objective_id = str(transition.get("objective_id") or "")
+        if objective_id and transition_objective_id and transition_objective_id != objective_id:
+            continue
+        if transition.get("executed") is not True:
+            continue
+        if transition.get("post_action_observed") is False:
+            continue
+        relevant.append(transition)
+    if len(relevant) < required_count:
+        return False, (
+            f"only {len(relevant)} of {required_count} required transition "
+            "observations were found"
+        )
+
+    groups: dict[tuple[Any, Any, Any], list[Mapping[str, Any]]] = {}
+    for item in relevant:
+        signature = (item.get("action"), item.get("row"), item.get("col"))
+        groups.setdefault(signature, []).append(item)
+    positive_signatures = {
+        signature
+        for signature, items in groups.items()
+        if sum(transition_has_stable_change(item) for item in items) >= 2
+    }
+    if not positive_signatures:
+        return False, (
+            "no exact action or coordinate produced stable change at least twice"
+        )
+
+    def action_family(signature: tuple[Any, Any, Any]) -> str:
+        action = str(signature[0] or "").strip().upper()
+        if action in {"UP", "RIGHT", "DOWN", "LEFT"}:
+            return "directional"
+        if action == "MOUSE":
+            return "mouse"
+        if action in {"SPACE", "ACTION7"}:
+            return "button"
+        return f"action:{action}"
+
+    def safe_negative(item: Mapping[str, Any]) -> bool:
+        outcome_class = str(item.get("outcome_class") or "").strip().lower()
+        return (
+            not transition_has_stable_change(item)
+            and not item.get("error")
+            and (
+                item.get("board_changed") is False
+                or outcome_class
+                in {
+                    "exact_noop",
+                    "behavioral_noop",
+                    "volatile_only",
+                    "transient_effect",
+                }
+            )
+        )
+
+    for positive_signature in positive_signatures:
+        positive_family = action_family(positive_signature)
+        for signature, items in groups.items():
+            if signature == positive_signature:
+                continue
+            if action_family(signature) != positive_family:
+                continue
+            if items and all(safe_negative(item) for item in items):
+                return True, (
+                    "repeated positive and matched same-family negative-control "
+                    "transition requirements are met"
+                )
+    return False, (
+        "no matched same-family negative-control action or coordinate was observed "
+        "without a corresponding stable change"
+    )
+
+
+def contrastive_transition_evidence_ready(objective: Any, transitions: Any) -> bool:
+    """Return whether host-verifiable causal transition evidence is ready."""
+
+    return contrastive_transition_evidence_status(objective, transitions)[0]
 
 
 def palette_value(symbol: Any) -> int:
@@ -1126,6 +1239,7 @@ POLICY_CODEGEN_GLOBALS = MappingProxyType(
         "board_digest": board_digest,
         "cells_digest": cells_digest,
         "consecutive_outcome_count": consecutive_outcome_count,
+        "contrastive_transition_evidence_ready": contrastive_transition_evidence_ready,
         "continue_decision": continue_decision,
         "edge_run_length": edge_run_length,
         "edge_value_count": edge_value_count,

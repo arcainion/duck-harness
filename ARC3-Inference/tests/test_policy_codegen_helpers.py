@@ -15,6 +15,8 @@ from inference.agent.policy_codegen_helpers import (
     board_digest,
     cells_digest,
     consecutive_outcome_count,
+    contrastive_transition_evidence_ready,
+    contrastive_transition_evidence_status,
     continue_decision,
     edge_run_length,
     edge_value_count,
@@ -254,6 +256,7 @@ class PolicyCodegenHelperTests(unittest.TestCase):
             "action_payload",
             "cells_digest",
             "continue_decision",
+            "contrastive_transition_evidence_ready",
             "edge_run_length",
             "first_matching_cell",
             "least_tried_mouse_point",
@@ -490,6 +493,59 @@ class PolicyCodegenHelperTests(unittest.TestCase):
         ready, reason = stable_transition_evidence_status(objective, reproduced)
         self.assertFalse(ready)
         self.assertIn("only 3 of 4", reason)
+
+    def test_contrastive_transition_requires_positive_and_negative_controls(self) -> None:
+        objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "contrastive_transition",
+            "minimum_evidence_actions": 4,
+        }
+
+        def transition(action: str, *, changed: bool) -> dict[str, object]:
+            return {
+                "objective_id": "tactical:1",
+                "action": action,
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": changed,
+                "outcome_class": "novel" if changed else "exact_noop",
+                "cycle_risk": not changed,
+                "loop_detected": not changed,
+            }
+
+        only_positive = [transition("LEFT", changed=True) for _ in range(4)]
+        ready, reason = contrastive_transition_evidence_status(
+            objective, only_positive
+        )
+        self.assertFalse(ready)
+        self.assertIn("negative-control", reason)
+        self.assertFalse(stable_transition_evidence_ready(objective, only_positive))
+
+        unmatched_control = [
+            transition("LEFT", changed=True),
+            transition("MOUSE", changed=False),
+            transition("LEFT", changed=True),
+            transition("MOUSE", changed=False),
+        ]
+        ready, reason = contrastive_transition_evidence_status(
+            objective, unmatched_control
+        )
+        self.assertFalse(ready)
+        self.assertIn("same-family", reason)
+
+        contrasted = [
+            transition("LEFT", changed=True),
+            transition("RIGHT", changed=False),
+            transition("LEFT", changed=True),
+            transition("RIGHT", changed=False),
+        ]
+        self.assertTrue(
+            contrastive_transition_evidence_ready(objective, contrasted)
+        )
+        stable_objective = {**objective, "evidence_mode": "stable_transition"}
+        self.assertFalse(
+            contrastive_transition_evidence_ready(stable_objective, contrasted)
+        )
 
     def test_recent_transition_summaries_are_bounded_and_host_classified(self) -> None:
         transitions = (

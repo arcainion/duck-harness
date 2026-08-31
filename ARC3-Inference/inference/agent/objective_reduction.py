@@ -36,6 +36,7 @@ class ObjectiveEvidenceMode(StrEnum):
 
     ENGINE_PROGRESS = "engine_progress"
     STABLE_TRANSITION = "stable_transition"
+    CONTRASTIVE_TRANSITION = "contrastive_transition"
 
 
 class ReductionVerdict(StrEnum):
@@ -102,8 +103,16 @@ class SubgoalSpec:
             )
         except ValueError as exc:
             raise ObjectiveError(
-                "subgoal evidence_mode must be engine_progress or stable_transition"
+                "subgoal evidence_mode must be engine_progress, stable_transition, "
+                "or contrastive_transition"
             ) from exc
+        if evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION and (
+            action_budget < 3 or raw_minimum_evidence < 3 or raw_single_step
+        ):
+            raise ObjectiveError(
+                "contrastive_transition subgoals require action_budget>=3, "
+                "minimum_evidence_actions>=3, and single_step=false"
+            )
         return cls(
             title=required_text("title", 200),
             success_criteria=required_text("success_criteria"),

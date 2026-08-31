@@ -30,12 +30,17 @@ from inference.agent.objective_reduction import (
     ObjectiveError,
     ObjectiveKind,
     ObjectiveNode,
+    ObjectiveStatus,
     ObjectiveTree,
     ReductionProposal,
     ReductionVerdict,
     SubgoalSpec,
 )
-from inference.agent.policy_codegen_helpers import stable_transition_evidence_status
+from inference.agent.policy_codegen_helpers import (
+    contrastive_transition_evidence_status,
+    stable_transition_evidence_status,
+    transition_has_stable_change,
+)
 from inference.agent.runtime_state import Frame, HistoryEntry, load_runtime_state
 from inference.agent.tool_agent import (
     AnalyzerTurnResult,
@@ -54,6 +59,8 @@ _MAX_STRUCTURED_ATTEMPTS = 3
 _MAX_POLICY_REPAIRS = 2
 _MAX_NO_ACTION_BOUNDARIES = 8
 _MAX_CONSECUTIVE_POLICY_FAILURES = _MAX_POLICY_REPAIRS + 1
+_ACTION_FAMILY_SATURATION_ATTEMPTS = 12
+_STRATEGIC_RECALIBRATION_FAILURES = 3
 _DEFAULT_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS = 300.0
 _DEFAULT_REDUCER_MAX_OUTPUT = 4096
 _DEFAULT_CODER_MAX_OUTPUT = 8192
@@ -134,6 +141,7 @@ def _empty_orchestration_metrics() -> dict[str, int | float]:
         "objective_completion_reinterpretations": 0,
         "objective_failure_rejections": 0,
         "repeated_action_repairs": 0,
+        "action_family_saturation_guards": 0,
     }
 
 
@@ -176,10 +184,17 @@ rationale, selected_index, and subgoals. verdict is continue, complete, fail, or
 decompose. Each subgoal contains title, success_criteria, failure_criteria,
 expected_evidence, evidence_mode, an integer action_budget from 1 to 32, an integer
 minimum_evidence_actions from 1 through min(4, action_budget), and a boolean
-single_step. evidence_mode is engine_progress or stable_transition. Use
-stable_transition only for epistemic tactical goals such as identifying a control or
-repeatable interaction rule; it requires reproducible executed, nonvolatile,
-non-cyclic board changes but does not imply level progress. Use engine_progress when
+single_step. evidence_mode is engine_progress, stable_transition, or
+contrastive_transition. Use stable_transition only for descriptive repeatability: it
+requires reproducible executed, nonvolatile, non-cyclic board changes from the same
+action or coordinate but does not prove that action is uniquely causal. Use
+contrastive_transition when identifying a causal control, interaction, or coordinate;
+it requires the same exact positive action or coordinate to produce stable change at
+least twice plus a distinct executed negative-control action or coordinate from the
+same modality without a corresponding stable change: direction versus direction,
+MOUSE coordinate versus MOUSE coordinate, or button versus button. Contrastive
+subgoals must set action_budget at least 3,
+minimum_evidence_actions at least 3, and single_step=false. Use engine_progress when
 success requires meaningful_progress, reward, level_completed, or run_complete. The
 host owns all IDs,
 tree invariants, budgets, and game/level completion. You may complete or fail only
@@ -205,14 +220,26 @@ necessarily progress: volatile_only and exact_noop outcomes are negative evidenc
 Novel states are exploration evidence, not host-confirmed progress. Do not repeat a
 tactical contract already present in objective_tree; use its resolution evidence and
 select a materially different falsifiable objective.
+level_action_evidence is authoritative host evidence accumulated across every tactical
+objective in the current level. Treat saturated=true as a hard prohibition: do not
+select a subgoal that requires that action family. High no_progress with zero stable
+changes or meaningful progress is strong negative evidence even when coordinates or
+object labels differ. Do not evade failed MOUSE evidence by scanning fresh coordinates.
+After three consecutive failed engine_progress tactical objectives, the host requires a
+contrastive_transition recalibration before accepting another execution hypothesis.
+Use it to falsify the assumed control/action/coordinate mapping, not to rename the same
+object-manipulation story. MOUSE interaction-learning objectives must also use
+contrastive_transition; stable click repeatability alone is not causal evidence.
 The host accepts engine_progress tactical success only after controller-confirmed
 meaningful_progress, reward, level_completed, or run_complete. A stable_transition
 tactical objective may complete on repeated host-classified stable changes after its
 minimum evidence count; this resolves only that tactical learning goal, never the
 engine-owned level or game objective.
+A contrastive_transition objective has the same limited tactical scope and additionally
+requires the host-validated negative control.
 
 BEGIN_REDUCTION
-{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"run a bounded adaptive probe sequence","selected_index":0,"subgoals":[{"title":"Map a repeatable control rule","success_criteria":"the same action produces stable non-cyclic board changes at least twice","failure_criteria":"eight distinct adaptive probes produce no usable rule","expected_evidence":"four or more host transitions comparing distinct actions and change classes","evidence_mode":"stable_transition","action_budget":8,"minimum_evidence_actions":4,"single_step":false}]}
+{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"run a bounded adaptive probe sequence","selected_index":0,"subgoals":[{"title":"Identify a causal control action","success_criteria":"the same exact positive action produces stable change at least twice while a distinct negative-control action does not","failure_criteria":"eight adaptive probes produce no contrastive causal evidence","expected_evidence":"repeated positive transitions plus a distinct executed negative control","evidence_mode":"contrastive_transition","action_budget":8,"minimum_evidence_actions":4,"single_step":false}]}
 END_REDUCTION"""
 
 _CODER_SYSTEM_PROMPT = """You are the gameplay-policy coder role for an ARC-AGI-3 game.
@@ -257,6 +284,11 @@ reflection, engine calls, or hidden state. CPU support is mandatory; CUDA is opt
 Keep the complete source small. BEGIN_POLICY and END_POLICY must each appear exactly
 once on their own lines and are not part of the Python module.
 
+The generation payload's level_action_evidence is authoritative across prior tactical
+objectives in this level. Never emit an action whose entry has saturated=true. Use its
+executed, no_progress, stable_changes, meaningful_progress, and distinct_points counts
+to avoid repeating an exhausted action family through superficially new coordinates.
+
 Declare POLICY_REUSE_SCOPE = "tactical" only when the module is genuinely generic
 across tactical objectives in the same level: it must derive actions and terminal
 criteria from observation.objective, observation.board, valid_actions, and transition
@@ -268,7 +300,12 @@ novelty, adjacency, digest change, or inferred feature merge is not sufficient: 
 meaningful_progress, reward, level_completed, or run_complete. For stable_transition,
 require repeated executed, nonvolatile, non-cyclic changes from the same action or
 coordinate after the minimum evidence count; this completes only the tactical learning
-goal. Default to POLICY_REUSE_SCOPE = "none" when uncertain. The declaration is
+goal and proves repeatability, not causality. For contrastive_transition, require the
+same exact positive action or coordinate to produce stable change at least twice and a
+distinct executed same-modality negative-control action or coordinate without a
+corresponding stable change. Pair directions only with directions, MOUSE coordinates
+only with MOUSE coordinates, and SPACE/ACTION7 buttons with each other. Default to
+POLICY_REUSE_SCOPE = "none" when uncertain. The declaration is
 only a reuse candidate; the host qualifies, limits, and may evict it. The host always
 supplies fresh memory/context and preflights a reused policy against the new objective;
 reuse never crosses a game or level boundary.
@@ -327,7 +364,13 @@ non-cyclic, nonvolatile learning evidence. For evidence_mode=stable_transition,
 call stable_transition_evidence_ready(observation.objective,
 observation.recent_transitions); it applies the host's exact same-action/coordinate,
 minimum-evidence, nonvolatile, and non-cyclic rules. Do not replace it with a custom
-counter or group distinct directions under a generic MOVE key. For
+counter or group distinct directions under a generic MOVE key. It intentionally cannot
+resolve a contrastive_transition contract. For evidence_mode=contrastive_transition,
+call contrastive_transition_evidence_ready(observation.objective,
+observation.recent_transitions); plan both repeated positive probes and at least one
+distinct same-modality negative-control probe. An unrelated MOUSE no-op cannot control
+for a directional effect, and vice versa. Do not use
+stable_transition_evidence_ready for a causal or paired-control claim. For
 evidence_mode=engine_progress, require transition_has_progress instead.
 accumulate_transition_evidence(memory, last_transition, key="transition_evidence",
 limit=16) stores a rolling history. objective_evidence_ready(observation.objective,
@@ -542,6 +585,17 @@ def _tactical_contract_terms(value: Any) -> frozenset[str]:
     )
 
 
+def _tactical_title_terms(value: Any) -> frozenset[str]:
+    """Return target-bearing title terms for anti-churn identity checks."""
+
+    text = value.title if isinstance(value, SubgoalSpec) else getattr(value, "title", "")
+    return frozenset(
+        token
+        for token in re.findall(r"[a-z]+|\d+", str(text or "").lower())
+        if len(token) > 1 and token not in _TACTICAL_CONTRACT_STOPWORDS
+    )
+
+
 def _tactical_contract_similarity(left: Any, right: Any) -> float:
     """Measure salient-term containment for deterministic paraphrase detection."""
 
@@ -553,6 +607,84 @@ def _tactical_contract_similarity(left: Any, right: Any) -> float:
     if overlap < 6:
         return 0.0
     return overlap / min(len(left_terms), len(right_terms))
+
+
+def _tactical_title_similarity(left: Any, right: Any) -> float:
+    """Measure whether two contracts name the same action or spatial target."""
+
+    left_terms = _tactical_title_terms(left)
+    right_terms = _tactical_title_terms(right)
+    if not left_terms or not right_terms:
+        return 0.0
+    overlap = len(left_terms & right_terms)
+    if overlap < 2:
+        return 0.0
+    return overlap / min(len(left_terms), len(right_terms))
+
+
+def _contract_requests_mouse(spec: SubgoalSpec) -> bool:
+    """Return whether a tactical contract explicitly depends on mouse input."""
+
+    text = " ".join(
+        (spec.title, spec.success_criteria, spec.expected_evidence)
+    ).lower()
+    terms = set(re.findall(r"[a-z]+", text))
+    return bool(terms & {"click", "clicks", "cursor", "mouse"})
+
+
+def _action_family_saturation_reason(
+    evidence: dict[str, dict[str, Any]], action: Any
+) -> str:
+    """Explain when an action family has exhausted useful level evidence."""
+
+    action_name = str(action or "").strip().upper()
+    if action_name != "MOUSE":
+        return ""
+    stats = evidence.get(action_name)
+    if not isinstance(stats, dict):
+        return ""
+    executed = max(0, int(stats.get("executed", 0) or 0))
+    no_progress = max(0, int(stats.get("no_progress", 0) or 0))
+    stable_changes = max(0, int(stats.get("stable_changes", 0) or 0))
+    meaningful_progress = max(0, int(stats.get("meaningful_progress", 0) or 0))
+    if (
+        executed < _ACTION_FAMILY_SATURATION_ATTEMPTS
+        or no_progress < _ACTION_FAMILY_SATURATION_ATTEMPTS
+        or stable_changes > 0
+        or meaningful_progress > 0
+    ):
+        return ""
+    distinct_points = stats.get("distinct_points")
+    point_count = len(distinct_points) if isinstance(distinct_points, list) else 0
+    return (
+        f"MOUSE is saturated for this level after {executed} executed probes "
+        f"at {point_count} distinct coordinates produced no stable change or "
+        "controller-confirmed progress"
+    )
+
+
+def _failed_engine_progress_since_recalibration(tree: ObjectiveTree) -> int:
+    """Count failed execution hypotheses since grounded progress or recalibration."""
+
+    parent_id = tree.current_level_objective.objective_id
+    siblings = [
+        node
+        for node in tree.nodes.values()
+        if node.kind is ObjectiveKind.TACTICAL and node.parent_id == parent_id
+    ]
+    count = 0
+    for node in reversed(siblings):
+        if node.status is ObjectiveStatus.COMPLETED and node.evidence_mode in {
+            ObjectiveEvidenceMode.ENGINE_PROGRESS,
+            ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION,
+        }:
+            break
+        if (
+            node.status is ObjectiveStatus.FAILED
+            and node.evidence_mode is ObjectiveEvidenceMode.ENGINE_PROGRESS
+        ):
+            count += 1
+    return count
 
 
 def _equivalent_attempted_tactical(
@@ -568,7 +700,12 @@ def _equivalent_attempted_tactical(
             or (node.attempts <= 0 and node.actions_used <= 0)
         ):
             continue
-        if _tactical_contract_similarity(node, spec) >= threshold:
+        if node.evidence_mode is not spec.evidence_mode:
+            continue
+        if (
+            _tactical_contract_similarity(node, spec) >= threshold
+            and _tactical_title_similarity(node, spec) >= 0.5
+        ):
             return node
     return None
 
@@ -806,6 +943,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._reduction_required = True
         self._last_transition: dict[str, Any] | None = None
         self._recent_transitions: list[dict[str, Any]] = []
+        self._level_action_evidence: dict[str, dict[str, Any]] = {}
+        self._action_evidence_level = 0
         self._consecutive_activation_failures = 0
         self._failure_streak_objective_id = ""
         self._last_reduction_step = 0
@@ -849,6 +988,72 @@ class OrchestratedObjectiveAgent(ToolAgent):
             checked_limit,
         )
 
+    def _record_level_action_evidence(self, transition: dict[str, Any]) -> None:
+        """Accumulate bounded host-classified action evidence across objectives."""
+
+        if transition.get("executed") is not True:
+            return
+        action = str(transition.get("action") or "").strip().upper()
+        if action not in _MODEL_ACTION_CONTRACT:
+            return
+        stats = self._level_action_evidence.setdefault(
+            action,
+            {
+                "executed": 0,
+                "no_progress": 0,
+                "stable_changes": 0,
+                "meaningful_progress": 0,
+                "distinct_points": [],
+            },
+        )
+        stats["executed"] = min(4096, int(stats.get("executed", 0)) + 1)
+        stable = transition_has_stable_change(transition)
+        progress = bool(transition.get("meaningful_progress"))
+        if stable:
+            stats["stable_changes"] = min(
+                4096, int(stats.get("stable_changes", 0)) + 1
+            )
+        if progress:
+            stats["meaningful_progress"] = min(
+                4096, int(stats.get("meaningful_progress", 0)) + 1
+            )
+        if not stable and not progress:
+            stats["no_progress"] = min(
+                4096, int(stats.get("no_progress", 0)) + 1
+            )
+        if action == "MOUSE":
+            row = transition.get("row")
+            col = transition.get("col")
+            if isinstance(row, int) and isinstance(col, int):
+                key = f"{row},{col}"
+                points = stats.setdefault("distinct_points", [])
+                if isinstance(points, list) and key not in points:
+                    points.append(key)
+                    del points[:-64]
+
+    def _level_action_evidence_payload(self) -> dict[str, dict[str, Any]]:
+        """Return a JSON-safe summary with deterministic saturation state."""
+
+        payload: dict[str, dict[str, Any]] = {}
+        for action in sorted(self._level_action_evidence):
+            stats = self._level_action_evidence[action]
+            item = {
+                "executed": max(0, int(stats.get("executed", 0) or 0)),
+                "no_progress": max(0, int(stats.get("no_progress", 0) or 0)),
+                "stable_changes": max(
+                    0, int(stats.get("stable_changes", 0) or 0)
+                ),
+                "meaningful_progress": max(
+                    0, int(stats.get("meaningful_progress", 0) or 0)
+                ),
+                "distinct_points": list(stats.get("distinct_points") or [])[-64:],
+            }
+            item["saturated"] = bool(
+                _action_family_saturation_reason(self._level_action_evidence, action)
+            )
+            payload[action] = item
+        return payload
+
     def close(self) -> None:
         if self._policy_runtime is not None:
             self._policy_runtime.close()
@@ -884,6 +1089,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._reduction_required = True
         self._last_transition = None
         self._recent_transitions = []
+        self._level_action_evidence = {}
+        self._action_evidence_level = 0
         self._consecutive_activation_failures = 0
         self._failure_streak_objective_id = ""
         self._last_reduction_step = 0
@@ -970,6 +1177,44 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 for item in payload.get("recent_transitions") or []
                 if isinstance(item, dict)
             ][-8:]
+            self._action_evidence_level = max(
+                0, int(payload.get("action_evidence_level", 0) or 0)
+            )
+            raw_action_evidence = payload.get("level_action_evidence")
+            if isinstance(raw_action_evidence, dict):
+                for action, raw_stats in raw_action_evidence.items():
+                    action_name = str(action).strip().upper()
+                    if (
+                        action_name not in _MODEL_ACTION_CONTRACT
+                        or not isinstance(raw_stats, dict)
+                    ):
+                        continue
+                    points = raw_stats.get("distinct_points")
+                    self._level_action_evidence[action_name] = {
+                        "executed": min(
+                            4096, max(0, int(raw_stats.get("executed", 0) or 0))
+                        ),
+                        "no_progress": min(
+                            4096,
+                            max(0, int(raw_stats.get("no_progress", 0) or 0)),
+                        ),
+                        "stable_changes": min(
+                            4096,
+                            max(0, int(raw_stats.get("stable_changes", 0) or 0)),
+                        ),
+                        "meaningful_progress": min(
+                            4096,
+                            max(
+                                0,
+                                int(raw_stats.get("meaningful_progress", 0) or 0),
+                            ),
+                        ),
+                        "distinct_points": [
+                            str(point)[:16]
+                            for point in (points if isinstance(points, list) else [])
+                            if isinstance(point, str)
+                        ][-64:],
+                    }
             self._consecutive_activation_failures = max(
                 0, int(payload.get("consecutive_activation_failures", 0) or 0)
             )
@@ -1038,6 +1283,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "reduction_required": self._reduction_required,
             "last_transition": self._last_transition,
             "recent_transitions": self._recent_transitions[-8:],
+            "action_evidence_level": self._action_evidence_level,
+            "level_action_evidence": self._level_action_evidence_payload(),
             "consecutive_activation_failures": self._consecutive_activation_failures,
             "failure_streak_objective_id": self._failure_streak_objective_id,
             "last_reduction_step": self._last_reduction_step,
@@ -1435,6 +1682,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             },
             "action_contract": dict(_MODEL_ACTION_CONTRACT),
             "recent_transitions": _recent_transition_payload(history),
+            "level_action_evidence": self._level_action_evidence_payload(),
             "runtime_transition_scope": (
                 "PolicyObservation.last_transition and recent_transitions contain only "
                 "transitions whose objective_id matches active_objective. At objective "
@@ -1465,12 +1713,48 @@ class OrchestratedObjectiveAgent(ToolAgent):
             proposal = ReductionProposal.from_payload(raw)
             if proposal.verdict is ReductionVerdict.DECOMPOSE:
                 selected = proposal.subgoals[proposal.selected_index]
+                saturation_reason = _action_family_saturation_reason(
+                    self._level_action_evidence, "MOUSE"
+                )
+                if saturation_reason and _contract_requests_mouse(selected):
+                    raise ObjectiveError(
+                        f"selected subgoal requires a saturated action family: "
+                        f"{saturation_reason}. Select a non-MOUSE objective supported "
+                        "by remaining action evidence"
+                    )
+                if (
+                    _contract_requests_mouse(selected)
+                    and selected.evidence_mode
+                    is ObjectiveEvidenceMode.STABLE_TRANSITION
+                ):
+                    raise ObjectiveError(
+                        "a MOUSE interaction-learning contract cannot use "
+                        "stable_transition because repeatability alone does not prove "
+                        "the clicked coordinate is causal; use contrastive_transition "
+                        "with a repeated positive and distinct negative control"
+                    )
+                failed_execution_hypotheses = (
+                    _failed_engine_progress_since_recalibration(self._tree)
+                )
+                if (
+                    failed_execution_hypotheses
+                    >= _STRATEGIC_RECALIBRATION_FAILURES
+                    and selected.evidence_mode
+                    is not ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION
+                ):
+                    raise ObjectiveError(
+                        f"{failed_execution_hypotheses} consecutive engine_progress "
+                        "objectives failed without a successful recalibration; select "
+                        "a contrastive_transition control experiment before another "
+                        "execution hypothesis"
+                    )
                 repeated = _equivalent_attempted_tactical(self._tree, selected)
                 if repeated is not None:
                     raise ObjectiveError(
                         "selected subgoal repeats already-attempted tactical contract "
-                        f"{repeated.objective_id!r}; select a materially different "
-                        "objective and use its resolution evidence"
+                        f"{repeated.objective_id!r} ({repeated.title!r}); selected "
+                        f"title was {selected.title!r}. Select a materially different "
+                        "action or spatial target and use the prior resolution evidence"
                     )
             probe = ObjectiveTree.from_dict(self._tree.to_dict())
             probe.apply_proposal(
@@ -1525,6 +1809,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             },
             "action_contract": dict(_MODEL_ACTION_CONTRACT),
             "recent_transitions": _recent_transition_payload(history),
+            "level_action_evidence": self._level_action_evidence_payload(),
             "requested_backend": os.environ.get("LOCAL_GAMEPLAY_POLICY_BACKEND", "cpu"),
             "repair_reason": repair,
         }
@@ -2053,6 +2338,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         status_matches_frame = status is not None and status[0] == frame.level
         level_action_budget = status[2] if status_matches_frame else 32
         if self._tree is None:
+            self._action_evidence_level = frame.level
             self._tree = ObjectiveTree.start_game(
                 self._knowledge_game_id or "unknown",
                 level=frame.level,
@@ -2066,6 +2352,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
             self._boundary_reason = "game_start"
         elif frame.level != self._tree.current_level:
             self._invalidate_policy("level_transition", require_reduction=True)
+            self._level_action_evidence = {}
+            self._action_evidence_level = frame.level
             level = self._tree.start_level(
                 frame.level,
                 level_action_budget=level_action_budget,
@@ -2075,6 +2363,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 active_objective_id=level.objective_id,
                 level=frame.level,
             )
+        elif self._action_evidence_level != frame.level:
+            self._level_action_evidence = {}
+            self._action_evidence_level = frame.level
         if status_matches_frame:
             self._tree.sync_level_action_status(used=status[1], limit=status[2])
 
@@ -2151,7 +2442,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
         ):
             return True, "engine terminal progress confirms completion"
         outcome_class = str(transition.get("outcome_class") or "").strip().lower()
-        if outcome_class in _NON_PROGRESS_OUTCOME_CLASSES:
+        if (
+            active.evidence_mode is not ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION
+            and outcome_class in _NON_PROGRESS_OUTCOME_CLASSES
+        ):
             return False, f"latest transition is non-progress outcome {outcome_class}"
         if active.actions_used < required_actions:
             return False, (
@@ -2169,6 +2463,13 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 f"only {len(relevant)} of {required_actions} required transition "
                 "observations are retained"
             )
+        if active.evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION:
+            allowed, reason = contrastive_transition_evidence_status(
+                active.to_dict(), relevant
+            )
+            if not allowed:
+                return False, reason
+            return True, "host minimum-evidence and " + reason
         if active.evidence_mode is ObjectiveEvidenceMode.STABLE_TRANSITION:
             allowed, reason = stable_transition_evidence_status(
                 active.to_dict(), relevant
@@ -2700,6 +3001,48 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     )
                     no_action_boundaries += 1
                     continue
+                saturation_reason = _action_family_saturation_reason(
+                    self._level_action_evidence, action_payload.get("action")
+                )
+                if saturation_reason:
+                    objective_id = self._tree.active_id
+                    evidence = (
+                        "policy action rejected by the host action-family guard: "
+                        f"{saturation_reason}"
+                    )
+                    self._tree.fail_active_tactical(evidence)
+                    self._orchestration_metrics["objectives_failed"] = (
+                        int(self._orchestration_metrics.get("objectives_failed", 0))
+                        + 1
+                    )
+                    self._orchestration_metrics[
+                        "action_family_saturation_guards"
+                    ] = (
+                        int(
+                            self._orchestration_metrics.get(
+                                "action_family_saturation_guards", 0
+                            )
+                        )
+                        + 1
+                    )
+                    self._invalidate_policy(
+                        "action_family_saturated", require_reduction=True
+                    )
+                    self._emit_event(
+                        "action_family_saturated",
+                        objective_id=objective_id,
+                        action=action_payload.get("action"),
+                        row=action_payload.get("row"),
+                        col=action_payload.get("col"),
+                        detail=saturation_reason,
+                    )
+                    self._emit_event(
+                        "objective_failed",
+                        objective_id=objective_id,
+                        evidence=evidence,
+                    )
+                    no_action_boundaries += 1
+                    continue
                 result = step_env(action_payload)
                 transition = _policy_transition_payload(
                     action_payload,
@@ -2710,6 +3053,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 self._last_transition = transition
                 self._recent_transitions.append(transition)
                 del self._recent_transitions[:-8]
+                self._record_level_action_evidence(transition)
                 if bool(transition.get("meaningful_progress")):
                     self._policy_observed_host_progress = True
                 self._emit_event("gameplay_decision", **transition)
