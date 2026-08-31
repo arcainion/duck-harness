@@ -35,6 +35,7 @@ from inference.agent.objective_reduction import (
     ReductionProposal,
     ReductionVerdict,
     SubgoalSpec,
+    TacticalExecutionMode,
 )
 from inference.agent.policy_codegen_helpers import (
     contrastive_transition_evidence_status,
@@ -61,6 +62,27 @@ _MAX_NO_ACTION_BOUNDARIES = 8
 _MAX_CONSECUTIVE_POLICY_FAILURES = _MAX_POLICY_REPAIRS + 1
 _ACTION_FAMILY_SATURATION_ATTEMPTS = 12
 _STRATEGIC_RECALIBRATION_FAILURES = 3
+_NAVIGATION_LOCALIZATION_HELPERS = frozenset(
+    {
+        "component_boxes",
+        "component_centers",
+        "find_cells",
+        "first_matching_cell",
+        "matching_region_center",
+        "nearest_matching_cell",
+    }
+)
+_NAVIGATION_PASSABILITY_HELPERS = frozenset({"value_mask"})
+_NAVIGATION_PLANNER_HELPERS = frozenset(
+    {
+        "shortest_approach_path",
+        "shortest_path",
+        "shortest_path_through",
+        "shortest_path_to_any",
+        "weighted_shortest_path",
+        "weighted_shortest_path_to_any",
+    }
+)
 _DEFAULT_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS = 300.0
 _DEFAULT_REDUCER_MAX_OUTPUT = 4096
 _DEFAULT_CODER_MAX_OUTPUT = 8192
@@ -142,6 +164,7 @@ def _empty_orchestration_metrics() -> dict[str, int | float]:
         "objective_failure_rejections": 0,
         "repeated_action_repairs": 0,
         "action_family_saturation_guards": 0,
+        "guard_resolved_objectives": 0,
     }
 
 
@@ -182,7 +205,7 @@ between BEGIN_REDUCTION and END_REDUCTION lines. Do not use a tool call, Markdow
 or prose outside the markers. The object must contain objective_id, verdict, evidence,
 rationale, selected_index, and subgoals. verdict is continue, complete, fail, or
 decompose. Each subgoal contains title, success_criteria, failure_criteria,
-expected_evidence, evidence_mode, an integer action_budget from 1 to 32, an integer
+expected_evidence, evidence_mode, execution_mode, an integer action_budget from 1 to 32, an integer
 minimum_evidence_actions from 1 through min(4, action_budget), and a boolean
 single_step. evidence_mode is engine_progress, stable_transition, or
 contrastive_transition. Use stable_transition only for descriptive repeatability: it
@@ -196,6 +219,12 @@ MOUSE coordinate versus MOUSE coordinate, or button versus button. Contrastive
 subgoals must set action_budget at least 3,
 minimum_evidence_actions at least 3, and single_step=false. Use engine_progress when
 success requires meaningful_progress, reward, level_completed, or run_complete. The
+execution_mode is probe, navigate, or interact. Use navigate whenever success requires
+an actor/object to approach, reach, contact, merge with, or move toward a spatial
+destination. Navigate policies are host-required to localize board entities, build a
+passability mask, call trusted pathfinding, and replan from transition evidence. Use
+probe for bounded control experiments and interact for non-routing buttons or clicks.
+Do not describe a spatial route while declaring probe or interact. The
 host owns all IDs,
 tree invariants, budgets, and game/level completion. You may complete or fail only
 the active tactical objective. A game or level objective must be decomposed into one
@@ -239,7 +268,7 @@ A contrastive_transition objective has the same limited tactical scope and addit
 requires the host-validated negative control.
 
 BEGIN_REDUCTION
-{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"run a bounded adaptive probe sequence","selected_index":0,"subgoals":[{"title":"Identify a causal control action","success_criteria":"the same exact positive action produces stable change at least twice while a distinct negative-control action does not","failure_criteria":"eight adaptive probes produce no contrastive causal evidence","expected_evidence":"repeated positive transitions plus a distinct executed negative control","evidence_mode":"contrastive_transition","action_budget":8,"minimum_evidence_actions":4,"single_step":false}]}
+{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"run a bounded adaptive probe sequence","selected_index":0,"subgoals":[{"title":"Identify a causal control action","success_criteria":"the same exact positive action produces stable change at least twice while a distinct negative-control action does not","failure_criteria":"eight adaptive probes produce no contrastive causal evidence","expected_evidence":"repeated positive transitions plus a distinct executed negative control","evidence_mode":"contrastive_transition","execution_mode":"probe","action_budget":8,"minimum_evidence_actions":4,"single_step":false}]}
 END_REDUCTION"""
 
 _CODER_SYSTEM_PROMPT = """You are the gameplay-policy coder role for an ARC-AGI-3 game.
@@ -288,6 +317,13 @@ The generation payload's level_action_evidence is authoritative across prior tac
 objectives in this level. Never emit an action whose entry has saturated=true. Use its
 executed, no_progress, stable_changes, meaningful_progress, and distinct_points counts
 to avoid repeating an exhausted action family through superficially new coordinates.
+Read observation.objective["execution_mode"]. For navigate, the reachable decide path
+must call at least one board localization/component helper, at least one trusted route
+planner such as shortest_path/shortest_path_to_any/shortest_approach_path, and
+transition_requires_replan. Build the passability mask from the current board, derive
+actor and target cells rather than hardcoding a route, store only JSON coordinates in
+memory, validate any stored suffix, and replan after blocking or relevant board change.
+The host rejects fixed directional sequences for navigate objectives.
 
 Declare POLICY_REUSE_SCOPE = "tactical" only when the module is genuinely generic
 across tactical objectives in the same level: it must derive actions and terminal
@@ -632,6 +668,60 @@ def _contract_requests_mouse(spec: SubgoalSpec) -> bool:
     return bool(terms & {"click", "clicks", "cursor", "mouse"})
 
 
+def _contract_requires_navigation(spec: SubgoalSpec) -> bool:
+    """Identify contracts whose success explicitly depends on spatial routing."""
+
+    text = " ".join(
+        (spec.title, spec.success_criteria, spec.expected_evidence)
+    ).lower()
+    terms = set(re.findall(r"[a-z]+", text))
+    if terms & {"navigate", "pathfind", "pathfinding", "route"}:
+        return True
+    if terms & {"approach", "contact", "merge", "reach"}:
+        return True
+    return bool(
+        terms & {"drive", "move"}
+        and terms
+        & {
+            "boundary",
+            "column",
+            "destination",
+            "goal",
+            "row",
+            "target",
+            "toward",
+            "wall",
+        }
+    )
+
+
+def _reachable_policy_call_names(source: str) -> frozenset[str]:
+    """Return direct-name calls reachable through generated policy entrypoints."""
+
+    tree = ast.parse(source, mode="exec")
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    pending = [name for name in ("decide", "initialize") if name in functions]
+    visited: set[str] = set()
+    calls: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        for node in ast.walk(functions[name]):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            called = node.func.id
+            calls.add(called)
+            if called in functions and called not in visited:
+                pending.append(called)
+    return frozenset(calls)
+
+
 def _action_family_saturation_reason(
     evidence: dict[str, dict[str, Any]], action: Any
 ) -> str:
@@ -700,7 +790,10 @@ def _equivalent_attempted_tactical(
             or (node.attempts <= 0 and node.actions_used <= 0)
         ):
             continue
-        if node.evidence_mode is not spec.evidence_mode:
+        if (
+            node.evidence_mode is not spec.evidence_mode
+            or node.execution_mode is not spec.execution_mode
+        ):
             continue
         if (
             _tactical_contract_similarity(node, spec) >= threshold
@@ -727,6 +820,7 @@ def _objective_contract_hash(objective: Any) -> str:
     }
     material["single_step"] = bool(payload.get("single_step"))
     material["evidence_mode"] = str(payload.get("evidence_mode") or "engine_progress")
+    material["execution_mode"] = str(payload.get("execution_mode") or "probe")
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
     return hashlib.blake2b(encoded.encode("utf-8"), digest_size=12).hexdigest()
 
@@ -1723,6 +1817,15 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         "by remaining action evidence"
                     )
                 if (
+                    _contract_requires_navigation(selected)
+                    and selected.execution_mode is not TacticalExecutionMode.NAVIGATE
+                ):
+                    raise ObjectiveError(
+                        "selected subgoal describes spatial routing but execution_mode "
+                        "is not navigate; declare execution_mode=navigate so the policy "
+                        "must localize the board, plan a route, and replan after changes"
+                    )
+                if (
                     _contract_requests_mouse(selected)
                     and selected.evidence_mode
                     is ObjectiveEvidenceMode.STABLE_TRANSITION
@@ -1819,6 +1922,23 @@ class OrchestratedObjectiveAgent(ToolAgent):
             raise PolicyRuntimeError("objective tree is unavailable")
         source = str(raw.get("source") or "")
         source_hash = verify_policy_source(source)
+        active = self._tree.active
+        if active.execution_mode is TacticalExecutionMode.NAVIGATE:
+            calls = _reachable_policy_call_names(source)
+            missing: list[str] = []
+            if not calls.intersection(_NAVIGATION_LOCALIZATION_HELPERS):
+                missing.append("a board localization/component helper")
+            if not calls.intersection(_NAVIGATION_PASSABILITY_HELPERS):
+                missing.append("a passability-mask helper")
+            if not calls.intersection(_NAVIGATION_PLANNER_HELPERS):
+                missing.append("a trusted pathfinding planner")
+            if "transition_requires_replan" not in calls:
+                missing.append("transition_requires_replan")
+            if missing:
+                raise PolicyRuntimeError(
+                    "navigate policy must call " + ", ".join(missing),
+                    category="policy_navigation_contract",
+                )
         return {
             "objective_id": self._tree.active_id,
             "source": source,
@@ -2505,6 +2625,55 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "actions have post-action evidence"
         )
 
+    def _resolve_loop_guard_as_tactical_failure(
+        self, transition: dict[str, Any]
+    ) -> bool:
+        """Route a mature controller loop guard to reduction instead of code repair."""
+
+        if self._tree is None or self._tree.active.kind is not ObjectiveKind.TACTICAL:
+            return False
+        if str(transition.get("stop_reason") or "").strip() != "loop_guard":
+            return False
+        active = self._tree.active
+        if active.actions_used < active.minimum_evidence_actions:
+            return False
+        objective_id = active.objective_id
+        action = str(transition.get("action") or "unknown")
+        point = ""
+        if action == "MOUSE":
+            point = f" at ({transition.get('row')},{transition.get('col')})"
+        evidence = (
+            f"controller loop guard falsified the tactical strategy after "
+            f"{active.actions_used} executed evidence actions: {action}{point} "
+            "would repeat a guarded cycle"
+        )
+        self._tree.fail_active_tactical(evidence)
+        self._orchestration_metrics["objectives_failed"] = (
+            int(self._orchestration_metrics.get("objectives_failed", 0)) + 1
+        )
+        self._orchestration_metrics["guard_resolved_objectives"] = (
+            int(self._orchestration_metrics.get("guard_resolved_objectives", 0)) + 1
+        )
+        self._consecutive_activation_failures = 0
+        self._failure_streak_objective_id = ""
+        self._invalidate_policy("loop_guard_falsified_objective", require_reduction=True)
+        self._emit_event(
+            "objective_guard_falsified",
+            objective_id=objective_id,
+            action=transition.get("action"),
+            row=transition.get("row"),
+            col=transition.get("col"),
+            actions_used=active.actions_used,
+            minimum_evidence_actions=active.minimum_evidence_actions,
+            evidence=evidence,
+        )
+        self._emit_event(
+            "objective_failed",
+            objective_id=objective_id,
+            evidence=evidence,
+        )
+        return True
+
     def _repair_premature_failure(
         self, *, policy_evidence: str, failure_reason: str
     ) -> bool:
@@ -3083,6 +3252,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         efficiency_metrics=dict(self._orchestration_metrics),
                         attempts=1,
                     )
+                if self._resolve_loop_guard_as_tactical_failure(transition):
+                    no_action_boundaries += 1
+                    continue
                 self._policy_failure(
                     PolicyRuntimeError(
                         transition["error"]

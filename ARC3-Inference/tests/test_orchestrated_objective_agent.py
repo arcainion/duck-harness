@@ -20,8 +20,10 @@ from inference.agent.orchestrated_objective_agent import (
     OrchestrationFailure,
     OrchestratedObjectiveAgent,
     _action_family_saturation_reason,
+    _contract_requires_navigation,
     _contract_requests_mouse,
     _equivalent_attempted_tactical,
+    _failed_engine_progress_since_recalibration,
     _meaningful_progress,
     _objective_contract_hash,
     _policy_source_from_message,
@@ -30,12 +32,12 @@ from inference.agent.orchestrated_objective_agent import (
     _reduction_from_message,
     _repeats_non_progress_action,
     _tactical_contract_similarity,
-    _failed_engine_progress_since_recalibration,
 )
 from inference.agent.objective_reduction import (
     ObjectiveStatus,
     ObjectiveTree,
     ReductionProposal,
+    TacticalExecutionMode,
 )
 from inference.agent.runtime_state import Frame, HistoryEntry, write_runtime_state
 from inference.agent.tool_agent import AnalyzerModelConfig
@@ -53,6 +55,22 @@ REUSABLE_POLICY_SOURCE = POLICY_SOURCE.replace(
     'SUPPORTED_BACKENDS = ("cpu",)',
     'SUPPORTED_BACKENDS = ("cpu",)\nPOLICY_REUSE_SCOPE = "tactical"',
 )
+
+NAVIGATION_POLICY_SOURCE = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+POLICY_REUSE_SCOPE = "none"
+def decide(observation, memory):
+    actor = first_matching_cell(observation.board, (1,))
+    targets = find_cells(observation.board, (2,))
+    passable = value_mask(observation.board, (0, 1))
+    if transition_requires_replan(observation.last_transition):
+        memory = {}
+    if actor is None or not targets:
+        return subgoal_failed(memory, "actor or target is unavailable")
+    path = shortest_path(passable, actor, targets[0])
+    return path_decision(path, observation.valid_actions, memory, "board-derived route")
+"""
 
 
 def frame(
@@ -320,6 +338,84 @@ class _ActivationRepairRuntimeFactory:
 
 
 class OrchestratedObjectiveAgentTests(unittest.TestCase):
+    def test_spatial_contract_classification_requires_navigation_mode(self) -> None:
+        spatial = ReductionProposal.from_payload(
+            reduction_for(
+                "level:1:1", title="Move the actor toward the target boundary"
+            )
+        ).subgoals[0]
+        probe = ReductionProposal.from_payload(
+            reduction_for("level:1:1", title="Probe ACTION7 for a stable effect")
+        ).subgoals[0]
+
+        self.assertTrue(_contract_requires_navigation(spatial))
+        self.assertFalse(_contract_requires_navigation(probe))
+
+    def test_navigation_policy_requires_localization_planning_and_replanning(
+        self,
+    ) -> None:
+        reduction = reduction_for("level:1:1", title="Reach the target component")
+        subgoals = reduction["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0]["execution_mode"] = "navigate"
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+
+        with self.assertRaisesRegex(PolicyRuntimeError, "localization") as raised:
+            agent._policy_validator({"source": POLICY_SOURCE})
+        self.assertEqual("policy_navigation_contract", raised.exception.category)
+        without_replan = NAVIGATION_POLICY_SOURCE.replace(
+            "    if transition_requires_replan(observation.last_transition):\n"
+            "        memory = {}\n",
+            "",
+        )
+        with self.assertRaisesRegex(PolicyRuntimeError, "transition_requires_replan"):
+            agent._policy_validator({"source": without_replan})
+        without_passability = NAVIGATION_POLICY_SOURCE.replace(
+            "    passable = value_mask(observation.board, (0, 1))\n",
+            "    passable = observation.board\n",
+        )
+        with self.assertRaisesRegex(PolicyRuntimeError, "passability-mask"):
+            agent._policy_validator({"source": without_passability})
+        unreachable_helpers = (
+            POLICY_SOURCE
+            + "\ndef unused_navigation(observation):\n"
+            "    cells = find_cells(observation.board, (1,))\n"
+            "    transition_requires_replan(observation.last_transition)\n"
+            "    return shortest_path(value_mask(observation.board, (0,)), "
+            "cells[0], cells[-1])\n"
+        )
+        with self.assertRaisesRegex(PolicyRuntimeError, "localization"):
+            agent._policy_validator({"source": unreachable_helpers})
+        accepted = agent._policy_validator({"source": NAVIGATION_POLICY_SOURCE})
+
+        self.assertEqual(
+            verify_policy_source(NAVIGATION_POLICY_SOURCE), accepted["source_hash"]
+        )
+        self.assertEqual(TacticalExecutionMode.NAVIGATE, tree.active.execution_mode)
+        agent.close()
+
+    def test_reducer_rejects_spatial_contract_without_navigation_mode(self) -> None:
+        spatial = reduction_for(
+            "level:1:1", title="Drive the actor toward the goal boundary"
+        )
+        agent = self._agent()
+        agent._tree = ObjectiveTree.start_game(
+            "game-a", level=1, level_action_budget=20
+        )
+        agent.model_client = _ScriptedModelClient([spatial] * 3)
+
+        with self.assertRaises(OrchestrationFailure) as raised:
+            agent._reduce(frame(), [], request_deadline=None, should_stop=None)
+
+        self.assertIn("execution_mode=navigate", str(raised.exception))
+        agent.close()
+
     def test_policy_reuse_scope_requires_a_literal_opt_in(self) -> None:
         self.assertEqual(
             "tactical", _policy_reuse_scope_from_source(REUSABLE_POLICY_SOURCE)
@@ -1850,6 +1946,131 @@ def decide(observation, memory):
             event for event in events if event["type"] == "policy_failed"
         ]
         self.assertEqual("coder", policy_failures[0]["repair_route"])
+
+    def test_mature_loop_guard_falsifies_objective_without_coder_repair(self) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_for("level:1:1")),
+            remaining_level_actions=20,
+        )
+        for _ in range(4):
+            tree.record_action()
+        tactical = tree.active
+        agent._tree = tree
+        transition = {
+            "objective_id": tactical.objective_id,
+            "action": "RIGHT",
+            "executed": False,
+            "stop_reason": "loop_guard",
+            "loop_detected": True,
+        }
+        agent._last_transition = transition
+
+        resolved = agent._resolve_loop_guard_as_tactical_failure(transition)
+
+        self.assertTrue(resolved)
+        self.assertEqual(ObjectiveStatus.FAILED, tactical.status)
+        self.assertEqual("level:1:1", tree.active_id)
+        self.assertTrue(agent._reduction_required)
+        self.assertEqual({}, agent._policy_repairs)
+        self.assertEqual(1, agent._orchestration_metrics["objectives_failed"])
+        self.assertEqual(
+            1, agent._orchestration_metrics["guard_resolved_objectives"]
+        )
+        agent.close()
+
+    def test_early_loop_guard_keeps_existing_coder_repair_route(self) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_for("level:1:1")),
+            remaining_level_actions=20,
+        )
+        tree.record_action()
+        tactical = tree.active
+        agent._tree = tree
+        transition = {
+            "objective_id": tactical.objective_id,
+            "action": "RIGHT",
+            "executed": False,
+            "stop_reason": "loop_guard",
+            "loop_detected": True,
+        }
+
+        resolved = agent._resolve_loop_guard_as_tactical_failure(transition)
+
+        self.assertFalse(resolved)
+        self.assertEqual(ObjectiveStatus.ACTIVE, tactical.status)
+        self.assertEqual(0, agent._orchestration_metrics["guard_resolved_objectives"])
+        agent.close()
+
+    def test_mature_loop_guard_analyzer_path_makes_no_additional_model_call(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                _FakeRuntime,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            client = _FakeModelClient()
+            agent.model_client = client
+            action_results = [
+                {
+                    "executed": True,
+                    "board_changed": True,
+                    "outcome_class": "novel",
+                    "state": "PLAYING",
+                    "level": 1,
+                }
+                for _ in range(4)
+            ]
+            action_results.append(
+                {
+                    "executed": False,
+                    "board_changed": False,
+                    "stop_reason": "loop_guard",
+                    "loop_detected": True,
+                    "state": "PLAYING",
+                    "level": 1,
+                }
+            )
+            step_env = mock.Mock(side_effect=action_results)
+            for step in range(4):
+                result = agent.analyze(
+                    state_path,
+                    step,
+                    step_env=step_env,
+                    should_stop=lambda: step_env.call_count >= 5,
+                )
+                self.assertTrue(result.step_executed)
+                write_runtime_state(
+                    state_path,
+                    current_frame=frame(step=step + 1),
+                    history=[],
+                )
+            guarded = agent.analyze(
+                state_path,
+                4,
+                step_env=step_env,
+                should_stop=lambda: step_env.call_count >= 5,
+            )
+            tactical = agent._tree.nodes["tactical:1"]
+            metrics = dict(agent._orchestration_metrics)
+            repairs = dict(agent._policy_repairs)
+            agent.close()
+
+        self.assertTrue(guarded.yielded_control)
+        self.assertEqual(5, step_env.call_count)
+        self.assertEqual(2, client.calls)
+        self.assertEqual(ObjectiveStatus.FAILED, tactical.status)
+        self.assertEqual({}, repairs)
+        self.assertEqual(1, metrics["guard_resolved_objectives"])
 
     def test_premature_subgoal_completion_repairs_policy_without_reducing(self) -> None:
         client = _ScriptedModelClient(

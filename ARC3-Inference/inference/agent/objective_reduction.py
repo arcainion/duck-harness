@@ -39,6 +39,14 @@ class ObjectiveEvidenceMode(StrEnum):
     CONTRASTIVE_TRANSITION = "contrastive_transition"
 
 
+class TacticalExecutionMode(StrEnum):
+    """Host-enforced gameplay implementation style for a tactical objective."""
+
+    PROBE = "probe"
+    NAVIGATE = "navigate"
+    INTERACT = "interact"
+
+
 class ReductionVerdict(StrEnum):
     CONTINUE = "continue"
     COMPLETE = "complete"
@@ -54,6 +62,7 @@ class SubgoalSpec:
     expected_evidence: str
     action_budget: int
     evidence_mode: ObjectiveEvidenceMode = ObjectiveEvidenceMode.ENGINE_PROGRESS
+    execution_mode: TacticalExecutionMode = TacticalExecutionMode.PROBE
     minimum_evidence_actions: int = 4
     single_step: bool = False
 
@@ -106,6 +115,14 @@ class SubgoalSpec:
                 "subgoal evidence_mode must be engine_progress, stable_transition, "
                 "or contrastive_transition"
             ) from exc
+        try:
+            execution_mode = TacticalExecutionMode(
+                str(payload.get("execution_mode") or "probe").strip()
+            )
+        except ValueError as exc:
+            raise ObjectiveError(
+                "subgoal execution_mode must be probe, navigate, or interact"
+            ) from exc
         if evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION and (
             action_budget < 3 or raw_minimum_evidence < 3 or raw_single_step
         ):
@@ -120,6 +137,7 @@ class SubgoalSpec:
             expected_evidence=required_text("expected_evidence"),
             action_budget=action_budget,
             evidence_mode=evidence_mode,
+            execution_mode=execution_mode,
             minimum_evidence_actions=raw_minimum_evidence,
             single_step=raw_single_step,
         )
@@ -132,6 +150,7 @@ class SubgoalSpec:
             "expected_evidence": self.expected_evidence,
             "action_budget": self.action_budget,
             "evidence_mode": self.evidence_mode.value,
+            "execution_mode": self.execution_mode.value,
             "minimum_evidence_actions": self.minimum_evidence_actions,
             "single_step": self.single_step,
         }
@@ -197,6 +216,7 @@ class ObjectiveNode:
     expected_evidence: str
     action_budget: int
     evidence_mode: ObjectiveEvidenceMode = ObjectiveEvidenceMode.ENGINE_PROGRESS
+    execution_mode: TacticalExecutionMode = TacticalExecutionMode.PROBE
     minimum_evidence_actions: int = 1
     single_step: bool = False
     status: ObjectiveStatus = ObjectiveStatus.PENDING
@@ -220,6 +240,7 @@ class ObjectiveNode:
             "expected_evidence": self.expected_evidence,
             "action_budget": self.action_budget,
             "evidence_mode": self.evidence_mode.value,
+            "execution_mode": self.execution_mode.value,
             "minimum_evidence_actions": self.minimum_evidence_actions,
             "single_step": self.single_step,
             "status": self.status.value,
@@ -246,6 +267,9 @@ class ObjectiveNode:
             action_budget=max(0, int(payload.get("action_budget", 0) or 0)),
             evidence_mode=ObjectiveEvidenceMode(
                 str(payload.get("evidence_mode") or "engine_progress")
+            ),
+            execution_mode=TacticalExecutionMode(
+                str(payload.get("execution_mode") or "probe")
             ),
             minimum_evidence_actions=max(
                 1,
@@ -366,6 +390,8 @@ class ObjectiveTree:
                 raise ObjectiveError("objective action budgets must be positive")
             if not isinstance(node.evidence_mode, ObjectiveEvidenceMode):
                 raise ObjectiveError("objective evidence mode is invalid")
+            if not isinstance(node.execution_mode, TacticalExecutionMode):
+                raise ObjectiveError("objective execution mode is invalid")
             if (
                 node.kind is not ObjectiveKind.TACTICAL
                 and node.evidence_mode is not ObjectiveEvidenceMode.ENGINE_PROGRESS
@@ -373,6 +399,11 @@ class ObjectiveTree:
                 raise ObjectiveError(
                     "game and level objectives require engine_progress evidence"
                 )
+            if (
+                node.kind is not ObjectiveKind.TACTICAL
+                and node.execution_mode is not TacticalExecutionMode.PROBE
+            ):
+                raise ObjectiveError("game and level objectives require probe execution")
             if not 1 <= node.minimum_evidence_actions <= min(4, node.action_budget):
                 raise ObjectiveError(
                     "objective minimum evidence actions must fit its action budget"
@@ -555,6 +586,7 @@ class ObjectiveTree:
                 expected_evidence=spec.expected_evidence,
                 action_budget=effective_budget,
                 evidence_mode=spec.evidence_mode,
+                execution_mode=spec.execution_mode,
                 minimum_evidence_actions=min(
                     spec.minimum_evidence_actions, effective_budget
                 ),
