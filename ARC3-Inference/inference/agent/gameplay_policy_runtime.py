@@ -892,11 +892,16 @@ class GameplayPolicyRuntime:
             action = decision.action or {}
             return action.get("action"), action.get("row"), action.get("col")
 
+        def terminal_detail(decision: PolicyDecision) -> str:
+            evidence = decision.evidence.strip() or "no evidence provided"
+            return f"{decision.status.value}: {evidence}"
+
         try:
             decision = self.decide(observation)
             if decision.status is not PolicyStatus.CONTINUE:
                 raise PolicyRuntimeError(
-                    "policy preflight terminated before proposing its first action",
+                    "policy preflight terminated before proposing its first action: "
+                    f"{terminal_detail(decision)}",
                     category="policy_preflight",
                 )
             previous_signature = signature(decision)
@@ -944,7 +949,7 @@ class GameplayPolicyRuntime:
                     raise PolicyRuntimeError(
                         "policy preflight terminated after only "
                         f"{evidence_count} inconclusive action(s); the objective "
-                        f"requires {required}",
+                        f"requires {required}; {terminal_detail(decision)}",
                         category="policy_preflight",
                     )
                 current_signature = signature(decision)

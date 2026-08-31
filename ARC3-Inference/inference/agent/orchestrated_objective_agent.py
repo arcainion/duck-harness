@@ -153,6 +153,40 @@ def _empty_orchestration_metrics() -> dict[str, int | float]:
     }
 
 
+def _rejected_policy_repair_guidance(user_payload: dict[str, Any]) -> str:
+    """Return repair advice scoped to the active solver contract."""
+
+    solver_contract = user_payload.get("solver_contract")
+    objective = user_payload.get("active_objective")
+    solver_contract = solver_contract if isinstance(solver_contract, dict) else {}
+    objective = objective if isinstance(objective, dict) else {}
+    selected_type = str(solver_contract.get("selected_type") or "").strip().lower()
+    selected_family = str(solver_contract.get("selected_family") or "").strip().lower()
+    evidence_mode = str(objective.get("evidence_mode") or "").strip().lower()
+
+    guidance = (
+        "If it wraps solver_decide, propagate decision['memory'] in every rebuilt "
+        "decision."
+    )
+    if selected_family == "navigation":
+        return (
+            guidance
+            + " For a navigation policy, probe_actions do not control routing. If "
+            "preflight reports subgoal_succeeded or that the configured target is "
+            "already reached while engine progress is still required, reconsider "
+            "actor_values, target_values, passable_values, approach_distance, and "
+            "interaction_actions from the board evidence; do not repair the policy "
+            "by only changing probe_actions."
+        )
+    if selected_type == "static" and evidence_mode == "contrastive_transition":
+        return (
+            guidance
+            + " For contrastive static probes, separate repeated positives with a "
+            "same-modality control instead of placing duplicate actions consecutively."
+        )
+    return guidance
+
+
 def _positive_env_float(name: str, default: float) -> float | None:
     raw = os.environ.get(name, str(default))
     try:
@@ -1687,10 +1721,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 )
                 user_text += (
                     "\nThe policy below is the most recent rejected candidate. "
-                    "Minimally repair it and preserve working changes. If it wraps "
-                    "solver_decide, propagate decision['memory']; for contrastive "
-                    "static probes, separate repeated positives with a same-modality "
-                    "control instead of placing duplicate actions consecutively.\n"
+                    "Minimally repair it and preserve working changes. "
+                    f"{_rejected_policy_repair_guidance(user_payload)}\n"
                     "<REJECTED_POLICY_SOURCE>\n"
                     f"{bounded_source}{truncation}\n"
                     "</REJECTED_POLICY_SOURCE>"

@@ -172,6 +172,25 @@ def decide(observation, memory):
                 with self.assertRaisesRegex(PolicyRuntimeError, message) as raised:
                     runtime.preflight(initial, minimum_actions=4)
                 self.assertEqual("policy_preflight", raised.exception.category)
+                if source == early:
+                    self.assertIn("subgoal_failed", str(raised.exception))
+                    self.assertIn("one noop is enough", str(raised.exception))
+
+    def test_preflight_terminal_error_preserves_status_and_evidence(self) -> None:
+        already_reached = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    return subgoal_succeeded(memory, "solver reached the configured target")
+"""
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(already_reached, context={})
+            with self.assertRaises(PolicyRuntimeError) as raised:
+                runtime.preflight(observation(), minimum_actions=4)
+
+        self.assertEqual("policy_preflight", raised.exception.category)
+        self.assertIn("subgoal_succeeded", str(raised.exception))
+        self.assertIn("solver reached the configured target", str(raised.exception))
 
     def test_verifier_reports_concrete_nonnull_board_rewrite(self) -> None:
         source = """

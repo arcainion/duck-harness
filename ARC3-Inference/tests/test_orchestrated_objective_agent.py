@@ -28,6 +28,7 @@ from inference.agent.orchestrated_objective_agent import (
     _objective_contract_hash,
     _policy_source_from_message,
     _policy_reuse_scope_from_source,
+    _rejected_policy_repair_guidance,
     _policy_transition_payload,
     _reduction_from_message,
     _repeats_non_progress_action,
@@ -1749,9 +1750,48 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertIn("<REJECTED_POLICY_SOURCE>", repair_prompt)
         self.assertIn(rejected_source, repair_prompt)
         self.assertIn("propagate decision['memory']", repair_prompt)
-        self.assertIn("instead of placing duplicate actions consecutively", repair_prompt)
+        self.assertNotIn("instead of placing duplicate actions consecutively", repair_prompt)
         self.assertEqual(1, len(rejected_artifacts))
         self.assertEqual(rejected_source.strip(), rejected_artifact_text.strip())
+
+    def test_rejected_navigation_policy_receives_navigation_repair_guidance(self) -> None:
+        guidance = _rejected_policy_repair_guidance(
+            {
+                "active_objective": {"evidence_mode": "engine_progress"},
+                "solver_contract": {
+                    "selected_type": "navigation",
+                    "selected_family": "navigation",
+                },
+            }
+        )
+
+        self.assertIn("configured target is already reached", guidance)
+        self.assertIn("actor_values", guidance)
+        self.assertIn("interaction_actions", guidance)
+        self.assertIn("do not repair the policy by only changing probe_actions", guidance)
+
+    def test_rejected_static_policy_only_receives_contrastive_probe_guidance(self) -> None:
+        ordinary = _rejected_policy_repair_guidance(
+            {
+                "active_objective": {"evidence_mode": "engine_progress"},
+                "solver_contract": {
+                    "selected_type": "static",
+                    "selected_family": "observation",
+                },
+            }
+        )
+        contrastive = _rejected_policy_repair_guidance(
+            {
+                "active_objective": {"evidence_mode": "contrastive_transition"},
+                "solver_contract": {
+                    "selected_type": "static",
+                    "selected_family": "observation",
+                },
+            }
+        )
+
+        self.assertNotIn("duplicate actions consecutively", ordinary)
+        self.assertIn("duplicate actions consecutively", contrastive)
 
     def test_missing_decide_stays_in_coder_loop_and_saves_rejected_source(
         self,
