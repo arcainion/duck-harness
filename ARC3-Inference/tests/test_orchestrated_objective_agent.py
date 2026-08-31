@@ -297,6 +297,15 @@ class _DecisionRuntime(_FakeRuntime):
         return self._decision
 
 
+class _PreflightRejectingRuntime(_FakeRuntime):
+    def preflight(self, _observation: object, *, minimum_actions: int = 4) -> None:
+        del minimum_actions
+        raise PolicyRuntimeError(
+            "policy preflight repeated the same action after exact_noop",
+            category="policy_preflight",
+        )
+
+
 class _SequentialDecisionRuntime(_FakeRuntime):
     def __init__(self, decisions: list[PolicyDecision]) -> None:
         super().__init__()
@@ -1699,6 +1708,50 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             "same-modality negative control",
             client.messages[2][-1]["content"],
         )
+
+    def test_preflight_repair_receives_exact_rejected_policy_source(self) -> None:
+        rejected_source = POLICY_SOURCE.replace('["UP"]', '["UP", "DOWN"]')
+        repaired_source = POLICY_SOURCE.replace('["UP"]', '["UP", "RIGHT"]')
+        client = _ScriptedModelClient(
+            [
+                reduction_for("level:1:1"),
+                policy_for("tactical:1", source=rejected_source),
+                policy_for("tactical:1", source=repaired_source),
+            ]
+        )
+        runtimes = [_PreflightRejectingRuntime(), _FakeRuntime()]
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                side_effect=runtimes,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+            result = agent.analyze(
+                state_path,
+                0,
+                valid_actions=["ACTION1"],
+                step_env=lambda _payload: {"executed": True, "board_changed": True},
+            )
+            rejected_artifacts = list(
+                (Path(temp_dir) / "policies" / "rejected").glob("*.py")
+            )
+            rejected_artifact_text = rejected_artifacts[0].read_text(encoding="utf-8")
+            agent.close()
+
+        self.assertTrue(result.step_executed)
+        self.assertEqual(3, client.calls)
+        repair_prompt = client.messages[2][-1]["content"]
+        self.assertIn("<REJECTED_POLICY_SOURCE>", repair_prompt)
+        self.assertIn(rejected_source, repair_prompt)
+        self.assertIn("propagate decision['memory']", repair_prompt)
+        self.assertIn("instead of placing duplicate actions consecutively", repair_prompt)
+        self.assertEqual(1, len(rejected_artifacts))
+        self.assertEqual(rejected_source.strip(), rejected_artifact_text.strip())
 
     def test_missing_decide_stays_in_coder_loop_and_saves_rejected_source(
         self,

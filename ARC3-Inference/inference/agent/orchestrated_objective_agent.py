@@ -341,6 +341,9 @@ alignment/manipulation/multi-agent also require actor and passability plus a tar
 interactive role; field types require source/actor, target, and passability; coverage
 requires target_values. Do not
 reimplement a selected solver with a fixed action loop or call another solver type.
+Prefer returning the dispatcher mapping directly. If post-processing it is necessary,
+propagate decision["memory"] in every rebuilt continue, mouse, or terminal decision;
+passing the input memory back discards the trusted solver's probe/plan position.
 
 Declare POLICY_REUSE_SCOPE = "tactical" only when the module is genuinely generic
 across tactical objectives in the same level: it must derive actions and terminal
@@ -357,8 +360,11 @@ goal and proves repeatability, not causality. For contrastive_transition, requir
 same exact positive action or coordinate to produce stable change at least twice and a
 distinct executed same-modality negative-control action or coordinate without a
 corresponding stable change. Pair directions only with directions, MOUSE coordinates
-only with MOUSE coordinates, and SPACE/ACTION7 buttons with each other. Default to
-POLICY_REUSE_SCOPE = "none" when uncertain. The declaration is
+only with MOUSE coordinates, and SPACE/ACTION7 buttons with each other. For static
+contrastive probe_actions, separate repeated positives with the negative
+control so synthetic exact_noop preflight observations advance through different
+actions; for example, SPACE, ACTION7, SPACE, ACTION7 rather than consecutive SPACE.
+Default to POLICY_REUSE_SCOPE = "none" when uncertain. The declaration is
 only a reuse candidate; the host qualifies, limits, and may evict it. The host always
 supplies fresh memory/context and preflights a reused policy against the new objective;
 reuse never crosses a game or level boundary.
@@ -1122,6 +1128,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_objective_id = ""
         self._policy_source_hash = ""
         self._policy_artifact = ""
+        self._rejected_policy_objective_id = ""
+        self._rejected_policy_source_hash = ""
+        self._rejected_policy_artifact = ""
         self._policy_solver_type = ""
         self._policy_solver_family = ""
         self._active_policy_reuse_scope = "none"
@@ -1270,6 +1279,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_objective_id = ""
         self._policy_source_hash = ""
         self._policy_artifact = ""
+        self._rejected_policy_objective_id = ""
+        self._rejected_policy_source_hash = ""
+        self._rejected_policy_artifact = ""
         self._policy_solver_type = ""
         self._policy_solver_family = ""
         self._active_policy_reuse_scope = "none"
@@ -1323,6 +1335,15 @@ class OrchestratedObjectiveAgent(ToolAgent):
             self._policy_objective_id = str(payload.get("policy_objective_id") or "")
             self._policy_source_hash = str(payload.get("policy_source_hash") or "")
             self._policy_artifact = str(payload.get("policy_artifact") or "")
+            self._rejected_policy_objective_id = str(
+                payload.get("rejected_policy_objective_id") or ""
+            )
+            self._rejected_policy_source_hash = str(
+                payload.get("rejected_policy_source_hash") or ""
+            )
+            self._rejected_policy_artifact = str(
+                payload.get("rejected_policy_artifact") or ""
+            )
             self._policy_solver_type = str(payload.get("policy_solver_type") or "")
             self._policy_solver_family = str(payload.get("policy_solver_family") or "")
             if self._policy_solver_type:
@@ -1476,6 +1497,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "policy_objective_id": self._policy_objective_id,
             "policy_source_hash": self._policy_source_hash,
             "policy_artifact": self._policy_artifact,
+            "rejected_policy_objective_id": self._rejected_policy_objective_id,
+            "rejected_policy_source_hash": self._rejected_policy_source_hash,
+            "rejected_policy_artifact": self._rejected_policy_artifact,
             "policy_solver_type": self._policy_solver_type,
             "policy_solver_family": self._policy_solver_family,
             "active_policy_reuse_scope": self._active_policy_reuse_scope,
@@ -1607,10 +1631,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
         validator: Callable[[dict[str, Any]], Any],
         request_deadline: float | None,
         should_stop: Callable[[], bool] | None,
+        rejected_policy_source: str = "",
     ) -> Any:
         history = self._role_histories[role]
         corrections: list[str] = []
-        rejected_policy_source = ""
         last_error = ""
         context_output_limit: int | None = None
         context_adjustments = 0
@@ -1652,20 +1676,25 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     + "\n"
                     f"{response_instruction}"
                 )
-                if role == "coder" and rejected_policy_source:
-                    bounded_source = rejected_policy_source[
-                        :_MAX_REJECTED_POLICY_REPAIR_CHARS
-                    ]
-                    truncation = (
-                        "\n[rejected source truncated by host]"
-                        if len(rejected_policy_source) > len(bounded_source)
-                        else ""
-                    )
-                    user_text += (
-                        "\n<REJECTED_POLICY_SOURCE>\n"
-                        f"{bounded_source}{truncation}\n"
-                        "</REJECTED_POLICY_SOURCE>"
-                    )
+            if role == "coder" and rejected_policy_source:
+                bounded_source = rejected_policy_source[
+                    :_MAX_REJECTED_POLICY_REPAIR_CHARS
+                ]
+                truncation = (
+                    "\n[rejected source truncated by host]"
+                    if len(rejected_policy_source) > len(bounded_source)
+                    else ""
+                )
+                user_text += (
+                    "\nThe policy below is the most recent rejected candidate. "
+                    "Minimally repair it and preserve working changes. If it wraps "
+                    "solver_decide, propagate decision['memory']; for contrastive "
+                    "static probes, separate repeated positives with a same-modality "
+                    "control instead of placing duplicate actions consecutively.\n"
+                    "<REJECTED_POLICY_SOURCE>\n"
+                    f"{bounded_source}{truncation}\n"
+                    "</REJECTED_POLICY_SOURCE>"
+                )
             messages = [
                 {"role": "system", "content": system_prompt},
                 *history[-_MAX_ROLE_HISTORY:],
@@ -2208,7 +2237,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         category: str,
         structured_attempt: int | None = None,
         semantic_hash: str = "",
-    ) -> None:
+    ) -> tuple[str, str]:
         artifact, content_hash = self._save_rejected_policy_artifact(source)
         self._emit_event(
             "policy_candidate_rejected",
@@ -2222,6 +2251,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             source_bytes=len(source.encode("utf-8")),
             artifact=artifact,
         )
+        return artifact, content_hash
 
     def _record_rejected_structured_response(
         self,
@@ -2285,6 +2315,32 @@ class OrchestratedObjectiveAgent(ToolAgent):
         except (OSError, PolicyRuntimeError, ValueError):
             return None
         return source
+
+    def _rejected_policy_source_for_repair(self) -> str:
+        if (
+            self._tree is None
+            or self._rejected_policy_objective_id != self._tree.active_id
+        ):
+            return ""
+        return (
+            self._policy_artifact_source(
+                self._rejected_policy_artifact,
+                self._rejected_policy_source_hash,
+            )
+            or ""
+        )
+
+    def _remember_rejected_policy(
+        self, *, objective_id: str, artifact: str, source_hash: str
+    ) -> None:
+        self._rejected_policy_objective_id = objective_id
+        self._rejected_policy_artifact = artifact
+        self._rejected_policy_source_hash = source_hash
+
+    def _clear_rejected_policy(self) -> None:
+        self._rejected_policy_objective_id = ""
+        self._rejected_policy_artifact = ""
+        self._rejected_policy_source_hash = ""
 
     def _evict_reusable_policy(self, source_hash: str, reason: str) -> None:
         before = len(self._reusable_policies)
@@ -2526,6 +2582,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             validator=self._policy_validator,
             request_deadline=request_deadline,
             should_stop=should_stop,
+            rejected_policy_source=self._rejected_policy_source_for_repair(),
         )
         source = str(raw["source"])
         source_hash = str(raw["source_hash"])
@@ -2556,7 +2613,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 activation = runtime.activation
         except PolicyRuntimeError as exc:
             runtime.close()
-            self._record_rejected_policy_candidate(
+            artifact, _ = self._record_rejected_policy_candidate(
                 source,
                 phase=(
                     "preflight" if exc.category == "policy_preflight" else "activation"
@@ -2565,15 +2622,25 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 category=exc.category,
                 semantic_hash=source_hash,
             )
+            self._remember_rejected_policy(
+                objective_id=self._tree.active_id,
+                artifact=artifact,
+                source_hash=source_hash,
+            )
             raise
         if activation.source_hash != source_hash:
             runtime.close()
-            self._record_rejected_policy_candidate(
+            artifact, _ = self._record_rejected_policy_candidate(
                 source,
                 phase="activation_fingerprint",
                 detail="activated policy fingerprint does not match verified source",
                 category="policy_protocol",
                 semantic_hash=source_hash,
+            )
+            self._remember_rejected_policy(
+                objective_id=self._tree.active_id,
+                artifact=artifact,
+                source_hash=source_hash,
             )
             raise PolicyRuntimeError(
                 "activated policy fingerprint does not match verified source",
@@ -2582,6 +2649,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         if self._policy_runtime is not None:
             self._policy_runtime.close()
         self._policy_runtime = runtime
+        self._clear_rejected_policy()
         self._policy_objective_id = self._tree.active_id
         self._policy_source_hash = source_hash
         self._policy_artifact = self._save_policy_artifact(source, source_hash)
