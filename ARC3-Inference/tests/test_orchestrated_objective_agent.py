@@ -749,8 +749,72 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual("LEFT", policy_payload["recent_transitions"][0]["action"])
         self.assertIn("row and col", reducer_payload["action_contract"]["MOUSE"])
         self.assertEqual(
+            {"used": 0, "limit": 32, "remaining": 32},
+            reducer_payload["level_action_budget"],
+        )
+        self.assertEqual(
             reducer_payload["action_contract"], policy_payload["action_contract"]
         )
+
+    def test_exhausted_host_level_budget_stops_without_llm_or_gameplay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = mock.Mock()
+            step_env = mock.Mock()
+            agent.set_level_action_status(1, 32, 32)
+            result = agent.analyze(state_path, 32, step_env=step_env)
+            tree = agent._tree
+            agent.close()
+
+        self.assertTrue(result.exhausted)
+        self.assertEqual(
+            "orchestration_level_action_budget_exhausted",
+            result.failure_category,
+        )
+        self.assertIn("32/32", result.failure_detail)
+        self.assertIsNotNone(tree)
+        self.assertEqual(0, tree.remaining_level_actions)
+        agent.model_client.complete.assert_not_called()
+        step_env.assert_not_called()
+
+    def test_final_allowed_action_is_capped_then_next_turn_is_llm_free(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                _FakeRuntime,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            model_client = _FakeModelClient()
+            agent.model_client = model_client
+            step_env = mock.Mock(
+                return_value={"executed": True, "board_changed": True}
+            )
+            agent.set_level_action_status(1, 31, 32)
+
+            final_action = agent.analyze(state_path, 31, step_env=step_env)
+            calls_after_final_action = model_client.calls
+            self.assertEqual(1, agent._tree.active.action_budget)
+            self.assertEqual(0, agent._tree.remaining_level_actions)
+
+            agent.set_level_action_status(1, 32, 32)
+            exhausted = agent.analyze(state_path, 32, step_env=step_env)
+            agent.close()
+
+        self.assertTrue(final_action.step_executed)
+        self.assertEqual(2, calls_after_final_action)
+        self.assertTrue(exhausted.exhausted)
+        self.assertEqual(
+            "orchestration_level_action_budget_exhausted",
+            exhausted.failure_category,
+        )
+        self.assertEqual(calls_after_final_action, model_client.calls)
+        step_env.assert_called_once()
 
     def test_ordinary_policy_turn_does_not_call_llm(self) -> None:
         current_frame = frame()

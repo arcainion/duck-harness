@@ -786,6 +786,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._consecutive_activation_failures = 0
         self._failure_streak_objective_id = ""
         self._last_reduction_step = 0
+        self._level_action_status: tuple[int, int, int] | None = None
         self._orchestration_metrics = _empty_orchestration_metrics()
         self._current_transcript_path: Path | None = None
         self._orchestration_request_timeout_seconds = _positive_env_float(
@@ -812,6 +813,18 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 _DEFAULT_CODER_THINKING_BUDGET,
             ),
         }
+
+    def set_level_action_status(self, level: int, used: int, limit: int) -> None:
+        """Receive the controller's authoritative current-level action counters."""
+
+        checked_level = max(1, int(level))
+        checked_used = max(0, int(used))
+        checked_limit = max(1, int(limit))
+        self._level_action_status = (
+            checked_level,
+            min(checked_used, checked_limit),
+            checked_limit,
+        )
 
     def close(self) -> None:
         if self._policy_runtime is not None:
@@ -1380,10 +1393,16 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self, frame: Frame, history: list[HistoryEntry]
     ) -> dict[str, Any]:
         assert self._tree is not None
+        level = self._tree.current_level_objective
         return {
             "boundary_reason": self._boundary_reason,
             "active_objective": self._tree.active.to_dict(),
             "objective_tree": self._tree.to_dict(),
+            "level_action_budget": {
+                "used": level.actions_used,
+                "limit": level.action_budget,
+                "remaining": level.remaining_actions,
+            },
             "observation": {
                 "level": frame.level,
                 "step": frame.step,
@@ -1412,6 +1431,12 @@ class OrchestratedObjectiveAgent(ToolAgent):
         should_stop: Callable[[], bool] | None,
     ) -> None:
         assert self._tree is not None
+        remaining_level_actions = self._tree.remaining_level_actions
+        if remaining_level_actions <= 0:
+            raise OrchestrationFailure(
+                "the host level action budget is exhausted",
+                category="orchestration_level_action_budget_exhausted",
+            )
 
         def validate_reduction(raw: dict[str, Any]) -> ReductionProposal:
             proposal = ReductionProposal.from_payload(raw)
@@ -1425,7 +1450,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         "objective and use its resolution evidence"
                     )
             probe = ObjectiveTree.from_dict(self._tree.to_dict())
-            probe.apply_proposal(proposal, remaining_level_actions=32)
+            probe.apply_proposal(
+                proposal,
+                remaining_level_actions=remaining_level_actions,
+            )
             return proposal
 
         proposal = self._structured_role_call(
@@ -1437,7 +1465,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
             should_stop=should_stop,
         )
         previous_id = self._tree.active_id
-        active = self._tree.apply_proposal(proposal, remaining_level_actions=32)
+        active = self._tree.apply_proposal(
+            proposal,
+            remaining_level_actions=remaining_level_actions,
+        )
         if proposal.verdict.value == "complete":
             self._orchestration_metrics["objectives_completed"] = (
                 int(self._orchestration_metrics.get("objectives_completed", 0)) + 1
@@ -1995,11 +2026,14 @@ class OrchestratedObjectiveAgent(ToolAgent):
         return all(entry.frame.grid == recent[0].frame.grid for entry in recent[1:])
 
     def _ensure_tree(self, frame: Frame) -> None:
+        status = self._level_action_status
+        status_matches_frame = status is not None and status[0] == frame.level
+        level_action_budget = status[2] if status_matches_frame else 32
         if self._tree is None:
             self._tree = ObjectiveTree.start_game(
                 self._knowledge_game_id or "unknown",
                 level=frame.level,
-                level_action_budget=32,
+                level_action_budget=level_action_budget,
             )
             self._emit_event(
                 "objective_created",
@@ -2007,15 +2041,19 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 active_objective_id=self._tree.active_id,
             )
             self._boundary_reason = "game_start"
-            return
-        if frame.level != self._tree.current_level:
+        elif frame.level != self._tree.current_level:
             self._invalidate_policy("level_transition", require_reduction=True)
-            level = self._tree.start_level(frame.level, level_action_budget=32)
+            level = self._tree.start_level(
+                frame.level,
+                level_action_budget=level_action_budget,
+            )
             self._emit_event(
                 "level_objective_created",
                 active_objective_id=level.objective_id,
                 level=frame.level,
             )
+        if status_matches_frame:
+            self._tree.sync_level_action_status(used=status[1], limit=status[2])
 
     def _policy_failure(
         self,
@@ -2363,6 +2401,28 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 return AnalyzerTurnResult(
                     step_executed=False,
                     reasoning=f"Engine resolved game as {frame.engine_state}.",
+                    efficiency_metrics=dict(self._orchestration_metrics),
+                )
+            if self._tree.remaining_level_actions <= 0:
+                level = self._tree.current_level_objective
+                detail = (
+                    f"level {frame.level} exhausted its host action budget "
+                    f"({level.actions_used}/{level.action_budget})"
+                )
+                self._boundary_reason = "level_action_budget_exhausted"
+                self._emit_event(
+                    "level_action_budget_exhausted",
+                    level=frame.level,
+                    actions_used=level.actions_used,
+                    action_budget=level.action_budget,
+                )
+                self._persist_durable_state()
+                return AnalyzerTurnResult(
+                    step_executed=False,
+                    exhausted=True,
+                    failure_category="orchestration_level_action_budget_exhausted",
+                    failure_detail=detail,
+                    reasoning=detail,
                     efficiency_metrics=dict(self._orchestration_metrics),
                 )
             if self._stagnated(frame, history) and self._policy_runtime is not None:

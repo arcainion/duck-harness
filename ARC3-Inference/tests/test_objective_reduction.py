@@ -294,8 +294,33 @@ class ObjectiveTreeTests(unittest.TestCase):
         )
         tree.record_action()
         self.assertEqual(0, tactical.remaining_actions)
+        self.assertEqual(1, tree.current_level_objective.actions_used)
+        self.assertEqual(19, tree.remaining_level_actions)
         with self.assertRaisesRegex(ObjectiveError, "budget is exhausted"):
             tree.record_action()
+
+    def test_controller_level_budget_is_authoritative_and_cannot_be_exceeded(
+        self,
+    ) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.sync_level_action_status(used=19, limit=20)
+        tactical = tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_payload()),
+            remaining_level_actions=32,
+        )
+        self.assertEqual(1, tactical.action_budget)
+        self.assertEqual(1, tree.remaining_level_actions)
+        tree.record_action()
+        self.assertEqual(1, tactical.actions_used)
+        self.assertEqual(0, tree.remaining_level_actions)
+        with self.assertRaisesRegex(ObjectiveError, "level action budget"):
+            tree.record_action()
+
+    def test_level_action_status_sync_clamps_controller_overrun(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.sync_level_action_status(used=22, limit=20)
+        self.assertEqual(20, tree.current_level_objective.actions_used)
+        self.assertEqual(0, tree.remaining_level_actions)
 
     def test_same_level_transition_is_idempotent(self) -> None:
         tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)

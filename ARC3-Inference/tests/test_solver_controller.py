@@ -893,6 +893,32 @@ class SolverControllerTests(TestCase):
         self.assertEqual(session.level_action_limit_status(), (1, 16, 16))
         self.assertTrue(session.level_action_limit_reached())
 
+    def test_level_action_status_is_forwarded_to_capable_analyzer(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.controller_config = InferenceControllerConfig(
+            level_action_limit_multiplier=2.0,
+            level_action_limit_minimum=16,
+        )
+        session.game = SimpleNamespace(
+            game_run=SimpleNamespace(
+                base_actions_per_level=[7],
+                actions_per_level=[15],
+                levels_completed=0,
+            )
+        )
+        session.analyzer = SimpleNamespace(set_level_action_status=mock.Mock())
+
+        session.sync_analyzer_level_action_status()
+
+        session.analyzer.set_level_action_status.assert_called_once_with(1, 15, 16)
+
+    def test_level_action_status_ignores_legacy_analyzer(self) -> None:
+        session = object.__new__(_HarnessGameSession)
+        session.level_action_limit_status = lambda: (1, 3, 16)
+        session.analyzer = SimpleNamespace()
+
+        session.sync_analyzer_level_action_status()
+
     def test_consecutive_cycle_risk_limit_stops_session(self) -> None:
         session = object.__new__(_HarnessGameSession)
         session.controller_config = InferenceControllerConfig(cycle_stop_limit=8)

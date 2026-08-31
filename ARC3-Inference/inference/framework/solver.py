@@ -508,6 +508,14 @@ class _HarnessGameSession:
         status = self.level_action_limit_status()
         return status is not None and status[1] >= status[2]
 
+    def sync_analyzer_level_action_status(self) -> None:
+        """Forward host action accounting to analyzers that consume it."""
+
+        status = self.level_action_limit_status()
+        setter = getattr(self.analyzer, "set_level_action_status", None)
+        if status is not None and callable(setter):
+            setter(*status)
+
     def level_no_progress_token_status(self) -> tuple[int, int, int] | None:
         limit = getattr(
             getattr(self, "controller_config", None),
@@ -722,6 +730,7 @@ class _HarnessGameSession:
                 else:
                     analysis_step = retry_analysis_step
 
+                self.sync_analyzer_level_action_status()
                 self.write_runtime_state()
                 transcript_before = self._read_transcript_bytes()
                 try:

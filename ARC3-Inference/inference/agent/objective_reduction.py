@@ -427,6 +427,32 @@ class ObjectiveTree:
             current = self.nodes[current.parent_id]
         return current.objective_id
 
+    @property
+    def current_level_objective(self) -> ObjectiveNode:
+        """Return the host-owned level node on the active objective path."""
+
+        return self.nodes[self._level_id_for_active_path()]
+
+    @property
+    def remaining_level_actions(self) -> int:
+        """Return the authoritative remaining action budget for this level."""
+
+        return self.current_level_objective.remaining_actions
+
+    def sync_level_action_status(self, *, used: int, limit: int) -> None:
+        """Synchronize the level node with the controller's authoritative counters."""
+
+        checked_limit = int(limit)
+        checked_used = int(used)
+        if checked_limit < 1:
+            raise ObjectiveError("level action limit must be positive")
+        if checked_used < 0:
+            raise ObjectiveError("level actions used may not be negative")
+        level = self.current_level_objective
+        level.action_budget = checked_limit
+        level.actions_used = min(checked_used, checked_limit)
+        self.validate()
+
     def apply_proposal(
         self, proposal: ReductionProposal, *, remaining_level_actions: int
     ) -> ObjectiveNode:
@@ -463,7 +489,10 @@ class ObjectiveTree:
             if child.status in {ObjectiveStatus.PENDING, ObjectiveStatus.ACTIVE}:
                 child.status = ObjectiveStatus.SUPERSEDED
         created: list[ObjectiveNode] = []
-        available = int(remaining_level_actions)
+        available = min(
+            int(remaining_level_actions),
+            self.remaining_level_actions,
+        )
         if available <= 0:
             raise ObjectiveError(
                 "no level action budget remains for a tactical subgoal"
@@ -504,9 +533,13 @@ class ObjectiveTree:
     def record_action(self) -> None:
         node = self.active
         if node.kind is ObjectiveKind.TACTICAL:
+            level = self.current_level_objective
+            if level.remaining_actions <= 0:
+                raise ObjectiveError("level action budget is exhausted")
             if node.remaining_actions <= 0:
                 raise ObjectiveError("tactical action budget is exhausted")
             node.actions_used += 1
+            level.actions_used += 1
 
     def complete_active_tactical(self, evidence: str) -> ObjectiveNode:
         if self.active.kind is not ObjectiveKind.TACTICAL:
