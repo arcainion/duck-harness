@@ -35,7 +35,7 @@ from inference.agent.objective_reduction import (
     ReductionVerdict,
     SubgoalSpec,
 )
-from inference.agent.policy_codegen_helpers import transition_has_stable_change
+from inference.agent.policy_codegen_helpers import stable_transition_evidence_status
 from inference.agent.runtime_state import Frame, HistoryEntry, load_runtime_state
 from inference.agent.tool_agent import (
     AnalyzerTurnResult,
@@ -324,8 +324,10 @@ transition_change_class(last_transition) preserves host state-change classes suc
 novel, revisit, volatile_only, and exact_noop independently of progress.
 transition_has_stable_change(last_transition) accepts only executed, board-changing,
 non-cyclic, nonvolatile learning evidence. For evidence_mode=stable_transition,
-confirm the same action or coordinate produces stable change at least twice after the
-minimum evidence count before returning subgoal_succeeded. For
+call stable_transition_evidence_ready(observation.objective,
+observation.recent_transitions); it applies the host's exact same-action/coordinate,
+minimum-evidence, nonvolatile, and non-cyclic rules. Do not replace it with a custom
+counter or group distinct directions under a generic MOVE key. For
 evidence_mode=engine_progress, require transition_has_progress instead.
 accumulate_transition_evidence(memory, last_transition, key="transition_evidence",
 limit=16) stores a rolling history. objective_evidence_ready(observation.objective,
@@ -338,7 +340,9 @@ memory_update(memory, updates), memory_push(memory, key, value, limit=16), and
 memory_increment(memory, key, amount=1, minimum=None, maximum=None) return new finite
 JSON memory with 64-key, 32-KiB, and rolling-history limits. For a standalone list use
 history_push(history, value, limit=16), then store the returned list; do not call
-memory_push with a list as its first argument.
+memory_push with a list as its first argument. memory_increment keys are literal and
+never dotted paths. To increment memory[FIELD][KEY], use memory_mapping_increment(
+memory, FIELD, KEY, amount=1, minimum=None, maximum=None).
 recent_outcome_counts(observation.recent_transitions), consecutive_outcome_count(...),
 and recent_action_counts(..., only_nonprogress=False) summarize at most 64 transitions.
 least_tried_action(observation.valid_actions, observation.recent_transitions, exclude=(),
@@ -358,7 +362,10 @@ matching_region_center(board, values) instead of rewriting marker scans. Use
 line_value_count(board, values, axis, index), line_run_length(..., from_end=False),
 edge_value_count(board, values, edge), and edge_run_length(board, values, edge, offset)
 for rows, columns, progress bars, and inward edge runs. All helpers are host-owned and
-bounded. ord is available for a one-character string, though numeric values are clearer.
+bounded. The reducer/coder payload's board_hex_rows use hexadecimal symbols
+0123456789abcdef, while observation.board stores the corresponding integers 0 through
+15. Convert payload symbols with palette_value("b") == 11 or
+palette_values("b5") == (11, 5). Never use ord() for board values.
 
 observation.board is a NumPy uint8 array. Never use it directly as a boolean or compare
 it with == or !=; use board.size, np.array_equal, or a finite Python integer digest.
@@ -2163,31 +2170,12 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 "observations are retained"
             )
         if active.evidence_mode is ObjectiveEvidenceMode.STABLE_TRANSITION:
-            if not transition_has_stable_change(transition):
-                return False, (
-                    "latest transition is not an executed, stable, non-cyclic "
-                    "board change"
-                )
-            stable = [item for item in relevant if transition_has_stable_change(item)]
-            minimum_stable = 1 if required_actions == 1 else 2
-            if len(stable) < minimum_stable:
-                return False, (
-                    f"only {len(stable)} of {minimum_stable} required stable "
-                    "transition observations were found"
-                )
-            signatures: dict[tuple[Any, Any, Any], int] = {}
-            for item in stable:
-                signature = _action_signature(item)
-                signatures[signature] = signatures.get(signature, 0) + 1
-            if required_actions > 1 and max(signatures.values(), default=0) < 2:
-                return False, (
-                    "stable changes were not reproduced by the same action or "
-                    "coordinate"
-                )
-            return True, (
-                "host minimum-evidence and reproducible stable-transition "
-                "requirements are met"
+            allowed, reason = stable_transition_evidence_status(
+                active.to_dict(), relevant
             )
+            if not allowed:
+                return False, reason
+            return True, "host minimum-evidence and " + reason
         if not any(bool(item.get("meaningful_progress")) for item in relevant):
             return False, (
                 "novel or changed states alone do not prove tactical completion; "

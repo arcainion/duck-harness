@@ -375,9 +375,14 @@ def decide(observation, memory):
     digest = board_digest(observation.board)
     memory = memory_push(memory, "digests", digest, limit=2)
     memory = memory_increment(memory, "calls", maximum=10)
+    memory = memory_mapping_increment(memory, "palette_counts", "b")
     memory = memory_update(
         memory,
-        {"outcomes": recent_outcome_counts(observation.recent_transitions)},
+        {
+            "outcomes": recent_outcome_counts(observation.recent_transitions),
+            "palette": list(palette_values("b5")),
+            "b_value": palette_value("b"),
+        },
     )
     action_name = least_tried_action(
         observation.valid_actions, observation.recent_transitions
@@ -412,6 +417,9 @@ def decide(observation, memory):
         self.assertEqual({"action": "UP"}, first.action)
         self.assertEqual({"action": "RIGHT"}, second.action)
         self.assertEqual(2, second.memory["calls"])
+        self.assertEqual({"b": 2}, second.memory["palette_counts"])
+        self.assertEqual([11, 5], second.memory["palette"])
+        self.assertEqual(11, second.memory["b_value"])
         self.assertEqual({"no_progress": 1}, second.memory["outcomes"])
         self.assertEqual(2, len(second.memory["digests"]))
         self.assertEqual(second.memory["digests"][0], second.memory["digests"][1])
@@ -687,6 +695,39 @@ def decide(observation, memory):
         )
         for source, message in cases:
             with self.subTest(message=message):
+                with self.assertRaisesRegex(PolicyRuntimeError, message) as captured:
+                    verify_policy_source(source)
+                self.assertEqual("policy_verification", captured.exception.category)
+
+    def test_source_verifier_rejects_invalid_decision_builder_arguments(self) -> None:
+        cases = (
+            (
+                'mouse_decision(point, memory, evidence="probe", point=point)',
+                "both positionally and by keyword: point",
+            ),
+            (
+                'mouse_decision(point, memory, reason="probe")',
+                "unknown keyword argument.*reason",
+            ),
+            (
+                'subgoal_succeeded(memory, "done", None)',
+                "too many positional arguments",
+            ),
+            (
+                "continue_decision(*parts)",
+                "may not use unpacked",
+            ),
+        )
+        for expression, message in cases:
+            source = (
+                "POLICY_API_VERSION = 1\n"
+                'SUPPORTED_BACKENDS = ("cpu",)\n'
+                "def decide(observation, memory):\n"
+                "    point = (1, 2)\n"
+                "    parts = ('UP', memory)\n"
+                f"    return {expression}\n"
+            )
+            with self.subTest(expression=expression):
                 with self.assertRaisesRegex(PolicyRuntimeError, message) as captured:
                     verify_policy_source(source)
                 self.assertEqual("policy_verification", captured.exception.category)

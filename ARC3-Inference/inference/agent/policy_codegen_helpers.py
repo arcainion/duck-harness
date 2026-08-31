@@ -17,6 +17,7 @@ from inference.agent.policy_pathfinding import next_path_action
 
 POLICY_CODEGEN_API_VERSION = 1
 POLICY_ACTIONS = ("UP", "RIGHT", "DOWN", "LEFT", "SPACE", "MOUSE", "ACTION7")
+POLICY_BOARD_HEX_SYMBOLS = "0123456789abcdef"
 MAX_HELPER_MEMORY_BYTES = 32_768
 MAX_HELPER_MEMORY_KEYS = 64
 MAX_RECENT_TRANSITIONS = 64
@@ -447,6 +448,104 @@ def objective_evidence_ready(objective: Any, transitions: Any) -> bool:
     return False
 
 
+def stable_transition_evidence_status(
+    objective: Any, transitions: Any
+) -> tuple[bool, str]:
+    """Validate the host contract for reproducible tactical learning evidence."""
+
+    if not isinstance(objective, Mapping):
+        raise ValueError("objective must be a mapping")
+    required = objective.get("minimum_evidence_actions", 1)
+    if isinstance(required, bool):
+        raise ValueError("minimum_evidence_actions must be an integer from 0 through 32")
+    try:
+        required_count = index(required)
+    except TypeError as exc:
+        raise ValueError(
+            "minimum_evidence_actions must be an integer from 0 through 32"
+        ) from exc
+    if not 0 <= required_count <= 32:
+        raise ValueError("minimum_evidence_actions must be an integer from 0 through 32")
+
+    objective_id = str(objective.get("objective_id") or objective.get("id") or "")
+    relevant: list[Mapping[str, Any]] = []
+    for transition in _recent_items(transitions):
+        transition_objective_id = str(transition.get("objective_id") or "")
+        if objective_id and transition_objective_id and transition_objective_id != objective_id:
+            continue
+        if transition.get("executed") is not True:
+            continue
+        if transition.get("post_action_observed") is False:
+            continue
+        relevant.append(transition)
+
+    if len(relevant) < required_count:
+        return False, (
+            f"only {len(relevant)} of {required_count} required transition "
+            "observations were found"
+        )
+    if not relevant:
+        return False, "no executed post-action transition was found"
+    latest = relevant[-1]
+    if not transition_has_stable_change(latest):
+        outcome = transition_change_class(latest)
+        suffix = f" ({outcome})" if outcome != "unknown" else ""
+        return False, (
+            "latest transition is not an executed, stable, non-cyclic board change"
+            + suffix
+        )
+
+    stable = [item for item in relevant if transition_has_stable_change(item)]
+    minimum_stable = 1 if required_count <= 1 else 2
+    if len(stable) < minimum_stable:
+        return False, (
+            f"only {len(stable)} of {minimum_stable} required stable transition "
+            "observations were found"
+        )
+    if required_count > 1:
+        signatures: dict[tuple[Any, Any, Any], int] = {}
+        for item in stable:
+            signature = (item.get("action"), item.get("row"), item.get("col"))
+            signatures[signature] = signatures.get(signature, 0) + 1
+        if max(signatures.values(), default=0) < 2:
+            return False, (
+                "stable changes were not reproduced by the same action or coordinate"
+            )
+    return True, "reproducible stable-transition requirements are met"
+
+
+def stable_transition_evidence_ready(objective: Any, transitions: Any) -> bool:
+    """Return whether host-verifiable stable tactical evidence is ready."""
+
+    return stable_transition_evidence_status(objective, transitions)[0]
+
+
+def palette_value(symbol: Any) -> int:
+    """Convert one reducer-facing hexadecimal board symbol to a value from 0 to 15."""
+
+    if not isinstance(symbol, str) or len(symbol) != 1:
+        raise ValueError("palette symbol must be one hexadecimal character")
+    normalized = symbol.lower()
+    if normalized not in POLICY_BOARD_HEX_SYMBOLS:
+        raise ValueError("palette symbol must be one hexadecimal character")
+    return POLICY_BOARD_HEX_SYMBOLS.index(normalized)
+
+
+def palette_values(symbols: Any) -> tuple[int, ...]:
+    """Convert reducer-facing hexadecimal symbols to unique board values."""
+
+    if isinstance(symbols, str):
+        raw = list(symbols)
+    elif isinstance(symbols, (list, tuple, set, frozenset)):
+        raw = list(symbols)
+    else:
+        raise ValueError("palette symbols must be a string or bounded collection")
+    if not raw or len(raw) > 16:
+        raise ValueError("palette symbols must contain between 1 and 16 characters")
+    values = [palette_value(symbol) for symbol in raw]
+    return tuple(dict.fromkeys(values))
+
+
 def transition_requires_replan(
     transition: Any, replan_on_no_progress: bool = True
 ) -> bool:
@@ -791,6 +890,55 @@ def memory_increment(
     return memory_update(result, {key: updated})
 
 
+def memory_mapping_increment(
+    memory: Any,
+    field: Any,
+    key: Any,
+    amount: int | float = 1,
+    minimum: int | float | None = None,
+    maximum: int | float | None = None,
+) -> dict[str, Any]:
+    """Increment one numeric entry inside a copied JSON memory mapping."""
+
+    if not isinstance(field, str) or not field:
+        raise ValueError("memory mapping field must be a non-empty string")
+    if not isinstance(key, str) or not key:
+        raise ValueError("memory mapping key must be a non-empty string")
+    numeric_values = (amount, minimum, maximum)
+    if any(
+        value is not None
+        and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        )
+        for value in numeric_values
+    ):
+        raise ValueError("memory increment bounds and amount must be finite numbers")
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError("memory increment minimum may not exceed maximum")
+    result = _memory_mapping(memory)
+    existing = result.get(field, {})
+    if not isinstance(existing, Mapping):
+        raise ValueError(f"memory value for {field!r} must be a mapping")
+    nested = dict(existing)
+    if len(nested) >= MAX_HELPER_MEMORY_KEYS and key not in nested:
+        raise ValueError(
+            f"memory mapping {field!r} may contain at most "
+            f"{MAX_HELPER_MEMORY_KEYS} keys"
+        )
+    current = nested.get(key, 0)
+    if isinstance(current, bool) or not isinstance(current, (int, float)):
+        raise ValueError(f"memory mapping value for {key!r} must be numeric")
+    updated = current + amount
+    if minimum is not None:
+        updated = max(updated, minimum)
+    if maximum is not None:
+        updated = min(updated, maximum)
+    nested[key] = updated
+    return memory_update(result, {field: nested})
+
+
 def recent_outcome_counts(transitions: Any) -> dict[str, int]:
     """Count host outcome classes across a bounded recent-transition window."""
 
@@ -972,6 +1120,7 @@ POLICY_CODEGEN_GLOBALS = MappingProxyType(
     {
         "POLICY_CODEGEN_API_VERSION": POLICY_CODEGEN_API_VERSION,
         "POLICY_ACTIONS": POLICY_ACTIONS,
+        "POLICY_BOARD_HEX_SYMBOLS": POLICY_BOARD_HEX_SYMBOLS,
         "accumulate_transition_evidence": accumulate_transition_evidence,
         "action_payload": action_payload,
         "board_digest": board_digest,
@@ -988,12 +1137,15 @@ POLICY_CODEGEN_GLOBALS = MappingProxyType(
         "line_value_count": line_value_count,
         "matching_region_center": matching_region_center,
         "memory_increment": memory_increment,
+        "memory_mapping_increment": memory_mapping_increment,
         "memory_push": memory_push,
         "memory_update": memory_update,
         "memory_with_defaults": memory_with_defaults,
         "mouse_decision": mouse_decision,
         "nearest_matching_cell": nearest_matching_cell,
         "objective_evidence_ready": objective_evidence_ready,
+        "palette_value": palette_value,
+        "palette_values": palette_values,
         "path_decision": path_decision,
         "region_digest": region_digest,
         "subgoal_failed": subgoal_failed,
@@ -1008,5 +1160,6 @@ POLICY_CODEGEN_GLOBALS = MappingProxyType(
         "transition_outcome": transition_outcome,
         "transition_repeats_nonprogress_action": transition_repeats_nonprogress_action,
         "transition_requires_replan": transition_requires_replan,
+        "stable_transition_evidence_ready": stable_transition_evidence_ready,
     }
 )

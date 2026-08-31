@@ -82,6 +82,13 @@ POLICY_OBSERVATION_ATTRIBUTES = {
     "step",
     "valid_actions",
 }
+POLICY_DECISION_BUILDER_PARAMETERS = {
+    "continue_decision": ("action", "memory", "evidence", "prediction", "point"),
+    "mouse_decision": ("point", "memory", "evidence", "prediction"),
+    "path_decision": ("path", "valid_actions", "memory", "evidence", "prediction"),
+    "subgoal_failed": ("memory", "evidence"),
+    "subgoal_succeeded": ("memory", "evidence"),
+}
 
 
 class PolicyRuntimeError(RuntimeError):
@@ -388,6 +395,33 @@ def verify_policy_source(source: str) -> str:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in FORBIDDEN_CALLS:
                 reject(f"call {node.func.id!r} is not permitted")
+            parameters = POLICY_DECISION_BUILDER_PARAMETERS.get(node.func.id)
+            if parameters is not None:
+                if any(isinstance(argument, ast.Starred) for argument in node.args) or any(
+                    keyword.arg is None for keyword in node.keywords
+                ):
+                    reject(
+                        f"{node.func.id} may not use unpacked positional or keyword "
+                        "arguments"
+                    )
+                if len(node.args) > len(parameters):
+                    reject(f"{node.func.id} received too many positional arguments")
+                keyword_names = {
+                    keyword.arg for keyword in node.keywords if keyword.arg is not None
+                }
+                unknown = keyword_names.difference(parameters)
+                if unknown:
+                    reject(
+                        f"{node.func.id} received unknown keyword argument(s): "
+                        + ", ".join(sorted(unknown))
+                    )
+                duplicates = keyword_names.intersection(parameters[: len(node.args)])
+                if duplicates:
+                    reject(
+                        f"{node.func.id} received argument(s) both positionally and "
+                        "by keyword: "
+                        + ", ".join(sorted(duplicates))
+                    )
     top_level_functions = {
         statement.name: statement
         for statement in tree.body

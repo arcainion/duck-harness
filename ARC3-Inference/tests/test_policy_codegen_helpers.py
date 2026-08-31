@@ -7,6 +7,7 @@ import numpy as np
 
 from inference.agent.policy_codegen_helpers import (
     POLICY_ACTIONS,
+    POLICY_BOARD_HEX_SYMBOLS,
     POLICY_CODEGEN_API_VERSION,
     POLICY_CODEGEN_GLOBALS,
     accumulate_transition_evidence,
@@ -25,12 +26,15 @@ from inference.agent.policy_codegen_helpers import (
     line_value_count,
     matching_region_center,
     memory_increment,
+    memory_mapping_increment,
     memory_push,
     memory_update,
     memory_with_defaults,
     mouse_decision,
     nearest_matching_cell,
     objective_evidence_ready,
+    palette_value,
+    palette_values,
     path_decision,
     region_digest,
     subgoal_failed,
@@ -45,6 +49,8 @@ from inference.agent.policy_codegen_helpers import (
     transition_outcome,
     transition_repeats_nonprogress_action,
     transition_requires_replan,
+    stable_transition_evidence_ready,
+    stable_transition_evidence_status,
 )
 
 
@@ -253,9 +259,12 @@ class PolicyCodegenHelperTests(unittest.TestCase):
             "least_tried_mouse_point",
             "line_value_count",
             "memory_with_defaults",
+            "memory_mapping_increment",
             "mouse_decision",
             "nearest_matching_cell",
             "objective_evidence_ready",
+            "palette_value",
+            "palette_values",
             "path_decision",
             "region_digest",
             "subgoal_failed",
@@ -265,10 +274,15 @@ class PolicyCodegenHelperTests(unittest.TestCase):
             "transition_has_stable_change",
             "transition_outcome",
             "transition_requires_replan",
+            "stable_transition_evidence_ready",
         }
         self.assertEqual(1, POLICY_CODEGEN_API_VERSION)
         self.assertEqual(1, POLICY_CODEGEN_GLOBALS["POLICY_CODEGEN_API_VERSION"])
         self.assertEqual(POLICY_ACTIONS, POLICY_CODEGEN_GLOBALS["POLICY_ACTIONS"])
+        self.assertEqual(
+            POLICY_BOARD_HEX_SYMBOLS,
+            POLICY_CODEGEN_GLOBALS["POLICY_BOARD_HEX_SYMBOLS"],
+        )
         self.assertTrue(expected.issubset(POLICY_CODEGEN_GLOBALS))
         self.assertTrue(
             all(callable(POLICY_CODEGEN_GLOBALS[name]) for name in expected)
@@ -407,6 +421,75 @@ class PolicyCodegenHelperTests(unittest.TestCase):
             memory_increment({}, "attempts", float("inf"))
         with self.assertRaisesRegex(ValueError, "may not exceed"):
             memory_increment({}, "attempts", minimum=2, maximum=1)
+
+    def test_memory_mapping_increment_updates_nested_counter_without_dotted_keys(
+        self,
+    ) -> None:
+        original = {"stable_keys": {"UP": 1}}
+        updated = memory_mapping_increment(original, "stable_keys", "UP")
+        updated = memory_mapping_increment(updated, "stable_keys", "ACTION7", 2)
+        self.assertEqual(
+            {"stable_keys": {"UP": 2, "ACTION7": 2}},
+            updated,
+        )
+        self.assertEqual({"stable_keys": {"UP": 1}}, original)
+        self.assertEqual(
+            {"stable_keys.UP": 1},
+            memory_increment({}, "stable_keys.UP"),
+        )
+        with self.assertRaisesRegex(ValueError, "must be a mapping"):
+            memory_mapping_increment({"stable_keys": 1}, "stable_keys", "UP")
+        with self.assertRaisesRegex(ValueError, "must be numeric"):
+            memory_mapping_increment(
+                {"stable_keys": {"UP": "one"}}, "stable_keys", "UP"
+            )
+
+    def test_palette_helpers_translate_reducer_hex_symbols_not_ascii(self) -> None:
+        self.assertEqual("0123456789abcdef", POLICY_BOARD_HEX_SYMBOLS)
+        self.assertEqual(5, palette_value("5"))
+        self.assertEqual(11, palette_value("b"))
+        self.assertEqual(15, palette_value("F"))
+        self.assertEqual((11, 5, 15), palette_values("b5f5"))
+        self.assertNotEqual(ord("b"), palette_value("b"))
+        with self.assertRaisesRegex(ValueError, "hexadecimal"):
+            palette_value("W")
+        with self.assertRaisesRegex(ValueError, "between 1 and 16"):
+            palette_values("")
+
+    def test_stable_evidence_helper_matches_exact_action_and_objective_contract(
+        self,
+    ) -> None:
+        objective = {
+            "objective_id": "tactical:1",
+            "minimum_evidence_actions": 4,
+        }
+
+        def transition(action: str, *, objective_id: str = "tactical:1") -> dict:
+            return {
+                "objective_id": objective_id,
+                "action": action,
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": True,
+                "outcome_class": "novel",
+                "loop_detected": False,
+                "cycle_risk": False,
+            }
+
+        unreproduced = [transition(action) for action in ("UP", "RIGHT", "DOWN", "LEFT")]
+        ready, reason = stable_transition_evidence_status(objective, unreproduced)
+        self.assertFalse(ready)
+        self.assertIn("not reproduced", reason)
+        reproduced = [transition(action) for action in ("UP", "RIGHT", "UP", "RIGHT")]
+        self.assertTrue(stable_transition_evidence_ready(objective, reproduced))
+        reproduced[-1]["outcome_class"] = "volatile_only"
+        ready, reason = stable_transition_evidence_status(objective, reproduced)
+        self.assertFalse(ready)
+        self.assertIn("volatile_only", reason)
+        reproduced[-1] = transition("RIGHT", objective_id="tactical:other")
+        ready, reason = stable_transition_evidence_status(objective, reproduced)
+        self.assertFalse(ready)
+        self.assertIn("only 3 of 4", reason)
 
     def test_recent_transition_summaries_are_bounded_and_host_classified(self) -> None:
         transitions = (
