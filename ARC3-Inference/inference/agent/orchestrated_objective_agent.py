@@ -26,6 +26,7 @@ from inference.agent.gameplay_policy_runtime import (
     verify_policy_source,
 )
 from inference.agent.objective_reduction import (
+    ObjectiveEvidenceMode,
     ObjectiveError,
     ObjectiveKind,
     ObjectiveNode,
@@ -34,6 +35,7 @@ from inference.agent.objective_reduction import (
     ReductionVerdict,
     SubgoalSpec,
 )
+from inference.agent.policy_codegen_helpers import transition_has_stable_change
 from inference.agent.runtime_state import Frame, HistoryEntry, load_runtime_state
 from inference.agent.tool_agent import (
     AnalyzerTurnResult,
@@ -172,9 +174,14 @@ between BEGIN_REDUCTION and END_REDUCTION lines. Do not use a tool call, Markdow
 or prose outside the markers. The object must contain objective_id, verdict, evidence,
 rationale, selected_index, and subgoals. verdict is continue, complete, fail, or
 decompose. Each subgoal contains title, success_criteria, failure_criteria,
-expected_evidence, an integer action_budget from 1 to 32, an integer
+expected_evidence, evidence_mode, an integer action_budget from 1 to 32, an integer
 minimum_evidence_actions from 1 through min(4, action_budget), and a boolean
-single_step. The host owns all IDs,
+single_step. evidence_mode is engine_progress or stable_transition. Use
+stable_transition only for epistemic tactical goals such as identifying a control or
+repeatable interaction rule; it requires reproducible executed, nonvolatile,
+non-cyclic board changes but does not imply level progress. Use engine_progress when
+success requires meaningful_progress, reward, level_completed, or run_complete. The
+host owns all IDs,
 tree invariants, budgets, and game/level completion. You may complete or fail only
 the active tactical objective. A game or level objective must be decomposed into one
 to six falsifiable tactical subgoals. Prefer the selected subgoal whose result will
@@ -198,13 +205,14 @@ necessarily progress: volatile_only and exact_noop outcomes are negative evidenc
 Novel states are exploration evidence, not host-confirmed progress. Do not repeat a
 tactical contract already present in objective_tree; use its resolution evidence and
 select a materially different falsifiable objective.
-The host accepts tactical success only after controller-confirmed meaningful_progress,
-reward, level_completed, or run_complete. Frame pure exploration so useful observations
-without that progress satisfy failure_criteria and drive a materially different next
-reduction instead of claiming completion.
+The host accepts engine_progress tactical success only after controller-confirmed
+meaningful_progress, reward, level_completed, or run_complete. A stable_transition
+tactical objective may complete on repeated host-classified stable changes after its
+minimum evidence count; this resolves only that tactical learning goal, never the
+engine-owned level or game objective.
 
 BEGIN_REDUCTION
-{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"run a bounded adaptive probe sequence","selected_index":0,"subgoals":[{"title":"Map legal actions and execute the best discovered route","success_criteria":"establish a repeatable transition rule and use it toward level progress","failure_criteria":"eight distinct adaptive probes produce no usable rule","expected_evidence":"four or more host transitions comparing distinct actions and outcomes","action_budget":8,"minimum_evidence_actions":4,"single_step":false}]}
+{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"run a bounded adaptive probe sequence","selected_index":0,"subgoals":[{"title":"Map a repeatable control rule","success_criteria":"the same action produces stable non-cyclic board changes at least twice","failure_criteria":"eight distinct adaptive probes produce no usable rule","expected_evidence":"four or more host transitions comparing distinct actions and change classes","evidence_mode":"stable_transition","action_budget":8,"minimum_evidence_actions":4,"single_step":false}]}
 END_REDUCTION"""
 
 _CODER_SYSTEM_PROMPT = """You are the gameplay-policy coder role for an ARC-AGI-3 game.
@@ -254,13 +262,13 @@ across tactical objectives in the same level: it must derive actions and termina
 criteria from observation.objective, observation.board, valid_actions, and transition
 evidence rather than embedding the current objective's title, fixed route, target
 coordinates, or success threshold. Prefer reusable board-driven exploration and
-pathfinding policies when they can honor different tactical contracts. A local board
-change, novelty, adjacency, digest change, or inferred feature merge is not sufficient
-to claim tactical success: require the active contract plus explicit host
-transition evidence such as meaningful_progress, reward, level_completed, or
-run_complete. If bounded exploration produces useful evidence but no host-confirmed
-progress, return subgoal_failed with that evidence so the reducer can choose a different
-contract. Default to POLICY_REUSE_SCOPE = "none" when uncertain. The declaration is
+pathfinding policies when they can honor different tactical contracts. Read
+observation.objective["evidence_mode"]. For engine_progress, a local board change,
+novelty, adjacency, digest change, or inferred feature merge is not sufficient: require
+meaningful_progress, reward, level_completed, or run_complete. For stable_transition,
+require repeated executed, nonvolatile, non-cyclic changes from the same action or
+coordinate after the minimum evidence count; this completes only the tactical learning
+goal. Default to POLICY_REUSE_SCOPE = "none" when uncertain. The declaration is
 only a reuse candidate; the host qualifies, limits, and may evict it. The host always
 supplies fresh memory/context and preflights a reused policy against the new objective;
 reuse never crosses a game or level boundary.
@@ -312,6 +320,13 @@ transition_requires_replan(..., replan_on_no_progress=True) implement host seman
 Before retrying, transition_repeats_nonprogress_action(last_transition, action, point=None)
 detects the exact action/coordinate repeat. POLICY_CODEGEN_API_VERSION is 1.
 transition_facts(last_transition) provides one bounded JSON snapshot, while
+transition_change_class(last_transition) preserves host state-change classes such as
+novel, revisit, volatile_only, and exact_noop independently of progress.
+transition_has_stable_change(last_transition) accepts only executed, board-changing,
+non-cyclic, nonvolatile learning evidence. For evidence_mode=stable_transition,
+confirm the same action or coordinate produces stable change at least twice after the
+minimum evidence count before returning subgoal_succeeded. For
+evidence_mode=engine_progress, require transition_has_progress instead.
 accumulate_transition_evidence(memory, last_transition, key="transition_evidence",
 limit=16) stores a rolling history. objective_evidence_ready(observation.objective,
 observation.recent_transitions) checks the host-requested minimum evidence count.
@@ -367,10 +382,10 @@ board digest is needed; hashlib/json imports, getattr, and observation.engine_st
 not permitted. The active objective exposes minimum_evidence_actions and single_step.
 Unless the engine reports level/run completion, the host requires exactly that many
 executed post-action observations before accepting tactical success or failure. Do not
-return subgoal_succeeded merely for board_changed, novel_state, or
-meaningful_progress; continue gathering evidence until the complete declared success
-criteria are satisfied. volatile_only and transient_effect can never prove tactical
-success. Runtime transition history is objective-scoped: at entry to a new tactical
+return subgoal_succeeded from one board_changed, novel_state, or meaningful_progress
+observation; continue gathering evidence until the complete declared success criteria
+and evidence_mode are satisfied. volatile_only and transient_effect can never prove
+tactical success. Runtime transition history is objective-scoped: at entry to a new tactical
 objective observation.last_transition is None, and recent_transitions contains only
 transitions from that objective. Never evaluate post-action evidence until
 last_transition is a mapping produced by this objective. The host preflights a new
@@ -567,6 +582,7 @@ def _objective_contract_hash(objective: Any) -> str:
         )
     }
     material["single_step"] = bool(payload.get("single_step"))
+    material["evidence_mode"] = str(payload.get("evidence_mode") or "engine_progress")
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
     return hashlib.blake2b(encoded.encode("utf-8"), digest_size=12).hexdigest()
 
@@ -2145,6 +2161,32 @@ class OrchestratedObjectiveAgent(ToolAgent):
             return False, (
                 f"only {len(relevant)} of {required_actions} required transition "
                 "observations are retained"
+            )
+        if active.evidence_mode is ObjectiveEvidenceMode.STABLE_TRANSITION:
+            if not transition_has_stable_change(transition):
+                return False, (
+                    "latest transition is not an executed, stable, non-cyclic "
+                    "board change"
+                )
+            stable = [item for item in relevant if transition_has_stable_change(item)]
+            minimum_stable = 1 if required_actions == 1 else 2
+            if len(stable) < minimum_stable:
+                return False, (
+                    f"only {len(stable)} of {minimum_stable} required stable "
+                    "transition observations were found"
+                )
+            signatures: dict[tuple[Any, Any, Any], int] = {}
+            for item in stable:
+                signature = _action_signature(item)
+                signatures[signature] = signatures.get(signature, 0) + 1
+            if required_actions > 1 and max(signatures.values(), default=0) < 2:
+                return False, (
+                    "stable changes were not reproduced by the same action or "
+                    "coordinate"
+                )
+            return True, (
+                "host minimum-evidence and reproducible stable-transition "
+                "requirements are met"
             )
         if not any(bool(item.get("meaningful_progress")) for item in relevant):
             return False, (

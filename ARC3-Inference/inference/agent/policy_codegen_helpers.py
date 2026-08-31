@@ -26,6 +26,20 @@ _NO_PROGRESS_OUTCOMES = {
     "no_progress",
     "volatile_only",
 }
+_CHANGE_CLASSES = {
+    "behavioral_noop",
+    "exact_noop",
+    "guarded",
+    "level_progress",
+    "negative_reward",
+    "no_progress",
+    "novel",
+    "revisit",
+    "terminal_failure",
+    "transient_effect",
+    "volatile_only",
+}
+_STABLE_CHANGE_CLASSES = {"changed", "level_progress", "novel", "revisit"}
 
 
 def _point(value: Any) -> tuple[int, int]:
@@ -307,12 +321,50 @@ def transition_has_progress(transition: Any) -> bool:
     return transition_outcome(transition) in {"progress", "terminal"}
 
 
+def transition_change_class(transition: Any) -> str:
+    """Preserve the host's state-change class independently of progress semantics."""
+
+    if not isinstance(transition, Mapping):
+        return "unknown"
+    outcome = str(transition.get("outcome_class") or "").strip().lower()
+    if transition.get("error") or transition.get("executed") is False:
+        return "failed"
+    if bool(transition.get("game_over")):
+        return "terminal_failure"
+    if (
+        outcome == "guarded"
+        or bool(transition.get("cycle_risk"))
+        or bool(transition.get("loop_detected"))
+    ):
+        return "guarded"
+    if outcome in _CHANGE_CLASSES:
+        return outcome
+    if transition.get("executed") is True:
+        return "changed" if transition.get("board_changed") is True else "exact_noop"
+    return "unknown"
+
+
+def transition_has_stable_change(transition: Any) -> bool:
+    """Return whether an executed transition is stable learning evidence."""
+
+    return (
+        isinstance(transition, Mapping)
+        and transition.get("executed") is True
+        and transition.get("board_changed") is True
+        and not transition.get("error")
+        and not bool(transition.get("cycle_risk"))
+        and not bool(transition.get("loop_detected"))
+        and transition_change_class(transition) in _STABLE_CHANGE_CLASSES
+    )
+
+
 def transition_facts(transition: Any) -> dict[str, Any]:
     """Return a bounded JSON snapshot using the host's transition semantics."""
 
     if not isinstance(transition, Mapping):
         return {
             "outcome": "unknown",
+            "change_class": "unknown",
             "action": "",
             "point": None,
             "executed": None,
@@ -341,6 +393,7 @@ def transition_facts(transition: Any) -> dict[str, Any]:
 
     return {
         "outcome": transition_outcome(transition),
+        "change_class": transition_change_class(transition),
         "action": action,
         "point": point,
         "executed": optional_bool("executed"),
@@ -949,7 +1002,9 @@ POLICY_CODEGEN_GLOBALS = MappingProxyType(
         "recent_mouse_point_counts": recent_mouse_point_counts,
         "recent_outcome_counts": recent_outcome_counts,
         "transition_facts": transition_facts,
+        "transition_change_class": transition_change_class,
         "transition_has_progress": transition_has_progress,
+        "transition_has_stable_change": transition_has_stable_change,
         "transition_outcome": transition_outcome,
         "transition_repeats_nonprogress_action": transition_repeats_nonprogress_action,
         "transition_requires_replan": transition_requires_replan,

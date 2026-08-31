@@ -1829,6 +1829,90 @@ def decide(observation, memory):
         self.assertIn("transient_effect", reason)
         agent.close()
 
+    def test_stable_transition_mode_accepts_reproducible_novel_control_evidence(
+        self,
+    ) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        reduction = reduction_for("level:1:1")
+        subgoals = reduction["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0]["evidence_mode"] = "stable_transition"
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+        transitions: list[dict[str, object]] = []
+        for action in ("UP", "RIGHT", "UP", "RIGHT"):
+            tree.record_action()
+            transition: dict[str, object] = {
+                "objective_id": "tactical:1",
+                "action": action,
+                "row": None,
+                "col": None,
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": True,
+                "outcome_class": "novel",
+                "novel_state": True,
+                "meaningful_progress": False,
+                "loop_detected": False,
+                "cycle_risk": False,
+                "level_completed": False,
+                "run_complete": False,
+            }
+            transitions.append(transition)
+        agent._last_transition = dict(transitions[-1])
+        agent._recent_transitions = [dict(item) for item in transitions]
+
+        allowed, reason = agent._tactical_completion_evidence()
+
+        self.assertTrue(allowed, reason)
+        self.assertIn("reproducible stable-transition", reason)
+
+        agent._last_transition = {
+            **agent._last_transition,
+            "outcome_class": "volatile_only",
+        }
+        agent._recent_transitions[-1] = dict(agent._last_transition)
+        allowed, reason = agent._tactical_completion_evidence()
+        self.assertFalse(allowed)
+        self.assertIn("volatile_only", reason)
+        agent.close()
+
+    def test_stable_transition_mode_rejects_unreproduced_novel_changes(self) -> None:
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        reduction = reduction_for("level:1:1")
+        subgoals = reduction["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0]["evidence_mode"] = "stable_transition"
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+        for action in ("UP", "RIGHT", "DOWN", "LEFT"):
+            tree.record_action()
+            transition = {
+                "objective_id": "tactical:1",
+                "action": action,
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": True,
+                "outcome_class": "novel",
+                "meaningful_progress": False,
+            }
+            agent._recent_transitions.append(transition)
+            agent._last_transition = transition
+
+        allowed, reason = agent._tactical_completion_evidence()
+
+        self.assertFalse(allowed)
+        self.assertIn("not reproduced", reason)
+        agent.close()
+
     def test_policy_observation_filters_transitions_from_previous_objective(
         self,
     ) -> None:

@@ -315,13 +315,23 @@ POLICY_API_VERSION = 1
 SUPPORTED_BACKENDS = ("cpu",)
 def decide(observation, memory):
     outcome = transition_outcome(observation.last_transition)
+    change = transition_change_class(observation.last_transition)
+    stable = transition_has_stable_change(observation.last_transition)
     if transition_repeats_nonprogress_action(observation.last_transition, "LEFT"):
-        return subgoal_failed({"outcome": outcome}, "do not repeat blocked action")
+        return subgoal_failed(
+            {"outcome": outcome, "change": change, "stable": stable},
+            "do not repeat blocked action",
+        )
     path = ((1, 1), (1, 2))
     return path_decision(
         path,
         observation.valid_actions,
-        {"api": POLICY_CODEGEN_API_VERSION, "outcome": outcome},
+        {
+            "api": POLICY_CODEGEN_API_VERSION,
+            "outcome": outcome,
+            "change": change,
+            "stable": stable,
+        },
         "follow safe route",
     )
 """
@@ -346,10 +356,16 @@ def decide(observation, memory):
             second = runtime.decide(blocked_observation)
         self.assertEqual(PolicyStatus.CONTINUE, first.status)
         self.assertEqual({"action": "RIGHT"}, first.action)
-        self.assertEqual({"api": 1, "outcome": "unknown"}, first.memory)
+        self.assertEqual(
+            {"api": 1, "outcome": "unknown", "change": "unknown", "stable": False},
+            first.memory,
+        )
         self.assertEqual(PolicyStatus.SUBGOAL_FAILED, second.status)
         self.assertIsNone(second.action)
-        self.assertEqual({"outcome": "no_progress"}, second.memory)
+        self.assertEqual(
+            {"outcome": "no_progress", "change": "exact_noop", "stable": False},
+            second.memory,
+        )
 
     def test_policy_can_use_digest_bounded_memory_and_exploration_helpers(self) -> None:
         source = """

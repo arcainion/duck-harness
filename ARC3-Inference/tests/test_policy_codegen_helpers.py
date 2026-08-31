@@ -39,7 +39,9 @@ from inference.agent.policy_codegen_helpers import (
     recent_mouse_point_counts,
     recent_outcome_counts,
     transition_facts,
+    transition_change_class,
     transition_has_progress,
+    transition_has_stable_change,
     transition_outcome,
     transition_repeats_nonprogress_action,
     transition_requires_replan,
@@ -140,6 +142,29 @@ class PolicyCodegenHelperTests(unittest.TestCase):
         self.assertFalse(transition_requires_replan(noop, False))
         self.assertFalse(transition_requires_replan({"meaningful_progress": True}))
 
+    def test_change_helpers_preserve_novel_learning_evidence_without_progress(
+        self,
+    ) -> None:
+        novel = {
+            "executed": True,
+            "board_changed": True,
+            "outcome_class": "novel",
+            "meaningful_progress": False,
+        }
+        self.assertEqual("no_progress", transition_outcome(novel))
+        self.assertEqual("novel", transition_change_class(novel))
+        self.assertTrue(transition_has_stable_change(novel))
+        self.assertFalse(transition_has_progress(novel))
+        for unstable in (
+            {**novel, "outcome_class": "volatile_only"},
+            {**novel, "loop_detected": True},
+            {**novel, "cycle_risk": True},
+            {**novel, "board_changed": False},
+            {**novel, "executed": False},
+        ):
+            with self.subTest(unstable=unstable):
+                self.assertFalse(transition_has_stable_change(unstable))
+
     def test_transition_facts_and_evidence_accumulation_are_json_bounded(self) -> None:
         transition = {
             "action": "mouse",
@@ -156,6 +181,7 @@ class PolicyCodegenHelperTests(unittest.TestCase):
         self.assertEqual("MOUSE", facts["action"])
         self.assertEqual([4, 5], facts["point"])
         self.assertEqual("failed", facts["outcome"])
+        self.assertEqual("failed", facts["change_class"])
         self.assertEqual(512, len(facts["error"]))
         memory = accumulate_transition_evidence({}, transition, limit=2)
         memory = accumulate_transition_evidence(memory, None, limit=2)
@@ -235,6 +261,8 @@ class PolicyCodegenHelperTests(unittest.TestCase):
             "subgoal_failed",
             "subgoal_succeeded",
             "transition_facts",
+            "transition_change_class",
+            "transition_has_stable_change",
             "transition_outcome",
             "transition_requires_replan",
         }

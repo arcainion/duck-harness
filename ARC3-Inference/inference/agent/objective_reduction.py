@@ -31,6 +31,13 @@ class ObjectiveStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
+class ObjectiveEvidenceMode(StrEnum):
+    """Host-verifiable evidence required to complete a tactical objective."""
+
+    ENGINE_PROGRESS = "engine_progress"
+    STABLE_TRANSITION = "stable_transition"
+
+
 class ReductionVerdict(StrEnum):
     CONTINUE = "continue"
     COMPLETE = "complete"
@@ -45,6 +52,7 @@ class SubgoalSpec:
     failure_criteria: str
     expected_evidence: str
     action_budget: int
+    evidence_mode: ObjectiveEvidenceMode = ObjectiveEvidenceMode.ENGINE_PROGRESS
     minimum_evidence_actions: int = 4
     single_step: bool = False
 
@@ -88,12 +96,21 @@ class SubgoalSpec:
             raise ObjectiveError(
                 "action_budget=1 is reserved for explicitly single-step subgoals"
             )
+        try:
+            evidence_mode = ObjectiveEvidenceMode(
+                str(payload.get("evidence_mode") or "engine_progress").strip()
+            )
+        except ValueError as exc:
+            raise ObjectiveError(
+                "subgoal evidence_mode must be engine_progress or stable_transition"
+            ) from exc
         return cls(
             title=required_text("title", 200),
             success_criteria=required_text("success_criteria"),
             failure_criteria=required_text("failure_criteria"),
             expected_evidence=required_text("expected_evidence"),
             action_budget=action_budget,
+            evidence_mode=evidence_mode,
             minimum_evidence_actions=raw_minimum_evidence,
             single_step=raw_single_step,
         )
@@ -105,6 +122,7 @@ class SubgoalSpec:
             "failure_criteria": self.failure_criteria,
             "expected_evidence": self.expected_evidence,
             "action_budget": self.action_budget,
+            "evidence_mode": self.evidence_mode.value,
             "minimum_evidence_actions": self.minimum_evidence_actions,
             "single_step": self.single_step,
         }
@@ -169,6 +187,7 @@ class ObjectiveNode:
     failure_criteria: str
     expected_evidence: str
     action_budget: int
+    evidence_mode: ObjectiveEvidenceMode = ObjectiveEvidenceMode.ENGINE_PROGRESS
     minimum_evidence_actions: int = 1
     single_step: bool = False
     status: ObjectiveStatus = ObjectiveStatus.PENDING
@@ -191,6 +210,7 @@ class ObjectiveNode:
             "failure_criteria": self.failure_criteria,
             "expected_evidence": self.expected_evidence,
             "action_budget": self.action_budget,
+            "evidence_mode": self.evidence_mode.value,
             "minimum_evidence_actions": self.minimum_evidence_actions,
             "single_step": self.single_step,
             "status": self.status.value,
@@ -215,6 +235,9 @@ class ObjectiveNode:
             failure_criteria=str(payload.get("failure_criteria") or ""),
             expected_evidence=str(payload.get("expected_evidence") or ""),
             action_budget=max(0, int(payload.get("action_budget", 0) or 0)),
+            evidence_mode=ObjectiveEvidenceMode(
+                str(payload.get("evidence_mode") or "engine_progress")
+            ),
             minimum_evidence_actions=max(
                 1,
                 int(
@@ -332,6 +355,15 @@ class ObjectiveTree:
                 raise ObjectiveError("objective node ID does not match its map key")
             if node.action_budget < 1:
                 raise ObjectiveError("objective action budgets must be positive")
+            if not isinstance(node.evidence_mode, ObjectiveEvidenceMode):
+                raise ObjectiveError("objective evidence mode is invalid")
+            if (
+                node.kind is not ObjectiveKind.TACTICAL
+                and node.evidence_mode is not ObjectiveEvidenceMode.ENGINE_PROGRESS
+            ):
+                raise ObjectiveError(
+                    "game and level objectives require engine_progress evidence"
+                )
             if not 1 <= node.minimum_evidence_actions <= min(4, node.action_budget):
                 raise ObjectiveError(
                     "objective minimum evidence actions must fit its action budget"
@@ -513,6 +545,7 @@ class ObjectiveTree:
                 failure_criteria=spec.failure_criteria,
                 expected_evidence=spec.expected_evidence,
                 action_budget=effective_budget,
+                evidence_mode=spec.evidence_mode,
                 minimum_evidence_actions=min(
                     spec.minimum_evidence_actions, effective_budget
                 ),

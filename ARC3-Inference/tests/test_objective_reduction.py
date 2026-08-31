@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from inference.agent.objective_reduction import (
+    ObjectiveEvidenceMode,
     ObjectiveError,
     ObjectiveKind,
     ObjectiveStatus,
@@ -45,7 +46,29 @@ class ObjectiveTreeTests(unittest.TestCase):
         self.assertEqual(ObjectiveKind.TACTICAL, tactical.kind)
         self.assertEqual(7, tactical.action_budget)
         self.assertEqual(ObjectiveStatus.ACTIVE, tactical.status)
+        self.assertEqual(ObjectiveEvidenceMode.ENGINE_PROGRESS, tactical.evidence_mode)
         tree.validate()
+
+    def test_stable_transition_evidence_mode_round_trips_to_tactical_node(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        subgoal = dict(reduction_payload()["subgoals"][0])  # type: ignore[index,arg-type]
+        subgoal["evidence_mode"] = "stable_transition"
+        tactical = tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_payload(subgoals=[subgoal])),
+            remaining_level_actions=20,
+        )
+        restored = ObjectiveTree.from_dict(tree.to_dict())
+        self.assertEqual(
+            ObjectiveEvidenceMode.STABLE_TRANSITION,
+            tactical.evidence_mode,
+        )
+        self.assertEqual(tactical.evidence_mode, restored.active.evidence_mode)
+
+    def test_invalid_evidence_mode_is_rejected(self) -> None:
+        subgoal = dict(reduction_payload()["subgoals"][0])  # type: ignore[index,arg-type]
+        subgoal["evidence_mode"] = "board_changed"
+        with self.assertRaisesRegex(ObjectiveError, "evidence_mode"):
+            ReductionProposal.from_payload(reduction_payload(subgoals=[subgoal]))
 
     def test_host_expands_short_non_single_step_to_macro_horizon(self) -> None:
         tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
