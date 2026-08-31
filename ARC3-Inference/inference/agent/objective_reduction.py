@@ -47,6 +47,47 @@ class TacticalExecutionMode(StrEnum):
     INTERACT = "interact"
 
 
+class GameSolverType(StrEnum):
+    """Portable gameplay solver labels available to generated policies."""
+
+    BEAM = "beam"
+    BEAM_COVERAGE = "beam-coverage"
+    CARRIER_PLACEMENT = "carrier-placement"
+    CELLULAR_AUTOMATA = "cellular-automata"
+    CLICK_INTERACTION = "click-interaction"
+    CONNECTOR_ALIGN = "connector-align"
+    CYCLE_ROTATION = "cycle-rotation"
+    FLOW_DEFLECTOR = "flow-deflector"
+    GLYPH_TRANSFORM_ROUTE = "glyph-transform-route"
+    GRAVITY = "gravity"
+    GUIDED_ATTRACTION = "guided-attraction"
+    HYBRID = "hybrid"
+    INERTIAL_BLOCK = "inertial-block"
+    INVENTORY = "inventory"
+    LATTICE_CORRIDOR = "lattice-corridor"
+    LINKED_CENTROID = "linked-centroid"
+    MARKER_COVERAGE = "marker-coverage"
+    MIRROR = "mirror"
+    MIRROR_MERGE = "mirror-merge"
+    MULTI_AGENT = "multi-agent"
+    NAVIGATION = "navigation"
+    PAIRED_PLATFORM_ALIGNMENT = "paired-platform-alignment"
+    PAIRED_SEQUENCE_ARM = "paired-sequence-arm"
+    PATTERN_TRANSFORM = "pattern-transform"
+    PEG_JUMP = "peg-jump"
+    PUZZLE = "puzzle"
+    PUSH_PULL = "push-pull"
+    RELATION_TOGGLE = "relation-toggle"
+    SIGNAL = "signal"
+    SLIDING = "sliding"
+    STATIC = "static"
+    SWITCH_BRIDGE = "switch-bridge"
+    SYMBOL_RULE_SEQUENCE = "symbol-rule-sequence"
+    TEMPLATE_PAINT = "template-paint"
+    TRAJECTORY_REPLAY = "trajectory-replay"
+    TRANSFORM_PROGRAM = "transform-program"
+
+
 class ReductionVerdict(StrEnum):
     CONTINUE = "continue"
     COMPLETE = "complete"
@@ -63,6 +104,7 @@ class SubgoalSpec:
     action_budget: int
     evidence_mode: ObjectiveEvidenceMode = ObjectiveEvidenceMode.ENGINE_PROGRESS
     execution_mode: TacticalExecutionMode = TacticalExecutionMode.PROBE
+    solver_type: GameSolverType = GameSolverType.HYBRID
     minimum_evidence_actions: int = 4
     single_step: bool = False
 
@@ -123,6 +165,12 @@ class SubgoalSpec:
             raise ObjectiveError(
                 "subgoal execution_mode must be probe, navigate, or interact"
             ) from exc
+        try:
+            solver_type = GameSolverType(
+                str(payload.get("solver_type") or "hybrid").strip()
+            )
+        except ValueError as exc:
+            raise ObjectiveError("subgoal solver_type is not registered") from exc
         if evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION and (
             action_budget < 3 or raw_minimum_evidence < 3 or raw_single_step
         ):
@@ -138,6 +186,7 @@ class SubgoalSpec:
             action_budget=action_budget,
             evidence_mode=evidence_mode,
             execution_mode=execution_mode,
+            solver_type=solver_type,
             minimum_evidence_actions=raw_minimum_evidence,
             single_step=raw_single_step,
         )
@@ -151,6 +200,7 @@ class SubgoalSpec:
             "action_budget": self.action_budget,
             "evidence_mode": self.evidence_mode.value,
             "execution_mode": self.execution_mode.value,
+            "solver_type": self.solver_type.value,
             "minimum_evidence_actions": self.minimum_evidence_actions,
             "single_step": self.single_step,
         }
@@ -217,6 +267,7 @@ class ObjectiveNode:
     action_budget: int
     evidence_mode: ObjectiveEvidenceMode = ObjectiveEvidenceMode.ENGINE_PROGRESS
     execution_mode: TacticalExecutionMode = TacticalExecutionMode.PROBE
+    solver_type: GameSolverType | None = None
     minimum_evidence_actions: int = 1
     single_step: bool = False
     status: ObjectiveStatus = ObjectiveStatus.PENDING
@@ -241,6 +292,7 @@ class ObjectiveNode:
             "action_budget": self.action_budget,
             "evidence_mode": self.evidence_mode.value,
             "execution_mode": self.execution_mode.value,
+            "solver_type": self.solver_type.value if self.solver_type is not None else None,
             "minimum_evidence_actions": self.minimum_evidence_actions,
             "single_step": self.single_step,
             "status": self.status.value,
@@ -270,6 +322,11 @@ class ObjectiveNode:
             ),
             execution_mode=TacticalExecutionMode(
                 str(payload.get("execution_mode") or "probe")
+            ),
+            solver_type=(
+                GameSolverType(str(payload.get("solver_type") or "hybrid"))
+                if ObjectiveKind(str(payload["kind"])) is ObjectiveKind.TACTICAL
+                else None
             ),
             minimum_evidence_actions=max(
                 1,
@@ -392,6 +449,11 @@ class ObjectiveTree:
                 raise ObjectiveError("objective evidence mode is invalid")
             if not isinstance(node.execution_mode, TacticalExecutionMode):
                 raise ObjectiveError("objective execution mode is invalid")
+            if node.kind is ObjectiveKind.TACTICAL:
+                if not isinstance(node.solver_type, GameSolverType):
+                    raise ObjectiveError("tactical objective solver type is invalid")
+            elif node.solver_type is not None:
+                raise ObjectiveError("game and level objectives may not select a solver")
             if (
                 node.kind is not ObjectiveKind.TACTICAL
                 and node.evidence_mode is not ObjectiveEvidenceMode.ENGINE_PROGRESS
@@ -587,6 +649,7 @@ class ObjectiveTree:
                 action_budget=effective_budget,
                 evidence_mode=spec.evidence_mode,
                 execution_mode=spec.execution_mode,
+                solver_type=spec.solver_type,
                 minimum_evidence_actions=min(
                     spec.minimum_evidence_actions, effective_budget
                 ),

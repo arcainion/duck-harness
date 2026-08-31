@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from inference.agent.objective_reduction import (
+    GameSolverType,
     ObjectiveEvidenceMode,
     ObjectiveError,
     ObjectiveKind,
@@ -37,6 +38,32 @@ def reduction_payload(**overrides: object) -> dict[str, object]:
 
 
 class ObjectiveTreeTests(unittest.TestCase):
+    def test_legacy_tactical_objective_defaults_to_hybrid_solver(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tactical = tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_payload()),
+            remaining_level_actions=20,
+        )
+        restored = ObjectiveTree.from_dict(tree.to_dict())
+
+        self.assertIsNone(tree.nodes[tree.root_id].solver_type)
+        self.assertEqual(GameSolverType.HYBRID, tactical.solver_type)
+        self.assertEqual(GameSolverType.HYBRID, restored.active.solver_type)
+
+    def test_solver_type_round_trips_and_invalid_type_is_rejected(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        subgoal = dict(reduction_payload()["subgoals"][0])  # type: ignore[index,arg-type]
+        subgoal["solver_type"] = "navigation"
+        tactical = tree.apply_proposal(
+            ReductionProposal.from_payload(reduction_payload(subgoals=[subgoal])),
+            remaining_level_actions=20,
+        )
+
+        self.assertEqual(GameSolverType.NAVIGATION, tactical.solver_type)
+        subgoal["solver_type"] = "unknown-solver"
+        with self.assertRaisesRegex(ObjectiveError, "solver_type"):
+            ReductionProposal.from_payload(reduction_payload(subgoals=[subgoal]))
+
     def test_host_creates_game_level_and_tactical_path(self) -> None:
         tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
         self.assertEqual(ObjectiveKind.LEVEL, tree.active.kind)

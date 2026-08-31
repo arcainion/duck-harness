@@ -47,8 +47,12 @@ from inference.framework.solver import HarnessSolver
 POLICY_SOURCE = """
 POLICY_API_VERSION = 1
 SUPPORTED_BACKENDS = ("cpu",)
+POLICY_SOLVER_TYPE = "static"
+POLICY_SOLVER_CONFIG = {"probe_actions": ["UP"]}
 def decide(observation, memory):
-    return {"status": "continue", "action": {"action": "UP"}, "memory": memory}
+    return solver_decide(
+        POLICY_SOLVER_TYPE, observation, memory, POLICY_SOLVER_CONFIG
+    )
 """
 
 REUSABLE_POLICY_SOURCE = POLICY_SOURCE.replace(
@@ -60,16 +64,17 @@ NAVIGATION_POLICY_SOURCE = """
 POLICY_API_VERSION = 1
 SUPPORTED_BACKENDS = ("cpu",)
 POLICY_REUSE_SCOPE = "none"
+POLICY_SOLVER_TYPE = "navigation"
+POLICY_SOLVER_CONFIG = {
+    "actor_values": [1],
+    "target_values": [2],
+    "passable_values": [0, 1, 2],
+    "approach_distance": 0,
+}
 def decide(observation, memory):
-    actor = first_matching_cell(observation.board, (1,))
-    targets = find_cells(observation.board, (2,))
-    passable = value_mask(observation.board, (0, 1))
-    if transition_requires_replan(observation.last_transition):
-        memory = {}
-    if actor is None or not targets:
-        return subgoal_failed(memory, "actor or target is unavailable")
-    path = shortest_path(passable, actor, targets[0])
-    return path_decision(path, observation.valid_actions, memory, "board-derived route")
+    return solver_decide(
+        POLICY_SOLVER_TYPE, observation, memory, POLICY_SOLVER_CONFIG
+    )
 """
 
 
@@ -105,6 +110,7 @@ def reduction_for(
                 "success_criteria": "board changes",
                 "failure_criteria": "action is guarded or unchanged",
                 "expected_evidence": "one transition",
+                "solver_type": "static",
                 "action_budget": 4,
                 "minimum_evidence_actions": 4,
                 "single_step": False,
@@ -163,6 +169,7 @@ class _FakeModelClient:
                         "success_criteria": "board changes",
                         "failure_criteria": "action is guarded or unchanged",
                         "expected_evidence": "one transition",
+                        "solver_type": "static",
                         "action_budget": 4,
                         "minimum_evidence_actions": 4,
                         "single_step": False,
@@ -351,13 +358,14 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertTrue(_contract_requires_navigation(spatial))
         self.assertFalse(_contract_requires_navigation(probe))
 
-    def test_navigation_policy_requires_localization_planning_and_replanning(
+    def test_navigation_policy_requires_matching_reachable_solver_dispatch(
         self,
     ) -> None:
         reduction = reduction_for("level:1:1", title="Reach the target component")
         subgoals = reduction["subgoals"]
         assert isinstance(subgoals, list)
         subgoals[0]["execution_mode"] = "navigate"
+        subgoals[0]["solver_type"] = "navigation"
         agent = self._agent()
         tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
         tree.apply_proposal(
@@ -366,37 +374,70 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         )
         agent._tree = tree
 
-        with self.assertRaisesRegex(PolicyRuntimeError, "localization") as raised:
+        with self.assertRaisesRegex(PolicyRuntimeError, "does not match") as raised:
             agent._policy_validator({"source": POLICY_SOURCE})
-        self.assertEqual("policy_navigation_contract", raised.exception.category)
-        without_replan = NAVIGATION_POLICY_SOURCE.replace(
-            "    if transition_requires_replan(observation.last_transition):\n"
-            "        memory = {}\n",
-            "",
+        self.assertEqual("policy_solver_contract", raised.exception.category)
+        dynamic_type = NAVIGATION_POLICY_SOURCE.replace(
+            'POLICY_SOLVER_TYPE = "navigation"',
+            'POLICY_SOLVER_TYPE = "navi" + "gation"',
         )
-        with self.assertRaisesRegex(PolicyRuntimeError, "transition_requires_replan"):
-            agent._policy_validator({"source": without_replan})
-        without_passability = NAVIGATION_POLICY_SOURCE.replace(
-            "    passable = value_mask(observation.board, (0, 1))\n",
-            "    passable = observation.board\n",
+        with self.assertRaisesRegex(PolicyRuntimeError, "literal"):
+            agent._policy_validator({"source": dynamic_type})
+        invalid_config = NAVIGATION_POLICY_SOURCE.replace(
+            '    "approach_distance": 0,',
+            '    "approach_distance": 0,\n    "typo": True,',
         )
-        with self.assertRaisesRegex(PolicyRuntimeError, "passability-mask"):
-            agent._policy_validator({"source": without_passability})
-        unreachable_helpers = (
-            POLICY_SOURCE
-            + "\ndef unused_navigation(observation):\n"
-            "    cells = find_cells(observation.board, (1,))\n"
-            "    transition_requires_replan(observation.last_transition)\n"
-            "    return shortest_path(value_mask(observation.board, (0,)), "
-            "cells[0], cells[-1])\n"
+        with self.assertRaisesRegex(PolicyRuntimeError, "unknown.*key"):
+            agent._policy_validator({"source": invalid_config})
+        unreachable_dispatch = NAVIGATION_POLICY_SOURCE.replace(
+            "    return solver_decide(\n"
+            "        POLICY_SOLVER_TYPE, observation, memory, POLICY_SOLVER_CONFIG\n"
+            "    )",
+            '    return continue_decision("UP", memory, "manual")',
+        ) + (
+            "\ndef unused_solver(observation, memory):\n"
+            "    return solver_decide(POLICY_SOLVER_TYPE, observation, memory, "
+            "POLICY_SOLVER_CONFIG)\n"
         )
-        with self.assertRaisesRegex(PolicyRuntimeError, "localization"):
-            agent._policy_validator({"source": unreachable_helpers})
+        with self.assertRaisesRegex(PolicyRuntimeError, "decide path"):
+            agent._policy_validator({"source": unreachable_dispatch})
+        wrong_dispatch_arguments = NAVIGATION_POLICY_SOURCE.replace(
+            "        POLICY_SOLVER_TYPE, observation, memory, POLICY_SOLVER_CONFIG",
+            '        "navigation", observation, memory, POLICY_SOLVER_CONFIG',
+        )
+        with self.assertRaisesRegex(PolicyRuntimeError, "exactly POLICY_SOLVER_TYPE"):
+            agent._policy_validator({"source": wrong_dispatch_arguments})
+        shadowed_dispatch = NAVIGATION_POLICY_SOURCE + (
+            "\ndef solver_decide(solver_type, observation, memory, config):\n"
+            "    return continue_decision(\"UP\", memory, \"shadowed\")\n"
+        )
+        with self.assertRaisesRegex(PolicyRuntimeError, "may not be redefined"):
+            agent._policy_validator({"source": shadowed_dispatch})
+        parameter_shadow = NAVIGATION_POLICY_SOURCE + (
+            "\ndef unused(solver_decide):\n    return solver_decide\n"
+        )
+        with self.assertRaisesRegex(PolicyRuntimeError, "shadowed by a parameter"):
+            agent._policy_validator({"source": parameter_shadow})
+        mutated_config = NAVIGATION_POLICY_SOURCE.replace(
+            "def decide(observation, memory):",
+            "def decide(observation, memory):\n"
+            '    POLICY_SOLVER_CONFIG["approach_distance"] = 1',
+        )
+        with self.assertRaisesRegex(PolicyRuntimeError, "may only be read"):
+            agent._policy_validator({"source": mutated_config})
+        reassigned_type = NAVIGATION_POLICY_SOURCE.replace(
+            "def decide(observation, memory):",
+            'def decide(observation, memory):\n    POLICY_SOLVER_TYPE = "static"',
+        )
+        with self.assertRaisesRegex(PolicyRuntimeError, "may not be reassigned"):
+            agent._policy_validator({"source": reassigned_type})
         accepted = agent._policy_validator({"source": NAVIGATION_POLICY_SOURCE})
 
         self.assertEqual(
             verify_policy_source(NAVIGATION_POLICY_SOURCE), accepted["source_hash"]
         )
+        self.assertEqual("navigation", accepted["solver_type"])
+        self.assertEqual("routing", accepted["solver_family"])
         self.assertEqual(TacticalExecutionMode.NAVIGATE, tree.active.execution_mode)
         agent.close()
 
@@ -415,6 +456,44 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
 
         self.assertIn("execution_mode=navigate", str(raised.exception))
         agent.close()
+
+    def test_reducer_rejects_non_navigation_solver_for_navigate_objective(self) -> None:
+        spatial = reduction_for("level:1:1", title="Reach the target component")
+        subgoals = spatial["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0]["execution_mode"] = "navigate"
+        subgoals[0]["solver_type"] = "static"
+        agent = self._agent()
+        agent._tree = ObjectiveTree.start_game(
+            "game-a", level=1, level_action_budget=20
+        )
+        agent.model_client = _ScriptedModelClient([spatial] * 3)
+
+        with self.assertRaises(OrchestrationFailure) as raised:
+            agent._reduce(frame(), [], request_deadline=None, should_stop=None)
+
+        self.assertIn("non-navigation solver type", str(raised.exception))
+        agent.close()
+
+    def test_solver_type_changes_contract_identity(self) -> None:
+        first = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        first_payload = reduction_for("level:1:1")
+        first.apply_proposal(
+            ReductionProposal.from_payload(first_payload), remaining_level_actions=20
+        )
+        second_payload = reduction_for("level:1:1")
+        second_subgoals = second_payload["subgoals"]
+        assert isinstance(second_subgoals, list)
+        second_subgoals[0]["solver_type"] = "click-interaction"
+        second = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        second.apply_proposal(
+            ReductionProposal.from_payload(second_payload), remaining_level_actions=20
+        )
+
+        self.assertNotEqual(
+            _objective_contract_hash(first.active),
+            _objective_contract_hash(second.active),
+        )
 
     def test_policy_reuse_scope_requires_a_literal_opt_in(self) -> None:
         self.assertEqual(
@@ -490,6 +569,51 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             )
             self.assertEqual("proven", agent._reusable_policies[0]["qualification"])
             agent.close()
+
+    def test_reuse_rejects_artifact_whose_declared_solver_mismatches_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_path = root / "runtime_state.json"
+            runtime_path.touch()
+            policy_dir = root / "policies"
+            policy_dir.mkdir()
+            source = NAVIGATION_POLICY_SOURCE.replace(
+                'POLICY_REUSE_SCOPE = "none"',
+                'POLICY_REUSE_SCOPE = "tactical"',
+            )
+            source_hash = verify_policy_source(source)
+            artifact = policy_dir / f"mismatch-{source_hash}.py"
+            artifact.write_text(source, encoding="utf-8")
+            agent = self._agent()
+            agent._knowledge_game_id = "game-a"
+            agent._session_runtime_dir = runtime_path
+            agent._tree = ObjectiveTree.start_game(
+                "game-a", level=1, level_action_budget=32
+            )
+            active = agent._tree.apply_proposal(
+                ReductionProposal.from_payload(reduction_for("level:1:1")),
+                remaining_level_actions=32,
+            )
+            agent._reusable_policies = [
+                {
+                    "game_id": "game-a",
+                    "level": 1,
+                    "source_hash": source_hash,
+                    "artifact": str(artifact.relative_to(root)),
+                    "origin_objective_id": "tactical:old",
+                    "contract_hash": _objective_contract_hash(active),
+                    "solver_type": "static",
+                    "solver_family": "observe",
+                    "qualification": "proven",
+                }
+            ]
+
+            reused = agent._try_reuse_policy(frame())
+            rejections = agent._orchestration_metrics["policy_reuse_rejections"]
+            agent.close()
+
+        self.assertFalse(reused)
+        self.assertEqual(1, rejections)
 
     def test_provisional_policy_reuses_only_matching_contract_then_is_evicted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1536,7 +1660,7 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertIn("every item must be fixed", client.messages[2][-1]["content"])
         coder_prompt = client.messages[1][0]["content"]
         self.assertIn("PolicyObservation is an immutable object", coder_prompt)
-        self.assertIn("observation.valid_actions[0]", coder_prompt)
+        self.assertIn("solver_decide(", coder_prompt)
         self.assertIn("Never call observation.get()", coder_prompt)
         self.assertIn("shortest_path(passable, start, goal", coder_prompt)
         self.assertIn("next_path_action(path, observation.valid_actions)", coder_prompt)

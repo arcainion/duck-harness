@@ -16,6 +16,7 @@ import numpy as np
 
 from inference.agent.policy_codegen_helpers import POLICY_CODEGEN_GLOBALS
 from inference.agent.policy_pathfinding import POLICY_PATHFINDING_GLOBALS
+from inference.agent.policy_solver_helpers import POLICY_SOLVER_GLOBALS
 
 
 POLICY_API_VERSION = 1
@@ -89,6 +90,7 @@ POLICY_DECISION_BUILDER_PARAMETERS = {
     "subgoal_failed": ("memory", "evidence"),
     "subgoal_succeeded": ("memory", "evidence"),
 }
+RESERVED_SOLVER_GLOBALS = frozenset(POLICY_SOLVER_GLOBALS)
 
 
 class PolicyRuntimeError(RuntimeError):
@@ -352,6 +354,28 @@ def verify_policy_source(source: str) -> str:
                     reject(f"import {name!r} is not permitted")
         if isinstance(node, ast.Name) and node.id.startswith("__"):
             reject(f"dunder name {node.id!r} is not permitted")
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Store)
+            and node.id in RESERVED_SOLVER_GLOBALS
+        ):
+            reject(f"trusted solver global {node.id!r} may not be reassigned")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            node.name in RESERVED_SOLVER_GLOBALS
+        ):
+            reject(f"trusted solver global {node.name!r} may not be redefined")
+        if isinstance(node, ast.arg) and node.arg in RESERVED_SOLVER_GLOBALS:
+            reject(
+                f"trusted solver global {node.arg!r} may not be shadowed by a parameter"
+            )
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound_name = alias.asname or alias.name.split(".", 1)[0]
+                if bound_name in RESERVED_SOLVER_GLOBALS:
+                    reject(
+                        f"trusted solver global {bound_name!r} may not be shadowed "
+                        "by an import"
+                    )
         if isinstance(node, ast.Attribute):
             if (
                 isinstance(node.value, ast.Name)
@@ -614,6 +638,7 @@ def _policy_worker_main(connection: Connection) -> None:
                 }
                 namespace.update(POLICY_CODEGEN_GLOBALS)
                 namespace.update(POLICY_PATHFINDING_GLOBALS)
+                namespace.update(POLICY_SOLVER_GLOBALS)
                 exec(compile(source, "<generated-gameplay-policy>", "exec"), namespace)
                 if namespace.get("POLICY_API_VERSION") != POLICY_API_VERSION:
                     raise PolicyRuntimeError(

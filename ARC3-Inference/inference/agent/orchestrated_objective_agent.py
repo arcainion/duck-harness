@@ -37,6 +37,12 @@ from inference.agent.objective_reduction import (
     SubgoalSpec,
     TacticalExecutionMode,
 )
+from inference.agent.policy_solver_helpers import (
+    NAVIGATION_SOLVER_FAMILIES,
+    POLICY_SOLVER_TYPES,
+    solver_family,
+    validate_solver_config,
+)
 from inference.agent.policy_codegen_helpers import (
     contrastive_transition_evidence_status,
     stable_transition_evidence_status,
@@ -62,27 +68,6 @@ _MAX_NO_ACTION_BOUNDARIES = 8
 _MAX_CONSECUTIVE_POLICY_FAILURES = _MAX_POLICY_REPAIRS + 1
 _ACTION_FAMILY_SATURATION_ATTEMPTS = 12
 _STRATEGIC_RECALIBRATION_FAILURES = 3
-_NAVIGATION_LOCALIZATION_HELPERS = frozenset(
-    {
-        "component_boxes",
-        "component_centers",
-        "find_cells",
-        "first_matching_cell",
-        "matching_region_center",
-        "nearest_matching_cell",
-    }
-)
-_NAVIGATION_PASSABILITY_HELPERS = frozenset({"value_mask"})
-_NAVIGATION_PLANNER_HELPERS = frozenset(
-    {
-        "shortest_approach_path",
-        "shortest_path",
-        "shortest_path_through",
-        "shortest_path_to_any",
-        "weighted_shortest_path",
-        "weighted_shortest_path_to_any",
-    }
-)
 _DEFAULT_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS = 300.0
 _DEFAULT_REDUCER_MAX_OUTPUT = 4096
 _DEFAULT_CODER_MAX_OUTPUT = 8192
@@ -205,7 +190,7 @@ between BEGIN_REDUCTION and END_REDUCTION lines. Do not use a tool call, Markdow
 or prose outside the markers. The object must contain objective_id, verdict, evidence,
 rationale, selected_index, and subgoals. verdict is continue, complete, fail, or
 decompose. Each subgoal contains title, success_criteria, failure_criteria,
-expected_evidence, evidence_mode, execution_mode, an integer action_budget from 1 to 32, an integer
+expected_evidence, evidence_mode, execution_mode, solver_type, an integer action_budget from 1 to 32, an integer
 minimum_evidence_actions from 1 through min(4, action_budget), and a boolean
 single_step. evidence_mode is engine_progress, stable_transition, or
 contrastive_transition. Use stable_transition only for descriptive repeatability: it
@@ -225,6 +210,18 @@ destination. Navigate policies are host-required to localize board entities, bui
 passability mask, call trusted pathfinding, and replan from transition evidence. Use
 probe for bounded control experiments and interact for non-routing buttons or clicks.
 Do not describe a spatial route while declaring probe or interact. The
+solver_type must be one registered portable solver label. Choose by mechanic:
+routing (navigation, lattice-corridor, glyph-transform-route, guided-attraction),
+physics (sliding, inertial-block, trajectory-replay, gravity), manipulation
+(push-pull, carrier-placement, inventory), interaction (click-interaction,
+relation-toggle, switch-bridge, signal), alignment (connector-align,
+linked-centroid, mirror-merge, paired-platform-alignment), coverage/transform
+(beam-coverage, marker-coverage, template-paint, pattern-transform,
+transform-program), sequence/search (cycle-rotation, paired-sequence-arm,
+symbol-rule-sequence, peg-jump), field mechanics (beam, flow-deflector, mirror,
+puzzle), multi-agent, observation (static, cellular-automata), or hybrid. A
+navigate objective must select a navigation-capable family, not static,
+interaction, sequence, transform, or hybrid. The
 host owns all IDs,
 tree invariants, budgets, and game/level completion. You may complete or fail only
 the active tactical objective. A game or level objective must be decomposed into one
@@ -268,7 +265,7 @@ A contrastive_transition objective has the same limited tactical scope and addit
 requires the host-validated negative control.
 
 BEGIN_REDUCTION
-{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"run a bounded adaptive probe sequence","selected_index":0,"subgoals":[{"title":"Identify a causal control action","success_criteria":"the same exact positive action produces stable change at least twice while a distinct negative-control action does not","failure_criteria":"eight adaptive probes produce no contrastive causal evidence","expected_evidence":"repeated positive transitions plus a distinct executed negative control","evidence_mode":"contrastive_transition","execution_mode":"probe","action_budget":8,"minimum_evidence_actions":4,"single_step":false}]}
+{"objective_id":"level:1:1","verdict":"decompose","evidence":"initial board","rationale":"run a bounded adaptive probe sequence","selected_index":0,"subgoals":[{"title":"Identify a causal control action","success_criteria":"the same exact positive action produces stable change at least twice while a distinct negative-control action does not","failure_criteria":"eight adaptive probes produce no contrastive causal evidence","expected_evidence":"repeated positive transitions plus a distinct executed negative control","evidence_mode":"contrastive_transition","execution_mode":"probe","solver_type":"static","action_budget":8,"minimum_evidence_actions":4,"single_step":false}]}
 END_REDUCTION"""
 
 _CODER_SYSTEM_PROMPT = """You are the gameplay-policy coder role for an ARC-AGI-3 game.
@@ -289,14 +286,15 @@ BEGIN_POLICY
 POLICY_API_VERSION = 1
 SUPPORTED_BACKENDS = ("cpu",)
 POLICY_REUSE_SCOPE = "none"
+POLICY_SOLVER_TYPE = "static"
+POLICY_SOLVER_CONFIG = {"probe_actions": ["ACTION7"]}
 
 def initialize(context):
     return {}
 
 def decide(observation, memory):
-    action_name = observation.valid_actions[0]
-    return continue_decision(
-        action_name, memory, "why this action advances the active objective"
+    return solver_decide(
+        POLICY_SOLVER_TYPE, observation, memory, POLICY_SOLVER_CONFIG
     )
 END_POLICY
 
@@ -318,12 +316,28 @@ objectives in this level. Never emit an action whose entry has saturated=true. U
 executed, no_progress, stable_changes, meaningful_progress, and distinct_points counts
 to avoid repeating an exhausted action family through superficially new coordinates.
 Read observation.objective["execution_mode"]. For navigate, the reachable decide path
-must call at least one board localization/component helper, at least one trusted route
-planner such as shortest_path/shortest_path_to_any/shortest_approach_path, and
-transition_requires_replan. Build the passability mask from the current board, derive
-actor and target cells rather than hardcoding a route, store only JSON coordinates in
-memory, validate any stored suffix, and replan after blocking or relevant board change.
-The host rejects fixed directional sequences for navigate objectives.
+must call solver_decide with a navigation-capable selected solver type. The trusted
+dispatcher localizes the board, builds passability, plans a route, and replans after
+blocking or relevant board change. Supply correct board-derived color roles rather
+than hardcoded coordinates or a fixed directional sequence.
+
+Every new policy must declare literal POLICY_SOLVER_TYPE and
+POLICY_SOLVER_CONFIG values matching observation.objective["solver_type"], and its
+reachable decide path must call the trusted dispatcher exactly as
+solver_decide(POLICY_SOLVER_TYPE, observation, memory, POLICY_SOLVER_CONFIG).
+The dispatcher returns a complete PolicyDecision-compatible mapping. Configure only
+finite JSON using actor_values, target_values, passable_values, hazard_values,
+interactive_values, source_values, coverage_values, interaction_actions,
+probe_actions, action_sequences, approach_distance, and max_plan_length.
+Routing-capable solvers also support clearance_radius from 0 through 8 for multi-cell
+actors. Hybrid
+requires non-hybrid fallback_types and matching fallback_configs. Sequence types
+require action_sequences; static/cellular-automata require probe_actions. Routing,
+momentum, and gravity require actor_values, target_values, and passable_values;
+alignment/manipulation/multi-agent also require actor and passability plus a target or
+interactive role; field types require source/actor, target, and passability; coverage
+requires target_values. Do not
+reimplement a selected solver with a fixed action loop or call another solver type.
 
 Declare POLICY_REUSE_SCOPE = "tactical" only when the module is genuinely generic
 across tactical objectives in the same level: it must derive actions and terminal
@@ -695,8 +709,8 @@ def _contract_requires_navigation(spec: SubgoalSpec) -> bool:
     )
 
 
-def _reachable_policy_call_names(source: str) -> frozenset[str]:
-    """Return direct-name calls reachable through generated policy entrypoints."""
+def _reachable_policy_calls(source: str, target: str) -> tuple[ast.Call, ...]:
+    """Return calls to ``target`` reachable through generated entrypoints."""
 
     tree = ast.parse(source, mode="exec")
     functions = {
@@ -706,7 +720,7 @@ def _reachable_policy_call_names(source: str) -> frozenset[str]:
     }
     pending = [name for name in ("decide", "initialize") if name in functions]
     visited: set[str] = set()
-    calls: set[str] = set()
+    matches: list[ast.Call] = []
     while pending:
         name = pending.pop()
         if name in visited:
@@ -716,10 +730,64 @@ def _reachable_policy_call_names(source: str) -> frozenset[str]:
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
                 continue
             called = node.func.id
-            calls.add(called)
+            if called == target:
+                matches.append(node)
             if called in functions and called not in visited:
                 pending.append(called)
-    return frozenset(calls)
+    return tuple(matches)
+
+
+def _valid_solver_dispatch_call(call: ast.Call) -> bool:
+    if call.keywords or len(call.args) != 4:
+        return False
+    expected_names = (
+        "POLICY_SOLVER_TYPE",
+        "observation",
+        "memory",
+        "POLICY_SOLVER_CONFIG",
+    )
+    return all(
+        isinstance(argument, ast.Name) and argument.id == expected
+        for argument, expected in zip(call.args, expected_names)
+    )
+
+
+def _validate_solver_declaration_usage(source: str) -> None:
+    """Keep validated solver declarations immutable and single-purpose."""
+
+    tree = ast.parse(source, mode="exec")
+    declaration_names = {"POLICY_SOLVER_TYPE", "POLICY_SOLVER_CONFIG"}
+    allowed_stores: set[int] = set()
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in declaration_names:
+                allowed_stores.add(id(target))
+    allowed_loads: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != "solver_decide" or len(node.args) != 4:
+            continue
+        for index in (0, 3):
+            argument = node.args[index]
+            if isinstance(argument, ast.Name):
+                allowed_loads.add(id(argument))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name) or node.id not in declaration_names:
+            continue
+        if isinstance(node.ctx, ast.Store) and id(node) not in allowed_stores:
+            raise PolicyRuntimeError(
+                f"policy {node.id} may not be reassigned after declaration",
+                category="policy_solver_contract",
+            )
+        if isinstance(node.ctx, ast.Load) and id(node) not in allowed_loads:
+            raise PolicyRuntimeError(
+                f"policy {node.id} may only be read as a solver_decide argument",
+                category="policy_solver_contract",
+            )
 
 
 def _action_family_saturation_reason(
@@ -793,6 +861,7 @@ def _equivalent_attempted_tactical(
         if (
             node.evidence_mode is not spec.evidence_mode
             or node.execution_mode is not spec.execution_mode
+            or node.solver_type is not spec.solver_type
         ):
             continue
         if (
@@ -821,6 +890,7 @@ def _objective_contract_hash(objective: Any) -> str:
     material["single_step"] = bool(payload.get("single_step"))
     material["evidence_mode"] = str(payload.get("evidence_mode") or "engine_progress")
     material["execution_mode"] = str(payload.get("execution_mode") or "probe")
+    material["solver_type"] = str(payload.get("solver_type") or "hybrid")
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
     return hashlib.blake2b(encoded.encode("utf-8"), digest_size=12).hexdigest()
 
@@ -982,6 +1052,32 @@ def _policy_reuse_scope_from_source(source: str) -> str:
     return "none"
 
 
+def _literal_policy_assignment(source: str, name: str) -> Any:
+    """Read one top-level generated-policy literal without executing source."""
+
+    module = ast.parse(source, mode="exec")
+    matches: list[ast.AST] = []
+    for statement in module.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        if any(isinstance(target, ast.Name) and target.id == name for target in targets):
+            if statement.value is not None:
+                matches.append(statement.value)
+    if len(matches) != 1:
+        raise PolicyRuntimeError(
+            f"policy must declare exactly one literal {name}",
+            category="policy_solver_contract",
+        )
+    try:
+        return ast.literal_eval(matches[0])
+    except (ValueError, TypeError, SyntaxError) as exc:
+        raise PolicyRuntimeError(
+            f"policy {name} must be a literal value",
+            category="policy_solver_contract",
+        ) from exc
+
+
 def _without_policy_source(entry: dict[str, Any]) -> dict[str, Any]:
     sanitized = dict(entry)
     content = sanitized.get("content")
@@ -1023,6 +1119,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_objective_id = ""
         self._policy_source_hash = ""
         self._policy_artifact = ""
+        self._policy_solver_type = ""
+        self._policy_solver_family = ""
         self._active_policy_reuse_scope = "none"
         self._reusable_policies: list[dict[str, Any]] = []
         self._policy_memory: Any = {}
@@ -1169,6 +1267,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_objective_id = ""
         self._policy_source_hash = ""
         self._policy_artifact = ""
+        self._policy_solver_type = ""
+        self._policy_solver_family = ""
         self._active_policy_reuse_scope = "none"
         self._reusable_policies = []
         self._policy_memory = {}
@@ -1220,6 +1320,16 @@ class OrchestratedObjectiveAgent(ToolAgent):
             self._policy_objective_id = str(payload.get("policy_objective_id") or "")
             self._policy_source_hash = str(payload.get("policy_source_hash") or "")
             self._policy_artifact = str(payload.get("policy_artifact") or "")
+            self._policy_solver_type = str(payload.get("policy_solver_type") or "")
+            self._policy_solver_family = str(payload.get("policy_solver_family") or "")
+            if self._policy_solver_type:
+                try:
+                    self._policy_solver_family = solver_family(self._policy_solver_type)
+                except ValueError:
+                    self._policy_solver_type = ""
+                    self._policy_solver_family = ""
+            else:
+                self._policy_solver_family = ""
             self._active_policy_reuse_scope = str(
                 payload.get("active_policy_reuse_scope") or "none"
             )
@@ -1363,6 +1473,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "policy_objective_id": self._policy_objective_id,
             "policy_source_hash": self._policy_source_hash,
             "policy_artifact": self._policy_artifact,
+            "policy_solver_type": self._policy_solver_type,
+            "policy_solver_family": self._policy_solver_family,
             "active_policy_reuse_scope": self._active_policy_reuse_scope,
             "reusable_policies": self._reusable_policies[-4:],
             "policy_memory": self._policy_memory,
@@ -1419,6 +1531,15 @@ class OrchestratedObjectiveAgent(ToolAgent):
         runtime_path = getattr(self, "_session_runtime_dir", None)
         if runtime_path is None:
             return
+        if event_type.startswith(("objective_", "policy_")):
+            active = self._tree.active if self._tree is not None else None
+            selected = active.solver_type if active is not None else None
+            payload.setdefault(
+                "solver_type", selected.value if selected is not None else ""
+            )
+            payload.setdefault(
+                "solver_family", solver_family(selected.value) if selected is not None else ""
+            )
         event = {
             "type": event_type,
             "time": time.time(),
@@ -1806,6 +1927,14 @@ class OrchestratedObjectiveAgent(ToolAgent):
         def validate_reduction(raw: dict[str, Any]) -> ReductionProposal:
             proposal = ReductionProposal.from_payload(raw)
             if proposal.verdict is ReductionVerdict.DECOMPOSE:
+                raw_subgoals = raw.get("subgoals")
+                if not isinstance(raw_subgoals, list) or any(
+                    not isinstance(item, dict) or "solver_type" not in item
+                    for item in raw_subgoals
+                ):
+                    raise ObjectiveError(
+                        "every new tactical subgoal must declare solver_type"
+                    )
                 selected = proposal.subgoals[proposal.selected_index]
                 saturation_reason = _action_family_saturation_reason(
                     self._level_action_evidence, "MOUSE"
@@ -1824,6 +1953,17 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         "selected subgoal describes spatial routing but execution_mode "
                         "is not navigate; declare execution_mode=navigate so the policy "
                         "must localize the board, plan a route, and replan after changes"
+                    )
+                selected_family = solver_family(selected.solver_type.value)
+                if (
+                    selected.execution_mode is TacticalExecutionMode.NAVIGATE
+                    and selected_family not in NAVIGATION_SOLVER_FAMILIES
+                ):
+                    raise ObjectiveError(
+                        f"navigate subgoal selected non-navigation solver type "
+                        f"{selected.solver_type.value!r} ({selected_family}); select a "
+                        "routing, physics, manipulation, alignment, coverage, field, "
+                        "gravity, or multi-agent solver"
                     )
                 if (
                     _contract_requests_mouse(selected)
@@ -1895,14 +2035,22 @@ class OrchestratedObjectiveAgent(ToolAgent):
             active_objective_id=active.objective_id,
             verdict=proposal.verdict.value,
             rationale=proposal.rationale,
+            solver_type=active.solver_type.value if active.solver_type is not None else "",
+            solver_family=(
+                solver_family(active.solver_type.value)
+                if active.solver_type is not None
+                else ""
+            ),
         )
 
     def _policy_payload(
         self, frame: Frame, history: list[HistoryEntry], repair: str
     ) -> dict[str, Any]:
         assert self._tree is not None
+        active = self._tree.active
+        selected_solver = active.solver_type.value if active.solver_type is not None else ""
         return {
-            "active_objective": self._tree.active.to_dict(),
+            "active_objective": active.to_dict(),
             "observation": {
                 "level": frame.level,
                 "step": frame.step,
@@ -1914,6 +2062,16 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "recent_transitions": _recent_transition_payload(history),
             "level_action_evidence": self._level_action_evidence_payload(),
             "requested_backend": os.environ.get("LOCAL_GAMEPLAY_POLICY_BACKEND", "cpu"),
+            "solver_contract": {
+                "api_version": 1,
+                "selected_type": selected_solver,
+                "selected_family": solver_family(selected_solver) if selected_solver else "",
+                "registered_types": list(POLICY_SOLVER_TYPES),
+                "required_entrypoint": (
+                    "solver_decide(POLICY_SOLVER_TYPE, observation, memory, "
+                    "POLICY_SOLVER_CONFIG)"
+                ),
+            },
             "repair_reason": repair,
         }
 
@@ -1923,26 +2081,61 @@ class OrchestratedObjectiveAgent(ToolAgent):
         source = str(raw.get("source") or "")
         source_hash = verify_policy_source(source)
         active = self._tree.active
-        if active.execution_mode is TacticalExecutionMode.NAVIGATE:
-            calls = _reachable_policy_call_names(source)
-            missing: list[str] = []
-            if not calls.intersection(_NAVIGATION_LOCALIZATION_HELPERS):
-                missing.append("a board localization/component helper")
-            if not calls.intersection(_NAVIGATION_PASSABILITY_HELPERS):
-                missing.append("a passability-mask helper")
-            if not calls.intersection(_NAVIGATION_PLANNER_HELPERS):
-                missing.append("a trusted pathfinding planner")
-            if "transition_requires_replan" not in calls:
-                missing.append("transition_requires_replan")
-            if missing:
-                raise PolicyRuntimeError(
-                    "navigate policy must call " + ", ".join(missing),
-                    category="policy_navigation_contract",
-                )
+        if active.solver_type is None:
+            raise PolicyRuntimeError(
+                "active tactical objective has no solver type",
+                category="policy_solver_contract",
+            )
+        declared_type = _literal_policy_assignment(source, "POLICY_SOLVER_TYPE")
+        if not isinstance(declared_type, str):
+            raise PolicyRuntimeError(
+                "POLICY_SOLVER_TYPE must be a literal string",
+                category="policy_solver_contract",
+            )
+        declared_type = declared_type.strip().lower()
+        if declared_type != active.solver_type.value:
+            raise PolicyRuntimeError(
+                f"policy solver type {declared_type!r} does not match active objective "
+                f"solver type {active.solver_type.value!r}",
+                category="policy_solver_contract",
+            )
+        declared_config = _literal_policy_assignment(source, "POLICY_SOLVER_CONFIG")
+        try:
+            validate_solver_config(declared_type, declared_config)
+        except ValueError as exc:
+            raise PolicyRuntimeError(
+                f"invalid POLICY_SOLVER_CONFIG: {exc}",
+                category="policy_solver_contract",
+            ) from exc
+        solver_calls = _reachable_policy_calls(source, "solver_decide")
+        if not solver_calls:
+            raise PolicyRuntimeError(
+                "generated policy decide path must call solver_decide",
+                category="policy_solver_contract",
+            )
+        if any(not _valid_solver_dispatch_call(call) for call in solver_calls):
+            raise PolicyRuntimeError(
+                "solver_decide must be called with exactly POLICY_SOLVER_TYPE, "
+                "observation, memory, POLICY_SOLVER_CONFIG",
+                category="policy_solver_contract",
+            )
+        _validate_solver_declaration_usage(source)
+        declared_family = solver_family(declared_type)
+        if (
+            active.execution_mode is TacticalExecutionMode.NAVIGATE
+            and declared_family not in NAVIGATION_SOLVER_FAMILIES
+        ):
+            raise PolicyRuntimeError(
+                f"navigate policy solver family {declared_family!r} is not "
+                "navigation-capable",
+                category="policy_navigation_contract",
+            )
         return {
             "objective_id": self._tree.active_id,
             "source": source,
             "source_hash": source_hash,
+            "solver_type": declared_type,
+            "solver_family": declared_family,
         }
 
     def _save_policy_artifact(self, source: str, source_hash: str) -> str:
@@ -2128,6 +2321,12 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "artifact": self._policy_artifact,
             "origin_objective_id": self._policy_objective_id,
             "contract_hash": _objective_contract_hash(origin),
+            "solver_type": origin.solver_type.value if origin.solver_type is not None else "",
+            "solver_family": (
+                solver_family(origin.solver_type.value)
+                if origin.solver_type is not None
+                else ""
+            ),
             "qualification": qualification,
         }
         self._reusable_policies = [
@@ -2160,6 +2359,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
             if (
                 str(entry.get("game_id") or "") != self._knowledge_game_id
                 or entry_level != self._tree.current_level
+                or str(entry.get("solver_type") or "")
+                != (objective.solver_type.value if objective.solver_type is not None else "")
             ):
                 continue
             qualification = str(entry.get("qualification") or "provisional")
@@ -2176,6 +2377,12 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 continue
             runtime = GameplayPolicyRuntime()
             try:
+                validated = self._policy_validator({"source": source})
+                if str(validated.get("source_hash") or "") != source_hash:
+                    raise PolicyRuntimeError(
+                        "reused policy solver validation changed source fingerprint",
+                        category="policy_protocol",
+                    )
                 activation = runtime.activate(
                     source,
                     context={
@@ -2224,6 +2431,12 @@ class OrchestratedObjectiveAgent(ToolAgent):
             self._policy_objective_id = objective.objective_id
             self._policy_source_hash = source_hash
             self._policy_artifact = artifact
+            self._policy_solver_type = (
+                objective.solver_type.value if objective.solver_type is not None else ""
+            )
+            self._policy_solver_family = (
+                solver_family(self._policy_solver_type) if self._policy_solver_type else ""
+            )
             self._active_policy_reuse_scope = "tactical"
             self._policy_memory = runtime.memory
             self._policy_executed_action = False
@@ -2249,6 +2462,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 contract_hash=contract_hash,
                 backend=activation.backend,
                 backend_fallback_reason=activation.backend_fallback_reason,
+                solver_type=self._policy_solver_type,
+                solver_family=self._policy_solver_family,
             )
             return True
         return False
@@ -2337,6 +2552,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_objective_id = self._tree.active_id
         self._policy_source_hash = source_hash
         self._policy_artifact = self._save_policy_artifact(source, source_hash)
+        self._policy_solver_type = str(raw["solver_type"])
+        self._policy_solver_family = str(raw["solver_family"])
         self._active_policy_reuse_scope = _policy_reuse_scope_from_source(source)
         self._policy_memory = runtime.memory
         self._policy_executed_action = False
@@ -2356,6 +2573,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
             artifact=self._policy_artifact,
             backend=activation.backend,
             backend_fallback_reason=activation.backend_fallback_reason,
+            solver_type=self._policy_solver_type,
+            solver_family=self._policy_solver_family,
         )
 
     def _invalidate_policy(
@@ -2396,6 +2615,23 @@ class OrchestratedObjectiveAgent(ToolAgent):
         source = artifact.read_text(encoding="utf-8")
         if verify_policy_source(source) != self._policy_source_hash:
             return False
+        try:
+            restored_solver = _literal_policy_assignment(source, "POLICY_SOLVER_TYPE")
+        except PolicyRuntimeError:
+            restored_solver = ""
+        self._policy_solver_type = (
+            str(restored_solver).strip().lower()
+            if isinstance(restored_solver, str)
+            else ""
+        )
+        try:
+            self._policy_solver_family = (
+                solver_family(self._policy_solver_type)
+                if self._policy_solver_type
+                else ""
+            )
+        except ValueError:
+            return False
         self._active_policy_reuse_scope = _policy_reuse_scope_from_source(source)
         runtime = GameplayPolicyRuntime()
         activation = runtime.activate(
@@ -2412,6 +2648,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
             objective_id=self._policy_objective_id,
             source_hash=self._policy_source_hash,
             backend=activation.backend,
+            solver_type=self._policy_solver_type,
+            solver_family=self._policy_solver_family,
         )
         return True
 
@@ -3124,6 +3362,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     "objective_id": self._tree.active_id,
                     "objective_title": self._tree.active.title,
                     "policy_hash": self._policy_source_hash,
+                    "solver_type": self._policy_solver_type,
+                    "solver_family": self._policy_solver_family,
                     "policy_backend": self._policy_runtime.activation.backend
                     if self._policy_runtime.activation is not None
                     else "cpu",
