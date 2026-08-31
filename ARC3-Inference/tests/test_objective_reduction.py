@@ -61,7 +61,10 @@ class ObjectiveTreeTests(unittest.TestCase):
 
         self.assertEqual(GameSolverType.NAVIGATION, tactical.solver_type)
         subgoal["solver_type"] = "unknown-solver"
-        with self.assertRaisesRegex(ObjectiveError, "solver_type"):
+        with self.assertRaisesRegex(
+            ObjectiveError,
+            "solver_type 'unknown-solver' is not registered; choose one of: .*navigation",
+        ):
             ReductionProposal.from_payload(reduction_payload(subgoals=[subgoal]))
 
     def test_host_creates_game_level_and_tactical_path(self) -> None:

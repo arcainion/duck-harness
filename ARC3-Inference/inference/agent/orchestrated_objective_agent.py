@@ -210,9 +210,12 @@ destination. Navigate policies are host-required to localize board entities, bui
 passability mask, call trusted pathfinding, and replan from transition evidence. Use
 probe for bounded control experiments and interact for non-routing buttons or clicks.
 Do not describe a spatial route while declaring probe or interact. The
-solver_type must be one registered portable solver label. Choose by mechanic:
-routing (navigation, lattice-corridor, glyph-transform-route, guided-attraction),
-physics (sliding, inertial-block, trajectory-replay, gravity), manipulation
+solver_type must be one registered portable solver label. Family headings such as
+routing, physics, manipulation, interaction, alignment, observation, sequence/search,
+coverage/transform, and field mechanics are explanatory categories, not valid
+solver_type values. Choose the concrete label inside the matching category: routing
+(navigation, lattice-corridor, glyph-transform-route, guided-attraction), physics
+(sliding, inertial-block, trajectory-replay, gravity), manipulation
 (push-pull, carrier-placement, inventory), interaction (click-interaction,
 relation-toggle, switch-bridge, signal), alignment (connector-align,
 linked-centroid, mirror-merge, paired-platform-alignment), coverage/transform
@@ -2101,7 +2104,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             )
         declared_config = _literal_policy_assignment(source, "POLICY_SOLVER_CONFIG")
         try:
-            validate_solver_config(declared_type, declared_config)
+            normalized_config = validate_solver_config(declared_type, declared_config)
         except ValueError as exc:
             raise PolicyRuntimeError(
                 f"invalid POLICY_SOLVER_CONFIG: {exc}",
@@ -2121,6 +2124,36 @@ class OrchestratedObjectiveAgent(ToolAgent):
             )
         _validate_solver_declaration_usage(source)
         declared_family = solver_family(declared_type)
+        if (
+            active.evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION
+            and declared_family == "observe"
+        ):
+            probes = list(normalized_config["probe_actions"])
+            repeated = {action for action in probes if probes.count(action) >= 2}
+            modalities = {
+                "direction": {"UP", "DOWN", "LEFT", "RIGHT"},
+                "button": {"SPACE", "ACTION7"},
+            }
+            has_same_modality_control = any(
+                positive in actions
+                and any(candidate != positive for candidate in probes if candidate in actions)
+                for positive in repeated
+                for actions in modalities.values()
+            )
+            if len(probes) < active.minimum_evidence_actions:
+                raise PolicyRuntimeError(
+                    "contrastive observation policy probe_actions must contain at least "
+                    f"{active.minimum_evidence_actions} actions to meet the objective's "
+                    "minimum evidence count",
+                    category="policy_solver_contract",
+                )
+            if not repeated or not has_same_modality_control:
+                raise PolicyRuntimeError(
+                    "contrastive observation policy probe_actions must repeat one exact "
+                    "positive action and include a distinct same-modality negative control "
+                    "(direction versus direction or button versus button)",
+                    category="policy_solver_contract",
+                )
         if (
             active.execution_mode is TacticalExecutionMode.NAVIGATE
             and declared_family not in NAVIGATION_SOLVER_FAMILIES

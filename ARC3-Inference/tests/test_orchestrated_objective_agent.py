@@ -1606,6 +1606,100 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual(14, metrics["reducer_generated_tokens"])
         self.assertEqual(14, metrics["coder_generated_tokens"])
 
+    def test_reducer_solver_family_rejection_lists_concrete_types_for_retry(
+        self,
+    ) -> None:
+        invalid_reduction = reduction_for("level:1:1")
+        subgoals = invalid_reduction["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0]["solver_type"] = "routing"
+        client = _ScriptedModelClient(
+            [
+                invalid_reduction,
+                reduction_for("level:1:1"),
+                policy_for("tactical:1"),
+            ]
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                _FakeRuntime,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+            result = agent.analyze(
+                state_path,
+                0,
+                valid_actions=["ACTION1"],
+                step_env=lambda _payload: {"executed": True, "board_changed": True},
+            )
+            agent.close()
+
+        self.assertTrue(result.step_executed)
+        repair_prompt = client.messages[1][-1]["content"]
+        self.assertIn("solver_type 'routing' is not registered", repair_prompt)
+        self.assertIn("choose one of: beam, beam-coverage", repair_prompt)
+        self.assertIn("navigation", repair_prompt)
+        reducer_system_prompt = client.messages[0][0]["content"]
+        self.assertIn(
+            "Family headings such as\nrouting, physics, manipulation, interaction",
+            reducer_system_prompt,
+        )
+
+    def test_contrastive_observation_policy_requires_repeat_and_negative_control(
+        self,
+    ) -> None:
+        reduction = reduction_for("level:1:1")
+        subgoals = reduction["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0].update(
+            evidence_mode="contrastive_transition",
+            action_budget=8,
+            minimum_evidence_actions=4,
+        )
+        unique_probes = POLICY_SOURCE.replace(
+            '["UP"]', '["UP", "DOWN", "LEFT", "RIGHT"]'
+        )
+        contrastive_probes = POLICY_SOURCE.replace(
+            '["UP"]', '["UP", "UP", "DOWN", "LEFT"]'
+        )
+        client = _ScriptedModelClient(
+            [
+                reduction,
+                policy_for("tactical:1", source=unique_probes),
+                policy_for("tactical:1", source=contrastive_probes),
+            ]
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                _FakeRuntime,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+            result = agent.analyze(
+                state_path,
+                0,
+                valid_actions=["ACTION1"],
+                step_env=lambda _payload: {"executed": True, "board_changed": True},
+            )
+            agent.close()
+
+        self.assertTrue(result.step_executed)
+        self.assertIn(
+            "must repeat one exact positive action and include a distinct "
+            "same-modality negative control",
+            client.messages[2][-1]["content"],
+        )
+
     def test_missing_decide_stays_in_coder_loop_and_saves_rejected_source(
         self,
     ) -> None:

@@ -165,12 +165,15 @@ class SubgoalSpec:
             raise ObjectiveError(
                 "subgoal execution_mode must be probe, navigate, or interact"
             ) from exc
+        raw_solver_type = str(payload.get("solver_type") or "hybrid").strip()
         try:
-            solver_type = GameSolverType(
-                str(payload.get("solver_type") or "hybrid").strip()
-            )
+            solver_type = GameSolverType(raw_solver_type)
         except ValueError as exc:
-            raise ObjectiveError("subgoal solver_type is not registered") from exc
+            registered = ", ".join(item.value for item in GameSolverType)
+            raise ObjectiveError(
+                f"subgoal solver_type {raw_solver_type!r} is not registered; "
+                f"choose one of: {registered}"
+            ) from exc
         if evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION and (
             action_budget < 3 or raw_minimum_evidence < 3 or raw_single_step
         ):
