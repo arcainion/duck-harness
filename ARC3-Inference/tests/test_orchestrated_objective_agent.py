@@ -1749,7 +1749,12 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         repair_prompt = client.messages[2][-1]["content"]
         self.assertIn("<REJECTED_POLICY_SOURCE>", repair_prompt)
         self.assertIn(rejected_source, repair_prompt)
-        self.assertIn("propagate decision['memory']", repair_prompt)
+        self.assertIn("Do not wrap, retry, or rebuild", repair_prompt)
+        self.assertIn(
+            "return solver_decide(POLICY_SOLVER_TYPE, observation, memory, "
+            "POLICY_SOLVER_CONFIG)",
+            repair_prompt,
+        )
         self.assertNotIn("instead of placing duplicate actions consecutively", repair_prompt)
         self.assertEqual(1, len(rejected_artifacts))
         self.assertEqual(rejected_source.strip(), rejected_artifact_text.strip())
@@ -1768,7 +1773,14 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertIn("configured target is already reached", guidance)
         self.assertIn("actor_values", guidance)
         self.assertIn("interaction_actions", guidance)
-        self.assertIn("do not repair the policy by only changing probe_actions", guidance)
+        self.assertIn("stable/contrastive evidence phase", guidance)
+        self.assertIn("rather than changing only probe_actions", guidance)
+        self.assertIn("Do not wrap, retry, or rebuild", guidance)
+        self.assertIn(
+            "return solver_decide(POLICY_SOLVER_TYPE, observation, memory, "
+            "POLICY_SOLVER_CONFIG)",
+            guidance,
+        )
 
     def test_rejected_static_policy_only_receives_contrastive_probe_guidance(self) -> None:
         ordinary = _rejected_policy_repair_guidance(

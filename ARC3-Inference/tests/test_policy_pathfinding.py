@@ -83,6 +83,20 @@ class PolicyPathfindingTests(unittest.TestCase):
             shortest_path_to_any(passable, (1, 1), ((2, 1), (0, 1))),
         )
 
+    def test_shortest_path_avoids_only_forbidden_first_edge(self) -> None:
+        passable = np.ones((3, 3), dtype=bool)
+
+        path = shortest_path_to_any(
+            passable,
+            (1, 1),
+            ((0, 1),),
+            forbidden_first_steps=((0, 1),),
+        )
+
+        self.assertEqual((1, 1), path[0])
+        self.assertNotEqual((0, 1), path[1])
+        self.assertEqual((0, 1), path[-1])
+
     def test_unreachable_empty_goals_and_same_cell_results(self) -> None:
         passable = np.zeros((3, 3), dtype=bool)
         self.assertEqual((), shortest_path(passable, (0, 0), (2, 2)))

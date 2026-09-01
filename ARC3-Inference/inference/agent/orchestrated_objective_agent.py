@@ -164,18 +164,22 @@ def _rejected_policy_repair_guidance(user_payload: dict[str, Any]) -> str:
     evidence_mode = str(objective.get("evidence_mode") or "").strip().lower()
 
     guidance = (
-        "If it wraps solver_decide, propagate decision['memory'] in every rebuilt "
-        "decision."
+        "Do not wrap, retry, or rebuild the result of solver_decide. The decide "
+        "function must contain one canonical return: return solver_decide("
+        "POLICY_SOLVER_TYPE, observation, memory, POLICY_SOLVER_CONFIG). Repair "
+        "behavior only through POLICY_SOLVER_CONFIG."
     )
     if selected_family == "navigation":
         return (
             guidance
-            + " For a navigation policy, probe_actions do not control routing. If "
+            + " For a navigation policy, probe_actions control only the bounded "
+            "stable/contrastive evidence phase; actor_values, target_values, "
+            "passable_values, and approach_distance control route execution. If "
             "preflight reports subgoal_succeeded or that the configured target is "
             "already reached while engine progress is still required, reconsider "
             "actor_values, target_values, passable_values, approach_distance, and "
-            "interaction_actions from the board evidence; do not repair the policy "
-            "by only changing probe_actions."
+            "interaction_actions from the board evidence rather than changing only "
+            "probe_actions."
         )
     if selected_type == "static" and evidence_mode == "contrastive_transition":
         return (

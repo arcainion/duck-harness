@@ -183,6 +183,8 @@ def shortest_path_to_any(
     start: Any,
     goals: Iterable[Any],
     max_expansions: int = MAX_GRID_CELLS,
+    *,
+    forbidden_first_steps: Iterable[Any] = (),
 ) -> Path:
     """Return a shortest path to any goal using deterministic bounded BFS.
 
@@ -194,6 +196,9 @@ def shortest_path_to_any(
     mask = _mask(passable)
     origin = _checked_point(start, "start", mask.shape)
     destinations = set(_checked_points(goals, "goal", mask.shape))
+    forbidden = set(
+        _checked_points(forbidden_first_steps, "forbidden first step", mask.shape)
+    )
     if not destinations:
         return ()
     if origin in destinations:
@@ -209,6 +214,8 @@ def shortest_path_to_any(
         expansions += 1
         for _action, row_delta, col_delta in CARDINAL_MOVES:
             candidate = (current[0] + row_delta, current[1] + col_delta)
+            if current == origin and candidate in forbidden:
+                continue
             if not _in_bounds(candidate, mask.shape) or candidate in parents:
                 continue
             if candidate not in destinations and not bool(mask[candidate]):
@@ -657,6 +664,8 @@ def shortest_approach_path(
     targets: Iterable[Any],
     distance: int = 1,
     max_expansions: int = MAX_GRID_CELLS,
+    *,
+    forbidden_first_steps: Iterable[Any] = (),
 ) -> Path:
     """Return a shortest route to a passable target-approach cell."""
 
@@ -664,7 +673,13 @@ def shortest_approach_path(
     candidates = approach_points(mask, targets, distance)
     if not candidates:
         return ()
-    return shortest_path_to_any(mask, start, candidates, max_expansions)
+    return shortest_path_to_any(
+        mask,
+        start,
+        candidates,
+        max_expansions,
+        forbidden_first_steps=forbidden_first_steps,
+    )
 
 
 def path_is_valid(passable: Any, path: Iterable[Any]) -> bool:

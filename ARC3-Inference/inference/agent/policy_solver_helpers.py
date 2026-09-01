@@ -17,6 +17,9 @@ from inference.agent.objective_reduction import GameSolverType
 from inference.agent.policy_codegen_helpers import (
     POLICY_ACTIONS,
     board_digest,
+    contrastive_transition_evidence_status,
+    objective_evidence_ready,
+    stable_transition_evidence_status,
     transition_has_progress,
     transition_repeats_nonprogress_action,
     transition_requires_replan,
@@ -291,6 +294,32 @@ def _memory(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def _memory_index(value: Any, upper: int) -> int:
+    """Normalize an untrusted JSON counter into a bounded index."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return min(max(0, value), max(0, upper))
+
+
+def _memory_point(value: Any) -> tuple[int, int] | None:
+    """Return one bounded JSON grid point, ignoring malformed state."""
+
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    row, col = value
+    if (
+        isinstance(row, bool)
+        or isinstance(col, bool)
+        or not isinstance(row, int)
+        or not isinstance(col, int)
+        or not 0 <= row <= 63
+        or not 0 <= col <= 63
+    ):
+        return None
+    return row, col
+
+
 def _continue(action: str, memory: Mapping[str, Any], evidence: str, **prediction: Any) -> dict[str, Any]:
     return {
         "status": "continue",
@@ -314,9 +343,279 @@ def _terminal(status: str, memory: Mapping[str, Any], evidence: str) -> dict[str
     return {"status": status, "action": None, "memory": dict(memory), "evidence": evidence}
 
 
-def _valid_action(observation: Any, candidates: Sequence[str]) -> str | None:
-    valid = set(str(item).upper() for item in observation.valid_actions)
-    return next((item for item in candidates if item in valid), None)
+def _objective_evidence_status(observation: Any) -> tuple[bool, str]:
+    """Evaluate host-owned tactical evidence without generated wrapper logic."""
+
+    objective = observation.objective
+    if not isinstance(objective, Mapping) or not objective:
+        ready = transition_has_progress(observation.last_transition)
+        return ready, "latest transition showed meaningful progress"
+    recent = [
+        item
+        for item in observation.recent_transitions
+        if isinstance(item, Mapping)
+    ][-32:]
+    last = observation.last_transition
+    if isinstance(last, Mapping) and (not recent or recent[-1] != last):
+        recent = [*recent, last][-32:]
+    mode = str(objective.get("evidence_mode") or "engine_progress").strip().lower()
+    try:
+        if mode == "stable_transition":
+            return stable_transition_evidence_status(objective, recent)
+        if mode == "contrastive_transition":
+            return contrastive_transition_evidence_status(objective, recent)
+        if mode == "engine_progress":
+            ready = transition_has_progress(last) and objective_evidence_ready(
+                objective, recent
+            )
+            return (
+                ready,
+                "engine progress and minimum transition evidence are present"
+                if ready
+                else "engine progress or minimum transition evidence is incomplete",
+            )
+    except ValueError as exc:
+        return False, f"objective evidence is invalid: {exc}"
+    return False, f"unsupported objective evidence mode {mode!r}"
+
+
+def _objective_budget_usage(observation: Any) -> tuple[int, int] | None:
+    """Return validated host-owned objective budget usage when available."""
+
+    objective = observation.objective
+    if not isinstance(objective, Mapping) or not objective:
+        return None
+    action_budget = objective.get("action_budget")
+    actions_used = objective.get("actions_used")
+    if (
+        isinstance(action_budget, bool)
+        or not isinstance(action_budget, int)
+        or action_budget < 1
+        or isinstance(actions_used, bool)
+        or not isinstance(actions_used, int)
+        or actions_used < 0
+    ):
+        return None
+    return actions_used, action_budget
+
+
+def _transition_evidence_mode(observation: Any) -> str:
+    objective = observation.objective
+    if not isinstance(objective, Mapping):
+        return ""
+    mode = str(objective.get("evidence_mode") or "").strip().lower()
+    return mode if mode in {"stable_transition", "contrastive_transition"} else ""
+
+
+def _bounded_probe_decision(
+    observation: Any,
+    memory: dict[str, Any],
+    probes: Sequence[str],
+    evidence: str,
+) -> dict[str, Any]:
+    index = _memory_index(memory.get("probe_index"), len(probes))
+    while index < len(probes):
+        action = probes[index]
+        index += 1
+        if (
+            action != "MOUSE"
+            and action in observation.valid_actions
+            and not transition_repeats_nonprogress_action(
+                observation.last_transition, action
+            )
+        ):
+            memory["probe_index"] = index
+            return _continue(action, memory, evidence)
+    return _terminal("subgoal_failed", memory, "solver exhausted bounded evidence probes")
+
+
+def _navigation_evidence_probes(observation: Any) -> tuple[str, ...]:
+    directions = tuple(
+        action
+        for action in ("UP", "RIGHT", "DOWN", "LEFT")
+        if action in observation.valid_actions
+    )
+    if len(directions) < 2:
+        return directions
+    probes: list[str] = []
+    for index, positive in enumerate(directions):
+        control = directions[(index + 1) % len(directions)]
+        probes.extend((positive, control, positive))
+    return tuple(probes)
+
+
+def _untried_safe_point(
+    candidates: Sequence[tuple[int, int]], memory: dict[str, Any]
+) -> tuple[int, int] | None:
+    """Select a bounded interior coordinate scoped to the current candidate set."""
+
+    safe_candidates = tuple(
+        dict.fromkeys(
+            point
+            for point in candidates
+            if 2 <= point[0] <= 61 and 2 <= point[1] <= 61
+        )
+    )[:64]
+    candidate_signature = [list(point) for point in safe_candidates]
+    if memory.get("point_candidates") != candidate_signature:
+        tried: set[tuple[int, int]] = set()
+        memory["point_candidates"] = candidate_signature
+    else:
+        tried = {
+            tuple(item)
+            for item in memory.get("tried_points", ())
+            if isinstance(item, list)
+            and len(item) == 2
+            and all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in item
+            )
+        }
+    target = next(
+        (point for point in safe_candidates if point not in tried),
+        None,
+    )
+    if target is None:
+        return None
+    tried.add(target)
+    memory["tried_points"] = [list(point) for point in sorted(tried)][-64:]
+    return target
+
+
+def _mouse_evidence_choice(
+    observation: Any,
+    memory: dict[str, Any],
+    candidates: Sequence[tuple[int, int]],
+    evidence: str,
+) -> dict[str, Any] | None:
+    """Repeat bounded positive coordinates around distinct controls."""
+
+    if "MOUSE" not in observation.valid_actions:
+        return None
+    points = tuple(
+        dict.fromkeys(
+            point
+            for point in candidates
+            if 2 <= point[0] <= 61 and 2 <= point[1] <= 61
+        )
+    )[:8]
+    if len(points) < 2:
+        return None
+    signature = [list(point) for point in points]
+    if memory.get("mouse_probe_candidates") != signature:
+        memory["mouse_probe_candidates"] = signature
+        memory["mouse_probe_index"] = 0
+    schedule: list[tuple[int, int]] = []
+    for index, positive in enumerate(points):
+        control = points[(index + 1) % len(points)]
+        schedule.extend((positive, control, positive))
+    probe_index = _memory_index(memory.get("mouse_probe_index"), len(schedule))
+    while probe_index < len(schedule):
+        point = schedule[probe_index]
+        probe_index += 1
+        if not transition_repeats_nonprogress_action(
+            observation.last_transition, "MOUSE", point
+        ):
+            memory["mouse_probe_index"] = probe_index
+            return _mouse(point, memory, evidence)
+    return None
+
+
+def _scalar_evidence_choice(
+    observation: Any,
+    memory: dict[str, Any],
+    actions: Sequence[str],
+    evidence: str,
+) -> dict[str, Any] | None:
+    """Select a bounded repeated-positive scalar evidence probe."""
+
+    mode = _transition_evidence_mode(observation)
+    candidates = tuple(
+        dict.fromkeys(
+            action
+            for action in actions
+            if action != "MOUSE" and action in observation.valid_actions
+        )
+    )
+    if mode == "contrastive_transition":
+        candidates = tuple(
+            action
+            for action in candidates
+            if action in {"UP", "RIGHT", "DOWN", "LEFT"}
+        )
+        if len(candidates) < 2:
+            return None
+    elif mode != "stable_transition" or not candidates:
+        return None
+    signature = [mode, *candidates]
+    if memory.get("scalar_probe_candidates") != signature:
+        memory["scalar_probe_candidates"] = signature
+        memory["scalar_probe_index"] = 0
+    schedule: list[str] = []
+    if len(candidates) == 1:
+        schedule.append(candidates[0])
+    else:
+        for index, positive in enumerate(candidates):
+            control = candidates[(index + 1) % len(candidates)]
+            schedule.extend((positive, control, positive))
+    probe_index = _memory_index(memory.get("scalar_probe_index"), len(schedule))
+    while probe_index < len(schedule):
+        action = schedule[probe_index]
+        probe_index += 1
+        if not transition_repeats_nonprogress_action(
+            observation.last_transition, action
+        ):
+            memory["scalar_probe_index"] = probe_index
+            return _continue(action, memory, evidence)
+    return None
+
+
+def _interaction_choice(
+    observation: Any,
+    memory: dict[str, Any],
+    actions: Sequence[str],
+    points: Sequence[tuple[int, int]],
+    evidence: str,
+) -> dict[str, Any] | None:
+    """Select one coordinate-safe or non-repeating interaction."""
+
+    if "MOUSE" in actions and "MOUSE" in observation.valid_actions:
+        if _transition_evidence_mode(observation):
+            mouse_probe = _mouse_evidence_choice(
+                observation, memory, points, evidence
+            )
+            if mouse_probe is not None:
+                return mouse_probe
+        else:
+            target = _untried_safe_point(points, memory)
+            if target is not None:
+                return _mouse(target, memory, evidence)
+    if _transition_evidence_mode(observation):
+        scalar_probe = _scalar_evidence_choice(
+            observation, memory, actions, evidence
+        )
+        if scalar_probe is not None:
+            return scalar_probe
+        return None
+    counts = _memory(memory.get("action_counts"))
+    available = [
+        (position, action)
+        for position, action in enumerate(actions)
+        if action != "MOUSE"
+        and action in observation.valid_actions
+        and not transition_repeats_nonprogress_action(
+            observation.last_transition, action
+        )
+    ]
+    if not available:
+        return None
+    _position, action = min(
+        available,
+        key=lambda item: (_memory_index(counts.get(item[1]), 1_000_000), item[0]),
+    )
+    counts[action] = _memory_index(counts.get(action), 1_000_000) + 1
+    memory["action_counts"] = counts
+    return _continue(action, memory, evidence)
 
 
 def _points(board: np.ndarray, values: Sequence[int]) -> tuple[tuple[int, int], ...]:
@@ -341,6 +640,27 @@ def _route_decision(
     *,
     approach: bool = False,
 ) -> dict[str, Any]:
+    evidence_mode = _transition_evidence_mode(observation)
+    if evidence_mode:
+        evidence_ready, evidence = _objective_evidence_status(observation)
+        if evidence_ready:
+            return _terminal("subgoal_succeeded", memory, evidence)
+        configured = tuple(
+            action for action in config["probe_actions"] if action != "MOUSE"
+        )
+        probes = configured or _navigation_evidence_probes(observation)
+        if evidence_mode == "contrastive_transition" and len(set(probes)) < 2:
+            return _terminal(
+                "subgoal_failed",
+                memory,
+                "navigation evidence probes require two distinct scalar actions",
+            )
+        return _bounded_probe_decision(
+            observation,
+            memory,
+            probes,
+            "navigation solver gathered bounded transition evidence",
+        )
     board = observation.board
     actors = _points(board, config["actor_values"])
     targets = _points(board, config["target_values"])
@@ -360,13 +680,55 @@ def _route_decision(
     passable[actor] = True
     for target in targets:
         passable[target] = True
+    current_digest = board_digest(board)
+    blocked_first_steps = (
+        [
+            checked
+            for point in memory.get("blocked_first_steps", ())
+            if (checked := _memory_point(point)) is not None
+        ]
+        if memory.get("blocked_board_digest") == current_digest
+        and isinstance(memory.get("blocked_first_steps"), (list, tuple))
+        else []
+    )
     if transition_requires_replan(observation.last_transition):
         memory.pop("path", None)
+        transition = observation.last_transition
+        failed_action = (
+            str(transition.get("action") or "").strip().upper()
+            if isinstance(transition, Mapping)
+            else ""
+        )
+        if failed_action == str(memory.get("last_action") or "").strip().upper():
+            delta = {
+                "UP": (-1, 0),
+                "RIGHT": (0, 1),
+                "DOWN": (1, 0),
+                "LEFT": (0, -1),
+            }.get(failed_action)
+            if delta is not None:
+                failed_step = (actor[0] + delta[0], actor[1] + delta[1])
+                if failed_step not in blocked_first_steps:
+                    blocked_first_steps.append(failed_step)
+    blocked_first_steps = blocked_first_steps[-4:]
+    memory["blocked_board_digest"] = current_digest
+    memory["blocked_first_steps"] = [list(point) for point in blocked_first_steps]
     distance = int(config["approach_distance"])
     path = (
-        shortest_approach_path(passable, actor, targets, distance=distance)
+        shortest_approach_path(
+            passable,
+            actor,
+            targets,
+            distance=distance,
+            forbidden_first_steps=blocked_first_steps,
+        )
         if approach or distance > 0
-        else shortest_path_to_any(passable, actor, targets)
+        else shortest_path_to_any(
+            passable,
+            actor,
+            targets,
+            forbidden_first_steps=blocked_first_steps,
+        )
     )
     if not path:
         return _terminal("subgoal_failed", memory, "solver found no traversable route")
@@ -380,7 +742,7 @@ def _route_decision(
         {
             "actor": list(actor),
             "path": [list(point) for point in path],
-            "board_digest": board_digest(board),
+            "board_digest": current_digest,
             "last_action": action,
         }
     )
@@ -392,9 +754,9 @@ def _momentum_decision(observation: Any, memory: dict[str, Any], config: Mapping
     if not actors:
         return _terminal("subgoal_failed", memory, "momentum solver could not localize actor")
     actor = actors[0]
-    previous = memory.get("actor")
-    if isinstance(previous, list) and len(previous) == 2:
-        velocity = (actor[0] - int(previous[0]), actor[1] - int(previous[1]))
+    previous = _memory_point(memory.get("actor"))
+    if previous is not None:
+        velocity = (actor[0] - previous[0], actor[1] - previous[1])
         if velocity != (0, 0):
             memory["velocity"] = list(velocity)
             predicted = (actor[0] + velocity[0], actor[1] + velocity[1])
@@ -450,15 +812,29 @@ def _gravity_decision(observation: Any, memory: dict[str, Any], config: Mapping[
                 )
             memory.update(actor=list(actor), target=list(target), last_action=action)
             return _continue(action, memory, "gravity solver aligned the actor with a landing lane")
-    interaction = _valid_action(observation, config["interaction_actions"])
-    if interaction:
-        return _continue(interaction, memory, "gravity solver activated the aligned support interaction")
+    interaction_actions = config["interaction_actions"]
+    interaction = _interaction_choice(
+        observation,
+        memory,
+        interaction_actions,
+        targets,
+        "gravity solver activated the aligned support interaction",
+    )
+    if interaction is not None:
+        return interaction
+    if interaction_actions:
+        return _terminal(
+            "subgoal_failed",
+            memory,
+            "gravity solver has no alternate aligned interaction",
+        )
     return _route_decision(observation, memory, config)
 
 
 def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
-    if transition_has_progress(observation.last_transition):
-        return _terminal("subgoal_succeeded", memory, "interaction solver observed meaningful progress")
+    evidence_ready, evidence = _objective_evidence_status(observation)
+    if evidence_ready:
+        return _terminal("subgoal_succeeded", memory, evidence)
     points: list[tuple[int, int]] = []
     if config["interactive_values"]:
         mask = value_mask(observation.board, config["interactive_values"])
@@ -474,34 +850,23 @@ def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapp
                 points.append(point)
                 if len(points) >= 64:
                     break
-    tried = {tuple(item) for item in memory.get("tried_points", []) if isinstance(item, list) and len(item) == 2}
-    if "MOUSE" in observation.valid_actions:
-        target = next((point for point in points if point not in tried), None)
-        if target is not None:
-            tried.add(target)
-            memory["tried_points"] = [list(point) for point in sorted(tried)][-64:]
-            return _mouse(target, memory, "interaction solver selected an untried component")
     actions = config["interaction_actions"] or config["probe_actions"]
-    counts = dict(memory.get("action_counts") or {})
-    available = [
-        action
-        for action in actions
-        if action != "MOUSE"
-        and action in observation.valid_actions
-        and not transition_repeats_nonprogress_action(
-            observation.last_transition, action
-        )
-    ]
-    if not available:
-        return _terminal(
-            "subgoal_failed",
-            memory,
-            "interaction solver has no untried coordinate or valid non-MOUSE configured action",
-        )
-    action = min(available, key=lambda item: (int(counts.get(item, 0)), item))
-    counts[action] = int(counts.get(action, 0)) + 1
-    memory["action_counts"] = counts
-    return _continue(action, memory, "interaction solver selected the least-tried valid action")
+    if points and "MOUSE" in observation.valid_actions and "MOUSE" not in actions:
+        actions = ("MOUSE", *actions)
+    interaction = _interaction_choice(
+        observation,
+        memory,
+        actions,
+        points,
+        "interaction solver selected the least-tried valid interaction",
+    )
+    if interaction is not None:
+        return interaction
+    return _terminal(
+        "subgoal_failed",
+        memory,
+        "interaction solver has no untried coordinate or valid non-MOUSE configured action",
+    )
 
 
 def _approach_then_interact(
@@ -513,29 +878,65 @@ def _approach_then_interact(
         return _terminal("subgoal_failed", memory, "solver could not localize movable and destination components")
     distance = min(abs(actors[0][0] - point[0]) + abs(actors[0][1] - point[1]) for point in targets)
     if distance <= int(config["approach_distance"]):
-        action = _valid_action(observation, config["interaction_actions"])
-        if action:
-            return _continue(action, memory, "solver reached the interaction distance")
+        actions = config["interaction_actions"]
+        interaction = _interaction_choice(
+            observation,
+            memory,
+            actions,
+            targets,
+            "solver reached the interaction distance",
+        )
+        if interaction is not None:
+            return interaction
+        if actions:
+            return _terminal(
+                "subgoal_failed",
+                memory,
+                "solver has no untried coordinate or alternate interaction action",
+            )
+        if _transition_evidence_mode(observation):
+            return _terminal(
+                "subgoal_failed",
+                memory,
+                "solver has no configured action for required transition evidence",
+            )
         return _terminal("subgoal_succeeded", memory, "solver aligned the configured components")
     return _route_decision(observation, memory, config, approach=True)
 
 
 def _coverage_decision(observation: Any, memory: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
-    if transition_has_progress(observation.last_transition):
-        return _terminal("subgoal_succeeded", memory, "coverage solver observed meaningful progress")
+    evidence_ready, evidence = _objective_evidence_status(observation)
+    if evidence_ready:
+        return _terminal("subgoal_succeeded", memory, evidence)
     targets = _points(observation.board, config["target_values"])
     covered = set(_points(observation.board, config["coverage_values"]))
     remaining = tuple(point for point in targets if point not in covered)
     if not remaining:
+        if _transition_evidence_mode(observation):
+            return _terminal(
+                "subgoal_failed",
+                memory,
+                "coverage geometry completed without required transition evidence",
+            )
         return _terminal("subgoal_succeeded", memory, "coverage solver found no uncovered targets")
     if "MOUSE" in observation.valid_actions and (not config["actor_values"]):
-        safe = next(
-            (point for point in remaining if 2 <= point[0] <= 61 and 2 <= point[1] <= 61),
-            None,
-        )
+        if _transition_evidence_mode(observation):
+            mouse_probe = _mouse_evidence_choice(
+                observation,
+                memory,
+                remaining,
+                "coverage solver gathered coordinate transition evidence",
+            )
+            if mouse_probe is not None:
+                return mouse_probe
+            safe = None
+        else:
+            safe = _untried_safe_point(remaining, memory)
         if safe is None:
             return _terminal(
-                "subgoal_failed", memory, "coverage targets are confined to the HUD edge"
+                "subgoal_failed",
+                memory,
+                "coverage solver has no untried safe target",
             )
         return _mouse(safe, memory, "coverage solver selected the next uncovered target")
     patched = dict(config)
@@ -544,11 +945,14 @@ def _coverage_decision(observation: Any, memory: dict[str, Any], config: Mapping
 
 
 def _sequence_decision(observation: Any, memory: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
-    if transition_has_progress(observation.last_transition):
-        return _terminal("subgoal_succeeded", memory, "sequence solver observed meaningful progress")
+    evidence_ready, evidence = _objective_evidence_status(observation)
+    if evidence_ready:
+        return _terminal("subgoal_succeeded", memory, evidence)
     sequences = config["action_sequences"]
-    sequence_index = min(max(0, int(memory.get("sequence_index", 0))), len(sequences) - 1)
-    offset = max(0, int(memory.get("sequence_offset", 0)))
+    sequence_index = _memory_index(memory.get("sequence_index"), len(sequences) - 1)
+    offset = _memory_index(
+        memory.get("sequence_offset"), len(sequences[sequence_index])
+    )
     if transition_requires_replan(observation.last_transition) and offset:
         sequence_index += 1
         offset = 0
@@ -573,9 +977,28 @@ def _field_decision(observation: Any, memory: dict[str, Any], config: Mapping[st
     passable = _passability(observation.board, config)
     pair = min(((source, target) for source in sources for target in targets), key=lambda pair: abs(pair[0][0]-pair[1][0]) + abs(pair[0][1]-pair[1][1]))
     if line_of_sight(passable, pair[0], pair[1]):
-        action = _valid_action(observation, config["interaction_actions"])
-        if action:
-            return _continue(action, memory, "field solver activated a clear source-target line")
+        actions = config["interaction_actions"]
+        interaction = _interaction_choice(
+            observation,
+            memory,
+            actions,
+            (pair[1],),
+            "field solver activated a clear source-target line",
+        )
+        if interaction is not None:
+            return interaction
+        if actions:
+            return _terminal(
+                "subgoal_failed",
+                memory,
+                "field solver has no alternate clear-line interaction",
+            )
+        if _transition_evidence_mode(observation):
+            return _terminal(
+                "subgoal_failed",
+                memory,
+                "field geometry completed without required transition evidence",
+            )
         return _terminal("subgoal_succeeded", memory, "field solver verified source-target line of sight")
     if config["interactive_values"]:
         return _interaction_decision(observation, memory, config)
@@ -591,18 +1014,27 @@ def _field_decision(observation: Any, memory: dict[str, Any], config: Mapping[st
 def _transform_decision(
     observation: Any, memory: dict[str, Any], config: Mapping[str, Any]
 ) -> dict[str, Any]:
-    if transition_has_progress(observation.last_transition):
-        return _terminal("subgoal_succeeded", memory, "transform solver observed progress")
+    evidence_ready, evidence = _objective_evidence_status(observation)
+    if evidence_ready:
+        return _terminal("subgoal_succeeded", memory, evidence)
     if config["interactive_values"]:
         return _interaction_decision(observation, memory, config)
     targets = _points(observation.board, config["target_values"])
     if config["actor_values"]:
         return _route_decision(observation, memory, config, approach=True)
     if "MOUSE" in observation.valid_actions:
-        target = next(
-            (point for point in targets if 2 <= point[0] <= 61 and 2 <= point[1] <= 61),
-            None,
-        )
+        if _transition_evidence_mode(observation):
+            mouse_probe = _mouse_evidence_choice(
+                observation,
+                memory,
+                targets,
+                "transform solver gathered coordinate transition evidence",
+            )
+            if mouse_probe is not None:
+                return mouse_probe
+            target = None
+        else:
+            target = _untried_safe_point(targets, memory)
         if target is not None:
             return _mouse(target, memory, "transform solver selected a mismatched target")
     return _terminal(
@@ -611,20 +1043,36 @@ def _transform_decision(
 
 
 def _observe_decision(observation: Any, memory: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
-    if transition_has_progress(observation.last_transition):
-        return _terminal("subgoal_succeeded", memory, "observation solver detected progress")
-    index = max(0, int(memory.get("probe_index", 0)))
+    evidence_ready, evidence = _objective_evidence_status(observation)
+    if evidence_ready:
+        return _terminal("subgoal_succeeded", memory, evidence)
     probes = config["probe_actions"]
-    while index < len(probes):
-        action = probes[index]
-        index += 1
-        if action in observation.valid_actions:
-            memory["probe_index"] = index
-            return _continue(action, memory, "observation solver issued a bounded probe")
-    return _terminal("subgoal_failed", memory, "observation solver exhausted bounded probes")
+    return _bounded_probe_decision(
+        observation,
+        memory,
+        probes,
+        "observation solver issued a bounded probe",
+    )
 
 
 def _dispatch(solver_type: str, observation: Any, memory: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
+    objective = observation.objective
+    if isinstance(objective, Mapping) and objective:
+        evidence_ready, evidence = _objective_evidence_status(observation)
+        if evidence_ready:
+            return _terminal("subgoal_succeeded", memory, evidence)
+        budget_usage = _objective_budget_usage(observation)
+        if budget_usage is not None:
+            actions_used, action_budget = budget_usage
+            if actions_used >= action_budget:
+                return _terminal(
+                    "subgoal_failed",
+                    memory,
+                    "objective action budget exhausted "
+                    f"({actions_used}/{action_budget}) before required evidence: "
+                    f"{evidence}",
+                )
+
     family = solver_family(solver_type)
     if family == "routing":
         return _route_decision(observation, memory, config)
@@ -647,7 +1095,7 @@ def _dispatch(solver_type: str, observation: Any, memory: dict[str, Any], config
     if family == "observe":
         return _observe_decision(observation, memory, config)
     if family == "hybrid":
-        states = dict(memory.get("fallback_memory") or {})
+        states = _memory(memory.get("fallback_memory"))
         failures: list[str] = []
         for fallback in config["fallback_types"]:
             child_memory = _memory(states.get(fallback))
