@@ -1778,7 +1778,9 @@ def infer_game_state(
                 "edge_only",
             }:
                 continue
-            raw_shifts = object_motion.get("distinct_shifts_twice")
+            raw_shifts = object_motion.get("salient_distinct_shifts_twice")
+            if not isinstance(raw_shifts, (list, tuple)):
+                raw_shifts = object_motion.get("distinct_shifts_twice")
             shift_set: tuple[tuple[int, int], ...] = ()
             if isinstance(raw_shifts, (list, tuple)):
                 try:

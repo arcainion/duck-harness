@@ -24,6 +24,7 @@ from inference.agent.orchestrated_objective_agent import (
     _contract_requests_mouse,
     _equivalent_attempted_tactical,
     _failed_engine_progress_since_recalibration,
+    _host_control_model,
     _meaningful_progress,
     _objective_contract_hash,
     _policy_source_from_message,
@@ -483,6 +484,64 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             agent._reduce(frame(), [], request_deadline=None, should_stop=None)
 
         self.assertIn("non-navigation solver type", str(raised.exception))
+        agent.close()
+
+    def test_host_control_model_guides_and_enforces_linked_solver_selection(self) -> None:
+        def motion_entry(
+            action: str,
+            classification: str,
+            shifts: list[list[int]],
+            step: int,
+        ) -> HistoryEntry:
+            return HistoryEntry(
+                action=action,
+                frame=frame(step=step),
+                animation={
+                    "object_motion": {
+                        "tracking_available": True,
+                        "classification": classification,
+                        "salient_distinct_shifts_twice": shifts,
+                    }
+                },
+            )
+
+        history = [
+            motion_entry("UP", "coherent", [[-6, 0]], 1),
+            motion_entry("RIGHT", "opposing", [[0, -6], [0, 6]], 2),
+            motion_entry("LEFT", "opposing", [[0, -6], [0, 6]], 3),
+            motion_entry("DOWN", "coherent", [[6, 0]], 4),
+        ]
+        model = _host_control_model(history, level=1)
+
+        self.assertEqual("linked_mixed", model["scheme"])
+        self.assertEqual("high", model["confidence"])
+        self.assertTrue(model["linked_high_confidence"])
+        self.assertEqual("multi-agent", model["recommended_solver_types"][0])
+
+        rejected = reduction_for("level:1:1")
+        agent = self._agent()
+        agent._tree = ObjectiveTree.start_game(
+            "game-a", level=1, level_action_budget=20
+        )
+        agent.model_client = _ScriptedModelClient([rejected] * 3)
+        with self.assertRaises(OrchestrationFailure) as raised:
+            agent._reduce(frame(step=4), history, request_deadline=None, should_stop=None)
+        self.assertIn("host control model is high-confidence linked_mixed", str(raised.exception))
+        agent.close()
+
+        accepted = reduction_for("level:1:1")
+        accepted_subgoals = accepted["subgoals"]
+        assert isinstance(accepted_subgoals, list)
+        accepted_subgoals[0]["control_model_override"] = (
+            "This probe isolates a non-motion button before manipulating structures."
+        )
+        agent = self._agent()
+        agent._tree = ObjectiveTree.start_game(
+            "game-a", level=1, level_action_budget=20
+        )
+        agent.model_client = _ScriptedModelClient([accepted])
+        agent._reduce(frame(step=4), history, request_deadline=None, should_stop=None)
+        self.assertEqual("static", agent._tree.active.solver_type.value)
         agent.close()
 
     def test_solver_type_changes_contract_identity(self) -> None:

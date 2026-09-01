@@ -291,6 +291,13 @@ objective in the current level. Treat saturated=true as a hard prohibition: do n
 select a subgoal that requires that action family. High no_progress with zero stable
 changes or meaningful progress is strong negative evidence even when coordinates or
 object labels differ. Do not evade failed MOUSE evidence by scanning fresh coordinates.
+host_control_model is authoritative, salience-weighted component-motion evidence across
+the current level. When linked_high_confidence=true, select multi-agent, linked-centroid,
+or paired-platform-alignment for objectives that manipulate the moving structures.
+Do not fall back to static or single-actor routing merely because no engine progress has
+occurred. If linked motion truly does not govern the selected objective, include a
+specific control_model_override string of at least 20 characters in that selected
+subgoal; the host validates this exception and otherwise rejects the mismatch.
 After three consecutive failed engine_progress tactical objectives, the host requires a
 contrastive_transition recalibration before accepting another execution hypothesis.
 Use it to falsify the assumed control/action/coordinate mapping, not to rename the same
@@ -641,6 +648,148 @@ def _animation_summary(value: Any) -> dict[str, Any]:
             "object_motion",
         )
         if key in value
+    }
+
+
+def _host_control_model(
+    history: list[HistoryEntry], *, level: int, limit: int = 64
+) -> dict[str, Any]:
+    """Aggregate bounded host-observed component motion for objective reduction."""
+
+    allowed_classes = {
+        "coherent",
+        "opposing",
+        "divergent",
+        "stationary",
+        "ambiguous",
+        "edge_only",
+    }
+    directional = {"UP", "RIGHT", "DOWN", "LEFT"}
+    evidence: dict[str, dict[str, Any]] = {}
+    for entry in history[-max(1, min(256, int(limit))) :]:
+        if entry.frame.level != level:
+            continue
+        motion = entry.animation.get("object_motion")
+        if not isinstance(motion, dict) or motion.get("tracking_available") is not True:
+            continue
+        classification = str(motion.get("classification") or "").strip()
+        if classification not in allowed_classes:
+            continue
+        action = to_model_action(entry.action)
+        if action not in {*directional, "SPACE", "MOUSE"}:
+            continue
+        action_evidence = evidence.setdefault(
+            action, {"classifications": {}, "shift_sets": {}}
+        )
+        classifications = action_evidence["classifications"]
+        classifications[classification] = classifications.get(classification, 0) + 1
+        raw_shifts = motion.get("salient_distinct_shifts_twice")
+        if not isinstance(raw_shifts, list):
+            raw_shifts = motion.get("distinct_shifts_twice")
+        shift_set: tuple[tuple[int, int], ...] = ()
+        if isinstance(raw_shifts, list):
+            try:
+                shift_set = tuple(
+                    sorted(
+                        (int(item[0]), int(item[1]))
+                        for item in raw_shifts[:8]
+                        if isinstance(item, (list, tuple)) and len(item) == 2
+                    )
+                )
+            except (TypeError, ValueError, OverflowError):
+                shift_set = ()
+        shift_sets = action_evidence["shift_sets"]
+        shift_sets[shift_set] = shift_sets.get(shift_set, 0) + 1
+
+    by_action: dict[str, dict[str, Any]] = {}
+    totals: dict[str, int] = {}
+    directional_samples = 0
+    for action in ("UP", "RIGHT", "DOWN", "LEFT", "SPACE", "MOUSE"):
+        action_evidence = evidence.get(action)
+        if action_evidence is None:
+            continue
+        classifications = action_evidence["classifications"]
+        samples = sum(int(count) for count in classifications.values())
+        if action in directional:
+            directional_samples += samples
+        for classification, count in classifications.items():
+            totals[classification] = totals.get(classification, 0) + int(count)
+        dominant, dominant_count = sorted(
+            classifications.items(), key=lambda item: (-int(item[1]), str(item[0]))
+        )[0]
+        shift_sets = sorted(
+            action_evidence["shift_sets"].items(),
+            key=lambda item: (-int(item[1]), item[0]),
+        )[:4]
+        by_action[action] = {
+            "samples": samples,
+            "classifications": dict(sorted(classifications.items())),
+            "dominant_classification": str(dominant),
+            "consistency": round(float(dominant_count) / float(samples), 4),
+            "salient_shift_sets_twice": [
+                {
+                    "shifts": [list(shift) for shift in shift_set],
+                    "count": int(count),
+                }
+                for shift_set, count in shift_sets
+            ],
+        }
+
+    opposing = int(totals.get("opposing", 0))
+    coherent = int(totals.get("coherent", 0))
+    divergent = int(totals.get("divergent", 0))
+    if opposing and coherent:
+        scheme = "linked_mixed"
+    elif opposing:
+        scheme = "linked_opposing"
+    elif divergent:
+        scheme = "divergent_multi_object"
+    elif coherent:
+        scheme = "coherent"
+    elif totals:
+        scheme = "stationary_or_ambiguous"
+    else:
+        scheme = "unknown"
+    confidence = (
+        "high"
+        if opposing >= 2 and directional_samples >= 4
+        else "medium"
+        if opposing or divergent >= 2 or coherent >= 2
+        else "low"
+    )
+    linked_high_confidence = confidence == "high" and scheme in {
+        "linked_mixed",
+        "linked_opposing",
+    }
+    ineffective_actions = [
+        action
+        for action, item in by_action.items()
+        if item["dominant_classification"] in {"stationary", "edge_only"}
+        and float(item["consistency"]) >= 0.75
+    ]
+    return {
+        "schema_version": 1,
+        "scheme": scheme,
+        "confidence": confidence,
+        "linked_high_confidence": linked_high_confidence,
+        "samples": sum(int(count) for count in totals.values()),
+        "directional_samples": directional_samples,
+        "classifications": dict(sorted(totals.items())),
+        "by_action": by_action,
+        "ineffective_actions": ineffective_actions,
+        "recommended_solver_types": (
+            ["multi-agent", "linked-centroid", "paired-platform-alignment"]
+            if linked_high_confidence
+            else ["navigation", "guided-attraction"]
+            if scheme == "coherent"
+            else []
+        ),
+        "selection_constraint": (
+            "Prefer a linked multi-object or alignment solver. Generic static and "
+            "single-actor routing require control_model_override in the selected subgoal."
+            if linked_high_confidence
+            else "Advisory until additional repeatable motion evidence is observed."
+        ),
     }
 
 
@@ -2039,6 +2188,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "action_contract": dict(_MODEL_ACTION_CONTRACT),
             "recent_transitions": _recent_transition_payload(history),
             "level_action_evidence": self._level_action_evidence_payload(),
+            "host_control_model": _host_control_model(history, level=frame.level),
             "runtime_transition_scope": (
                 "PolicyObservation.last_transition and recent_transitions contain only "
                 "transitions whose objective_id matches active_objective. At objective "
@@ -2064,6 +2214,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 "the host level action budget is exhausted",
                 category="orchestration_level_action_budget_exhausted",
             )
+        host_control_model = _host_control_model(history, level=frame.level)
 
         def validate_reduction(raw: dict[str, Any]) -> ReductionProposal:
             proposal = ReductionProposal.from_payload(raw)
@@ -2096,6 +2247,26 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         "must localize the board, plan a route, and replan after changes"
                     )
                 selected_family = solver_family(selected.solver_type.value)
+                raw_selected = raw_subgoals[proposal.selected_index]
+                control_model_override = str(
+                    raw_selected.get("control_model_override") or ""
+                ).strip()[:400]
+                if (
+                    host_control_model["linked_high_confidence"]
+                    and selected_family in {"observe", "routing"}
+                    and len(control_model_override) < 20
+                ):
+                    recommended = ", ".join(
+                        host_control_model["recommended_solver_types"]
+                    )
+                    raise ObjectiveError(
+                        f"host control model is high-confidence "
+                        f"{host_control_model['scheme']}; solver type "
+                        f"{selected.solver_type.value!r} ({selected_family}) assumes "
+                        "static or single-actor dynamics. Select one of "
+                        f"{recommended}, or provide a specific control_model_override "
+                        "explaining why linked motion is irrelevant to this subgoal"
+                    )
                 if (
                     selected.execution_mode is TacticalExecutionMode.NAVIGATE
                     and selected_family not in NAVIGATION_SOLVER_FAMILIES
@@ -2182,6 +2353,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 if active.solver_type is not None
                 else ""
             ),
+            host_control_scheme=host_control_model["scheme"],
+            host_control_confidence=host_control_model["confidence"],
         )
 
     def _policy_payload(

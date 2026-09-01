@@ -64,6 +64,10 @@ class SolverControllerTests(TestCase):
             grid((2, 1, 1), (2, 2, 1), (4, 5, 2), (5, 5, 2)),
             grid((2, 2, 1), (2, 3, 1), (5, 5, 2), (6, 5, 2)),
         )
+        salience_weighted = summary(
+            grid((1, 1, 1), (1, 2, 1), (1, 4, 2), (1, 5, 2), (2, 6, 3)),
+            grid((2, 1, 1), (2, 2, 1), (2, 4, 2), (2, 5, 2), (5, 6, 3)),
+        )
         stationary = summary(
             grid((2, 2, 1)),
             grid((2, 2, 1)),
@@ -81,6 +85,11 @@ class SolverControllerTests(TestCase):
         self.assertEqual([[0, -2], [0, 2]], opposing["distinct_shifts_twice"])
         self.assertEqual("coherent", coherent["classification"])
         self.assertEqual("divergent", divergent["classification"])
+        self.assertEqual("coherent", salience_weighted["classification"])
+        self.assertEqual(
+            [[2, 0]], salience_weighted["salient_distinct_shifts_twice"]
+        )
+        self.assertIn([6, 0], salience_weighted["distinct_shifts_twice"])
         self.assertEqual("stationary", stationary["classification"])
         self.assertEqual("edge_only", edge_only["classification"])
         self.assertTrue(edge_only["edge_only_change"])

@@ -166,7 +166,7 @@ def _component_motion_summary(
     """Match bounded interior components and classify their displacement pattern."""
 
     unavailable = {
-        "schema_version": 1,
+        "schema_version": 2,
         "tracking_available": False,
         "classification": "ambiguous",
         "confidence": "low",
@@ -178,6 +178,10 @@ def _component_motion_summary(
         "removed_count": 0,
         "ambiguous_matches": 0,
         "distinct_shifts_twice": [],
+        "salient_size_threshold": 1,
+        "salient_moved_count": 0,
+        "salient_component_cells": 0,
+        "salient_distinct_shifts_twice": [],
         "moved": [],
         "truncated": False,
     }
@@ -263,7 +267,6 @@ def _component_motion_summary(
     stable_count = 0
     ambiguous_matches = 0
     unmatched_after = 0
-    unambiguous_moved = 0
     for item in after_objects:
         candidates = [
             index
@@ -301,7 +304,6 @@ def _component_motion_summary(
             stable_count += 1
             continue
         moved_count += 1
-        unambiguous_moved += not ambiguous
         if len(moved) < maximum_moves:
             moved.append(
                 {
@@ -319,17 +321,33 @@ def _component_motion_summary(
         for row, col in changed_coordinates
     )
     shifts = sorted({tuple(item["shift_twice"]) for item in moved})
-    opposing = any((-row, -col) in shifts for row, col in shifts if row or col)
+    largest_moved = max((int(item["size"]) for item in moved), default=0)
+    salient_size_threshold = (
+        1 if largest_moved <= 1 else max(2, (largest_moved + 9) // 10)
+    )
+    salient_moved = [
+        item for item in moved if int(item["size"]) >= salient_size_threshold
+    ]
+    salient_shifts = sorted(
+        {tuple(item["shift_twice"]) for item in salient_moved}
+    )
+    opposing = any(
+        (-row, -col) in salient_shifts
+        for row, col in salient_shifts
+        if row or col
+    )
+    salient_ambiguous = sum(bool(item["ambiguous"]) for item in salient_moved)
+    salient_unambiguous = len(salient_moved) - salient_ambiguous
     truncated = before_truncated or after_truncated or moved_count > maximum_moves
     if changed_coordinates and not interior_changed:
         classification = "edge_only"
-    elif ambiguous_matches and not unambiguous_moved:
+    elif salient_ambiguous and not salient_unambiguous:
         classification = "ambiguous"
-    elif not moved:
+    elif not salient_moved:
         classification = "stationary"
     elif opposing:
         classification = "opposing"
-    elif len(shifts) == 1:
+    elif len(salient_shifts) == 1:
         classification = "coherent"
     else:
         classification = "divergent"
@@ -341,7 +359,7 @@ def _component_motion_summary(
         else "medium"
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "tracking_available": True,
         "classification": classification,
         "confidence": confidence,
@@ -353,6 +371,12 @@ def _component_motion_summary(
         "removed_count": len(remaining_before),
         "ambiguous_matches": ambiguous_matches,
         "distinct_shifts_twice": [list(shift) for shift in shifts[:8]],
+        "salient_size_threshold": salient_size_threshold,
+        "salient_moved_count": len(salient_moved),
+        "salient_component_cells": sum(int(item["size"]) for item in salient_moved),
+        "salient_distinct_shifts_twice": [
+            list(shift) for shift in salient_shifts[:8]
+        ],
         "moved": moved,
         "truncated": truncated,
     }
