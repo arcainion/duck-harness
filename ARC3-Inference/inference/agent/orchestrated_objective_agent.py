@@ -65,7 +65,6 @@ _MAX_ROLE_HISTORY = 12
 _MAX_STRUCTURED_ATTEMPTS = 3
 _MAX_POLICY_REPAIRS = 2
 _MAX_NO_ACTION_BOUNDARIES = 8
-_MAX_CONSECUTIVE_POLICY_FAILURES = _MAX_POLICY_REPAIRS + 1
 _ACTION_FAMILY_SATURATION_ATTEMPTS = 12
 _STRATEGIC_RECALIBRATION_FAILURES = 3
 _DEFAULT_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS = 300.0
@@ -102,7 +101,6 @@ _MODEL_ACTION_CONTRACT = {
     "RIGHT": "move right",
     "SPACE": "press space",
     "MOUSE": "click one board cell; integer row and col from 0 through 63 are required",
-    "ACTION7": "engine-defined seventh action",
 }
 
 
@@ -138,6 +136,7 @@ def _empty_orchestration_metrics() -> dict[str, int | float]:
         "policy_provisional_caches": 0,
         "role_context_adjustments": 0,
         "policy_repairs": 0,
+        "policy_activation_exhaustion_recoveries": 0,
         "policy_steps": 0,
         "cuda_fallbacks": 0,
         "cpu_policy_seconds": 0.0,
@@ -276,7 +275,7 @@ observations needed to prove the declared criteria, normally 4 for exploration a
 only for conclusive evidence. Use valid JSON with
 double-quoted keys and strings. Keep reasoning compact and reserve response space for
 the complete JSON object. All valid action names are already model-facing: UP, DOWN,
-LEFT, RIGHT, SPACE, MOUSE, or ACTION7. These meanings are exact, not hypotheses.
+LEFT, RIGHT, SPACE, or MOUSE. These meanings are exact, not hypotheses.
 MOUSE always requires integer row and col coordinates from 0 through 63. Never invent
 or reason about hidden ACTION1 through ACTION6 aliases. A mere board change is not
 necessarily progress: volatile_only and exact_noop outcomes are negative evidence.
@@ -324,7 +323,7 @@ POLICY_API_VERSION = 1
 SUPPORTED_BACKENDS = ("cpu",)
 POLICY_REUSE_SCOPE = "none"
 POLICY_SOLVER_TYPE = "static"
-POLICY_SOLVER_CONFIG = {"probe_actions": ["ACTION7"]}
+POLICY_SOLVER_CONFIG = {"probe_actions": ["SPACE"]}
 
 def initialize(context):
     return {}
@@ -336,7 +335,7 @@ def decide(observation, memory):
 END_POLICY
 
 All observation.valid_actions names are already model-facing and have exact meanings:
-UP, DOWN, LEFT, RIGHT, SPACE, MOUSE, or ACTION7. Never emit or reason about hidden
+UP, DOWN, LEFT, RIGHT, SPACE, or MOUSE. Never emit or reason about hidden
 ACTION1 through ACTION6 aliases. For MOUSE, action is
 {"action": "MOUSE", "row": row, "col": col}; integer row and col coordinates from
 0 through 63 are always required. A terminal
@@ -393,11 +392,11 @@ coordinate after the minimum evidence count; this completes only the tactical le
 goal and proves repeatability, not causality. For contrastive_transition, require the
 same exact positive action or coordinate to produce stable change at least twice and a
 distinct executed same-modality negative-control action or coordinate without a
-corresponding stable change. Pair directions only with directions, MOUSE coordinates
-only with MOUSE coordinates, and SPACE/ACTION7 buttons with each other. For static
+corresponding stable change. Pair directions only with directions and MOUSE coordinates
+only with MOUSE coordinates. SPACE has no distinct same-modality control. For static
 contrastive probe_actions, separate repeated positives with the negative
 control so synthetic exact_noop preflight observations advance through different
-actions; for example, SPACE, ACTION7, SPACE, ACTION7 rather than consecutive SPACE.
+actions; for example, UP, RIGHT, UP, RIGHT rather than consecutive UP.
 Default to POLICY_REUSE_SCOPE = "none" when uncertain. The declaration is
 only a reuse candidate; the host qualifies, limits, and may evict it. The host always
 supplies fresh memory/context and preflights a reused policy against the new objective;
@@ -2193,7 +2192,6 @@ class OrchestratedObjectiveAgent(ToolAgent):
             repeated = {action for action in probes if probes.count(action) >= 2}
             modalities = {
                 "direction": {"UP", "DOWN", "LEFT", "RIGHT"},
-                "button": {"SPACE", "ACTION7"},
             }
             has_same_modality_control = any(
                 positive in actions
@@ -2212,7 +2210,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 raise PolicyRuntimeError(
                     "contrastive observation policy probe_actions must repeat one exact "
                     "positive action and include a distinct same-modality negative control "
-                    "(direction versus direction or button versus button)",
+                    "(direction versus direction; SPACE has no distinct button control)",
                     category="policy_solver_contract",
                 )
         if (
@@ -2905,15 +2903,27 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 objective_id=objective_id,
                 evidence=evidence,
             )
-        if (
-            counts_activation_failure
-            and self._consecutive_activation_failures
-            >= _MAX_CONSECUTIVE_POLICY_FAILURES
-        ):
-            raise OrchestrationFailure(
-                "the initial policy and two replacements failed before executing an action",
-                category="orchestration_policy_activation_exhausted",
-            ) from exc
+            if counts_activation_failure:
+                self._orchestration_metrics[
+                    "policy_activation_exhaustion_recoveries"
+                ] = (
+                    int(
+                        self._orchestration_metrics.get(
+                            "policy_activation_exhaustion_recoveries", 0
+                        )
+                    )
+                    + 1
+                )
+                self._emit_event(
+                    "policy_activation_exhaustion_routed_to_reducer",
+                    objective_id=objective_id,
+                    activation_failures=self._consecutive_activation_failures,
+                    no_action_boundary_limit=_MAX_NO_ACTION_BOUNDARIES,
+                )
+            # This streak is scoped to the failed tactical leaf. The enclosing
+            # analyze loop retains its independent no-action boundary ceiling.
+            self._consecutive_activation_failures = 0
+            self._failure_streak_objective_id = ""
 
     def _tactical_completion_evidence(self) -> tuple[bool, str]:
         """Decide whether host evidence is strong enough to resolve a tactical leaf."""

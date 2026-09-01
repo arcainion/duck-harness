@@ -59,7 +59,6 @@ from inference.agent.policy_codegen_helpers import (
 class PolicyCodegenHelperTests(unittest.TestCase):
     def test_action_payload_canonicalizes_names_and_mappings(self) -> None:
         self.assertEqual({"action": "UP"}, action_payload(" up "))
-        self.assertEqual({"action": "ACTION7"}, action_payload({"action": "action7"}))
         self.assertEqual(
             {"action": "MOUSE", "row": 12, "col": 34},
             action_payload("mouse", (12, 34)),
@@ -72,6 +71,7 @@ class PolicyCodegenHelperTests(unittest.TestCase):
     def test_action_payload_rejects_invalid_names_and_coordinates(self) -> None:
         cases = (
             (("ACTION1", None), "one of"),
+            (("ACTION7", None), "one of"),
             (("MOUSE", None), "requires"),
             (("MOUSE", (64, 0)), "between 0 and 63"),
             (("UP", (1, 2)), "does not accept"),
@@ -430,9 +430,9 @@ class PolicyCodegenHelperTests(unittest.TestCase):
     ) -> None:
         original = {"stable_keys": {"UP": 1}}
         updated = memory_mapping_increment(original, "stable_keys", "UP")
-        updated = memory_mapping_increment(updated, "stable_keys", "ACTION7", 2)
+        updated = memory_mapping_increment(updated, "stable_keys", "SPACE", 2)
         self.assertEqual(
-            {"stable_keys": {"UP": 2, "ACTION7": 2}},
+            {"stable_keys": {"UP": 2, "SPACE": 2}},
             updated,
         )
         self.assertEqual({"stable_keys": {"UP": 1}}, original)

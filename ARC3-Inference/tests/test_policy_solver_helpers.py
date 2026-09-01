@@ -75,7 +75,7 @@ def observation(
         level=1,
         step=0,
         valid_actions=valid_actions
-        or ("UP", "RIGHT", "DOWN", "LEFT", "SPACE", "MOUSE", "ACTION7"),
+        or ("UP", "RIGHT", "DOWN", "LEFT", "SPACE", "MOUSE"),
         last_transition=last_transition,
         objective={},
         recent_transitions=(),
@@ -96,14 +96,14 @@ def config_for(solver_type: str) -> dict:
         "approach_distance": 1,
     }
     if family == "sequence":
-        common["action_sequences"] = [["RIGHT", "SPACE"], ["ACTION7"]]
+        common["action_sequences"] = [["RIGHT", "SPACE"], ["LEFT"]]
     if family == "observe":
-        common["probe_actions"] = ["ACTION7", "SPACE"]
+        common["probe_actions"] = ["UP", "RIGHT"]
     if family == "hybrid":
         return {
             "fallback_types": ["static", "navigation"],
             "fallback_configs": {
-                "static": {"probe_actions": ["ACTION7"]},
+                "static": {"probe_actions": ["SPACE"]},
                 "navigation": {
                     "actor_values": [1],
                     "target_values": [2],
@@ -228,6 +228,71 @@ class PolicySolverHelperTests(unittest.TestCase):
 
         self.assertEqual("subgoal_failed", edge_result["status"])
         self.assertEqual("subgoal_failed", repeated["status"])
+
+    def test_interaction_uses_distinct_cells_within_one_connected_region(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+        board[10:13, 20:23] = 3
+        board.setflags(write=False)
+        first_observation = observation(valid_actions=("MOUSE",))
+        first_observation.board = board
+        config = {
+            "interactive_values": [3],
+            "interaction_actions": ["MOUSE"],
+        }
+
+        first = solver_decide("click-interaction", first_observation, {}, config)
+        first_action = first["action"]
+        second_observation = observation(
+            valid_actions=("MOUSE",),
+            last_transition={
+                **first_action,
+                "executed": True,
+                "board_changed": False,
+                "outcome_class": "exact_noop",
+            },
+        )
+        second_observation.board = board
+        second = solver_decide(
+            "click-interaction", second_observation, first["memory"], config
+        )
+
+        self.assertEqual("continue", first["status"])
+        self.assertEqual("MOUSE", first_action["action"])
+        self.assertEqual("continue", second["status"])
+        self.assertEqual("MOUSE", second["action"]["action"])
+        self.assertNotEqual(first_action, second["action"])
+
+    def test_interaction_never_emits_coordinate_less_mouse_fallback(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+        board[8, 8] = 3
+        board.setflags(write=False)
+        first_observation = observation(valid_actions=("MOUSE",))
+        first_observation.board = board
+        config = {
+            "interactive_values": [3],
+            "interaction_actions": ["MOUSE"],
+            "probe_actions": ["MOUSE"],
+        }
+
+        first = solver_decide("click-interaction", first_observation, {}, config)
+        exhausted_observation = observation(
+            valid_actions=("MOUSE",),
+            last_transition={
+                **first["action"],
+                "executed": True,
+                "board_changed": False,
+                "outcome_class": "exact_noop",
+            },
+        )
+        exhausted_observation.board = board
+        exhausted = solver_decide(
+            "click-interaction", exhausted_observation, first["memory"], config
+        )
+
+        self.assertEqual({"action": "MOUSE", "row": 8, "col": 8}, first["action"])
+        self.assertEqual("subgoal_failed", exhausted["status"])
+        self.assertIsNone(exhausted["action"])
+        self.assertIn("no untried coordinate", exhausted["evidence"])
 
     def test_physics_normalizes_stride_and_rejects_blocked_gravity_repeat(self) -> None:
         physics_board = np.zeros((64, 64), dtype=np.uint8)

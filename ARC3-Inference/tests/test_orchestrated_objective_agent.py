@@ -362,7 +362,7 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             )
         ).subgoals[0]
         probe = ReductionProposal.from_payload(
-            reduction_for("level:1:1", title="Probe ACTION7 for a stable effect")
+            reduction_for("level:1:1", title="Probe SPACE for a stable effect")
         ).subgoals[0]
 
         self.assertTrue(_contract_requires_navigation(spatial))
@@ -1001,7 +1001,7 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertIn("contrastive_transition", str(raised.exception))
 
         recalibration = reduction_for(
-            "level:1:1", title="Contrast ACTION7 against SPACE"
+            "level:1:1", title="Contrast UP against RIGHT"
         )
         subgoals = recalibration["subgoals"]
         assert isinstance(subgoals, list)
@@ -2898,7 +2898,7 @@ def decide(observation, memory):
             self.assertFalse(agent._restore_policy_if_possible())
             agent.close()
 
-    def test_initial_policy_and_two_repairs_are_allowed_before_exhaustion(self) -> None:
+    def test_initial_policy_and_two_repairs_route_exhausted_leaf_to_reducer(self) -> None:
         agent = self._agent()
         tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
         tree.apply_proposal(
@@ -2928,12 +2928,91 @@ def decide(observation, memory):
         self.assertFalse(agent._reduction_required)
         agent._policy_failure(failure)
         self.assertFalse(agent._reduction_required)
-        with self.assertRaisesRegex(
-            RuntimeError, "initial policy and two replacements"
-        ):
-            agent._policy_failure(failure)
+        agent._policy_failure(failure)
+
         self.assertTrue(agent._reduction_required)
+        self.assertEqual(ObjectiveStatus.FAILED, tree.nodes["tactical:1"].status)
+        self.assertEqual(0, agent._consecutive_activation_failures)
+        self.assertEqual("", agent._failure_streak_objective_id)
+        self.assertEqual(
+            1,
+            agent._orchestration_metrics[
+                "policy_activation_exhaustion_recoveries"
+            ],
+        )
         agent.close()
+
+    def test_activation_exhaustion_reduces_to_replacement_leaf_in_same_turn(
+        self,
+    ) -> None:
+        replacement = reduction_for(
+            "level:1:1", title="Measure repeatable alternate control"
+        )
+        replacement_subgoal = replacement["subgoals"][0]
+        assert isinstance(replacement_subgoal, dict)
+        replacement_subgoal.update(
+            {
+                "success_criteria": "an alternate control changes the board twice",
+                "failure_criteria": "four alternate probes do not change the board",
+                "expected_evidence": "two stable transitions",
+                "evidence_mode": "stable_transition",
+                "minimum_evidence_actions": 2,
+            }
+        )
+        client = _ScriptedModelClient(
+            [
+                reduction_for("level:1:1"),
+                policy_for("tactical:1"),
+                policy_for("tactical:1"),
+                policy_for("tactical:1"),
+                replacement,
+                policy_for("tactical:2"),
+            ]
+        )
+        runtimes = [
+            _PreflightRejectingRuntime(),
+            _PreflightRejectingRuntime(),
+            _PreflightRejectingRuntime(),
+            _FakeRuntime(),
+        ]
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch(
+                "inference.agent.orchestrated_objective_agent.GameplayPolicyRuntime",
+                side_effect=runtimes,
+            ),
+        ):
+            state_path = Path(temp_dir) / "runtime_state.json"
+            write_runtime_state(state_path, current_frame=frame(), history=[])
+            agent = self._agent()
+            agent.model_client = client
+
+            result = agent.analyze(
+                state_path,
+                0,
+                valid_actions=["ACTION1"],
+                step_env=lambda _payload: {
+                    "executed": True,
+                    "board_changed": True,
+                },
+            )
+
+            self.assertTrue(result.step_executed)
+            self.assertEqual(6, client.calls)
+            assert agent._tree is not None
+            self.assertEqual(
+                ObjectiveStatus.FAILED,
+                agent._tree.nodes["tactical:1"].status,
+            )
+            self.assertEqual("tactical:2", agent._tree.active_id)
+            self.assertEqual(1, agent._tree.active.actions_used)
+            self.assertEqual(
+                1,
+                agent._orchestration_metrics[
+                    "policy_activation_exhaustion_recoveries"
+                ],
+            )
+            agent.close()
 
     def test_post_action_failures_exhaust_leaf_without_activation_exhaustion(
         self,

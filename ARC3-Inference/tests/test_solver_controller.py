@@ -999,18 +999,21 @@ class SolverControllerTests(TestCase):
         self.assertEqual(session.level_no_progress_token_status(), (1, 5000, 75000))
         self.assertFalse(session.level_no_progress_token_limit_reached())
 
-    def test_action7_round_trips_through_normalize_actions(self) -> None:
-        self.assertEqual(to_engine_action("ACTION7"), "ACTION7")
-        self.assertEqual(to_model_action("ACTION7"), "ACTION7")
+    def test_action7_is_filtered_and_rejected(self) -> None:
+        self.assertIsNone(to_engine_action("ACTION7"))
+        self.assertEqual(to_model_action("ACTION7"), "")
+        self.assertEqual(
+            to_model_actions(["ACTION1", "ACTION7", "ACTION5"]),
+            ["UP", "SPACE"],
+        )
 
         session = object.__new__(_HarnessGameSession)
         actions, error = session._normalize_actions(
             {"actions": [{"action": "ACTION7"}]}
         )
 
-        self.assertIsNone(error)
-        self.assertEqual(len(actions), 1)
-        self.assertEqual(actions[0].id, arcengine.GameAction.ACTION7)
+        self.assertIsNone(actions)
+        self.assertIn("Unknown action", error or "")
 
     def test_mouse_action_rejects_boolean_coordinates(self) -> None:
         session = object.__new__(_HarnessGameSession)

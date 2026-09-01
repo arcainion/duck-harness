@@ -387,7 +387,7 @@ grammar and prevents tool-call escaping from corrupting generated content. Each
 role uses one HTTP attempt per orchestration attempt; three rejected attempts
 exhaust the role visibly instead of restarting through the controller. Reducer,
 coder, and policy observations receive only the exact model-facing action names
-`UP`, `DOWN`, `LEFT`, `RIGHT`, `SPACE`, `MOUSE`, and `ACTION7`; conversion to
+`UP`, `DOWN`, `LEFT`, `RIGHT`, `SPACE`, and `MOUSE`; conversion to
 engine aliases happens only at the controller boundary, and `MOUSE` always
 requires bounded row/column coordinates. Pre-action failure streaks are scoped
 to one tactical leaf, and a policy receives one terminal-only evaluation of the

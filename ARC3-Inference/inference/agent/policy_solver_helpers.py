@@ -459,17 +459,21 @@ def _gravity_decision(observation: Any, memory: dict[str, Any], config: Mapping[
 def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
     if transition_has_progress(observation.last_transition):
         return _terminal("subgoal_succeeded", memory, "interaction solver observed meaningful progress")
-    points = (
-        tuple(
-            point
-            for point in component_centers(
-                value_mask(observation.board, config["interactive_values"])
-            )
-            if 2 <= point[0] <= 61 and 2 <= point[1] <= 61
-        )
-        if config["interactive_values"]
-        else ()
-    )
+    points: list[tuple[int, int]] = []
+    if config["interactive_values"]:
+        mask = value_mask(observation.board, config["interactive_values"])
+        # Try one representative per component first, then deterministic cells
+        # within connected regions. A component center alone cannot provide the
+        # distinct coordinates required by contrastive click objectives.
+        for point in (*component_centers(mask), *_points(observation.board, config["interactive_values"])):
+            if (
+                2 <= point[0] <= 61
+                and 2 <= point[1] <= 61
+                and point not in points
+            ):
+                points.append(point)
+                if len(points) >= 64:
+                    break
     tried = {tuple(item) for item in memory.get("tried_points", []) if isinstance(item, list) and len(item) == 2}
     if "MOUSE" in observation.valid_actions:
         target = next((point for point in points if point not in tried), None)
@@ -482,13 +486,18 @@ def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapp
     available = [
         action
         for action in actions
-        if action in observation.valid_actions
+        if action != "MOUSE"
+        and action in observation.valid_actions
         and not transition_repeats_nonprogress_action(
             observation.last_transition, action
         )
     ]
     if not available:
-        return _terminal("subgoal_failed", memory, "interaction solver has no valid configured action")
+        return _terminal(
+            "subgoal_failed",
+            memory,
+            "interaction solver has no untried coordinate or valid non-MOUSE configured action",
+        )
     action = min(available, key=lambda item: (int(counts.get(item, 0)), item))
     counts[action] = int(counts.get(action, 0)) + 1
     memory["action_counts"] = counts

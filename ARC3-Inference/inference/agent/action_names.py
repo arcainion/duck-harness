@@ -14,9 +14,10 @@ ENGINE_TO_MODEL_ACTION = {
     "ACTION4": "RIGHT",
     "ACTION5": "SPACE",
     "ACTION6": "MOUSE",
-    "ACTION7": "ACTION7",
     "RESET": "RESET",
 }
+
+DISABLED_ACTIONS = frozenset({"ACTION7"})
 
 MODEL_TO_ENGINE_ACTION = {value: key for key, value in ENGINE_TO_MODEL_ACTION.items()}
 
@@ -27,12 +28,14 @@ def _action_text(name: Any) -> str:
 
 def to_model_action(name: str | None) -> str:
     raw = _action_text(name)
+    if raw in DISABLED_ACTIONS:
+        return ""
     return ENGINE_TO_MODEL_ACTION.get(raw, raw)
 
 
 def to_engine_action(name: str | None) -> str | None:
     raw = _action_text(name)
-    if not raw:
+    if not raw or raw in DISABLED_ACTIONS:
         return None
     if raw in ENGINE_TO_MODEL_ACTION:
         return raw

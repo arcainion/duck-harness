@@ -16,7 +16,7 @@ from inference.agent.policy_pathfinding import next_path_action
 
 
 POLICY_CODEGEN_API_VERSION = 1
-POLICY_ACTIONS = ("UP", "RIGHT", "DOWN", "LEFT", "SPACE", "MOUSE", "ACTION7")
+POLICY_ACTIONS = ("UP", "RIGHT", "DOWN", "LEFT", "SPACE", "MOUSE")
 POLICY_BOARD_HEX_SYMBOLS = "0123456789abcdef"
 MAX_HELPER_MEMORY_BYTES = 32_768
 MAX_HELPER_MEMORY_KEYS = 64
@@ -588,8 +588,6 @@ def contrastive_transition_evidence_status(
             return "directional"
         if action == "MOUSE":
             return "mouse"
-        if action in {"SPACE", "ACTION7"}:
-            return "button"
         return f"action:{action}"
 
     def safe_negative(item: Mapping[str, Any]) -> bool:
