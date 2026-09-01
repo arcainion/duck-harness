@@ -444,6 +444,46 @@ def _navigation_evidence_probes(observation: Any) -> tuple[str, ...]:
     return tuple(probes)
 
 
+def _route_engine_progress_liveness(
+    observation: Any,
+    memory: dict[str, Any],
+    config: Mapping[str, Any],
+    terminal_evidence: str,
+    *,
+    terminal_status: str = "subgoal_failed",
+) -> dict[str, Any]:
+    """Probe safely when route geometry cannot yet satisfy engine evidence."""
+
+    objective = observation.objective
+    mode = (
+        str(objective.get("evidence_mode") or "").strip().lower()
+        if isinstance(objective, Mapping) and objective
+        else ""
+    )
+    if mode != "engine_progress":
+        return _terminal(terminal_status, memory, terminal_evidence)
+    configured = tuple(
+        action for action in config["probe_actions"] if action != "MOUSE"
+    )
+    probes = tuple(
+        dict.fromkeys((*configured, *_navigation_evidence_probes(observation)))
+    )
+    result = _bounded_probe_decision(
+        observation,
+        memory,
+        probes,
+        "trusted solver used a bounded engine-progress probe after route geometry "
+        f"terminated: {terminal_evidence}",
+    )
+    if result.get("status") == "subgoal_failed":
+        return _terminal(
+            "subgoal_failed",
+            memory,
+            f"{terminal_evidence}; solver exhausted bounded engine-progress probes",
+        )
+    return result
+
+
 def _untried_safe_point(
     candidates: Sequence[tuple[int, int]], memory: dict[str, Any]
 ) -> tuple[int, int] | None:
@@ -731,13 +771,29 @@ def _route_decision(
         )
     )
     if not path:
-        return _terminal("subgoal_failed", memory, "solver found no traversable route")
+        return _route_engine_progress_liveness(
+            observation,
+            memory,
+            config,
+            "solver found no traversable route",
+        )
     if len(path) == 1:
-        return _terminal("subgoal_succeeded", memory, "solver reached the configured target")
+        return _route_engine_progress_liveness(
+            observation,
+            memory,
+            config,
+            "solver reached the configured target",
+            terminal_status="subgoal_succeeded",
+        )
     path = path[: int(config["max_plan_length"])]
     action = next_path_action(path, observation.valid_actions)
     if action is None:
-        return _terminal("subgoal_failed", memory, "solver route has no currently valid action")
+        return _route_engine_progress_liveness(
+            observation,
+            memory,
+            config,
+            "solver route has no currently valid action",
+        )
     memory.update(
         {
             "actor": list(actor),

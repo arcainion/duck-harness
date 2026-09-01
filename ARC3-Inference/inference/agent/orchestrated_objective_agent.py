@@ -455,6 +455,37 @@ detects the exact action/coordinate repeat. POLICY_CODEGEN_API_VERSION is 1.
 transition_facts(last_transition) provides one bounded JSON snapshot, while
 transition_change_class(last_transition) preserves host state-change classes such as
 novel, revisit, volatile_only, and exact_noop independently of progress.
+infer_game_state(observation) returns a bounded JSON snapshot of board palette,
+component counts, foreground bounds, controls, objective budget, latest transition,
+spatial symmetry/topology cues, motion summaries, and classified per-action effects.
+controls["dynamics"] empirically maps directional actions to observed stable motion and
+classifies the scheme as standard, inverted, rotated, remapped, or state-dependent.
+Treat its confidence as advisory: animation motion can describe world motion or scrolling.
+Pass the prior result or its compact result["state_token"] as previous_state to obtain
+a state_delta that distinguishes unchanged boards, candidate translations, growth,
+shrinkage, topology changes, and recolor/transform changes without storing a board.
+Tokens are bound to level and board shape; a mismatch returns change_type=scope_reset
+instead of comparing unrelated states. A substantially present prior background remains
+stable across temporary palette-dominance flips and board["background_source"] reports
+whether continuity or dominant-color inference selected it.
+The compact token also contains at most 32 same-color object descriptors; state_delta[
+"object_changes"] deterministically reports stable, moved, resized, added, and removed
+objects, including per-object doubled-center shifts. Treat objects_truncated=true as
+partial evidence rather than a complete inventory.
+board["object_layout"] summarizes at most 32 nearest bounding-box relations, alignment
+overlaps/gaps, containment candidates, and repeated shape groups. Bounding-box contact
+is only a candidate relation, not proof that irregular object cells touch.
+infer_game_type(observation) ranks advisory routing, interaction, sequence, transform,
+multi_agent, hybrid, or observe families with explicit confidence, evidence,
+coverage, objective-alignment diagnostics, recommended registered solver types, and
+ranked unresolved probes. Its control_scheme repeats the empirical directional mapping
+so solver selection can avoid assuming standard controls. MOUSE probe suggestions always require a separately derived
+safe coordinate. infer_game_type accepts the same optional previous_state and uses the
+delta to distinguish routing-like translation from transform-like dynamics and coherent
+translation from divergent multi-object motion;
+the latter raises a multi_agent hypothesis and recommends registered cooperative solvers.
+Use these helpers to form or check hypotheses, not as proof of engine progress or as a
+replacement for the objective's declared solver.
 transition_has_stable_change(last_transition) accepts only executed, board-changing,
 non-cyclic, nonvolatile learning evidence. For evidence_mode=stable_transition,
 call stable_transition_evidence_ready(observation.objective,
@@ -661,6 +692,28 @@ _TACTICAL_CONTRACT_STOPWORDS = frozenset(
     }
 )
 
+_TACTICAL_ACTION_TERMS = {
+    "click": "MOUSE",
+    "clicked": "MOUSE",
+    "clicking": "MOUSE",
+    "clicks": "MOUSE",
+    "cursor": "MOUSE",
+    "down": "DOWN",
+    "downward": "DOWN",
+    "downwards": "DOWN",
+    "left": "LEFT",
+    "leftward": "LEFT",
+    "leftwards": "LEFT",
+    "mouse": "MOUSE",
+    "right": "RIGHT",
+    "rightward": "RIGHT",
+    "rightwards": "RIGHT",
+    "space": "SPACE",
+    "up": "UP",
+    "upward": "UP",
+    "upwards": "UP",
+}
+
 
 def _tactical_contract_terms(value: Any) -> frozenset[str]:
     """Return deterministic salient terms for host-side anti-churn checks."""
@@ -689,6 +742,17 @@ def _tactical_title_terms(value: Any) -> frozenset[str]:
         token
         for token in re.findall(r"[a-z]+|\d+", str(text or "").lower())
         if len(token) > 1 and token not in _TACTICAL_CONTRACT_STOPWORDS
+    )
+
+
+def _tactical_title_actions(value: Any) -> frozenset[str]:
+    """Return canonical controls explicitly named by a tactical title."""
+
+    text = value.title if isinstance(value, SubgoalSpec) else getattr(value, "title", "")
+    return frozenset(
+        action
+        for token in re.findall(r"[a-z]+", str(text or "").lower())
+        if (action := _TACTICAL_ACTION_TERMS.get(token)) is not None
     )
 
 
@@ -909,6 +973,10 @@ def _equivalent_attempted_tactical(
             or node.execution_mode is not spec.execution_mode
             or node.solver_type is not spec.solver_type
         ):
+            continue
+        node_actions = _tactical_title_actions(node)
+        spec_actions = _tactical_title_actions(spec)
+        if node_actions and spec_actions and node_actions.isdisjoint(spec_actions):
             continue
         if (
             _tactical_contract_similarity(node, spec) >= threshold

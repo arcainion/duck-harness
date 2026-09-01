@@ -317,6 +317,81 @@ class PolicySolverHelperTests(unittest.TestCase):
         self.assertEqual("subgoal_succeeded", result["status"])
         self.assertIn("negative-control", result["evidence"])
 
+    def test_engine_progress_navigation_stays_live_at_geometric_terminal(self) -> None:
+        current = observation()
+        current.objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "engine_progress",
+            "minimum_evidence_actions": 4,
+            "action_budget": 8,
+            "actions_used": 0,
+        }
+        config = {
+            **config_for("navigation"),
+            "target_values": [1],
+            "approach_distance": 0,
+        }
+        memory: dict = {}
+        actions: list[str] = []
+        recent: list[dict] = []
+
+        for step in range(4):
+            result = solver_decide("navigation", current, memory, config)
+            self.assertEqual("continue", result["status"])
+            actions.append(result["action"]["action"])
+            memory = result["memory"]
+            transition = {
+                "objective_id": "tactical:1",
+                "action": actions[-1],
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": False,
+                "meaningful_progress": False,
+                "outcome_class": "exact_noop",
+                "cycle_risk": False,
+                "loop_detected": False,
+                "error": "",
+            }
+            recent.append(transition)
+            current.last_transition = transition
+            current.recent_transitions = tuple(recent)
+            current.step = step + 1
+
+        self.assertEqual(4, len(set(actions)))
+
+    def test_engine_progress_navigation_probes_when_route_is_unavailable(self) -> None:
+        current = observation()
+        current.objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "engine_progress",
+            "minimum_evidence_actions": 4,
+            "action_budget": 8,
+            "actions_used": 0,
+        }
+        config = {
+            **config_for("navigation"),
+            "passable_values": [1, 2],
+        }
+
+        result = solver_decide("navigation", current, {}, config)
+
+        self.assertEqual("continue", result["status"])
+        self.assertIsNotNone(result["action"])
+        self.assertIn("no traversable route", result["evidence"])
+
+    def test_legacy_navigation_still_completes_at_geometric_target(self) -> None:
+        current = observation()
+        config = {
+            **config_for("navigation"),
+            "target_values": [1],
+            "approach_distance": 0,
+        }
+
+        result = solver_decide("navigation", current, {}, config)
+
+        self.assertEqual("subgoal_succeeded", result["status"])
+        self.assertIsNone(result["action"])
+
     def test_routing_respects_actor_clearance_radius(self) -> None:
         narrow = np.full((64, 64), 9, dtype=np.uint8)
         narrow[5, 5:10] = 0

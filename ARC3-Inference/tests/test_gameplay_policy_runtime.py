@@ -478,6 +478,39 @@ def decide(observation, memory):
         self.assertEqual(64, decision.memory["edge_run"])
         self.assertFalse(decision.memory["evidence_ready"])
 
+    def test_policy_can_use_game_type_and_state_inference_helpers(self) -> None:
+        source = """
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+def decide(observation, memory):
+    previous = memory.get("state_token") if isinstance(memory, dict) else None
+    state = infer_game_state(observation, previous)
+    game_type = infer_game_type(observation, previous)
+    memory = memory_update(memory, {
+        "phase": state["phase"],
+        "background": state["board"]["background_value"],
+        "change_type": state["state_delta"]["change_type"],
+        "state_token": state["state_token"],
+        "family": game_type["primary_family"],
+        "confidence": game_type["confidence"],
+    })
+    return continue_decision("UP", memory, "inference helpers available")
+"""
+        with GameplayPolicyRuntime(requested_backend="cpu") as runtime:
+            runtime.activate(source, context={})
+            decision = runtime.decide(observation(valid_actions=("UP",)))
+            changed_board = np.zeros((64, 64), dtype=np.uint8)
+            changed_board[4:6, 7:9] = 2
+            changed = runtime.decide(
+                observation(valid_actions=("UP",), board=changed_board)
+            )
+
+        self.assertEqual("initial", decision.memory["phase"])
+        self.assertEqual(0, decision.memory["background"])
+        self.assertEqual("observe", decision.memory["family"])
+        self.assertEqual("low", decision.memory["confidence"])
+        self.assertEqual("growth", changed.memory["change_type"])
+
     def test_policy_can_reuse_json_mouse_count_keys_as_exclusions(self) -> None:
         source = """
 POLICY_API_VERSION = 1

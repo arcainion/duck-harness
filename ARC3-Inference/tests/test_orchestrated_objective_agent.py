@@ -898,6 +898,58 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         )
         self.assertIsNone(_equivalent_attempted_tactical(tree, distinct))
 
+    def test_attempted_contract_matching_preserves_distinct_explicit_actions(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+
+        def directional_subgoal(action: str, direction: str) -> dict[str, object]:
+            return {
+                "title": (
+                    f"Test {direction} movement of the assembly toward the lower corridor"
+                ),
+                "success_criteria": (
+                    f"The same exact {action} action produces a stable board change "
+                    "moving the assembly toward the lower corridor at least twice, "
+                    "while a distinct executed control action produces no corresponding "
+                    "stable change."
+                ),
+                "failure_criteria": (
+                    "six adaptive probes produce no contrastive evidence for movement "
+                    "of the assembly toward the lower corridor"
+                ),
+                "expected_evidence": (
+                    f"two stable {action} transitions moving the assembly toward the "
+                    "lower corridor plus one distinct negative control"
+                ),
+                "evidence_mode": "contrastive_transition",
+                "execution_mode": "probe",
+                "solver_type": "lattice-corridor",
+                "action_budget": 6,
+                "minimum_evidence_actions": 3,
+                "single_step": False,
+            }
+
+        first = ReductionProposal.from_payload(
+            {
+                **reduction_for("level:1:1"),
+                "subgoals": [directional_subgoal("DOWN", "downward")],
+            }
+        )
+        tree.apply_proposal(first, remaining_level_actions=20)
+        tree.record_action()
+        tree.fail_active_tactical("DOWN did not advance the assembly")
+        distinct = ReductionProposal.from_payload(
+            {
+                **reduction_for("level:1:1"),
+                "subgoals": [directional_subgoal("RIGHT", "RIGHT")],
+            }
+        ).subgoals[0]
+        original = tree.nodes["tactical:1"]
+
+        self.assertGreaterEqual(
+            _tactical_contract_similarity(original, distinct), 0.72
+        )
+        self.assertIsNone(_equivalent_attempted_tactical(tree, distinct))
+
     def test_mouse_family_saturation_requires_repeated_pure_no_progress(self) -> None:
         mouse_spec = ReductionProposal.from_payload(
             reduction_for("level:1:1", title="Click a candidate MOUSE coordinate")

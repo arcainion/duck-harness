@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from itertools import repeat
 
@@ -22,6 +23,8 @@ from inference.agent.policy_codegen_helpers import (
     edge_value_count,
     first_matching_cell,
     history_push,
+    infer_game_state,
+    infer_game_type,
     least_tried_action,
     least_tried_mouse_point,
     line_run_length,
@@ -57,6 +60,328 @@ from inference.agent.policy_codegen_helpers import (
 
 
 class PolicyCodegenHelperTests(unittest.TestCase):
+    def test_game_state_inference_returns_bounded_structural_and_action_evidence(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+        board[5:7, 8:10] = 2
+        board[63, 3:6] = 3
+        board.setflags(write=False)
+        transitions = (
+            {
+                "action": "RIGHT",
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": True,
+                "outcome_class": "novel",
+                "meaningful_progress": False,
+                "cycle_risk": False,
+                "loop_detected": False,
+            },
+            {
+                "action": "MOUSE",
+                "row": 10,
+                "col": 11,
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": False,
+                "outcome_class": "exact_noop",
+                "meaningful_progress": False,
+                "cycle_risk": False,
+                "loop_detected": False,
+            },
+        )
+        observation = type("Observation", (), {})()
+        observation.board = board
+        observation.level = 2
+        observation.step = 7
+        observation.valid_actions = POLICY_ACTIONS
+        observation.last_transition = transitions[-1]
+        observation.recent_transitions = transitions
+        observation.objective = {
+            "objective_id": "tactical:4",
+            "evidence_mode": "engine_progress",
+            "action_budget": 8,
+            "actions_used": 3,
+        }
+
+        state = infer_game_state(observation)
+
+        self.assertEqual("active", state["phase"])
+        self.assertEqual(0, state["board"]["background_value"])
+        self.assertEqual(7, state["board"]["foreground_count"])
+        self.assertEqual([5, 3, 63, 9], state["board"]["foreground_bbox"])
+        self.assertEqual(5, state["objective"]["remaining_actions"])
+        self.assertEqual(1, state["recent"]["actions"]["RIGHT"]["stable_changed"])
+        self.assertEqual("responsive", state["recent"]["actions"]["RIGHT"]["classification"])
+        self.assertEqual(1, state["recent"]["actions"]["MOUSE"]["distinct_points"])
+        self.assertEqual("inconclusive", state["recent"]["actions"]["MOUSE"]["classification"])
+        self.assertEqual(4, state["schema_version"])
+        self.assertIn("horizontal_symmetry", state["board"])
+        self.assertLess(len(json.dumps(state)), 32_768)
+        self.assertFalse(board.flags.writeable)
+
+    def test_game_type_inference_ranks_observed_movement_without_overclaiming(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+        transition = {
+            "action": "RIGHT",
+            "executed": True,
+            "post_action_observed": True,
+            "board_changed": True,
+            "outcome_class": "novel",
+            "meaningful_progress": False,
+            "cycle_risk": False,
+            "loop_detected": False,
+        }
+        observation = type("Observation", (), {})()
+        observation.board = board
+        observation.level = 1
+        observation.step = 1
+        observation.valid_actions = POLICY_ACTIONS
+        observation.last_transition = transition
+        observation.recent_transitions = (transition, transition)
+        observation.objective = {}
+
+        inferred = infer_game_type(observation)
+
+        self.assertEqual("routing", inferred["primary_family"])
+        self.assertIn("navigation", inferred["recommended_solver_types"])
+        self.assertNotEqual("high", inferred["confidence"])
+        self.assertNotIn("engine_progress", inferred)
+        self.assertEqual(4, inferred["schema_version"])
+        self.assertEqual(2, inferred["evidence_coverage"]["executed_actions"])
+        self.assertEqual("UP", inferred["recommended_probes"][0]["action"])
+
+    def test_game_inference_reports_inverted_directional_controls(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+
+        def transition(action: str, direction: str) -> dict[str, object]:
+            return {
+                "action": action,
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": True,
+                "outcome_class": "novel",
+                "meaningful_progress": False,
+                "cycle_risk": False,
+                "loop_detected": False,
+                "animation_summary": {"motion_direction": direction},
+            }
+
+        transitions = (
+            transition("UP", "down"),
+            transition("UP", "down"),
+            transition("LEFT", "right"),
+            transition("LEFT", "right"),
+        )
+        observation = type("Observation", (), {})()
+        observation.board = board
+        observation.level = 1
+        observation.step = 4
+        observation.valid_actions = ("UP", "LEFT")
+        observation.last_transition = transitions[-1]
+        observation.recent_transitions = transitions
+        observation.objective = {}
+
+        state = infer_game_state(observation)
+        inferred = infer_game_type(observation)
+
+        dynamics = state["controls"]["dynamics"]
+        self.assertEqual("inverted", dynamics["scheme"])
+        self.assertEqual("high", dynamics["confidence"])
+        self.assertEqual("down", dynamics["by_action"]["UP"]["dominant_motion_direction"])
+        self.assertEqual(1.0, dynamics["by_action"]["LEFT"]["consistency"])
+        self.assertEqual(dynamics, inferred["control_scheme"])
+
+    def test_game_type_inference_reports_high_confidence_execution_conflict(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+        transitions = tuple(
+            {
+                "action": "MOUSE",
+                "row": 10,
+                "col": 10,
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": True,
+                "outcome_class": "novel",
+                "meaningful_progress": False,
+                "cycle_risk": False,
+                "loop_detected": False,
+            }
+            for _ in range(4)
+        )
+        observation = type("Observation", (), {})()
+        observation.board = board
+        observation.level = 1
+        observation.step = 4
+        observation.valid_actions = POLICY_ACTIONS
+        observation.last_transition = transitions[-1]
+        observation.recent_transitions = transitions
+        observation.objective = {"execution_mode": "navigate"}
+
+        inferred = infer_game_type(observation)
+
+        self.assertEqual("interaction", inferred["primary_family"])
+        self.assertEqual("high", inferred["confidence"])
+        self.assertEqual("conflict", inferred["objective_alignment"]["status"])
+
+    def test_state_delta_distinguishes_translation_from_transform(self) -> None:
+        def make_observation(board: np.ndarray, step: int) -> object:
+            observation = type("Observation", (), {})()
+            observation.board = board
+            observation.level = 1
+            observation.step = step
+            observation.valid_actions = ("RIGHT", "SPACE")
+            observation.last_transition = {
+                "action": "RIGHT",
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": True,
+                "outcome_class": "novel",
+                "meaningful_progress": False,
+                "cycle_risk": False,
+                "loop_detected": False,
+            }
+            observation.recent_transitions = (observation.last_transition,)
+            observation.objective = {}
+            return observation
+
+        before = np.zeros((64, 64), dtype=np.uint8)
+        before[10:12, 10:12] = 2
+        after = np.zeros((64, 64), dtype=np.uint8)
+        after[10:12, 13:15] = 2
+        first = infer_game_state(make_observation(before, 1))
+
+        translated = infer_game_state(
+            make_observation(after, 2), first["state_token"]
+        )
+        inferred = infer_game_type(
+            make_observation(after, 2), first["state_token"]
+        )
+
+        self.assertEqual(
+            "translation_candidate", translated["state_delta"]["change_type"]
+        )
+        self.assertEqual([0, 6], translated["state_delta"]["bbox_center_shift_twice"])
+        self.assertEqual("routing", inferred["primary_family"])
+        self.assertEqual("translation_candidate", inferred["state_change_type"])
+
+        transformed = after.copy()
+        transformed[10, 13] = 3
+        transform_state = infer_game_state(
+            make_observation(transformed, 3), translated["state_token"]
+        )
+        transform_type = infer_game_type(
+            make_observation(transformed, 3), translated["state_token"]
+        )
+
+        self.assertEqual(
+            "recolor_or_transform", transform_state["state_delta"]["change_type"]
+        )
+        self.assertEqual("transform", transform_type["primary_family"])
+
+    def test_state_delta_tracks_opposing_object_motion(self) -> None:
+        def make_observation(board: np.ndarray) -> object:
+            observation = type("Observation", (), {})()
+            observation.board = board
+            observation.level = 1
+            observation.step = 1
+            observation.valid_actions = ("LEFT", "RIGHT")
+            observation.last_transition = None
+            observation.recent_transitions = ()
+            observation.objective = {}
+            return observation
+
+        before = np.zeros((64, 64), dtype=np.uint8)
+        before[10:12, 10:12] = 2
+        before[10:12, 30:32] = 2
+        after = np.zeros((64, 64), dtype=np.uint8)
+        after[10:12, 12:14] = 2
+        after[10:12, 28:30] = 2
+        first = infer_game_state(make_observation(before))
+
+        second = infer_game_state(make_observation(after), first["state_token"])
+        inferred = infer_game_type(make_observation(after), first["state_token"])
+
+        changes = second["state_delta"]["object_changes"]
+        self.assertEqual("translation_candidate", second["state_delta"]["change_type"])
+        self.assertEqual(2, len(changes["moved"]))
+        self.assertEqual(
+            [[0, -4], [0, 4]],
+            sorted(item["shift_twice"] for item in changes["moved"]),
+        )
+        self.assertEqual(2, inferred["object_motion"]["moved_objects"])
+        self.assertTrue(inferred["object_motion"]["independent_motion"])
+        self.assertEqual("multi_agent", inferred["primary_family"])
+
+    def test_state_inference_summarizes_bounded_object_relations(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+        board[10:12, 10:12] = 2
+        board[10:12, 12:14] = 3
+        observation = type("Observation", (), {})()
+        observation.board = board
+        observation.level = 1
+        observation.step = 0
+        observation.valid_actions = ("UP",)
+        observation.last_transition = None
+        observation.recent_transitions = ()
+        observation.objective = {}
+
+        state = infer_game_state(observation)
+
+        layout = state["board"]["object_layout"]
+        self.assertEqual(1, layout["relation_count"])
+        self.assertEqual(1, layout["counts"]["bbox_contact_candidates"])
+        self.assertEqual(2, layout["relations"][0]["row_overlap"])
+        self.assertEqual(1, len(layout["repeated_shapes"]))
+
+    def test_state_inference_bounds_dense_component_inventory(self) -> None:
+        board = np.indices((64, 64)).sum(axis=0).astype(np.uint8) % 2
+        observation = type("Observation", (), {})()
+        observation.board = board
+        observation.level = 1
+        observation.step = 0
+        observation.valid_actions = ("UP",)
+        observation.last_transition = None
+        observation.recent_transitions = ()
+        observation.objective = {}
+
+        state = infer_game_state(observation)
+
+        self.assertTrue(state["board"]["objects_truncated"])
+        self.assertEqual(32, len(state["state_token"]["objects"]))
+        self.assertLess(len(json.dumps(state)), 32_768)
+
+    def test_state_inference_resets_scope_and_preserves_background_continuity(self) -> None:
+        def make_observation(board: np.ndarray, level: int) -> object:
+            observation = type("Observation", (), {})()
+            observation.board = board
+            observation.level = level
+            observation.step = 0
+            observation.valid_actions = ("UP",)
+            observation.last_transition = None
+            observation.recent_transitions = ()
+            observation.objective = {}
+            return observation
+
+        before = np.zeros((64, 64), dtype=np.uint8)
+        before[:20, :] = 1
+        after = np.zeros((64, 64), dtype=np.uint8)
+        after[:40, :] = 1
+        first = infer_game_state(make_observation(before, 1))
+
+        continued = infer_game_state(
+            make_observation(after, 1), first["state_token"]
+        )
+        reset = infer_game_state(make_observation(after, 2), first["state_token"])
+
+        self.assertEqual(0, continued["board"]["background_value"])
+        self.assertEqual("previous_state", continued["board"]["background_source"])
+        self.assertTrue(continued["state_delta"]["comparable"])
+        self.assertFalse(reset["state_delta"]["comparable"])
+        self.assertEqual("scope_reset", reset["state_delta"]["change_type"])
+        self.assertEqual(
+            "level_or_shape_changed", reset["state_delta"]["scope_reset_reason"]
+        )
+
     def test_action_payload_canonicalizes_names_and_mappings(self) -> None:
         self.assertEqual({"action": "UP"}, action_payload(" up "))
         self.assertEqual(
