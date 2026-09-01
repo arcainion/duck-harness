@@ -114,7 +114,7 @@ class PolicyCodegenHelperTests(unittest.TestCase):
         self.assertEqual("responsive", state["recent"]["actions"]["RIGHT"]["classification"])
         self.assertEqual(1, state["recent"]["actions"]["MOUSE"]["distinct_points"])
         self.assertEqual("inconclusive", state["recent"]["actions"]["MOUSE"]["classification"])
-        self.assertEqual(4, state["schema_version"])
+        self.assertEqual(5, state["schema_version"])
         self.assertIn("horizontal_symmetry", state["board"])
         self.assertLess(len(json.dumps(state)), 32_768)
         self.assertFalse(board.flags.writeable)
@@ -146,7 +146,7 @@ class PolicyCodegenHelperTests(unittest.TestCase):
         self.assertIn("navigation", inferred["recommended_solver_types"])
         self.assertNotEqual("high", inferred["confidence"])
         self.assertNotIn("engine_progress", inferred)
-        self.assertEqual(4, inferred["schema_version"])
+        self.assertEqual(5, inferred["schema_version"])
         self.assertEqual(2, inferred["evidence_coverage"]["executed_actions"])
         self.assertEqual("UP", inferred["recommended_probes"][0]["action"])
 
@@ -190,6 +190,50 @@ class PolicyCodegenHelperTests(unittest.TestCase):
         self.assertEqual("down", dynamics["by_action"]["UP"]["dominant_motion_direction"])
         self.assertEqual(1.0, dynamics["by_action"]["LEFT"]["consistency"])
         self.assertEqual(dynamics, inferred["control_scheme"])
+
+    def test_game_inference_ranks_opposing_transition_motion_as_multi_agent(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+        transition = {
+            "action": "RIGHT",
+            "executed": True,
+            "post_action_observed": True,
+            "board_changed": True,
+            "outcome_class": "novel",
+            "meaningful_progress": False,
+            "cycle_risk": False,
+            "loop_detected": False,
+            "animation_summary": {
+                "motion_direction": None,
+                "object_motion": {
+                    "tracking_available": True,
+                    "classification": "opposing",
+                    "distinct_shifts_twice": [[0, -6], [0, 6]],
+                },
+            },
+        }
+        observation = type("Observation", (), {})()
+        observation.board = board
+        observation.level = 1
+        observation.step = 2
+        observation.valid_actions = ("LEFT", "RIGHT")
+        observation.last_transition = transition
+        observation.recent_transitions = (transition, transition)
+        observation.objective = {}
+
+        state = infer_game_state(observation)
+        inferred = infer_game_type(observation)
+
+        motion = state["controls"]["dynamics"]["object_motion"]
+        self.assertEqual("linked_opposing", motion["scheme"])
+        self.assertEqual(2, motion["classifications"]["opposing"])
+        self.assertEqual(
+            [[0, -6], [0, 6]],
+            motion["by_action"]["RIGHT"]["observed_shift_sets_twice"][0][
+                "shifts"
+            ],
+        )
+        self.assertEqual("multi_agent", inferred["primary_family"])
+        self.assertEqual("linked_opposing", inferred["object_motion"]["transition_scheme"])
 
     def test_game_type_inference_reports_high_confidence_execution_conflict(self) -> None:
         board = np.zeros((64, 64), dtype=np.uint8)

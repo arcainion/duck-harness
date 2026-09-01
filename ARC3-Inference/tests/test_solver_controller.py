@@ -25,6 +25,7 @@ from inference.agent.runtime_state import Frame, HistoryEntry
 from inference.agent.trial_knowledge import TrialKnowledgeStore
 from inference.framework.solver import (
     _HarnessGameSession,
+    _component_motion_summary,
     _evaluate_strategy_prediction,
     _next_cycle_risk_streak,
     _summarize_animation,
@@ -32,6 +33,59 @@ from inference.framework.solver import (
 
 
 class SolverControllerTests(TestCase):
+    def test_component_motion_summary_classifies_bounded_motion_models(self) -> None:
+        def grid(*cells: tuple[int, int, int]) -> tuple[tuple[int, ...], ...]:
+            rows = [[0] * 8 for _ in range(8)]
+            for row, col, value in cells:
+                rows[row][col] = value
+            return tuple(tuple(row) for row in rows)
+
+        def summary(
+            before: tuple[tuple[int, ...], ...],
+            after: tuple[tuple[int, ...], ...],
+        ) -> dict[str, object]:
+            changed = {
+                (row, col)
+                for row in range(8)
+                for col in range(8)
+                if before[row][col] != after[row][col]
+            }
+            return _component_motion_summary(before, after, changed)
+
+        opposing = summary(
+            grid((2, 1, 1), (2, 2, 1), (5, 5, 2), (5, 6, 2)),
+            grid((2, 2, 1), (2, 3, 1), (5, 4, 2), (5, 5, 2)),
+        )
+        coherent = summary(
+            grid((2, 1, 1), (2, 2, 1), (5, 3, 2), (5, 4, 2)),
+            grid((2, 2, 1), (2, 3, 1), (5, 4, 2), (5, 5, 2)),
+        )
+        divergent = summary(
+            grid((2, 1, 1), (2, 2, 1), (4, 5, 2), (5, 5, 2)),
+            grid((2, 2, 1), (2, 3, 1), (5, 5, 2), (6, 5, 2)),
+        )
+        stationary = summary(
+            grid((2, 2, 1)),
+            grid((2, 2, 1)),
+        )
+        edge_only = summary(
+            grid((0, 1, 1)),
+            grid((0, 2, 1)),
+        )
+        ambiguous = summary(
+            grid((2, 2, 1), (2, 4, 1)),
+            grid((2, 3, 1)),
+        )
+
+        self.assertEqual("opposing", opposing["classification"])
+        self.assertEqual([[0, -2], [0, 2]], opposing["distinct_shifts_twice"])
+        self.assertEqual("coherent", coherent["classification"])
+        self.assertEqual("divergent", divergent["classification"])
+        self.assertEqual("stationary", stationary["classification"])
+        self.assertEqual("edge_only", edge_only["classification"])
+        self.assertTrue(edge_only["edge_only_change"])
+        self.assertEqual("ambiguous", ambiguous["classification"])
+
     def test_host_cross_trial_harm_check_uses_the_current_state(self) -> None:
         store = TrialKnowledgeStore()
         frame = Frame(grid=((2,),), step=1, level=1)

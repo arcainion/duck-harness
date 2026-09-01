@@ -155,6 +155,209 @@ def _grid_from_data(data: Any) -> tuple[tuple[int, ...], ...]:
     )
 
 
+def _component_motion_summary(
+    before_grid: tuple[tuple[int, ...], ...],
+    after_grid: tuple[tuple[int, ...], ...],
+    changed_coordinates: set[tuple[int, int]],
+    *,
+    maximum_objects: int = 32,
+    maximum_moves: int = 16,
+) -> dict[str, Any]:
+    """Match bounded interior components and classify their displacement pattern."""
+
+    unavailable = {
+        "schema_version": 1,
+        "tracking_available": False,
+        "classification": "ambiguous",
+        "confidence": "low",
+        "edge_only_change": False,
+        "interior_changed_cells": 0,
+        "stable_count": 0,
+        "moved_count": 0,
+        "added_count": 0,
+        "removed_count": 0,
+        "ambiguous_matches": 0,
+        "distinct_shifts_twice": [],
+        "moved": [],
+        "truncated": False,
+    }
+    if not before_grid or not after_grid:
+        return unavailable
+    before_shape = (len(before_grid), len(before_grid[0]))
+    after_shape = (len(after_grid), len(after_grid[0]))
+    if before_shape != after_shape or any(
+        len(row) != before_shape[1] for row in (*before_grid, *after_grid)
+    ):
+        return unavailable
+
+    counts: dict[int, int] = {}
+    for row in before_grid:
+        for value in row:
+            counts[int(value)] = counts.get(int(value), 0) + 1
+    background = min(counts, key=lambda value: (-counts[value], value))
+    row_count, col_count = before_shape
+
+    def components(grid: tuple[tuple[int, ...], ...]) -> tuple[list[dict[str, Any]], bool]:
+        visited: set[tuple[int, int]] = set()
+        found: list[dict[str, Any]] = []
+        for start_row in range(row_count):
+            for start_col in range(col_count):
+                start = (start_row, start_col)
+                value = int(grid[start_row][start_col])
+                if value == background or start in visited:
+                    continue
+                visited.add(start)
+                cells = [start]
+                frontier = [start]
+                while frontier:
+                    row, col = frontier.pop()
+                    for candidate in (
+                        (row - 1, col),
+                        (row, col + 1),
+                        (row + 1, col),
+                        (row, col - 1),
+                    ):
+                        next_row, next_col = candidate
+                        if (
+                            0 <= next_row < row_count
+                            and 0 <= next_col < col_count
+                            and candidate not in visited
+                            and int(grid[next_row][next_col]) == value
+                        ):
+                            visited.add(candidate)
+                            cells.append(candidate)
+                            frontier.append(candidate)
+                if any(
+                    row in {0, row_count - 1} or col in {0, col_count - 1}
+                    for row, col in cells
+                ):
+                    continue
+                rows = [point[0] for point in cells]
+                cols = [point[1] for point in cells]
+                top, left = min(rows), min(cols)
+                bottom, right = max(rows), max(cols)
+                found.append(
+                    {
+                        "value": value,
+                        "size": len(cells),
+                        "center_twice": [top + bottom, left + right],
+                        "shape": tuple(
+                            sorted((row - top, col - left) for row, col in cells)
+                        ),
+                    }
+                )
+        found.sort(
+            key=lambda item: (
+                -int(item["size"]),
+                int(item["value"]),
+                item["center_twice"],
+            )
+        )
+        return found[:maximum_objects], len(found) > maximum_objects
+
+    before_objects, before_truncated = components(before_grid)
+    after_objects, after_truncated = components(after_grid)
+    remaining_before = set(range(len(before_objects)))
+    moved: list[dict[str, Any]] = []
+    moved_count = 0
+    stable_count = 0
+    ambiguous_matches = 0
+    unmatched_after = 0
+    unambiguous_moved = 0
+    for item in after_objects:
+        candidates = [
+            index
+            for index in remaining_before
+            if before_objects[index]["value"] == item["value"]
+            and before_objects[index]["shape"] == item["shape"]
+        ]
+        if not candidates:
+            unmatched_after += 1
+            continue
+        distances = {
+            index: abs(
+                int(before_objects[index]["center_twice"][0])
+                - int(item["center_twice"][0])
+            )
+            + abs(
+                int(before_objects[index]["center_twice"][1])
+                - int(item["center_twice"][1])
+            )
+            for index in candidates
+        }
+        nearest_distance = min(distances.values())
+        ambiguous = sum(
+            distance == nearest_distance for distance in distances.values()
+        ) > 1
+        ambiguous_matches += ambiguous
+        before_index = min(candidates, key=lambda index: (distances[index], index))
+        remaining_before.remove(before_index)
+        old_center = before_objects[before_index]["center_twice"]
+        shift = [
+            int(item["center_twice"][0]) - int(old_center[0]),
+            int(item["center_twice"][1]) - int(old_center[1]),
+        ]
+        if shift == [0, 0]:
+            stable_count += 1
+            continue
+        moved_count += 1
+        unambiguous_moved += not ambiguous
+        if len(moved) < maximum_moves:
+            moved.append(
+                {
+                    "value": int(item["value"]),
+                    "size": int(item["size"]),
+                    "from_center_twice": list(old_center),
+                    "to_center_twice": list(item["center_twice"]),
+                    "shift_twice": shift,
+                    "ambiguous": ambiguous,
+                }
+            )
+
+    interior_changed = sum(
+        row not in {0, row_count - 1} and col not in {0, col_count - 1}
+        for row, col in changed_coordinates
+    )
+    shifts = sorted({tuple(item["shift_twice"]) for item in moved})
+    opposing = any((-row, -col) in shifts for row, col in shifts if row or col)
+    truncated = before_truncated or after_truncated or moved_count > maximum_moves
+    if changed_coordinates and not interior_changed:
+        classification = "edge_only"
+    elif ambiguous_matches and not unambiguous_moved:
+        classification = "ambiguous"
+    elif not moved:
+        classification = "stationary"
+    elif opposing:
+        classification = "opposing"
+    elif len(shifts) == 1:
+        classification = "coherent"
+    else:
+        classification = "divergent"
+    confidence = (
+        "low"
+        if truncated or classification == "ambiguous"
+        else "high"
+        if moved and not ambiguous_matches
+        else "medium"
+    )
+    return {
+        "schema_version": 1,
+        "tracking_available": True,
+        "classification": classification,
+        "confidence": confidence,
+        "edge_only_change": classification == "edge_only",
+        "interior_changed_cells": interior_changed,
+        "stable_count": stable_count,
+        "moved_count": moved_count,
+        "added_count": unmatched_after,
+        "removed_count": len(remaining_before),
+        "ambiguous_matches": ambiguous_matches,
+        "distinct_shifts_twice": [list(shift) for shift in shifts[:8]],
+        "moved": moved,
+        "truncated": truncated,
+    }
+
+
 def _summarize_animation(
     before_grid: tuple[tuple[int, ...], ...],
     state: taaf.game.GameState,
@@ -277,6 +480,9 @@ def _summarize_animation(
             "-".join(item for item in (vertical, horizontal) if item) or "stationary"
         )
 
+    object_motion = _component_motion_summary(
+        before_grid, final_grid, final_changed_coordinates
+    )
     return {
         "frame_count": len(frames),
         "intermediate_frame_count": max(0, len(frames) - 1),
@@ -293,6 +499,7 @@ def _summarize_animation(
         "temporally_reversible": bool(
             changed_coordinates and not final_changed_coordinates
         ),
+        "object_motion": object_motion,
     }
 
 

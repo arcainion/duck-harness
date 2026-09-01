@@ -1747,17 +1747,57 @@ def infer_game_state(
         "left": "right",
     }
     directional_evidence: dict[str, dict[str, int]] = {}
+    object_motion_evidence: dict[
+        str, dict[str, dict[Any, int]]
+    ] = {}
     for transition in recent:
         animation = transition.get("animation_summary")
         if not isinstance(animation, Mapping):
             continue
+        action = str(transition.get("action") or "").strip().upper()
         direction = str(animation.get("motion_direction") or "").strip().lower()
         if direction in {"up", "right", "down", "left"}:
             motion_directions[direction] = motion_directions.get(direction, 0) + 1
-            action = str(transition.get("action") or "").strip().upper()
             if action in expected_directions and transition_has_stable_change(transition):
                 counts_for_action = directional_evidence.setdefault(action, {})
                 counts_for_action[direction] = counts_for_action.get(direction, 0) + 1
+        object_motion = animation.get("object_motion")
+        if (
+            action in expected_directions
+            and transition_has_stable_change(transition)
+            and isinstance(object_motion, Mapping)
+            and object_motion.get("tracking_available") is True
+        ):
+            classification = str(object_motion.get("classification") or "").strip()
+            if classification not in {
+                "coherent",
+                "opposing",
+                "divergent",
+                "stationary",
+                "ambiguous",
+                "edge_only",
+            }:
+                continue
+            raw_shifts = object_motion.get("distinct_shifts_twice")
+            shift_set: tuple[tuple[int, int], ...] = ()
+            if isinstance(raw_shifts, (list, tuple)):
+                try:
+                    shift_set = tuple(
+                        sorted(
+                            (int(shift[0]), int(shift[1]))
+                            for shift in raw_shifts[:8]
+                            if isinstance(shift, (list, tuple)) and len(shift) == 2
+                        )
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    shift_set = ()
+            evidence = object_motion_evidence.setdefault(
+                action, {"classifications": {}, "shift_sets": {}}
+            )
+            classifications = evidence["classifications"]
+            classifications[classification] = classifications.get(classification, 0) + 1
+            shift_sets = evidence["shift_sets"]
+            shift_sets[shift_set] = shift_sets.get(shift_set, 0) + 1
 
     directional_by_action: dict[str, dict[str, Any]] = {}
     directional_samples = 0
@@ -1809,12 +1849,66 @@ def infer_game_state(
         if directional_samples >= 2
         else "low"
     )
+    object_motion_by_action: dict[str, dict[str, Any]] = {}
+    object_motion_classes: dict[str, int] = {}
+    object_motion_samples = 0
+    for action in expected_directions:
+        evidence = object_motion_evidence.get(action)
+        if evidence is None:
+            continue
+        classifications = evidence["classifications"]
+        samples = sum(classifications.values())
+        object_motion_samples += samples
+        for classification, count in classifications.items():
+            key = str(classification)
+            object_motion_classes[key] = object_motion_classes.get(key, 0) + int(count)
+        dominant_class, dominant_count = sorted(
+            classifications.items(), key=lambda item: (-int(item[1]), str(item[0]))
+        )[0]
+        shift_sets = sorted(
+            evidence["shift_sets"].items(),
+            key=lambda item: (-int(item[1]), item[0]),
+        )[:8]
+        object_motion_by_action[action] = {
+            "samples": samples,
+            "classifications": dict(sorted(classifications.items())),
+            "dominant_classification": str(dominant_class),
+            "consistency": round(float(dominant_count) / float(samples), 4),
+            "observed_shift_sets_twice": [
+                {
+                    "shifts": [list(shift) for shift in shift_set],
+                    "count": int(count),
+                }
+                for shift_set, count in shift_sets
+            ],
+        }
+    if object_motion_classes.get("opposing", 0) and object_motion_classes.get(
+        "coherent", 0
+    ):
+        object_motion_scheme = "linked_mixed"
+    elif object_motion_classes.get("opposing", 0):
+        object_motion_scheme = "linked_opposing"
+    elif object_motion_classes.get("divergent", 0):
+        object_motion_scheme = "divergent"
+    elif object_motion_classes.get("coherent", 0):
+        object_motion_scheme = "coherent"
+    elif object_motion_samples:
+        object_motion_scheme = "stationary_or_ambiguous"
+    else:
+        object_motion_scheme = "unknown"
     control_dynamics = {
         "scheme": control_scheme,
         "confidence": control_scheme_confidence,
         "directional_samples": directional_samples,
         "tested_actions": list(directional_by_action),
         "by_action": directional_by_action,
+        "object_motion": {
+            "scheme": object_motion_scheme,
+            "samples": object_motion_samples,
+            "classifications": dict(sorted(object_motion_classes.items())),
+            "tested_actions": list(object_motion_by_action),
+            "by_action": object_motion_by_action,
+        },
         "advisory": True,
     }
 
@@ -1979,7 +2073,7 @@ def infer_game_state(
             pass
 
     summary = {
-        "schema_version": 4,
+        "schema_version": 5,
         "level": level,
         "step": max(0, int(getattr(observation, "step", 0) or 0)),
         "phase": phase,
@@ -2051,6 +2145,10 @@ def infer_game_type(
     )
     controls = state["controls"]
     control_dynamics = controls["dynamics"]
+    transition_motion = control_dynamics["object_motion"]
+    transition_motion_classes = transition_motion["classifications"]
+    transition_opposing = int(transition_motion_classes.get("opposing", 0))
+    transition_divergent = int(transition_motion_classes.get("divergent", 0))
     delta_type = str(state["state_delta"]["change_type"])
     moved_objects = state["state_delta"]["object_changes"]["moved"]
     distinct_shifts = sorted(
@@ -2059,7 +2157,9 @@ def infer_game_type(
             for item in moved_objects
         }
     )
-    independent_motion = len(moved_objects) >= 2 and len(distinct_shifts) >= 2
+    independent_motion = (
+        len(moved_objects) >= 2 and len(distinct_shifts) >= 2
+    ) or bool(transition_opposing or transition_divergent)
     transform_score = (
         4
         if delta_type in {"topology_change", "recolor_or_transform", "structural_change"}
@@ -2080,7 +2180,15 @@ def infer_game_type(
         + min(4, interaction_changed)
         - (1 if interaction_no_progress >= 3 and not interaction_changed else 0),
         "sequence": 3 if changed_action_count >= 2 else 0,
-        "multi_agent": 4 if independent_motion else 0,
+        "multi_agent": (
+            6
+            if transition_opposing
+            else 5
+            if transition_divergent
+            else 4
+            if independent_motion
+            else 0
+        ),
         "transform": transform_score,
         "observe": 2 if not movement_changed and not interaction_changed else 0,
     }
@@ -2090,8 +2198,8 @@ def infer_game_type(
         "interaction": f"{interaction_changed} stable SPACE/MOUSE transition(s) observed",
         "sequence": f"{changed_action_count} distinct controls produced stable changes",
         "multi_agent": (
-            f"{len(moved_objects)} objects moved with {len(distinct_shifts)} "
-            "distinct displacement vectors"
+            f"{len(moved_objects)} cross-turn object(s), {transition_opposing} opposing "
+            f"and {transition_divergent} divergent transition sample(s)"
         ),
         "transform": f"cross-turn state delta was classified as {delta_type}",
         "observe": "insufficient stable action-effect evidence; continue bounded probing",
@@ -2192,7 +2300,7 @@ def infer_game_type(
         alignment_reason = "current evidence does not yet support the execution mode"
 
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "primary_family": primary,
         "confidence": confidence,
         "candidates": candidates,
@@ -2235,6 +2343,10 @@ def infer_game_type(
             "ambiguous_matches": int(
                 state["state_delta"]["object_changes"]["ambiguous_matches"]
             ),
+            "transition_scheme": transition_motion["scheme"],
+            "transition_samples": int(transition_motion["samples"]),
+            "transition_classifications": transition_motion_classes,
+            "transition_by_action": transition_motion["by_action"],
         },
         "control_scheme": control_dynamics,
         "state_change_type": delta_type,

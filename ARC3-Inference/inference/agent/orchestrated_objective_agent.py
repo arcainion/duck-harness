@@ -460,6 +460,8 @@ component counts, foreground bounds, controls, objective budget, latest transiti
 spatial symmetry/topology cues, motion summaries, and classified per-action effects.
 controls["dynamics"] empirically maps directional actions to observed stable motion and
 classifies the scheme as standard, inverted, rotated, remapped, or state-dependent.
+Its object_motion section aggregates per-action component displacement and identifies
+linked opposing or mixed multi-object controls when no global motion direction exists.
 Treat its confidence as advisory: animation motion can describe world motion or scrolling.
 Pass the prior result or its compact result["state_token"] as previous_state to obtain
 a state_delta that distinguishes unchanged boards, candidate translations, growth,
@@ -547,7 +549,10 @@ Transition mappings expose action, row, col, executed, board_changed, reward, sc
 level, engine_state, outcome_class, novel_state, decision_context_changed,
 meaningful_progress, loop_detected, cycle_risk, no_op_streak, stagnation_actions,
 level_completed, run_complete, game_over, stop_reason, error, objective_id, and a
-bounded animation_summary. Read them with mapping.get(), never getattr().
+bounded animation_summary. animation_summary["object_motion"] reports bounded
+per-object displacement, including coherent, opposing, divergent, stationary,
+ambiguous, and edge-only classifications. Read mappings with mapping.get(), never
+getattr().
 
 After issuing an action, the next decide call must inspect the resulting
 last_transition for the active objective. Issuing an action is never evidence that the
@@ -633,6 +638,7 @@ def _animation_summary(value: Any) -> dict[str, Any]:
             "transient_changed_cells",
             "motion_direction",
             "temporally_reversible",
+            "object_motion",
         )
         if key in value
     }
