@@ -286,11 +286,23 @@ necessarily progress: volatile_only and exact_noop outcomes are negative evidenc
 Novel states are exploration evidence, not host-confirmed progress. Do not repeat a
 tactical contract already present in objective_tree; use its resolution evidence and
 select a materially different falsifiable objective.
+attempted_tactical_contracts gives the host-parsed positive and negative-control action
+roles for prior siblings. Reversing those roles is a distinct contrastive experiment;
+preserve the role assignment explicitly in the new title using forms such as
+"Test DOWN against RIGHT control". Rewording the same positive/control assignment is
+not a new experiment.
 level_action_evidence is authoritative host evidence accumulated across every tactical
 objective in the current level. Treat saturated=true as a hard prohibition: do not
 select a subgoal that requires that action family. High no_progress with zero stable
 changes or meaningful progress is strong negative evidence even when coordinates or
 object labels differ. Do not evade failed MOUSE evidence by scanning fresh coordinates.
+For directional actions, dominant_motion_shift_twice and
+dominant_motion_consistency summarize observed screen-space effects. Treat a consistent
+mapping as learned control evidence and choose objectives that exploit it; do not spend
+another tactical horizon rediscovering the same direction-to-motion mapping.
+component_motion_by_value separates opposing or mixed motion by board value. Use it to
+assign actor_values to the component whose learned shift advances the selected spatial
+goal; a global shift is insufficient when different components move differently.
 host_control_model is authoritative, salience-weighted component-motion evidence across
 the current level. When linked_high_confidence=true, select multi-agent, linked-centroid,
 or paired-platform-alignment for objectives that manipulate the moving structures.
@@ -299,9 +311,13 @@ occurred. If linked motion truly does not govern the selected objective, include
 specific control_model_override string of at least 20 characters in that selected
 subgoal; the host validates this exception and otherwise rejects the mismatch.
 After three consecutive failed engine_progress tactical objectives, the host requires a
-contrastive_transition recalibration before accepting another execution hypothesis.
-Use it to falsify the assumed control/action/coordinate mapping, not to rename the same
-object-manipulation story. MOUSE interaction-learning objectives must also use
+contrastive_transition recalibration before accepting another execution hypothesis,
+but only when recalibration_constraint.contrastive_feasible is true. When it is false,
+use the remaining horizon for a distinct bounded execution hypothesis whose
+minimum_evidence_actions fits level_action_budget.remaining. Never propose an evidence
+minimum larger than the remaining level-action horizon. Use recalibration to falsify
+the assumed control/action/coordinate mapping, not to rename the same object-manipulation
+story. MOUSE interaction-learning objectives must also use
 contrastive_transition; stable click repeatability alone is not causal evidence.
 The host accepts engine_progress tactical success only after controller-confirmed
 meaningful_progress, reward, level_completed, or run_complete. A stable_transition
@@ -362,6 +378,20 @@ The generation payload's level_action_evidence is authoritative across prior tac
 objectives in this level. Never emit an action whose entry has saturated=true. Use its
 executed, no_progress, stable_changes, meaningful_progress, and distinct_points counts
 to avoid repeating an exhausted action family through superficially new coordinates.
+host_control_model is host-observed component-motion evidence. When it reports a
+high-confidence linked or opposing scheme, preserve that multi-component model in
+actor_values and target_values instead of collapsing to a single arbitrary cell.
+recent_transitions includes measured component shifts; trusted alignment and
+multi-agent solvers use those shifts to infer nonstandard directional controls.
+observation.objective["level_action_evidence"] carries the durable per-action dominant
+motion learned by earlier tactical objectives, and the trusted solvers consume it when
+current-objective transitions are still empty. Provide board-derived component roles
+and avoid assuming that action names imply screen-space motion. Each action may also
+contain component_motion_by_value; prefer those actor-specific effects over a global
+motion average in linked_mixed or linked_opposing games. For componentwise alignment,
+the trusted solver may add one dominant board-background value to passability when the
+generated passable_values omit an obvious open field; hazards and entity values remain
+excluded from that inference.
 Read observation.objective["execution_mode"]. For navigate, the reachable decide path
 must call solver_decide with a navigation-capable selected solver type. The trusted
 dispatcher localizes the board, builds passability, plans a route, and replans after
@@ -956,6 +986,34 @@ def _tactical_title_actions(value: Any) -> frozenset[str]:
     )
 
 
+def _tactical_action_roles(
+    value: Any,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Return explicitly named positive and negative-control title actions."""
+
+    text = value.title if isinstance(value, SubgoalSpec) else getattr(value, "title", "")
+    tokens = re.findall(r"[a-z]+", str(text or "").lower())
+    mentions = [
+        (index, action)
+        for index, token in enumerate(tokens)
+        if (action := _TACTICAL_ACTION_TERMS.get(token)) is not None
+    ]
+    controls: set[str] = set()
+    control_markers = {"against", "control", "versus", "vs"}
+    for index, action in mentions:
+        nearby = set(tokens[max(0, index - 2) : index]) | set(
+            tokens[index + 1 : index + 3]
+        )
+        if nearby & control_markers:
+            controls.add(action)
+    named = {action for _index, action in mentions}
+    positives = named.difference(controls)
+    if not positives and mentions:
+        positives.add(mentions[0][1])
+        controls.discard(mentions[0][1])
+    return frozenset(positives), frozenset(controls)
+
+
 def _tactical_contract_similarity(left: Any, right: Any) -> float:
     """Measure salient-term containment for deterministic paraphrase detection."""
 
@@ -999,12 +1057,19 @@ def _contract_requires_navigation(spec: SubgoalSpec) -> bool:
         (spec.title, spec.success_criteria, spec.expected_evidence)
     ).lower()
     terms = set(re.findall(r"[a-z]+", text))
-    if terms & {"navigate", "pathfind", "pathfinding", "route"}:
+    if terms & {"navigate", "pathfind", "pathfinding", "route", "routing"}:
         return True
-    if terms & {"approach", "contact", "merge", "reach"}:
-        return True
+    # Contrastive probes often describe their expected board effect with spatial
+    # language (for example, "test whether RIGHT moves toward the border").  That
+    # does not make the experiment a routing objective: its contract is to execute
+    # the bounded controls and compare transitions.
+    if (
+        spec.evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION
+        and spec.execution_mode is TacticalExecutionMode.PROBE
+    ):
+        return False
     return bool(
-        terms & {"drive", "move"}
+        terms & {"approach", "contact", "drive", "merge", "move", "reach"}
         and terms
         & {
             "boundary",
@@ -1178,12 +1243,48 @@ def _equivalent_attempted_tactical(
         spec_actions = _tactical_title_actions(spec)
         if node_actions and spec_actions and node_actions.isdisjoint(spec_actions):
             continue
+        node_positive, node_controls = _tactical_action_roles(node)
+        spec_positive, spec_controls = _tactical_action_roles(spec)
+        if node_positive and spec_positive and node_positive.isdisjoint(spec_positive):
+            continue
+        if (
+            node_controls
+            and spec_controls
+            and (node_positive, node_controls) != (spec_positive, spec_controls)
+        ):
+            continue
         if (
             _tactical_contract_similarity(node, spec) >= threshold
             and _tactical_title_similarity(node, spec) >= 0.5
         ):
             return node
     return None
+
+
+def _attempted_tactical_contracts(tree: ObjectiveTree) -> list[dict[str, Any]]:
+    """Summarize attempted siblings with action roles for reducer anti-churn."""
+
+    result: list[dict[str, Any]] = []
+    for node in tree.nodes.values():
+        if (
+            node.kind is not ObjectiveKind.TACTICAL
+            or node.parent_id != tree.active_id
+            or (node.attempts <= 0 and node.actions_used <= 0)
+        ):
+            continue
+        positives, controls = _tactical_action_roles(node)
+        result.append(
+            {
+                "objective_id": node.objective_id,
+                "title": node.title,
+                "status": node.status.value,
+                "positive_actions": sorted(positives),
+                "control_actions": sorted(controls),
+                "all_named_actions": sorted(_tactical_title_actions(node)),
+                "resolution_evidence": node.resolution_evidence,
+            }
+        )
+    return result[-24:]
 
 
 def _objective_contract_hash(objective: Any) -> str:
@@ -1513,6 +1614,8 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 "stable_changes": 0,
                 "meaningful_progress": 0,
                 "distinct_points": [],
+                "motion_shifts_twice": {},
+                "component_motion_shifts_twice": {},
             },
         )
         stats["executed"] = min(4096, int(stats.get("executed", 0)) + 1)
@@ -1530,6 +1633,58 @@ class OrchestratedObjectiveAgent(ToolAgent):
             stats["no_progress"] = min(
                 4096, int(stats.get("no_progress", 0)) + 1
             )
+        animation = transition.get("animation_summary")
+        motion = animation.get("object_motion") if isinstance(animation, dict) else {}
+        if not isinstance(motion, dict):
+            motion = {}
+        salient = (
+            motion.get("salient_distinct_shifts_twice")
+            if motion.get("tracking_available") is True
+            and motion.get("confidence") in {"medium", "high"}
+            else None
+        )
+        if isinstance(salient, list) and len(salient) == 1:
+            shift = salient[0]
+            if isinstance(shift, (list, tuple)) and len(shift) == 2:
+                try:
+                    row_delta, col_delta = int(shift[0]), int(shift[1])
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                else:
+                    if row_delta or col_delta:
+                        key = f"{row_delta},{col_delta}"
+                        shifts = stats.setdefault("motion_shifts_twice", {})
+                        if isinstance(shifts, dict):
+                            shifts[key] = min(4096, int(shifts.get(key, 0) or 0) + 1)
+        moved = motion.get("moved")
+        try:
+            salient_size_threshold = max(
+                1, int(motion.get("salient_size_threshold") or 1)
+            )
+        except (TypeError, ValueError, OverflowError):
+            salient_size_threshold = 1
+        if isinstance(moved, list):
+            component_shifts = stats.setdefault("component_motion_shifts_twice", {})
+            for component in moved[:64]:
+                if (
+                    not isinstance(component, dict)
+                    or component.get("ambiguous") is True
+                    or not isinstance(component_shifts, dict)
+                ):
+                    continue
+                try:
+                    value = int(component.get("value"))
+                    size = max(1, int(component.get("size") or 1))
+                    shift = component.get("shift_twice")
+                    row_delta, col_delta = int(shift[0]), int(shift[1])
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    continue
+                if size < salient_size_threshold or not (row_delta or col_delta):
+                    continue
+                key = f"{value}|{row_delta},{col_delta}"
+                component_shifts[key] = min(
+                    4096, int(component_shifts.get(key, 0) or 0) + 1
+                )
         if action == "MOUSE":
             row = transition.get("row")
             col = transition.get("col")
@@ -1557,6 +1712,57 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 ),
                 "distinct_points": list(stats.get("distinct_points") or [])[-64:],
             }
+            raw_shifts = stats.get("motion_shifts_twice")
+            shifts = {
+                str(key): max(0, int(count or 0))
+                for key, count in (
+                    raw_shifts.items() if isinstance(raw_shifts, dict) else ()
+                )
+                if max(0, int(count or 0)) > 0
+            }
+            ranked_shifts = sorted(shifts.items(), key=lambda pair: (-pair[1], pair[0]))
+            motion_samples = sum(shifts.values())
+            item["motion_samples"] = motion_samples
+            item["distinct_motion_shifts_twice"] = shifts
+            item["dominant_motion_shift_twice"] = (
+                [int(part) for part in ranked_shifts[0][0].split(",")]
+                if ranked_shifts
+                else None
+            )
+            item["dominant_motion_consistency"] = (
+                ranked_shifts[0][1] / motion_samples if motion_samples else 0.0
+            )
+            component_groups: dict[str, dict[str, int]] = {}
+            raw_component_shifts = stats.get("component_motion_shifts_twice")
+            if isinstance(raw_component_shifts, dict):
+                for raw_key, raw_count in raw_component_shifts.items():
+                    match = re.fullmatch(r"(-?\d+)\|(-?\d+,-?\d+)", str(raw_key))
+                    if match is None:
+                        continue
+                    try:
+                        count = max(0, int(raw_count or 0))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if count:
+                        group = component_groups.setdefault(match.group(1), {})
+                        group[match.group(2)] = count
+            component_motion: dict[str, dict[str, Any]] = {}
+            for value, value_shifts in sorted(
+                component_groups.items(), key=lambda pair: int(pair[0])
+            ):
+                ranked = sorted(
+                    value_shifts.items(), key=lambda pair: (-pair[1], pair[0])
+                )
+                samples = sum(value_shifts.values())
+                component_motion[value] = {
+                    "samples": samples,
+                    "dominant_shift_twice": [
+                        int(part) for part in ranked[0][0].split(",")
+                    ],
+                    "consistency": ranked[0][1] / samples,
+                    "distinct_shifts_twice": dict(sorted(value_shifts.items())),
+                }
+            item["component_motion_by_value"] = component_motion
             item["saturated"] = bool(
                 _action_family_saturation_reason(self._level_action_evidence, action)
             )
@@ -1723,6 +1929,41 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     ):
                         continue
                     points = raw_stats.get("distinct_points")
+                    raw_shifts = raw_stats.get("distinct_motion_shifts_twice")
+                    if not isinstance(raw_shifts, dict):
+                        raw_shifts = raw_stats.get("motion_shifts_twice")
+                    restored_shifts: dict[str, int] = {}
+                    if isinstance(raw_shifts, dict):
+                        for shift, count in raw_shifts.items():
+                            if not re.fullmatch(r"-?\d+,-?\d+", str(shift)):
+                                continue
+                            try:
+                                checked_count = min(4096, max(0, int(count or 0)))
+                            except (TypeError, ValueError, OverflowError):
+                                continue
+                            if checked_count:
+                                restored_shifts[str(shift)] = checked_count
+                    restored_component_shifts: dict[str, int] = {}
+                    raw_components = raw_stats.get("component_motion_by_value")
+                    if isinstance(raw_components, dict):
+                        for value, component_stats in raw_components.items():
+                            if not isinstance(component_stats, dict):
+                                continue
+                            distinct = component_stats.get("distinct_shifts_twice")
+                            if not isinstance(distinct, dict):
+                                continue
+                            for shift, count in distinct.items():
+                                key = f"{value}|{shift}"
+                                if not re.fullmatch(r"-?\d+\|-?\d+,-?\d+", key):
+                                    continue
+                                try:
+                                    checked_count = min(
+                                        4096, max(0, int(count or 0))
+                                    )
+                                except (TypeError, ValueError, OverflowError):
+                                    continue
+                                if checked_count:
+                                    restored_component_shifts[key] = checked_count
                     self._level_action_evidence[action_name] = {
                         "executed": min(
                             4096, max(0, int(raw_stats.get("executed", 0) or 0))
@@ -1747,6 +1988,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
                             for point in (points if isinstance(points, list) else [])
                             if isinstance(point, str)
                         ][-64:],
+                        "motion_shifts_twice": restored_shifts,
+                        "component_motion_shifts_twice": (
+                            restored_component_shifts
+                        ),
                     }
             self._consecutive_activation_failures = max(
                 0, int(payload.get("consecutive_activation_failures", 0) or 0)
@@ -2218,10 +2463,18 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "boundary_reason": self._boundary_reason,
             "active_objective": self._tree.active.to_dict(),
             "objective_tree": self._tree.to_dict(),
+            "attempted_tactical_contracts": _attempted_tactical_contracts(self._tree),
             "level_action_budget": {
                 "used": level.actions_used,
                 "limit": level.action_budget,
                 "remaining": level.remaining_actions,
+            },
+            "recalibration_constraint": {
+                "failed_engine_progress_since_recalibration": (
+                    _failed_engine_progress_since_recalibration(self._tree)
+                ),
+                "contrastive_minimum_actions": 3,
+                "contrastive_feasible": level.remaining_actions >= 3,
             },
             "observation": {
                 "level": frame.level,
@@ -2273,6 +2526,17 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         "every new tactical subgoal must declare solver_type"
                     )
                 selected = proposal.subgoals[proposal.selected_index]
+                if (
+                    selected.evidence_mode
+                    is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION
+                    and selected.minimum_evidence_actions > remaining_level_actions
+                ):
+                    raise ObjectiveError(
+                        "selected subgoal requires "
+                        f"{selected.minimum_evidence_actions} evidence actions but "
+                        f"only {remaining_level_actions} level actions remain; choose "
+                        "a feasible bounded objective"
+                    )
                 saturation_reason = _action_family_saturation_reason(
                     self._level_action_evidence, "MOUSE"
                 )
@@ -2339,6 +2603,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 if (
                     failed_execution_hypotheses
                     >= _STRATEGIC_RECALIBRATION_FAILURES
+                    and remaining_level_actions >= 3
                     and selected.evidence_mode
                     is not ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION
                 ):
@@ -2350,11 +2615,17 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     )
                 repeated = _equivalent_attempted_tactical(self._tree, selected)
                 if repeated is not None:
+                    selected_positive, selected_controls = _tactical_action_roles(selected)
+                    prior_positive, prior_controls = _tactical_action_roles(repeated)
                     raise ObjectiveError(
                         "selected subgoal repeats already-attempted tactical contract "
                         f"{repeated.objective_id!r} ({repeated.title!r}); selected "
-                        f"title was {selected.title!r}. Select a materially different "
-                        "action or spatial target and use the prior resolution evidence"
+                        f"title was {selected.title!r}. Prior positive/control actions "
+                        f"were {sorted(prior_positive)}/{sorted(prior_controls)}; "
+                        "selected positive/control actions are "
+                        f"{sorted(selected_positive)}/{sorted(selected_controls)}. "
+                        "Select a materially different action-role assignment or spatial "
+                        "target and use the prior resolution evidence"
                     )
             probe = ObjectiveTree.from_dict(self._tree.to_dict())
             probe.apply_proposal(
@@ -2404,6 +2675,13 @@ class OrchestratedObjectiveAgent(ToolAgent):
             host_control_decisive_opposing_samples=host_control_model[
                 "decisive_opposing_samples"
             ],
+            remaining_level_actions=self._tree.remaining_level_actions,
+            minimum_evidence_actions=active.minimum_evidence_actions,
+            evidence_mode=active.evidence_mode.value,
+            execution_mode=active.execution_mode.value,
+            failed_engine_progress_since_recalibration=(
+                _failed_engine_progress_since_recalibration(self._tree)
+            ),
         )
 
     def _policy_payload(
@@ -2424,6 +2702,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "action_contract": dict(_MODEL_ACTION_CONTRACT),
             "recent_transitions": _recent_transition_payload(history),
             "level_action_evidence": self._level_action_evidence_payload(),
+            "host_control_model": _host_control_model(history, level=frame.level),
             "requested_backend": os.environ.get("LOCAL_GAMEPLAY_POLICY_BACKEND", "cpu"),
             "solver_contract": {
                 "api_version": 1,
@@ -2437,6 +2716,16 @@ class OrchestratedObjectiveAgent(ToolAgent):
             },
             "repair_reason": repair,
         }
+
+    def _policy_objective_payload(
+        self, objective: ObjectiveNode | None = None
+    ) -> dict[str, Any]:
+        """Attach durable level control evidence to a runtime objective view."""
+
+        assert self._tree is not None
+        payload = (objective or self._tree.active).to_dict()
+        payload["level_action_evidence"] = self._level_action_evidence_payload()
+        return payload
 
     def _policy_validator(self, raw: dict[str, Any]) -> dict[str, Any]:
         if self._tree is None:
@@ -2484,11 +2773,22 @@ class OrchestratedObjectiveAgent(ToolAgent):
             )
         _validate_solver_declaration_usage(source)
         declared_family = solver_family(declared_type)
+        probes = list(normalized_config["probe_actions"])
+        if (
+            active.evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION
+            and probes
+            and len(probes) < active.minimum_evidence_actions
+        ):
+            raise PolicyRuntimeError(
+                "explicit policy probe_actions must contain at least "
+                f"{active.minimum_evidence_actions} actions to meet the objective's "
+                "minimum evidence count",
+                category="policy_solver_contract",
+            )
         if (
             active.evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION
             and declared_family == "observe"
         ):
-            probes = list(normalized_config["probe_actions"])
             repeated = {action for action in probes if probes.count(action) >= 2}
             modalities = {
                 "direction": {"UP", "DOWN", "LEFT", "RIGHT"},
@@ -2499,13 +2799,6 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 for positive in repeated
                 for actions in modalities.values()
             )
-            if len(probes) < active.minimum_evidence_actions:
-                raise PolicyRuntimeError(
-                    "contrastive observation policy probe_actions must contain at least "
-                    f"{active.minimum_evidence_actions} actions to meet the objective's "
-                    "minimum evidence count",
-                    category="policy_solver_contract",
-                )
             if not repeated or not has_same_modality_control:
                 raise PolicyRuntimeError(
                     "contrastive observation policy probe_actions must repeat one exact "
@@ -2806,7 +3099,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                     source,
                     context={
                         "game_id": self._knowledge_game_id,
-                        "objective": objective.to_dict(),
+                        "objective": self._policy_objective_payload(objective),
                     },
                 )
                 runtime.preflight(
@@ -2816,7 +3109,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         step=frame.step,
                         valid_actions=tuple(to_model_actions(frame.valid_actions)),
                         last_transition=None,
-                        objective=objective.to_dict(),
+                        objective=self._policy_objective_payload(objective),
                         recent_transitions=(),
                         backend=activation.backend,
                     ),
@@ -2922,7 +3215,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 source,
                 context={
                     "game_id": self._knowledge_game_id,
-                    "objective": self._tree.active.to_dict(),
+                    "objective": self._policy_objective_payload(),
                 },
             )
             if self._tree.active.actions_used == 0:
@@ -2933,7 +3226,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         step=frame.step,
                         valid_actions=tuple(to_model_actions(frame.valid_actions)),
                         last_transition=None,
-                        objective=self._tree.active.to_dict(),
+                        objective=self._policy_objective_payload(),
                         recent_transitions=(),
                         backend=activation.backend,
                     ),
@@ -3006,6 +3299,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
             backend_fallback_reason=activation.backend_fallback_reason,
             solver_type=self._policy_solver_type,
             solver_family=self._policy_solver_family,
+            evidence_mode=self._tree.active.evidence_mode.value,
+            execution_mode=self._tree.active.execution_mode.value,
+            minimum_evidence_actions=self._tree.active.minimum_evidence_actions,
+            remaining_level_actions=self._tree.remaining_level_actions,
         )
 
     def _invalidate_policy(
@@ -3111,7 +3408,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
             step=frame.step,
             valid_actions=tuple(to_model_actions(frame.valid_actions)),
             last_transition=last_transition,
-            objective=self._tree.active.to_dict(),
+            objective=self._policy_objective_payload(),
             recent_transitions=active_transitions,
             backend=self._policy_runtime.activation.backend,
         )

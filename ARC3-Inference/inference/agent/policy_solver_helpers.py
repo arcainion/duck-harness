@@ -407,6 +407,15 @@ def _transition_evidence_mode(observation: Any) -> str:
     return mode if mode in {"stable_transition", "contrastive_transition"} else ""
 
 
+def _objective_execution_mode(observation: Any) -> str:
+    objective = observation.objective
+    return (
+        str(objective.get("execution_mode") or "").strip().lower()
+        if isinstance(objective, Mapping) and objective
+        else ""
+    )
+
+
 def _bounded_probe_decision(
     observation: Any,
     memory: dict[str, Any],
@@ -659,7 +668,7 @@ def _interaction_choice(
 ) -> dict[str, Any] | None:
     """Select one coordinate-safe or non-repeating interaction."""
 
-    if ordered_evidence_schedule and _transition_evidence_mode(observation):
+    if ordered_evidence_schedule:
         return _ordered_interaction_evidence_choice(
             observation, memory, actions, points, evidence
         )
@@ -706,8 +715,175 @@ def _points(board: np.ndarray, values: Sequence[int]) -> tuple[tuple[int, int], 
     return find_cells(board, values) if values else ()
 
 
-def _passability(board: np.ndarray, config: Mapping[str, Any]) -> np.ndarray:
-    values = config["passable_values"] or config["actor_values"]
+def _component_points(
+    board: np.ndarray, values: Sequence[int]
+) -> tuple[tuple[int, int], ...]:
+    return component_centers(value_mask(board, values)) if values else ()
+
+
+def _empirical_directional_action(
+    observation: Any,
+    actor_values: Sequence[int],
+    target_delta: tuple[int, int],
+) -> tuple[str, tuple[int, int]] | None:
+    """Choose learned motion that most reduces distance to the route target."""
+
+    allowed_values = {int(value) for value in actor_values}
+    scores: dict[str, list[tuple[int, int]]] = {}
+    transitions = [
+        item
+        for item in observation.recent_transitions
+        if isinstance(item, Mapping)
+    ][-32:]
+    for transition in transitions:
+        action = str(transition.get("action") or "").strip().upper()
+        if action not in {"UP", "RIGHT", "DOWN", "LEFT"}:
+            continue
+        animation = transition.get("animation_summary")
+        if not isinstance(animation, Mapping):
+            continue
+        motion = animation.get("object_motion")
+        if not isinstance(motion, Mapping):
+            continue
+        shifts: list[tuple[int, int, int]] = []
+        moved = motion.get("moved")
+        if isinstance(moved, list):
+            for item in moved:
+                if not isinstance(item, Mapping) or item.get("ambiguous") is True:
+                    continue
+                try:
+                    value = int(item.get("value"))
+                    shift = item.get("shift_twice")
+                    size = int(item.get("size") or 1)
+                    row_delta, col_delta = int(shift[0]), int(shift[1])
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    continue
+                if value in allowed_values and (row_delta or col_delta):
+                    shifts.append((row_delta, col_delta, max(1, size)))
+        if not shifts:
+            salient = motion.get("salient_distinct_shifts_twice")
+            if isinstance(salient, list) and len(salient) == 1:
+                try:
+                    shifts.append((int(salient[0][0]), int(salient[0][1]), 1))
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    pass
+        if not shifts:
+            continue
+        total_weight = sum(size for _row, _col, size in shifts)
+        row_delta = round(sum(row * size for row, _col, size in shifts) / total_weight)
+        col_delta = round(sum(col * size for _row, col, size in shifts) / total_weight)
+        if row_delta or col_delta:
+            scores.setdefault(action, []).append((row_delta, col_delta))
+    objective = observation.objective
+    level_evidence = (
+        objective.get("level_action_evidence")
+        if isinstance(objective, Mapping)
+        else None
+    )
+    if isinstance(level_evidence, Mapping):
+        for action, raw_stats in level_evidence.items():
+            normalized_action = str(action).strip().upper()
+            if (
+                normalized_action not in {"UP", "RIGHT", "DOWN", "LEFT"}
+                or not isinstance(raw_stats, Mapping)
+            ):
+                continue
+            component_profiles = raw_stats.get("component_motion_by_value")
+            actor_effects: list[tuple[int, int, int]] = []
+            if isinstance(component_profiles, Mapping):
+                for value in allowed_values:
+                    profile = component_profiles.get(str(value))
+                    if not isinstance(profile, Mapping):
+                        continue
+                    shift = profile.get("dominant_shift_twice")
+                    try:
+                        consistency = float(profile.get("consistency") or 0.0)
+                        samples = max(0, int(profile.get("samples") or 0))
+                        row_delta, col_delta = int(shift[0]), int(shift[1])
+                    except (TypeError, ValueError, IndexError, OverflowError):
+                        continue
+                    if consistency >= 0.6 and samples and (row_delta or col_delta):
+                        actor_effects.append((row_delta, col_delta, samples))
+            if actor_effects:
+                total = sum(item[2] for item in actor_effects)
+                row_delta = round(sum(item[0] * item[2] for item in actor_effects) / total)
+                col_delta = round(sum(item[1] * item[2] for item in actor_effects) / total)
+                samples = total
+            else:
+                shift = raw_stats.get("dominant_motion_shift_twice")
+                try:
+                    consistency = float(
+                        raw_stats.get("dominant_motion_consistency") or 0.0
+                    )
+                    samples = max(0, int(raw_stats.get("motion_samples") or 0))
+                    row_delta, col_delta = int(shift[0]), int(shift[1])
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    continue
+                if consistency < 0.6:
+                    continue
+            if samples < 1 or not (row_delta or col_delta):
+                continue
+            scores.setdefault(normalized_action, []).extend(
+                [(row_delta, col_delta)] * min(samples, 8)
+            )
+    ranked: list[tuple[int, int, int, str, tuple[int, int]]] = []
+    distance_twice = abs(target_delta[0] * 2) + abs(target_delta[1] * 2)
+    for action, effects in scores.items():
+        row_delta = round(sum(item[0] for item in effects) / len(effects))
+        col_delta = round(sum(item[1] for item in effects) / len(effects))
+        alignment = row_delta * target_delta[0] + col_delta * target_delta[1]
+        projected_distance_twice = abs(target_delta[0] * 2 - row_delta) + abs(
+            target_delta[1] * 2 - col_delta
+        )
+        improvement_twice = distance_twice - projected_distance_twice
+        if improvement_twice <= 0 or alignment <= 0 or action not in observation.valid_actions:
+            continue
+        if transition_repeats_nonprogress_action(observation.last_transition, action):
+            continue
+        ranked.append(
+            (improvement_twice, alignment, len(effects), action, (row_delta, col_delta))
+        )
+    if not ranked:
+        return None
+    action_priority = {"UP": 0, "RIGHT": 1, "DOWN": 2, "LEFT": 3}
+    _improvement, _alignment, _samples, action, effect = max(
+        ranked,
+        key=lambda item: (item[0], item[1], item[2], -action_priority[item[3]]),
+    )
+    return action, effect
+
+
+def _inferred_background_values(
+    board: np.ndarray, config: Mapping[str, Any]
+) -> tuple[int, ...]:
+    """Infer a dominant open-field value omitted from an alignment config."""
+
+    excluded = {
+        int(value)
+        for key in ("actor_values", "target_values", "hazard_values")
+        for value in config[key]
+    }
+    configured = {int(value) for value in config["passable_values"]}
+    values, counts = np.unique(board, return_counts=True)
+    ranked = sorted(
+        ((int(count), int(value)) for value, count in zip(values, counts, strict=True)),
+        key=lambda item: (-item[0], item[1]),
+    )
+    if not ranked or ranked[0][0] < max(4, board.size // 4):
+        return ()
+    candidate = ranked[0][1]
+    return () if candidate in excluded or candidate in configured else (candidate,)
+
+
+def _passability(
+    board: np.ndarray,
+    config: Mapping[str, Any],
+    *,
+    extra_values: Sequence[int] = (),
+) -> np.ndarray:
+    values = tuple(config["passable_values"] or config["actor_values"]) + tuple(
+        extra_values
+    )
     passable = np.array(value_mask(board, values), dtype=bool, copy=True)
     if config["hazard_values"]:
         passable[value_mask(board, config["hazard_values"])] = False
@@ -723,44 +899,63 @@ def _route_decision(
     config: Mapping[str, Any],
     *,
     approach: bool = False,
+    componentwise: bool = False,
 ) -> dict[str, Any]:
     evidence_mode = _transition_evidence_mode(observation)
     if evidence_mode:
         evidence_ready, evidence = _objective_evidence_status(observation)
         if evidence_ready:
             return _terminal("subgoal_succeeded", memory, evidence)
-        configured = tuple(
-            action for action in config["probe_actions"] if action != "MOUSE"
-        )
-        probes = configured or _navigation_evidence_probes(observation)
-        if evidence_mode == "contrastive_transition" and len(set(probes)) < 2:
-            return _terminal(
-                "subgoal_failed",
-                memory,
-                "navigation evidence probes require two distinct scalar actions",
+        if _objective_execution_mode(observation) != "navigate":
+            configured = tuple(
+                action for action in config["probe_actions"] if action != "MOUSE"
             )
-        return _bounded_probe_decision(
-            observation,
-            memory,
-            probes,
-            "navigation solver gathered bounded transition evidence",
-        )
+            probes = configured or _navigation_evidence_probes(observation)
+            if evidence_mode == "contrastive_transition" and len(set(probes)) < 2:
+                return _terminal(
+                    "subgoal_failed",
+                    memory,
+                    "navigation evidence probes require two distinct scalar actions",
+                )
+            return _bounded_probe_decision(
+                observation,
+                memory,
+                probes,
+                "navigation solver gathered bounded transition evidence",
+            )
     board = observation.board
-    actors = _points(board, config["actor_values"])
-    targets = _points(board, config["target_values"])
+    point_finder = _component_points if componentwise else _points
+    actors = point_finder(board, config["actor_values"])
+    targets = point_finder(board, config["target_values"])
     if not actors or not targets:
         return _terminal("subgoal_failed", memory, "solver could not localize actor and target")
-    actor = min(
-        actors,
-        key=lambda candidate: (
-            min(
-                abs(candidate[0] - target[0]) + abs(candidate[1] - target[1])
-                for target in targets
-            ),
-            candidate,
-        ),
+    pairs = [
+        (
+            abs(actor_point[0] - target_point[0])
+            + abs(actor_point[1] - target_point[1]),
+            actor_point,
+            target_point,
+        )
+        for actor_point in actors
+        for target_point in targets
+        if not componentwise
+        or actor_point != target_point
+        or set(config["actor_values"]) != set(config["target_values"])
+    ]
+    if not pairs:
+        return _terminal(
+            "subgoal_failed", memory, "solver requires two distinct localized components"
+        )
+    _pair_distance, actor, selected_target = min(
+        pairs, key=lambda item: (item[0], item[1], item[2])
     )
-    passable = _passability(board, config)
+    targets = (selected_target,)
+    inferred_passable_values = (
+        _inferred_background_values(board, config) if componentwise else ()
+    )
+    passable = _passability(
+        board, config, extra_values=inferred_passable_values
+    )
     passable[actor] = True
     for target in targets:
         passable[target] = True
@@ -797,6 +992,7 @@ def _route_decision(
     blocked_first_steps = blocked_first_steps[-4:]
     memory["blocked_board_digest"] = current_digest
     memory["blocked_first_steps"] = [list(point) for point in blocked_first_steps]
+    memory["inferred_passable_values"] = list(inferred_passable_values)
     distance = int(config["approach_distance"])
     path = (
         shortest_approach_path(
@@ -830,7 +1026,20 @@ def _route_decision(
             terminal_status="subgoal_succeeded",
         )
     path = path[: int(config["max_plan_length"])]
-    action = next_path_action(path, observation.valid_actions)
+    target_delta = (
+        selected_target[0] - actor[0],
+        selected_target[1] - actor[1],
+    )
+    empirical = (
+        _empirical_directional_action(
+            observation, config["actor_values"], target_delta
+        )
+        if componentwise
+        else None
+    )
+    action = empirical[0] if empirical is not None else next_path_action(
+        path, observation.valid_actions
+    )
     if action is None:
         return _route_engine_progress_liveness(
             observation,
@@ -846,7 +1055,18 @@ def _route_decision(
             "last_action": action,
         }
     )
-    return _continue(action, memory, "trusted solver followed a board-derived route", target=list(path[-1]))
+    return _continue(
+        action,
+        memory,
+        (
+            "trusted solver followed an empirically mapped component route"
+            if empirical is not None
+            else "trusted solver followed a board-derived route"
+        ),
+        target=list(path[-1]),
+        empirical_shift_twice=list(empirical[1]) if empirical is not None else None,
+        inferred_passable_values=list(inferred_passable_values),
+    )
 
 
 def _momentum_decision(observation: Any, memory: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
@@ -951,8 +1171,16 @@ def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapp
                 if len(points) >= 64:
                     break
     explicit_probe_actions = config["probe_actions"]
+    objective = observation.objective
+    objective_evidence_mode = (
+        str(objective.get("evidence_mode") or "").strip().lower()
+        if isinstance(objective, Mapping) and objective
+        else ""
+    )
     ordered_evidence_schedule = bool(
-        _transition_evidence_mode(observation) and explicit_probe_actions
+        explicit_probe_actions
+        and objective_evidence_mode
+        in {"engine_progress", "stable_transition", "contrastive_transition"}
     )
     actions = (
         explicit_probe_actions
@@ -986,19 +1214,37 @@ def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapp
 def _approach_then_interact(
     observation: Any, memory: dict[str, Any], config: Mapping[str, Any]
 ) -> dict[str, Any]:
-    actors = _points(observation.board, config["actor_values"])
-    targets = _points(observation.board, config["target_values"] or config["interactive_values"])
+    actors = _component_points(observation.board, config["actor_values"])
+    target_values = config["target_values"] or config["interactive_values"]
+    targets = _component_points(observation.board, target_values)
     if not actors or not targets:
         return _terminal("subgoal_failed", memory, "solver could not localize movable and destination components")
-    distance = min(abs(actors[0][0] - point[0]) + abs(actors[0][1] - point[1]) for point in targets)
+    pairs = [
+        (
+            abs(actor[0] - target[0]) + abs(actor[1] - target[1]),
+            actor,
+            target,
+        )
+        for actor in actors
+        for target in targets
+        if actor != target or set(config["actor_values"]) != set(target_values)
+    ]
+    if not pairs:
+        return _terminal(
+            "subgoal_failed", memory, "solver requires two distinct localized components"
+        )
+    distance, _actor, selected_target = min(
+        pairs, key=lambda item: (item[0], item[1], item[2])
+    )
     if distance <= int(config["approach_distance"]):
-        actions = config["interaction_actions"]
+        actions = config["interaction_actions"] or config["probe_actions"]
         interaction = _interaction_choice(
             observation,
             memory,
             actions,
-            targets,
+            (selected_target,),
             "solver reached the interaction distance",
+            ordered_evidence_schedule=bool(config["probe_actions"]),
         )
         if interaction is not None:
             return interaction
@@ -1015,7 +1261,9 @@ def _approach_then_interact(
                 "solver has no configured action for required transition evidence",
             )
         return _terminal("subgoal_succeeded", memory, "solver aligned the configured components")
-    return _route_decision(observation, memory, config, approach=True)
+    return _route_decision(
+        observation, memory, config, approach=True, componentwise=True
+    )
 
 
 def _coverage_decision(observation: Any, memory: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:

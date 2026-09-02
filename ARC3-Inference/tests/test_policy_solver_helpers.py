@@ -707,6 +707,33 @@ class PolicySolverHelperTests(unittest.TestCase):
         self.assertEqual("SPACE", first["action"]["action"])
         self.assertEqual("UP", second["action"]["action"])
 
+    def test_interaction_engine_progress_starts_with_explicit_space_probe(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+        board[10, 10] = 3
+        board[20, 20] = 3
+        board.setflags(write=False)
+        current = observation(valid_actions=("MOUSE", "SPACE"))
+        current.board = board
+        current.objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "engine_progress",
+            "minimum_evidence_actions": 1,
+        }
+
+        result = solver_decide(
+            "click-interaction",
+            current,
+            {},
+            {
+                "interactive_values": [3],
+                "interaction_actions": ["SPACE"],
+                "probe_actions": ["SPACE"],
+            },
+        )
+
+        self.assertEqual("continue", result["status"])
+        self.assertEqual({"action": "SPACE"}, result["action"])
+
     def test_contrastive_scalar_evidence_requires_two_directional_actions(self) -> None:
         current = observation(valid_actions=("SPACE", "UP"))
         current.objective = {
@@ -1009,6 +1036,306 @@ class PolicySolverHelperTests(unittest.TestCase):
         self.assertEqual("continue", first["status"])
         self.assertEqual("continue", second["status"])
         self.assertNotEqual(first["action"], second["action"])
+
+    def test_alignment_navigate_mode_uses_component_geometry_before_probes(self) -> None:
+        board = np.zeros((12, 12), dtype=np.uint8)
+        board[5, 3] = 1
+        board[5, 8] = 2
+        board.setflags(write=False)
+        current = observation(valid_actions=("UP", "RIGHT", "DOWN", "LEFT"))
+        current.board = board
+        current.objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "stable_transition",
+            "execution_mode": "navigate",
+            "minimum_evidence_actions": 2,
+        }
+
+        result = solver_decide(
+            "linked-centroid",
+            current,
+            {},
+            {
+                "actor_values": [1],
+                "target_values": [2],
+                "passable_values": [0, 1, 2],
+                "probe_actions": ["UP", "LEFT"],
+            },
+        )
+
+        self.assertEqual("RIGHT", result["action"]["action"])
+        self.assertIn("board-derived route", result["evidence"])
+
+    def test_alignment_infers_omitted_dominant_background_passability(self) -> None:
+        board = np.zeros((12, 12), dtype=np.uint8)
+        board[5, 3] = 1
+        board[5, 8] = 2
+        board.setflags(write=False)
+        current = observation(valid_actions=("UP", "RIGHT", "DOWN", "LEFT"))
+        current.board = board
+        current.objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "engine_progress",
+            "execution_mode": "navigate",
+            "minimum_evidence_actions": 1,
+        }
+
+        result = solver_decide(
+            "linked-centroid",
+            current,
+            {},
+            {
+                "actor_values": [1],
+                "target_values": [2],
+                "passable_values": [1, 2],
+            },
+        )
+
+        self.assertEqual("RIGHT", result["action"]["action"])
+        self.assertEqual([0], result["prediction"]["inferred_passable_values"])
+        self.assertEqual([0], result["memory"]["inferred_passable_values"])
+
+    def test_alignment_never_infers_configured_hazard_as_background(self) -> None:
+        board = np.zeros((12, 12), dtype=np.uint8)
+        board[5, 3] = 1
+        board[5, 8] = 2
+        board.setflags(write=False)
+        current = observation(valid_actions=("UP", "RIGHT", "DOWN", "LEFT"))
+        current.board = board
+        current.objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "engine_progress",
+            "execution_mode": "navigate",
+            "minimum_evidence_actions": 1,
+        }
+
+        result = solver_decide(
+            "linked-centroid",
+            current,
+            {},
+            {
+                "actor_values": [1],
+                "target_values": [2],
+                "passable_values": [1, 2],
+                "hazard_values": [0],
+            },
+        )
+
+        self.assertEqual("continue", result["status"])
+        self.assertIn("no traversable route", result["evidence"])
+        self.assertEqual([], result["memory"]["inferred_passable_values"])
+
+    def test_alignment_same_value_config_uses_distinct_components(self) -> None:
+        board = np.zeros((12, 12), dtype=np.uint8)
+        board[5, 3] = 1
+        board[5, 8] = 1
+        board.setflags(write=False)
+        current = observation(valid_actions=("UP", "RIGHT", "DOWN", "LEFT"))
+        current.board = board
+        current.objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "engine_progress",
+            "execution_mode": "navigate",
+            "minimum_evidence_actions": 1,
+        }
+
+        result = solver_decide(
+            "paired-platform-alignment",
+            current,
+            {},
+            {
+                "actor_values": [1],
+                "target_values": [1],
+                "passable_values": [0, 1],
+            },
+        )
+
+        self.assertEqual("continue", result["status"])
+        self.assertEqual("RIGHT", result["action"]["action"])
+
+    def test_alignment_uses_empirical_nonstandard_action_direction(self) -> None:
+        board = np.zeros((12, 12), dtype=np.uint8)
+        board[5, 5] = 1
+        board[5, 1] = 2
+        board.setflags(write=False)
+        current = observation(valid_actions=("UP", "RIGHT", "DOWN", "LEFT"))
+        current.board = board
+        current.objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "engine_progress",
+            "execution_mode": "navigate",
+            "minimum_evidence_actions": 1,
+        }
+        current.recent_transitions = (
+            {
+                "objective_id": "tactical:1",
+                "action": "RIGHT",
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": True,
+                "outcome_class": "novel",
+                "animation_summary": {
+                    "object_motion": {
+                        "tracking_available": True,
+                        "moved": [
+                            {
+                                "value": 1,
+                                "size": 4,
+                                "shift_twice": [0, -6],
+                                "ambiguous": False,
+                            }
+                        ],
+                    }
+                },
+            },
+        )
+
+        result = solver_decide(
+            "multi-agent",
+            current,
+            {},
+            {
+                "actor_values": [1],
+                "target_values": [2],
+                "passable_values": [0, 1, 2],
+            },
+        )
+
+        self.assertEqual("RIGHT", result["action"]["action"])
+        self.assertIn("empirically mapped", result["evidence"])
+        self.assertEqual([0, -6], result["prediction"]["empirical_shift_twice"])
+
+    def test_alignment_reuses_durable_cross_objective_action_motion(self) -> None:
+        board = np.zeros((12, 12), dtype=np.uint8)
+        board[5, 5] = 1
+        board[5, 1] = 2
+        board.setflags(write=False)
+        current = observation(valid_actions=("UP", "RIGHT", "DOWN", "LEFT"))
+        current.board = board
+        current.objective = {
+            "objective_id": "tactical:8",
+            "evidence_mode": "engine_progress",
+            "execution_mode": "navigate",
+            "minimum_evidence_actions": 1,
+            "level_action_evidence": {
+                "RIGHT": {
+                    "motion_samples": 5,
+                    "dominant_motion_shift_twice": [0, 6],
+                    "dominant_motion_consistency": 0.8,
+                    "component_motion_by_value": {
+                        "1": {
+                            "samples": 4,
+                            "dominant_shift_twice": [0, -6],
+                            "consistency": 1.0,
+                        },
+                        "2": {
+                            "samples": 4,
+                            "dominant_shift_twice": [0, 6],
+                            "consistency": 1.0,
+                        },
+                    },
+                }
+            },
+        }
+        current.recent_transitions = ()
+
+        result = solver_decide(
+            "multi-agent",
+            current,
+            {},
+            {
+                "actor_values": [1],
+                "target_values": [2],
+                "passable_values": [0, 1, 2],
+            },
+        )
+
+        self.assertEqual("RIGHT", result["action"]["action"])
+        self.assertIn("empirically mapped", result["evidence"])
+        self.assertEqual([0, -6], result["prediction"]["empirical_shift_twice"])
+
+    def test_alignment_ignores_inconsistent_cross_objective_action_motion(self) -> None:
+        board = np.zeros((12, 12), dtype=np.uint8)
+        board[5, 5] = 1
+        board[5, 1] = 2
+        board.setflags(write=False)
+        current = observation(valid_actions=("UP", "RIGHT", "DOWN", "LEFT"))
+        current.board = board
+        current.objective = {
+            "objective_id": "tactical:8",
+            "evidence_mode": "engine_progress",
+            "execution_mode": "navigate",
+            "minimum_evidence_actions": 1,
+            "level_action_evidence": {
+                "RIGHT": {
+                    "motion_samples": 5,
+                    "dominant_motion_shift_twice": [0, -6],
+                    "dominant_motion_consistency": 0.4,
+                }
+            },
+        }
+
+        result = solver_decide(
+            "multi-agent",
+            current,
+            {},
+            {
+                "actor_values": [1],
+                "target_values": [2],
+                "passable_values": [0, 1, 2],
+            },
+        )
+
+        self.assertEqual("LEFT", result["action"]["action"])
+        self.assertIn("board-derived route", result["evidence"])
+
+    def test_alignment_prefers_learned_motion_that_does_not_overshoot(self) -> None:
+        board = np.zeros((12, 12), dtype=np.uint8)
+        board[5, 5] = 1
+        board[5, 4] = 2
+        board.setflags(write=False)
+        current = observation(valid_actions=("UP", "RIGHT", "DOWN", "LEFT"))
+        current.board = board
+        current.objective = {
+            "objective_id": "tactical:8",
+            "evidence_mode": "engine_progress",
+            "execution_mode": "navigate",
+            "minimum_evidence_actions": 1,
+            "level_action_evidence": {
+                "RIGHT": {
+                    "component_motion_by_value": {
+                        "1": {
+                            "samples": 4,
+                            "dominant_shift_twice": [0, -6],
+                            "consistency": 1.0,
+                        }
+                    }
+                },
+                "UP": {
+                    "component_motion_by_value": {
+                        "1": {
+                            "samples": 3,
+                            "dominant_shift_twice": [0, -2],
+                            "consistency": 1.0,
+                        }
+                    }
+                },
+            },
+        }
+
+        result = solver_decide(
+            "multi-agent",
+            current,
+            {},
+            {
+                "actor_values": [1],
+                "target_values": [2],
+                "passable_values": [0, 1, 2],
+            },
+        )
+
+        self.assertEqual("UP", result["action"]["action"])
+        self.assertEqual([0, -2], result["prediction"]["empirical_shift_twice"])
 
     def test_approach_interaction_mouse_is_coordinate_bearing(self) -> None:
         result = solver_decide(

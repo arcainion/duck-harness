@@ -20,6 +20,7 @@ from inference.agent.orchestrated_objective_agent import (
     OrchestrationFailure,
     OrchestratedObjectiveAgent,
     _action_family_saturation_reason,
+    _attempted_tactical_contracts,
     _contract_requires_navigation,
     _contract_requests_mouse,
     _equivalent_attempted_tactical,
@@ -34,6 +35,7 @@ from inference.agent.orchestrated_objective_agent import (
     _reduction_from_message,
     _repeats_non_progress_action,
     _tactical_contract_similarity,
+    _tactical_action_roles,
 )
 from inference.agent.objective_reduction import (
     ObjectiveStatus,
@@ -365,9 +367,39 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         probe = ReductionProposal.from_payload(
             reduction_for("level:1:1", title="Probe SPACE for a stable effect")
         ).subgoals[0]
+        contrastive_payload = reduction_for(
+            "level:1:1", title="Test whether RIGHT moves toward the border"
+        )
+        contrastive_subgoals = contrastive_payload["subgoals"]
+        assert isinstance(contrastive_subgoals, list)
+        contrastive_subgoals[0].update(
+            {
+                "evidence_mode": "contrastive_transition",
+                "execution_mode": "probe",
+                "action_budget": 3,
+                "minimum_evidence_actions": 3,
+            }
+        )
+        contrastive = ReductionProposal.from_payload(contrastive_payload).subgoals[0]
+        trigger_payload = reduction_for(
+            "level:1:1", title="Press SPACE to reach level completion"
+        )
+        trigger_subgoals = trigger_payload["subgoals"]
+        assert isinstance(trigger_subgoals, list)
+        trigger_subgoals[0].update(
+            {
+                "execution_mode": "interact",
+                "action_budget": 1,
+                "minimum_evidence_actions": 1,
+                "single_step": True,
+            }
+        )
+        trigger = ReductionProposal.from_payload(trigger_payload).subgoals[0]
 
         self.assertTrue(_contract_requires_navigation(spatial))
         self.assertFalse(_contract_requires_navigation(probe))
+        self.assertFalse(_contract_requires_navigation(contrastive))
+        self.assertFalse(_contract_requires_navigation(trigger))
 
     def test_navigation_policy_requires_matching_reachable_solver_dispatch(
         self,
@@ -450,6 +482,75 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual("navigation", accepted["solver_type"])
         self.assertEqual("routing", accepted["solver_family"])
         self.assertEqual(TacticalExecutionMode.NAVIGATE, tree.active.execution_mode)
+        agent.close()
+
+    def test_explicit_probe_schedule_must_cover_objective_evidence_minimum(
+        self,
+    ) -> None:
+        reduction = reduction_for("level:1:1", title="Compare linked component motion")
+        subgoals = reduction["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0].update(
+            {
+                "evidence_mode": "contrastive_transition",
+                "execution_mode": "probe",
+                "solver_type": "connector-align",
+                "action_budget": 3,
+                "minimum_evidence_actions": 3,
+            }
+        )
+        source = NAVIGATION_POLICY_SOURCE.replace(
+            'POLICY_SOLVER_TYPE = "navigation"',
+            'POLICY_SOLVER_TYPE = "connector-align"',
+        ).replace(
+            '"approach_distance": 0,',
+            '"approach_distance": 0,\n    "probe_actions": ["UP"],',
+        )
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+
+        with self.assertRaisesRegex(PolicyRuntimeError, "at least 3 actions"):
+            agent._policy_validator({"source": source})
+        agent.close()
+
+    def test_reducer_and_coder_payloads_expose_control_horizon_constraints(self) -> None:
+        agent = self._agent()
+        agent._tree = ObjectiveTree.start_game(
+            "game-a", level=1, level_action_budget=2
+        )
+        agent._level_action_evidence["RIGHT"] = {
+            "executed": 2,
+            "no_progress": 0,
+            "stable_changes": 2,
+            "meaningful_progress": 0,
+            "distinct_points": [],
+            "motion_shifts_twice": {"0,-6": 2},
+        }
+
+        reducer_payload = agent._reducer_payload(frame(), [])
+        coder_payload = agent._policy_payload(frame(), [], "")
+        runtime_objective = agent._policy_objective_payload()
+
+        self.assertEqual(
+            {
+                "failed_engine_progress_since_recalibration": 0,
+                "contrastive_minimum_actions": 3,
+                "contrastive_feasible": False,
+            },
+            reducer_payload["recalibration_constraint"],
+        )
+        self.assertIn("host_control_model", coder_payload)
+        self.assertEqual(
+            [0, -6],
+            runtime_objective["level_action_evidence"]["RIGHT"][
+                "dominant_motion_shift_twice"
+            ],
+        )
         agent.close()
 
     def test_reducer_rejects_spatial_contract_without_navigation_mode(self) -> None:
@@ -1058,6 +1159,58 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         )
         self.assertIsNone(_equivalent_attempted_tactical(tree, distinct))
 
+    def test_attempted_contract_matching_preserves_reversed_control_roles(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+
+        def contrastive(title: str) -> dict[str, object]:
+            payload = reduction_for("level:1:1", title=title)
+            subgoals = payload["subgoals"]
+            assert isinstance(subgoals, list)
+            subgoals[0].update(
+                {
+                    "success_criteria": (
+                        "the positive action produces stable displacement twice while "
+                        "the negative control has no corresponding displacement"
+                    ),
+                    "expected_evidence": (
+                        "two positive transitions and one negative-control transition"
+                    ),
+                    "evidence_mode": "contrastive_transition",
+                    "execution_mode": "probe",
+                    "solver_type": "linked-centroid",
+                    "action_budget": 6,
+                    "minimum_evidence_actions": 3,
+                }
+            )
+            return payload
+
+        first = ReductionProposal.from_payload(
+            contrastive(
+                "Test RIGHT-specific displacement of the structure against DOWN control"
+            )
+        )
+        tree.apply_proposal(first, remaining_level_actions=20)
+        tree.record_action()
+        tree.fail_active_tactical("RIGHT hypothesis failed")
+        reversed_spec = ReductionProposal.from_payload(
+            contrastive(
+                "Test DOWN-specific displacement of the structure against RIGHT control"
+            )
+        ).subgoals[0]
+        same_roles = ReductionProposal.from_payload(
+            contrastive("Compare RIGHT displacement versus DOWN control")
+        ).subgoals[0]
+
+        self.assertEqual(
+            (frozenset({"DOWN"}), frozenset({"RIGHT"})),
+            _tactical_action_roles(reversed_spec),
+        )
+        self.assertIsNone(_equivalent_attempted_tactical(tree, reversed_spec))
+        self.assertIsNotNone(_equivalent_attempted_tactical(tree, same_roles))
+        attempted = _attempted_tactical_contracts(tree)
+        self.assertEqual(["RIGHT"], attempted[0]["positive_actions"])
+        self.assertEqual(["DOWN"], attempted[0]["control_actions"])
+
     def test_mouse_family_saturation_requires_repeated_pure_no_progress(self) -> None:
         mouse_spec = ReductionProposal.from_payload(
             reduction_for("level:1:1", title="Click a candidate MOUSE coordinate")
@@ -1110,6 +1263,108 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual(12, len(payload["MOUSE"]["distinct_points"]))
         self.assertTrue(payload["MOUSE"]["saturated"])
         agent.close()
+
+    def test_level_action_evidence_retains_consistent_directional_motion(self) -> None:
+        agent = self._agent()
+        for objective_id in ("tactical:1", "tactical:2", "tactical:3"):
+            agent._record_level_action_evidence(
+                {
+                    "objective_id": objective_id,
+                    "action": "RIGHT",
+                    "executed": True,
+                    "board_changed": True,
+                    "outcome_class": "novel",
+                    "meaningful_progress": False,
+                    "animation_summary": {
+                        "object_motion": {
+                            "tracking_available": True,
+                            "confidence": "high",
+                            "salient_size_threshold": 4,
+                            "salient_distinct_shifts_twice": [[0, -6]],
+                            "moved": [
+                                {
+                                    "value": 4,
+                                    "size": 20,
+                                    "shift_twice": [0, -6],
+                                    "ambiguous": False,
+                                },
+                                {
+                                    "value": 5,
+                                    "size": 18,
+                                    "shift_twice": [0, 6],
+                                    "ambiguous": False,
+                                },
+                                {
+                                    "value": 0,
+                                    "size": 1,
+                                    "shift_twice": [0, -6],
+                                    "ambiguous": False,
+                                },
+                            ],
+                        }
+                    },
+                }
+            )
+
+        payload = agent._level_action_evidence_payload()
+
+        self.assertEqual(3, payload["RIGHT"]["motion_samples"])
+        self.assertEqual([0, -6], payload["RIGHT"]["dominant_motion_shift_twice"])
+        self.assertEqual(1.0, payload["RIGHT"]["dominant_motion_consistency"])
+        self.assertEqual(
+            {"0,-6": 3}, payload["RIGHT"]["distinct_motion_shifts_twice"]
+        )
+        self.assertEqual(
+            [0, -6],
+            payload["RIGHT"]["component_motion_by_value"]["4"][
+                "dominant_shift_twice"
+            ],
+        )
+        self.assertEqual(
+            [0, 6],
+            payload["RIGHT"]["component_motion_by_value"]["5"][
+                "dominant_shift_twice"
+            ],
+        )
+        self.assertNotIn("0", payload["RIGHT"]["component_motion_by_value"])
+        agent.close()
+
+    def test_component_motion_evidence_survives_durable_state_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_path = Path(temp_dir) / "runtime_state.json"
+            runtime_path.touch()
+            first = self._agent()
+            first._session_runtime_dir = runtime_path
+            first._tree = ObjectiveTree.start_game(
+                "game-a", level=1, level_action_budget=20
+            )
+            first._action_evidence_level = 1
+            first._level_action_evidence["DOWN"] = {
+                "executed": 2,
+                "no_progress": 0,
+                "stable_changes": 2,
+                "meaningful_progress": 0,
+                "distinct_points": [],
+                "motion_shifts_twice": {},
+                "component_motion_shifts_twice": {"4|6,0": 2, "5|-6,0": 2},
+            }
+            first._persist_durable_state()
+            first.close()
+
+            resumed = self._agent()
+            resumed._session_runtime_dir = runtime_path
+            resumed._load_durable_state()
+            restored = resumed._level_action_evidence_payload()["DOWN"]
+            resumed.close()
+
+        self.assertEqual(
+            [6, 0],
+            restored["component_motion_by_value"]["4"]["dominant_shift_twice"],
+        )
+        self.assertEqual(
+            [-6, 0],
+            restored["component_motion_by_value"]["5"]["dominant_shift_twice"],
+        )
 
     def test_reducer_rejects_mouse_contract_after_family_saturation(self) -> None:
         mouse_reduction = reduction_for(
@@ -1183,6 +1438,75 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual(
             0, _failed_engine_progress_since_recalibration(agent._tree)
         )
+        agent.close()
+
+    def test_low_action_horizon_relaxes_contrastive_recalibration(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=4)
+        for index in range(3):
+            payload = reduction_for(
+                "level:1:1", title=f"Bounded execution hypothesis {index}"
+            )
+            subgoals = payload["subgoals"]
+            assert isinstance(subgoals, list)
+            subgoals[0].update(
+                {
+                    "action_budget": 1,
+                    "minimum_evidence_actions": 1,
+                    "single_step": True,
+                    "execution_mode": "interact",
+                }
+            )
+            tree.apply_proposal(
+                ReductionProposal.from_payload(payload),
+                remaining_level_actions=tree.remaining_level_actions,
+            )
+            tree.record_action()
+            tree.fail_active_tactical("no controller-confirmed progress")
+
+        final_attempt = reduction_for(
+            "level:1:1", title="Final bounded SPACE completion trigger"
+        )
+        final_subgoals = final_attempt["subgoals"]
+        assert isinstance(final_subgoals, list)
+        final_subgoals[0].update(
+            {
+                "action_budget": 1,
+                "minimum_evidence_actions": 1,
+                "single_step": True,
+                "execution_mode": "interact",
+            }
+        )
+        agent = self._agent()
+        agent._tree = tree
+        agent.model_client = _ScriptedModelClient([final_attempt])
+
+        agent._reduce(frame(), [], request_deadline=None, should_stop=None)
+
+        self.assertEqual("Final bounded SPACE completion trigger", agent._tree.active.title)
+        self.assertEqual(1, agent._tree.active.minimum_evidence_actions)
+        agent.close()
+
+    def test_reducer_rejects_evidence_plan_larger_than_remaining_horizon(self) -> None:
+        agent = self._agent()
+        agent._tree = ObjectiveTree.start_game(
+            "game-a", level=1, level_action_budget=2
+        )
+        proposal = reduction_for("level:1:1", title="Oversized evidence plan")
+        subgoals = proposal["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0].update(
+            {
+                "evidence_mode": "contrastive_transition",
+                "action_budget": 3,
+                "minimum_evidence_actions": 3,
+            }
+        )
+        agent.model_client = _ScriptedModelClient([proposal] * 3)
+
+        with self.assertRaises(OrchestrationFailure) as raised:
+            agent._reduce(frame(), [], request_deadline=None, should_stop=None)
+
+        self.assertIn("only 2 level actions remain", str(raised.exception))
         agent.close()
 
     def test_mouse_learning_contract_requires_contrastive_evidence(self) -> None:
