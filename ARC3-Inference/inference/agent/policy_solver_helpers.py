@@ -610,15 +610,59 @@ def _scalar_evidence_choice(
     return None
 
 
-def _interaction_choice(
+def _ordered_interaction_evidence_choice(
     observation: Any,
     memory: dict[str, Any],
     actions: Sequence[str],
     points: Sequence[tuple[int, int]],
     evidence: str,
 ) -> dict[str, Any] | None:
+    """Consume an explicit mixed-modality probe schedule without reordering it."""
+
+    schedule = tuple(str(action).strip().upper() for action in actions)
+    signature = list(schedule)
+    if memory.get("interaction_probe_schedule") != signature:
+        memory["interaction_probe_schedule"] = signature
+        memory["interaction_probe_index"] = 0
+    probe_index = _memory_index(
+        memory.get("interaction_probe_index"), len(schedule)
+    )
+    while probe_index < len(schedule):
+        action = schedule[probe_index]
+        probe_index += 1
+        memory["interaction_probe_index"] = probe_index
+        if action == "MOUSE":
+            mouse_probe = _mouse_evidence_choice(
+                observation, memory, points, evidence
+            )
+            if mouse_probe is not None:
+                return mouse_probe
+            continue
+        if action not in observation.valid_actions:
+            continue
+        if transition_repeats_nonprogress_action(
+            observation.last_transition, action
+        ):
+            continue
+        return _continue(action, memory, evidence)
+    return None
+
+
+def _interaction_choice(
+    observation: Any,
+    memory: dict[str, Any],
+    actions: Sequence[str],
+    points: Sequence[tuple[int, int]],
+    evidence: str,
+    *,
+    ordered_evidence_schedule: bool = False,
+) -> dict[str, Any] | None:
     """Select one coordinate-safe or non-repeating interaction."""
 
+    if ordered_evidence_schedule and _transition_evidence_mode(observation):
+        return _ordered_interaction_evidence_choice(
+            observation, memory, actions, points, evidence
+        )
     if "MOUSE" in actions and "MOUSE" in observation.valid_actions:
         if _transition_evidence_mode(observation):
             mouse_probe = _mouse_evidence_choice(
@@ -906,8 +950,21 @@ def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapp
                 points.append(point)
                 if len(points) >= 64:
                     break
-    actions = config["interaction_actions"] or config["probe_actions"]
-    if points and "MOUSE" in observation.valid_actions and "MOUSE" not in actions:
+    explicit_probe_actions = config["probe_actions"]
+    ordered_evidence_schedule = bool(
+        _transition_evidence_mode(observation) and explicit_probe_actions
+    )
+    actions = (
+        explicit_probe_actions
+        if ordered_evidence_schedule
+        else config["interaction_actions"] or explicit_probe_actions
+    )
+    if (
+        not ordered_evidence_schedule
+        and points
+        and "MOUSE" in observation.valid_actions
+        and "MOUSE" not in actions
+    ):
         actions = ("MOUSE", *actions)
     interaction = _interaction_choice(
         observation,
@@ -915,6 +972,7 @@ def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapp
         actions,
         points,
         "interaction solver selected the least-tried valid interaction",
+        ordered_evidence_schedule=ordered_evidence_schedule,
     )
     if interaction is not None:
         return interaction

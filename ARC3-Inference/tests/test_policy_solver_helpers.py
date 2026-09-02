@@ -617,6 +617,96 @@ class PolicySolverHelperTests(unittest.TestCase):
 
         self.assertEqual(["UP", "RIGHT", "UP"], decisions)
 
+    def test_interaction_preserves_explicit_mixed_probe_order(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+        board[10, 10] = 3
+        board[20, 20] = 3
+        board.setflags(write=False)
+        objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "contrastive_transition",
+            "minimum_evidence_actions": 4,
+        }
+        config = {
+            "interactive_values": [3],
+            "interaction_actions": ["MOUSE", "SPACE"],
+            "probe_actions": ["MOUSE", "SPACE", "MOUSE", "SPACE"],
+        }
+        current = observation(valid_actions=("MOUSE", "SPACE"))
+        current.board = board
+        current.objective = objective
+        memory = {}
+        decisions = []
+        recent = []
+
+        for _ in range(4):
+            result = solver_decide("click-interaction", current, memory, config)
+            decisions.append(result["action"])
+            memory = result["memory"]
+            transition = {
+                "objective_id": "tactical:1",
+                **result["action"],
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": False,
+                "outcome_class": "exact_noop",
+            }
+            recent.append(transition)
+            current = observation(
+                valid_actions=("MOUSE", "SPACE"),
+                last_transition=transition,
+            )
+            current.board = board
+            current.objective = objective
+            current.recent_transitions = tuple(recent)
+
+        self.assertEqual(
+            ["MOUSE", "SPACE", "MOUSE", "SPACE"],
+            [decision["action"] for decision in decisions],
+        )
+        self.assertNotEqual(decisions[0], decisions[2])
+
+    def test_interaction_does_not_inject_mouse_into_explicit_scalar_probes(self) -> None:
+        board = np.zeros((64, 64), dtype=np.uint8)
+        board[10, 10] = 3
+        board[20, 20] = 3
+        board.setflags(write=False)
+        objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "contrastive_transition",
+            "minimum_evidence_actions": 2,
+        }
+        config = {
+            "interactive_values": [3],
+            "interaction_actions": ["SPACE", "UP"],
+            "probe_actions": ["SPACE", "UP"],
+        }
+        current = observation(valid_actions=("MOUSE", "SPACE", "UP"))
+        current.board = board
+        current.objective = objective
+        first = solver_decide("click-interaction", current, {}, config)
+        transition = {
+            "objective_id": "tactical:1",
+            **first["action"],
+            "executed": True,
+            "post_action_observed": True,
+            "board_changed": False,
+            "outcome_class": "exact_noop",
+        }
+        second_observation = observation(
+            valid_actions=("MOUSE", "SPACE", "UP"),
+            last_transition=transition,
+        )
+        second_observation.board = board
+        second_observation.objective = objective
+        second_observation.recent_transitions = (transition,)
+        second = solver_decide(
+            "click-interaction", second_observation, first["memory"], config
+        )
+
+        self.assertEqual("SPACE", first["action"]["action"])
+        self.assertEqual("UP", second["action"]["action"])
+
     def test_contrastive_scalar_evidence_requires_two_directional_actions(self) -> None:
         current = observation(valid_actions=("SPACE", "UP"))
         current.objective = {
