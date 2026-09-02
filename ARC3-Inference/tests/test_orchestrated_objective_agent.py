@@ -492,17 +492,22 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             classification: str,
             shifts: list[list[int]],
             step: int,
+            *,
+            confidence: str = "unknown",
+            salient_moved_count: int | None = None,
         ) -> HistoryEntry:
+            motion = {
+                "tracking_available": True,
+                "classification": classification,
+                "confidence": confidence,
+                "salient_distinct_shifts_twice": shifts,
+            }
+            if salient_moved_count is not None:
+                motion["salient_moved_count"] = salient_moved_count
             return HistoryEntry(
                 action=action,
                 frame=frame(step=step),
-                animation={
-                    "object_motion": {
-                        "tracking_available": True,
-                        "classification": classification,
-                        "salient_distinct_shifts_twice": shifts,
-                    }
-                },
+                animation={"object_motion": motion},
             )
 
         history = [
@@ -517,6 +522,50 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
         self.assertEqual("high", model["confidence"])
         self.assertTrue(model["linked_high_confidence"])
         self.assertEqual("multi-agent", model["recommended_solver_types"][0])
+
+        decisive_history = [
+            motion_entry("DOWN", "coherent", [[6, 0]], 1, confidence="medium"),
+            motion_entry(
+                "RIGHT",
+                "opposing",
+                [[0, -6], [0, 6]],
+                2,
+                confidence="high",
+                salient_moved_count=2,
+            ),
+            motion_entry("DOWN", "coherent", [[6, 0]], 3, confidence="medium"),
+            motion_entry("RIGHT", "coherent", [[0, 6]], 4, confidence="high"),
+        ]
+        decisive_model = _host_control_model(decisive_history, level=1)
+        self.assertEqual("linked_mixed", decisive_model["scheme"])
+        self.assertEqual("high", decisive_model["confidence"])
+        self.assertEqual(
+            "decisive_high_confidence_opposing_motion",
+            decisive_model["confidence_reason"],
+        )
+        self.assertEqual(1, decisive_model["decisive_opposing_samples"])
+        self.assertTrue(decisive_model["linked_high_confidence"])
+        self.assertEqual(
+            1, decisive_model["by_action"]["RIGHT"]["decisive_opposing_samples"]
+        )
+
+        nondecisive_history = [
+            motion_entry("DOWN", "coherent", [[6, 0]], 1, confidence="medium"),
+            motion_entry(
+                "RIGHT",
+                "opposing",
+                [[0, -6], [0, 6]],
+                2,
+                confidence="medium",
+                salient_moved_count=2,
+            ),
+            motion_entry("DOWN", "coherent", [[6, 0]], 3, confidence="medium"),
+            motion_entry("RIGHT", "coherent", [[0, 6]], 4, confidence="high"),
+        ]
+        nondecisive_model = _host_control_model(nondecisive_history, level=1)
+        self.assertEqual("medium", nondecisive_model["confidence"])
+        self.assertEqual(0, nondecisive_model["decisive_opposing_samples"])
+        self.assertFalse(nondecisive_model["linked_high_confidence"])
 
         rejected = reduction_for("level:1:1")
         agent = self._agent()

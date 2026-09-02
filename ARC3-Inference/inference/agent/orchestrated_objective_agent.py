@@ -679,10 +679,23 @@ def _host_control_model(
         if action not in {*directional, "SPACE", "MOUSE"}:
             continue
         action_evidence = evidence.setdefault(
-            action, {"classifications": {}, "shift_sets": {}}
+            action,
+            {
+                "classifications": {},
+                "motion_confidences": {},
+                "shift_sets": {},
+                "decisive_opposing_samples": 0,
+            },
         )
         classifications = action_evidence["classifications"]
         classifications[classification] = classifications.get(classification, 0) + 1
+        motion_confidence = str(motion.get("confidence") or "unknown").strip().lower()
+        if motion_confidence not in {"low", "medium", "high"}:
+            motion_confidence = "unknown"
+        motion_confidences = action_evidence["motion_confidences"]
+        motion_confidences[motion_confidence] = (
+            motion_confidences.get(motion_confidence, 0) + 1
+        )
         raw_shifts = motion.get("salient_distinct_shifts_twice")
         if not isinstance(raw_shifts, list):
             raw_shifts = motion.get("distinct_shifts_twice")
@@ -700,10 +713,22 @@ def _host_control_model(
                 shift_set = ()
         shift_sets = action_evidence["shift_sets"]
         shift_sets[shift_set] = shift_sets.get(shift_set, 0) + 1
+        try:
+            salient_moved_count = int(motion.get("salient_moved_count"))
+        except (TypeError, ValueError, OverflowError):
+            salient_moved_count = len(shift_set)
+        if (
+            action in directional
+            and classification == "opposing"
+            and motion_confidence == "high"
+            and salient_moved_count >= 2
+        ):
+            action_evidence["decisive_opposing_samples"] += 1
 
     by_action: dict[str, dict[str, Any]] = {}
     totals: dict[str, int] = {}
     directional_samples = 0
+    decisive_opposing_samples = 0
     for action in ("UP", "RIGHT", "DOWN", "LEFT", "SPACE", "MOUSE"):
         action_evidence = evidence.get(action)
         if action_evidence is None:
@@ -712,6 +737,9 @@ def _host_control_model(
         samples = sum(int(count) for count in classifications.values())
         if action in directional:
             directional_samples += samples
+            decisive_opposing_samples += int(
+                action_evidence["decisive_opposing_samples"]
+            )
         for classification, count in classifications.items():
             totals[classification] = totals.get(classification, 0) + int(count)
         dominant, dominant_count = sorted(
@@ -724,6 +752,12 @@ def _host_control_model(
         by_action[action] = {
             "samples": samples,
             "classifications": dict(sorted(classifications.items())),
+            "motion_confidences": dict(
+                sorted(action_evidence["motion_confidences"].items())
+            ),
+            "decisive_opposing_samples": int(
+                action_evidence["decisive_opposing_samples"]
+            ),
             "dominant_classification": str(dominant),
             "consistency": round(float(dominant_count) / float(samples), 4),
             "salient_shift_sets_twice": [
@@ -750,9 +784,10 @@ def _host_control_model(
         scheme = "stationary_or_ambiguous"
     else:
         scheme = "unknown"
+    repeated_opposing_evidence = opposing >= 2 and directional_samples >= 4
     confidence = (
         "high"
-        if opposing >= 2 and directional_samples >= 4
+        if decisive_opposing_samples >= 1 or repeated_opposing_evidence
         else "medium"
         if opposing or divergent >= 2 or coherent >= 2
         else "low"
@@ -768,10 +803,20 @@ def _host_control_model(
         and float(item["consistency"]) >= 0.75
     ]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scheme": scheme,
         "confidence": confidence,
+        "confidence_reason": (
+            "decisive_high_confidence_opposing_motion"
+            if decisive_opposing_samples >= 1
+            else "repeated_opposing_motion"
+            if repeated_opposing_evidence
+            else "mixed_or_repeated_motion_evidence"
+            if confidence == "medium"
+            else "insufficient_motion_evidence"
+        ),
         "linked_high_confidence": linked_high_confidence,
+        "decisive_opposing_samples": decisive_opposing_samples,
         "samples": sum(int(count) for count in totals.values()),
         "directional_samples": directional_samples,
         "classifications": dict(sorted(totals.items())),
@@ -2355,6 +2400,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
             ),
             host_control_scheme=host_control_model["scheme"],
             host_control_confidence=host_control_model["confidence"],
+            host_control_confidence_reason=host_control_model["confidence_reason"],
+            host_control_decisive_opposing_samples=host_control_model[
+                "decisive_opposing_samples"
+            ],
         )
 
     def _policy_payload(
