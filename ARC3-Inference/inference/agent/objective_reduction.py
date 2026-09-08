@@ -695,6 +695,46 @@ class ObjectiveTree:
         self.validate()
         return self.active
 
+    def activate_pending_tactical(
+        self, *, prefer_engine_progress: bool = False
+    ) -> ObjectiveNode | None:
+        """Activate a feasible pending child without asking the reducer again.
+
+        Reducer decompositions are ordered plans, not merely alternative prose.
+        Keeping their unselected leaves pending is only useful if the host can
+        hand control to one after the selected leaf resolves.
+        """
+
+        parent = self.active
+        if parent.kind is ObjectiveKind.TACTICAL:
+            raise ObjectiveError(
+                "pending tactical activation requires control at its parent"
+            )
+        candidates = [
+            self.nodes[child_id]
+            for child_id in parent.children
+            if self.nodes[child_id].kind is ObjectiveKind.TACTICAL
+            and self.nodes[child_id].status is ObjectiveStatus.PENDING
+            and self.nodes[child_id].minimum_evidence_actions
+            <= self.remaining_level_actions
+        ]
+        if not candidates:
+            return None
+        if prefer_engine_progress:
+            candidates.sort(
+                key=lambda node: (
+                    node.evidence_mode is not ObjectiveEvidenceMode.ENGINE_PROGRESS,
+                    parent.children.index(node.objective_id),
+                )
+            )
+        selected = candidates[0]
+        selected.status = ObjectiveStatus.ACTIVE
+        selected.attempts += 1
+        parent.status = ObjectiveStatus.ACTIVE
+        self.active_id = selected.objective_id
+        self.validate()
+        return selected
+
     def _resolve_active(self, status: ObjectiveStatus, evidence: str) -> None:
         node = self.active
         node.status = status

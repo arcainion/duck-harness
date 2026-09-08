@@ -182,6 +182,9 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__LOCAL_ANALYZER_OBJECTIVE_REDUCTION__": repr(
             os.environ.get("LOCAL_ANALYZER_OBJECTIVE_REDUCTION", "false")
         ),
+        "__KAGGLE_DUCK_SMOKE_TEST_ONLY__": repr(
+            os.environ.get("KAGGLE_DUCK_SMOKE_TEST_ONLY", "false")
+        ),
         "__LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS__": repr(
             os.environ.get(
                 "LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS", "300"
@@ -578,38 +581,107 @@ def start_vllm_server() -> None:
 
 
 def run_vllm_api_smoke_test() -> None:
-    def assert_raw_fidelity(label: str, fixture: str, max_tokens: int) -> None:
+    def request_content(
+        label: str, prompt: str, max_tokens: int, *, thinking_token_budget: int = 64
+    ) -> str:
         response = request_json(
             f'{VLLM_BASE_URL}/chat/completions',
             payload={
                 'model': SERVED_MODEL_NAME,
-                'messages': [
-                    {
-                        'role': 'user',
-                        'content': (
-                            f'Copy the following {label} envelope exactly. Preserve every '
-                            'quote, newline, space, and indentation character. Output no '
-                            'other text.\n\n' + fixture
-                        ),
-                    }
-                ],
+                'messages': [{'role': 'user', 'content': prompt}],
                 'temperature': 0.0,
                 'max_tokens': max_tokens,
                 'chat_template_kwargs': {'enable_thinking': True},
-                'thinking_token_budget': 64,
+                'thinking_token_budget': thinking_token_budget,
             },
             timeout=120,
         )
         choices = response.get('choices')
         if not isinstance(choices, list) or not choices:
-            raise ValueError(f'raw-{label} response did not contain a choice')
+            raise ValueError(f'{label} response did not contain a choice')
         message = choices[0].get('message')
         if not isinstance(message, dict):
-            raise ValueError(f'raw-{label} response did not contain a message')
+            raise ValueError(f'{label} response did not contain a message')
         content = message.get('content')
-        if not isinstance(content, str) or content.strip() != fixture:
+        if not isinstance(content, str):
+            raise ValueError(f'{label} response did not contain string content')
+        return content.strip()
+
+    def assert_raw_fidelity(label: str, fixture: str, max_tokens: int) -> None:
+        content = request_content(
+            f'raw-{label}',
+            f'Copy the following {label} envelope exactly. Preserve every quote, '
+            'newline, space, and indentation character. Output no other text.\n\n'
+            + fixture,
+            max_tokens,
+        )
+        if content != fixture:
             raise ValueError(
                 f'raw-{label} fidelity check changed quotes, newlines, or indentation'
+            )
+
+    def assert_probe_actions_contract() -> None:
+        prompt = '''Return exactly one JSON object and no Markdown or prose. Solve these
+three independent policy-configuration cases using the stated probe_actions contract:
+1. contrastive: UP is the positive directional probe, RIGHT is its directional
+same-modality control, and minimum_evidence_actions is 4. Produce the shortest valid
+finite schedule, alternating the positive and control. The minimum is a constraint,
+not an output field.
+2. clicks: preserve the ordered mouse_points [[28,30],[28,38],[28,30]] exactly and
+produce one scalar MOUSE probe_actions entry per coordinate.
+3. navigation: actor value 1 must route to target value 2 over passable values 0,1,2
+with approach_distance 1. UP and RIGHT are only its bounded evidence probes; retain
+all route configuration instead of treating probe_actions as the route.
+Use exactly the top-level keys contrastive, clicks, and navigation. Each value must be
+a JSON object containing only POLICY_SOLVER_CONFIG fields. Do not emit objective fields,
+solver types, explanations, or copies of the constraints.'''
+        content = request_content(
+            'probe-actions', prompt, 768, thinking_token_budget=256
+        )
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f'probe-actions response was not raw JSON; content was {content!r}'
+            ) from exc
+        if not isinstance(result, dict):
+            raise ValueError(f'probe-actions response was not an object: {result!r}')
+        contrastive = result.get('contrastive')
+        clicks = result.get('clicks')
+        navigation = result.get('navigation')
+        failures = []
+        contrastive_actions = (
+            contrastive.get('probe_actions') if isinstance(contrastive, dict) else None
+        )
+        if not (
+            isinstance(contrastive_actions, list)
+            and len(contrastive_actions) >= 4
+            and set(contrastive_actions) == {'UP', 'RIGHT'}
+            and contrastive_actions.count('UP') >= 2
+            and all(
+                left != right
+                for left, right in zip(contrastive_actions, contrastive_actions[1:])
+            )
+        ):
+            failures.append('contrastive schedule')
+        if not isinstance(clicks, dict) or (
+            clicks.get('mouse_points') != [[28, 30], [28, 38], [28, 30]]
+            or clicks.get('probe_actions') != ['MOUSE', 'MOUSE', 'MOUSE']
+        ):
+            failures.append('ordered click pairing')
+        if not isinstance(navigation, dict) or not (
+            set(navigation.get('actor_values', [])) == {1}
+            and set(navigation.get('target_values', [])) == {2}
+            and set(navigation.get('passable_values', [])) == {0, 1, 2}
+            and navigation.get('approach_distance') == 1
+            and set(navigation.get('probe_actions', [])) == {'UP', 'RIGHT'}
+        ):
+            failures.append('navigation route fields')
+        if failures:
+            raise ValueError(
+                'probe-actions contract check failed for '
+                + ', '.join(failures)
+                + f'; model JSON was {json.dumps(result, sort_keys=True)}'
             )
 
     reduction_fixture = (
@@ -636,6 +708,7 @@ def run_vllm_api_smoke_test() -> None:
     try:
         assert_raw_fidelity('reduction', reduction_fixture, 512)
         assert_raw_fidelity('policy', policy_fixture, 512)
+        assert_probe_actions_contract()
     except Exception as exc:
         raise RuntimeError(
             server_failure_message(
@@ -647,6 +720,7 @@ def run_vllm_api_smoke_test() -> None:
     print('VLLM OPENAI SERVER QWEN BOUNDED-THINKING TRANSPORT SMOKE TEST', flush=True)
     print('Raw reduction JSON fidelity: passed', flush=True)
     print('Raw policy source fidelity: passed', flush=True)
+    print('LLM probe_actions contract matrix: passed', flush=True)
     print('=' * 88 + '\n', flush=True)
 
 
@@ -679,6 +753,7 @@ setup_env = {
     'LOCAL_ANALYZER_CANDIDATES': __LOCAL_ANALYZER_CANDIDATES__,
     'LOCAL_ANALYZER_GAME_TOKEN_BUDGET': __LOCAL_ANALYZER_GAME_TOKEN_BUDGET__,
     'LOCAL_ANALYZER_OBJECTIVE_REDUCTION': __LOCAL_ANALYZER_OBJECTIVE_REDUCTION__,
+    'KAGGLE_DUCK_SMOKE_TEST_ONLY': __KAGGLE_DUCK_SMOKE_TEST_ONLY__,
     'LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS': __LOCAL_ANALYZER_ORCHESTRATION_REQUEST_TIMEOUT_SECONDS__,
     'LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT': __LOCAL_ANALYZER_ORCHESTRATION_REDUCER_MAX_OUTPUT__,
     'LOCAL_ANALYZER_ORCHESTRATION_CODER_MAX_OUTPUT': __LOCAL_ANALYZER_ORCHESTRATION_CODER_MAX_OUTPUT__,

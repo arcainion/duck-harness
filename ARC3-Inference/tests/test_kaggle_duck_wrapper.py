@@ -33,6 +33,7 @@ class KaggleDuckWrapperTests(unittest.TestCase):
                     "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
                     "KAGGLE_DRY_RUN": "true",
                     "KAGGLE_DUCK_DIAGNOSTIC": "true",
+                    "KAGGLE_DUCK_SMOKE_TEST_ONLY": "true",
                     "KAGGLE_DUCK_OBJECTIVE_REDUCTION": "true",
                     "LOCAL_GAMEPLAY_POLICY_BACKEND": "cpu",
                 }
@@ -49,6 +50,7 @@ class KaggleDuckWrapperTests(unittest.TestCase):
             arguments = json.loads(make_log.read_text(encoding="utf-8"))
 
         self.assertIn("KAGGLE_DUCK_PUBLIC_HARNESS=false", arguments)
+        self.assertIn("KAGGLE_DUCK_SMOKE_TEST_ONLY=true", arguments)
         self.assertIn("CONCURRENT_JOBS=1", arguments)
         self.assertIn("ANALYZER_TIMEOUT=900", arguments)
         self.assertIn("LOCAL_ANALYZER_OBJECTIVE_REDUCTION=true", arguments)

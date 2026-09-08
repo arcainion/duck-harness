@@ -367,6 +367,76 @@ class ObjectiveTreeTests(unittest.TestCase):
         self.assertEqual(ObjectiveStatus.SUPERSEDED, tree.nodes[pending_id].status)
         self.assertEqual(ObjectiveStatus.ACTIVE, replacement.status)
 
+    def test_pending_handoff_prefers_engine_progress_after_calibration(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        subgoal = dict(reduction_payload()["subgoals"][0])  # type: ignore[index, arg-type]
+        calibration = {
+            **subgoal,
+            "title": "Calibrate opposing controls",
+            "evidence_mode": "contrastive_transition",
+            "action_budget": 4,
+            "minimum_evidence_actions": 4,
+        }
+        execution = {
+            **subgoal,
+            "title": "Execute the calibrated route",
+            "evidence_mode": "engine_progress",
+        }
+        fallback = {
+            **subgoal,
+            "title": "Try a second calibration",
+            "evidence_mode": "stable_transition",
+        }
+        selected = tree.apply_proposal(
+            ReductionProposal.from_payload(
+                reduction_payload(
+                    subgoals=[calibration, fallback, execution], selected_index=0
+                )
+            ),
+            remaining_level_actions=20,
+        )
+        for _ in range(4):
+            tree.record_action()
+        tree.complete_active_tactical("controls calibrated")
+
+        handoff = tree.activate_pending_tactical(prefer_engine_progress=True)
+
+        assert handoff is not None
+        self.assertEqual("Execute the calibrated route", handoff.title)
+        self.assertEqual(ObjectiveStatus.ACTIVE, handoff.status)
+        self.assertEqual(1, handoff.attempts)
+        self.assertEqual(ObjectiveStatus.COMPLETED, tree.nodes[selected.objective_id].status)
+
+    def test_pending_handoff_skips_objective_infeasible_at_remaining_budget(self) -> None:
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=4)
+        subgoal = dict(reduction_payload()["subgoals"][0])  # type: ignore[index, arg-type]
+        selected = tree.apply_proposal(
+            ReductionProposal.from_payload(
+                reduction_payload(
+                    subgoals=[
+                        {**subgoal, "action_budget": 1, "minimum_evidence_actions": 1, "single_step": True},
+                        {**subgoal, "title": "Needs four actions"},
+                        {
+                            **subgoal,
+                            "title": "One-action fallback",
+                            "action_budget": 1,
+                            "minimum_evidence_actions": 1,
+                            "single_step": True,
+                        },
+                    ],
+                    selected_index=0,
+                )
+            ),
+            remaining_level_actions=4,
+        )
+        tree.record_action()
+        tree.complete_active_tactical("first probe complete")
+        handoff = tree.activate_pending_tactical()
+
+        assert handoff is not None
+        self.assertEqual("One-action fallback", handoff.title)
+        self.assertEqual(ObjectiveStatus.COMPLETED, tree.nodes[selected.objective_id].status)
+
     def test_nested_reduction_stops_at_maximum_depth(self) -> None:
         tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=32)
         while tree.depth(tree.active_id) < tree.max_depth:

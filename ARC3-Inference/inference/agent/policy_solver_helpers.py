@@ -21,6 +21,7 @@ from inference.agent.policy_codegen_helpers import (
     objective_evidence_ready,
     stable_transition_evidence_status,
     transition_has_progress,
+    transition_has_stable_change,
     transition_repeats_nonprogress_action,
     transition_requires_replan,
 )
@@ -111,12 +112,14 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "fallback_configs",
         "fallback_types",
         "max_plan_length",
+        "mouse_points",
     }
 )
 _MAX_COLOR_VALUES = 16
 _MAX_ACTIONS = 32
 _MAX_SEQUENCES = 8
 _MAX_FALLBACKS = 8
+_MAX_MOUSE_POINTS = 32
 
 
 def solver_family(solver_type: Any) -> str:
@@ -164,6 +167,36 @@ def _bounded_actions(value: Any, key: str, *, maximum: int = _MAX_ACTIONS) -> tu
     return tuple(result)
 
 
+def _bounded_mouse_points(value: Any) -> tuple[tuple[int, int], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError("solver config mouse_points must be a list of [row, col] pairs")
+    if len(value) > _MAX_MOUSE_POINTS:
+        raise ValueError(
+            f"solver config mouse_points may contain at most {_MAX_MOUSE_POINTS} points"
+        )
+    result: list[tuple[int, int]] = []
+    for item in value:
+        if (
+            isinstance(item, (str, bytes))
+            or not isinstance(item, Sequence)
+            or len(item) != 2
+            or type(item[0]) is not int
+            or type(item[1]) is not int
+        ):
+            raise ValueError(
+                "solver config mouse_points entries must be JSON integer [row, col] pairs"
+            )
+        point = (item[0], item[1])
+        if not (0 <= point[0] <= 63 and 0 <= point[1] <= 63):
+            raise ValueError(
+                "solver config mouse_points coordinates must be between 0 and 63"
+            )
+        result.append(point)
+    return tuple(result)
+
+
 def validate_solver_config(solver_type: Any, config: Any) -> dict[str, Any]:
     """Validate and normalize one finite-JSON solver configuration."""
 
@@ -180,6 +213,18 @@ def validate_solver_config(solver_type: Any, config: Any) -> dict[str, Any]:
         result[key] = list(_bounded_colors(config.get(key), key))
     for key in _ACTION_LIST_KEYS:
         result[key] = list(_bounded_actions(config.get(key), key))
+    result["mouse_points"] = [
+        list(point) for point in _bounded_mouse_points(config.get("mouse_points"))
+    ]
+    scheduled_mouse_actions = result["probe_actions"].count("MOUSE")
+    if result["mouse_points"] and scheduled_mouse_actions not in {
+        0,
+        len(result["mouse_points"]),
+    }:
+        raise ValueError(
+            "solver config probe_actions must contain one MOUSE entry per mouse_points "
+            "coordinate when an explicit mixed schedule is provided"
+        )
 
     approach = config.get("approach_distance", 0)
     clearance = config.get("clearance_radius", 0)
@@ -243,6 +288,7 @@ def validate_solver_config(solver_type: Any, config: Any) -> dict[str, Any]:
         result["interactive_values"]
         or result["interaction_actions"]
         or result["probe_actions"]
+        or result["mouse_points"]
     ):
         raise ValueError(
             "interaction solver config requires interactive_values or configured actions"
@@ -330,13 +376,21 @@ def _continue(action: str, memory: Mapping[str, Any], evidence: str, **predictio
     }
 
 
-def _mouse(point: tuple[int, int], memory: Mapping[str, Any], evidence: str) -> dict[str, Any]:
-    return {
+def _mouse(
+    point: tuple[int, int],
+    memory: Mapping[str, Any],
+    evidence: str,
+    **prediction: Any,
+) -> dict[str, Any]:
+    result = {
         "status": "continue",
         "action": {"action": "MOUSE", "row": point[0], "col": point[1]},
         "memory": dict(memory),
         "evidence": evidence,
     }
+    if prediction:
+        result["prediction"] = prediction
+    return result
 
 
 def _terminal(status: str, memory: Mapping[str, Any], evidence: str) -> dict[str, Any]:
@@ -399,11 +453,181 @@ def _objective_budget_usage(observation: Any) -> tuple[int, int] | None:
     return actions_used, action_budget
 
 
-def _transition_evidence_mode(observation: Any) -> str:
+def _transition_probe_payload(
+    transition: Any,
+) -> tuple[str, int | None, int | None] | None:
+    """Return the exact action identity used by probe evidence contracts."""
+
+    if not isinstance(transition, Mapping) or transition.get("executed") is not True:
+        return None
+    action = str(transition.get("action") or "").strip().upper()
+    if action not in POLICY_ACTIONS:
+        return None
+    if action != "MOUSE":
+        return action, None, None
+    row, col = transition.get("row"), transition.get("col")
+    if type(row) is not int or type(col) is not int:
+        return None
+    if not (0 <= row <= 63 and 0 <= col <= 63):
+        return None
+    return action, row, col
+
+
+def _preconsumed_probe_indices(
+    observation: Any,
+    payloads: Sequence[tuple[str, int | None, int | None]],
+) -> tuple[int, ...]:
+    """Match retained, useful objective evidence to a restarted probe schedule."""
+
+    def payload_family(payload: tuple[str, int | None, int | None]) -> str:
+        action = payload[0]
+        if action in {"UP", "RIGHT", "DOWN", "LEFT"}:
+            return "directional"
+        if action == "MOUSE":
+            return "mouse"
+        return f"action:{action}"
+
+    mode = _transition_evidence_mode(observation)
+    if mode not in {"stable_transition", "contrastive_transition"}:
+        return ()
+    objective = observation.objective
+    objective_id = (
+        str(objective.get("objective_id") or "")
+        if isinstance(objective, Mapping)
+        else ""
+    )
+    recent = [
+        item
+        for item in observation.recent_transitions
+        if isinstance(item, Mapping)
+    ][-32:]
+    last = observation.last_transition
+    if isinstance(last, Mapping) and (not recent or recent[-1] != last):
+        recent = [*recent, last][-32:]
+    retained = [
+        item
+        for item in recent
+        if str(item.get("objective_id") or "") == objective_id
+        and item.get("executed") is True
+        and item.get("post_action_observed") is True
+        and not item.get("error")
+        and not bool(item.get("cycle_risk"))
+        and not bool(item.get("loop_detected"))
+    ]
+    stable_payloads = {
+        payload
+        for item in retained
+        if transition_has_stable_change(item)
+        and (payload := _transition_probe_payload(item)) is not None
+    }
+    consumed: list[int] = []
+    for transition in retained:
+        payload = _transition_probe_payload(transition)
+        if payload is None:
+            continue
+        useful = transition_has_stable_change(transition)
+        if mode == "contrastive_transition" and not useful:
+            useful = (
+                transition.get("board_changed") is False
+                and any(
+                    candidate != payload
+                    and payload_family(candidate) == payload_family(payload)
+                    for candidate in stable_payloads
+                )
+            )
+        if not useful:
+            continue
+        match = next(
+            (
+                index
+                for index, candidate in enumerate(payloads)
+                if index not in consumed and candidate == payload
+            ),
+            None,
+        )
+        if match is not None:
+            consumed.append(match)
+    return tuple(sorted(consumed))
+
+
+def _engine_progress_probe_stats(
+    observation: Any, action: str
+) -> dict[str, int | bool]:
+    """Read bounded host-owned level evidence for one scalar probe action."""
+
+    objective = observation.objective
+    level_evidence = (
+        objective.get("level_action_evidence")
+        if isinstance(objective, Mapping)
+        else None
+    )
+    raw = level_evidence.get(action) if isinstance(level_evidence, Mapping) else None
+    raw = raw if isinstance(raw, Mapping) else {}
+
+    def count(key: str) -> int:
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return 0
+        return min(4096, max(0, value))
+
+    return {
+        "executed": count("executed"),
+        "meaningful_progress": count("meaningful_progress"),
+        "stable_changes": count("stable_changes"),
+        "no_progress": count("no_progress"),
+        "saturated": raw.get("saturated") is True,
+    }
+
+
+def _rank_engine_progress_probe_indices(
+    observation: Any,
+    schedule: Sequence[str],
+    pending: Sequence[int],
+) -> list[int]:
+    """Prefer proven progress, then untried controls, without changing other modes."""
+
+    def rank(index: int) -> tuple[int, int, int, int, int, int]:
+        stats = _engine_progress_probe_stats(observation, schedule[index])
+        executed = int(stats["executed"])
+        progress = int(stats["meaningful_progress"])
+        stable = int(stats["stable_changes"])
+        no_progress = int(stats["no_progress"])
+        if bool(stats["saturated"]):
+            evidence_class = 4
+        elif progress:
+            evidence_class = 0
+        elif not executed:
+            evidence_class = 1
+        elif stable:
+            evidence_class = 2
+        else:
+            evidence_class = 3
+        return (
+            evidence_class,
+            -progress,
+            -stable,
+            no_progress,
+            executed,
+            index,
+        )
+
+    return sorted(pending, key=rank)
+
+
+def _objective_evidence_mode(observation: Any) -> str:
     objective = observation.objective
     if not isinstance(objective, Mapping):
         return ""
     mode = str(objective.get("evidence_mode") or "").strip().lower()
+    return mode if mode in {
+        "engine_progress",
+        "stable_transition",
+        "contrastive_transition",
+    } else ""
+
+
+def _transition_evidence_mode(observation: Any) -> str:
+    mode = _objective_evidence_mode(observation)
     return mode if mode in {"stable_transition", "contrastive_transition"} else ""
 
 
@@ -422,20 +646,102 @@ def _bounded_probe_decision(
     probes: Sequence[str],
     evidence: str,
 ) -> dict[str, Any]:
-    index = _memory_index(memory.get("probe_index"), len(probes))
-    while index < len(probes):
-        action = probes[index]
-        index += 1
-        if (
-            action != "MOUSE"
-            and action in observation.valid_actions
-            and not transition_repeats_nonprogress_action(
-                observation.last_transition, action
+    schedule = tuple(str(action).strip().upper() for action in probes)
+    objective = observation.objective
+    signature = {
+        "objective_id": (
+            str(objective.get("objective_id") or "")
+            if isinstance(objective, Mapping)
+            else ""
+        ),
+        "evidence_mode": _objective_evidence_mode(observation),
+        "actions": list(schedule),
+    }
+    if memory.get("probe_schedule") != signature:
+        payloads = tuple((action, None, None) for action in schedule)
+        preconsumed = _preconsumed_probe_indices(observation, payloads)
+        memory["probe_schedule"] = signature
+        memory["probe_preconsumed_indices"] = list(preconsumed)
+        memory["probe_pending_indices"] = [
+            index for index in range(len(schedule)) if index not in preconsumed
+        ]
+        memory["probe_index"] = len(preconsumed)
+    raw_pending = memory.get("probe_pending_indices")
+    pending = (
+        [
+            item
+            for item in raw_pending
+            if type(item) is int and 0 <= item < len(schedule)
+        ]
+        if isinstance(raw_pending, list)
+        else list(range(len(schedule)))
+    )
+    pending = list(dict.fromkeys(pending))
+    engine_progress_ranking = _objective_evidence_mode(observation) == "engine_progress"
+    selection_order = (
+        _rank_engine_progress_probe_indices(observation, schedule, pending)
+        if engine_progress_ranking
+        else list(pending)
+    )
+    memory["probe_selection_order"] = list(selection_order)
+    deferred: list[dict[str, Any]] = []
+    for schedule_index in selection_order:
+        action = schedule[schedule_index]
+        if action == "MOUSE":
+            deferred.append(
+                {"index": schedule_index, "action": action, "reason": "unsupported"}
             )
-        ):
-            memory["probe_index"] = index
-            return _continue(action, memory, evidence)
-    return _terminal("subgoal_failed", memory, "solver exhausted bounded evidence probes")
+            continue
+        action_stats = _engine_progress_probe_stats(observation, action)
+        if engine_progress_ranking and bool(action_stats["saturated"]):
+            deferred.append(
+                {"index": schedule_index, "action": action, "reason": "saturated"}
+            )
+            continue
+        if action not in observation.valid_actions:
+            deferred.append(
+                {"index": schedule_index, "action": action, "reason": "invalid"}
+            )
+            continue
+        if transition_repeats_nonprogress_action(observation.last_transition, action):
+            deferred.append(
+                {
+                    "index": schedule_index,
+                    "action": action,
+                    "reason": "immediate_nonprogress_repeat",
+                }
+            )
+            continue
+        pending.remove(schedule_index)
+        memory["probe_pending_indices"] = pending
+        memory["probe_index"] = len(schedule) - len(pending)
+        memory["probe_deferred"] = deferred
+        return _continue(
+            action,
+            memory,
+            evidence,
+            probe_schedule_index=schedule_index,
+            probe_schedule_remaining=len(pending),
+            probe_schedule_preconsumed=len(
+                memory.get("probe_preconsumed_indices", ())
+            ),
+            probe_schedule_ranked_by_level_evidence=engine_progress_ranking,
+            selected_action_level_evidence=action_stats,
+            deferred_probes=deferred,
+        )
+    memory["probe_pending_indices"] = pending
+    memory["probe_index"] = len(schedule) - len(pending)
+    memory["probe_deferred"] = deferred
+    detail = (
+        "solver has no currently executable bounded evidence probe: "
+        + ", ".join(
+            f"{item['action']}[{item['index']}]={item['reason']}"
+            for item in deferred
+        )
+        if pending
+        else "solver exhausted bounded evidence probes"
+    )
+    return _terminal("subgoal_failed", memory, detail)
 
 
 def _navigation_evidence_probes(observation: Any) -> tuple[str, ...]:
@@ -625,36 +931,207 @@ def _ordered_interaction_evidence_choice(
     actions: Sequence[str],
     points: Sequence[tuple[int, int]],
     evidence: str,
+    mouse_points: Sequence[tuple[int, int]] = (),
 ) -> dict[str, Any] | None:
     """Consume an explicit mixed-modality probe schedule without reordering it."""
 
     schedule = tuple(str(action).strip().upper() for action in actions)
-    signature = list(schedule)
-    if memory.get("interaction_probe_schedule") != signature:
-        memory["interaction_probe_schedule"] = signature
-        memory["interaction_probe_index"] = 0
-    probe_index = _memory_index(
-        memory.get("interaction_probe_index"), len(schedule)
+    objective = observation.objective
+    signature = {
+        "objective_id": (
+            str(objective.get("objective_id") or "")
+            if isinstance(objective, Mapping)
+            else ""
+        ),
+        "evidence_mode": _objective_evidence_mode(observation),
+        "actions": list(schedule),
+        "mouse_points": [list(point) for point in mouse_points],
+    }
+    step_points: list[tuple[int, int] | None] = []
+    point_index = 0
+    for action in schedule:
+        point = None
+        if action == "MOUSE" and point_index < len(mouse_points):
+            point = mouse_points[point_index]
+            point_index += 1
+        step_points.append(point)
+    payloads = tuple(
+        (
+            (action, point[0], point[1])
+            if action == "MOUSE" and point is not None
+            else (action, None, None)
+        )
+        for action, point in zip(schedule, step_points, strict=True)
     )
-    while probe_index < len(schedule):
-        action = schedule[probe_index]
-        probe_index += 1
-        memory["interaction_probe_index"] = probe_index
+    if memory.get("interaction_probe_schedule") != signature:
+        preconsumed = _preconsumed_probe_indices(observation, payloads)
+        memory["interaction_probe_schedule"] = signature
+        memory["interaction_probe_preconsumed_indices"] = list(preconsumed)
+        memory["interaction_probe_pending_indices"] = [
+            index for index in range(len(schedule)) if index not in preconsumed
+        ]
+        memory["interaction_probe_index"] = len(preconsumed)
+    raw_pending = memory.get("interaction_probe_pending_indices")
+    pending = (
+        [
+            item
+            for item in raw_pending
+            if type(item) is int and 0 <= item < len(schedule)
+        ]
+        if isinstance(raw_pending, list)
+        else list(range(len(schedule)))
+    )
+    pending = list(dict.fromkeys(pending))
+    engine_progress_ranking = (
+        _objective_evidence_mode(observation) == "engine_progress"
+        and "MOUSE" not in schedule
+    )
+    selection_order = (
+        _rank_engine_progress_probe_indices(observation, schedule, pending)
+        if engine_progress_ranking
+        else list(pending)
+    )
+    memory["interaction_probe_selection_order"] = list(selection_order)
+    deferred: list[dict[str, Any]] = []
+    for schedule_index in selection_order:
+        action = schedule[schedule_index]
         if action == "MOUSE":
+            if mouse_points:
+                point = step_points[schedule_index]
+                if point is None:
+                    deferred.append(
+                        {
+                            "index": schedule_index,
+                            "action": action,
+                            "reason": "missing_coordinate",
+                        }
+                    )
+                    continue
+                if (
+                    "MOUSE" in observation.valid_actions
+                    and not transition_repeats_nonprogress_action(
+                        observation.last_transition, "MOUSE", point
+                    )
+                ):
+                    pending.remove(schedule_index)
+                    memory["interaction_probe_pending_indices"] = pending
+                    memory["interaction_probe_index"] = len(schedule) - len(pending)
+                    memory["interaction_probe_deferred"] = deferred
+                    return _mouse(
+                        point,
+                        memory,
+                        evidence,
+                        probe_schedule_index=schedule_index,
+                        probe_schedule_remaining=len(pending),
+                        probe_schedule_preconsumed=len(
+                            memory.get("interaction_probe_preconsumed_indices", ())
+                        ),
+                        deferred_probes=deferred,
+                    )
+                reason = (
+                    "invalid"
+                    if "MOUSE" not in observation.valid_actions
+                    else "immediate_nonprogress_repeat"
+                )
+                deferred.append(
+                    {
+                        "index": schedule_index,
+                        "action": action,
+                        "row": point[0],
+                        "col": point[1],
+                        "reason": reason,
+                    }
+                )
+                continue
             mouse_probe = _mouse_evidence_choice(
                 observation, memory, points, evidence
             )
             if mouse_probe is not None:
+                pending.remove(schedule_index)
+                memory["interaction_probe_pending_indices"] = pending
+                memory["interaction_probe_index"] = len(schedule) - len(pending)
+                memory["interaction_probe_deferred"] = deferred
+                mouse_probe["memory"] = dict(memory)
+                mouse_probe["prediction"] = {
+                    "probe_schedule_index": schedule_index,
+                    "probe_schedule_remaining": len(pending),
+                    "probe_schedule_preconsumed": len(
+                        memory.get("interaction_probe_preconsumed_indices", ())
+                    ),
+                    "deferred_probes": deferred,
+                }
                 return mouse_probe
+            deferred.append(
+                {
+                    "index": schedule_index,
+                    "action": action,
+                    "reason": "no_safe_coordinate",
+                }
+            )
+            continue
+        action_stats = _engine_progress_probe_stats(observation, action)
+        if engine_progress_ranking and bool(action_stats["saturated"]):
+            deferred.append(
+                {"index": schedule_index, "action": action, "reason": "saturated"}
+            )
             continue
         if action not in observation.valid_actions:
+            deferred.append(
+                {"index": schedule_index, "action": action, "reason": "invalid"}
+            )
             continue
         if transition_repeats_nonprogress_action(
             observation.last_transition, action
         ):
+            deferred.append(
+                {
+                    "index": schedule_index,
+                    "action": action,
+                    "reason": "immediate_nonprogress_repeat",
+                }
+            )
             continue
-        return _continue(action, memory, evidence)
-    return None
+        pending.remove(schedule_index)
+        memory["interaction_probe_pending_indices"] = pending
+        memory["interaction_probe_index"] = len(schedule) - len(pending)
+        memory["interaction_probe_deferred"] = deferred
+        return _continue(
+            action,
+            memory,
+            evidence,
+            probe_schedule_index=schedule_index,
+            probe_schedule_remaining=len(pending),
+            probe_schedule_preconsumed=len(
+                memory.get("interaction_probe_preconsumed_indices", ())
+            ),
+            probe_schedule_ranked_by_level_evidence=engine_progress_ranking,
+            selected_action_level_evidence=action_stats,
+            deferred_probes=deferred,
+        )
+    memory["interaction_probe_pending_indices"] = pending
+    memory["interaction_probe_index"] = len(schedule) - len(pending)
+    memory["interaction_probe_deferred"] = deferred
+    if not pending:
+        detail = (
+            "interaction solver exhausted bounded evidence probes without "
+            "satisfying objective evidence"
+        )
+    else:
+        descriptions = []
+        for item in deferred:
+            coordinate = (
+                f"@({item['row']},{item['col']})"
+                if "row" in item and "col" in item
+                else ""
+            )
+            descriptions.append(
+                f"{item['action']}[{item['index']}]{coordinate}={item['reason']}"
+            )
+        detail = (
+            "interaction solver has no currently executable bounded evidence probe: "
+            + ", ".join(descriptions)
+        )
+    return _terminal("subgoal_failed", memory, detail)
 
 
 def _interaction_choice(
@@ -665,12 +1142,13 @@ def _interaction_choice(
     evidence: str,
     *,
     ordered_evidence_schedule: bool = False,
+    mouse_points: Sequence[tuple[int, int]] = (),
 ) -> dict[str, Any] | None:
     """Select one coordinate-safe or non-repeating interaction."""
 
     if ordered_evidence_schedule:
         return _ordered_interaction_evidence_choice(
-            observation, memory, actions, points, evidence
+            observation, memory, actions, points, evidence, mouse_points
         )
     if "MOUSE" in actions and "MOUSE" in observation.valid_actions:
         if _transition_evidence_mode(observation):
@@ -1155,8 +1633,11 @@ def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapp
     evidence_ready, evidence = _objective_evidence_status(observation)
     if evidence_ready:
         return _terminal("subgoal_succeeded", memory, evidence)
-    points: list[tuple[int, int]] = []
-    if config["interactive_values"]:
+    explicit_mouse_points = tuple(
+        (int(point[0]), int(point[1])) for point in config["mouse_points"]
+    )
+    points: list[tuple[int, int]] = list(explicit_mouse_points)
+    if not explicit_mouse_points and config["interactive_values"]:
         mask = value_mask(observation.board, config["interactive_values"])
         # Try one representative per component first, then deterministic cells
         # within connected regions. A component center alone cannot provide the
@@ -1178,12 +1659,13 @@ def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapp
         else ""
     )
     ordered_evidence_schedule = bool(
-        explicit_probe_actions
+        (explicit_probe_actions or explicit_mouse_points)
         and objective_evidence_mode
         in {"engine_progress", "stable_transition", "contrastive_transition"}
     )
     actions = (
         explicit_probe_actions
+        or tuple("MOUSE" for _point in explicit_mouse_points)
         if ordered_evidence_schedule
         else config["interaction_actions"] or explicit_probe_actions
     )
@@ -1201,6 +1683,7 @@ def _interaction_decision(observation: Any, memory: dict[str, Any], config: Mapp
         points,
         "interaction solver selected the least-tried valid interaction",
         ordered_evidence_schedule=ordered_evidence_schedule,
+        mouse_points=explicit_mouse_points,
     )
     if interaction is not None:
         return interaction

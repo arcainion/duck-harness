@@ -24,7 +24,25 @@ def test_normal_kaggle_notebook_configures_explicit_offline_environment_dir() ->
     assert "def _configure_offline_games(games, env_dir: Path)" in code
     assert "dataclasses.replace(game.arcade_spec, environments_dir=str(env_dir))" in code
     assert '_configure_offline_games(bm.games, wheelhouse.parent / "environment_files")' in code
-    assert code.index("if true_submission:") < code.index("else:\n        # Ordinary Save & Run")
+    assert code.index("elif true_submission:") < code.index("else:\n        # Ordinary Save & Run")
+
+
+def test_kaggle_notebooks_can_stop_after_solver_smoke_tests() -> None:
+    notebook_dir = Path(__file__).parents[1] / "src" / "taaf" / "kaggle"
+
+    for filename in ("taaf_kaggle_run.ipynb", "taaf_kaggle_run_share.ipynb"):
+        notebook = json.loads((notebook_dir / filename).read_text(encoding="utf-8"))
+        code = "\n".join(
+            "".join(cell.get("source", []))
+            for cell in notebook["cells"]
+            if cell.get("cell_type") == "code"
+        )
+
+        assert "KAGGLE_DUCK_SMOKE_TEST_ONLY" in code
+        assert "smoke tests completed successfully; benchmark skipped" in code
+        assert 'WORKING_DIR / "smoke-tests-passed.txt"' in code
+        assert "if smoke_tests_only:" in code
+        assert "else:\n            await bm.run(" in code or "else:\n        await bm.run(" in code
 
 
 def test_kernel_bundle_declares_and_renders_model_sources(tmp_path: Path) -> None:

@@ -71,6 +71,7 @@ DEPLOYMENT_SLURM_PARTITION ?= $(shell $(CONFIG_VALUE) deployment.slurm.partition
 DEPLOYMENT_SLURM_NODELIST ?= $(shell $(CONFIG_VALUE) deployment.slurm.nodelist)
 DEPLOYMENT_SLURM_EXTRA_SBATCH_FLAGS ?= $(shell $(CONFIG_VALUE) deployment.slurm.extra_sbatch_flags [])
 KAGGLE_DUCK_PUBLIC_HARNESS ?= false
+KAGGLE_DUCK_SMOKE_TEST_ONLY ?= false
 KAGGLE_MAKE_SHARE_VERSION ?= false
 KAGGLE_USERNAME ?=
 KAGGLE_KERNEL_SLUG ?= $(if $(strip $(RUN_NAME)),taaf-$(RUN_NAME)$(if $(filter true TRUE 1 yes YES on ON,$(KAGGLE_MAKE_SHARE_VERSION)),-share),)
@@ -531,6 +532,7 @@ _taaf-run:
 			fi; \
 			;; \
 	esac; \
+	KAGGLE_DUCK_SMOKE_TEST_ONLY="$(KAGGLE_DUCK_SMOKE_TEST_ONLY)" \
 	LOCAL_ANALYZER_API_KEY="$$local_analyzer_api_key" $(UV_RUN) inference-taaf-run \
 		$(if $(filter-out [],$(strip $(GAME))),--game '$(GAME)',) \
 		$(if $(strip $(DATASET)),--dataset '$(DATASET)',) \

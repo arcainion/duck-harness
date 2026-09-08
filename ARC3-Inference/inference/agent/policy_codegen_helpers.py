@@ -607,8 +607,40 @@ def contrastive_transition_evidence_status(
             )
         )
 
+    def stable_effect_signature(item: Mapping[str, Any]) -> tuple[Any, ...] | None:
+        if not transition_has_stable_change(item):
+            return None
+        animation = item.get("animation_summary")
+        if not isinstance(animation, Mapping):
+            return None
+        motion = animation.get("object_motion")
+        if not isinstance(motion, Mapping) or motion.get("tracking_available") is not True:
+            return None
+        raw_shifts = motion.get("salient_distinct_shifts_twice")
+        if not isinstance(raw_shifts, list) or not raw_shifts:
+            return None
+        shifts: list[tuple[int, int]] = []
+        for shift in raw_shifts[:8]:
+            if not isinstance(shift, (list, tuple)) or len(shift) != 2:
+                continue
+            try:
+                normalized = (int(shift[0]), int(shift[1]))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if normalized != (0, 0):
+                shifts.append(normalized)
+        return ("motion_shifts_twice", *sorted(set(shifts))) if shifts else None
+
     for positive_signature in positive_signatures:
         positive_family = action_family(positive_signature)
+        positive_effect_counts: dict[tuple[Any, ...], int] = {}
+        for item in groups[positive_signature]:
+            effect = stable_effect_signature(item)
+            if effect is not None:
+                positive_effect_counts[effect] = positive_effect_counts.get(effect, 0) + 1
+        repeated_positive_effects = {
+            effect for effect, count in positive_effect_counts.items() if count >= 2
+        }
         for signature, items in groups.items():
             if signature == positive_signature:
                 continue
@@ -619,9 +651,24 @@ def contrastive_transition_evidence_status(
                     "repeated positive and matched same-family negative-control "
                     "transition requirements are met"
                 )
+            control_effects = {
+                effect
+                for item in items
+                if (effect := stable_effect_signature(item)) is not None
+            }
+            if (
+                repeated_positive_effects
+                and control_effects
+                and repeated_positive_effects.isdisjoint(control_effects)
+                and all(not item.get("error") for item in items)
+            ):
+                return True, (
+                    "repeated positive motion effect and distinct same-family control "
+                    "effect requirements are met"
+                )
     return False, (
         "no matched same-family negative-control action or coordinate was observed "
-        "without a corresponding stable change"
+        "without the positive effect or with a distinct stable motion effect"
     )
 
 

@@ -64,6 +64,9 @@
 - Set `KAGGLE_DUCK_DIAGNOSTIC=true` to run one `ar25-0c556536` diagnostic game at
   concurrency 1 with a 900-second analyzer timeout before committing to the public harness. Override the game list
   with `KAGGLE_DUCK_DIAGNOSTIC_GAMES='["game-id", ...]'` when needed.
+- Set `KAGGLE_DUCK_SMOKE_TEST_ONLY=true` to start the notebook's local vLLM server,
+  run only its LLM smoke checks, write `smoke-tests-passed.txt`, skip all game and
+  benchmark execution, and tear the server down.
 - Set `KAGGLE_DUCK_OBJECTIVE_REDUCTION=true` to use the host-owned objective
   tree and generated gameplay-policy runtime. Gameplay defaults to CPU; select
   `LOCAL_GAMEPLAY_POLICY_BACKEND=auto` or `cuda` explicitly to permit CUDA.

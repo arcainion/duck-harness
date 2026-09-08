@@ -516,6 +516,178 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
 
         with self.assertRaisesRegex(PolicyRuntimeError, "at least 3 actions"):
             agent._policy_validator({"source": source})
+        unique_source = source.replace(
+            '["UP"]', '["UP", "RIGHT", "DOWN"]'
+        )
+        with self.assertRaisesRegex(
+            PolicyRuntimeError, "repeat one exact positive action"
+        ):
+            agent._policy_validator({"source": unique_source})
+        tree.record_action()
+        agent._recent_transitions = [
+            {
+                "objective_id": tree.active_id,
+                "action": "UP",
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": True,
+                "outcome_class": "novel",
+            }
+        ]
+        repair_source = source.replace('["UP"]', '["RIGHT", "UP"]')
+        repaired = agent._policy_validator({"source": repair_source})
+
+        self.assertEqual("connector-align", repaired["solver_type"])
+        for _index in range(5):
+            tree.record_action()
+        agent._recent_transitions = [
+            {
+                "objective_id": tree.active_id,
+                "action": "SPACE",
+                "executed": True,
+            }
+        ]
+        unreachable_repeat = source.replace(
+            '["UP"]', '["UP", "RIGHT", "UP"]'
+        )
+        with self.assertRaisesRegex(
+            PolicyRuntimeError, "repeat one exact positive action"
+        ):
+            agent._policy_validator({"source": unreachable_repeat})
+        agent._recent_transitions[0]["action"] = "RIGHT"
+        reachable_repair = source.replace('["UP"]', '["UP", "UP"]')
+        accepted_repair = agent._policy_validator({"source": reachable_repair})
+
+        self.assertEqual("connector-align", accepted_repair["solver_type"])
+        agent.close()
+
+    def test_stable_probe_schedule_requires_a_repeatable_payload(self) -> None:
+        reduction = reduction_for("level:1:1", title="Measure a repeatable transition")
+        subgoals = reduction["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0].update(
+            {
+                "evidence_mode": "stable_transition",
+                "action_budget": 3,
+                "minimum_evidence_actions": 3,
+            }
+        )
+        unique_source = POLICY_SOURCE.replace(
+            '["UP"]', '["UP", "RIGHT", "DOWN"]'
+        )
+        repeated_source = POLICY_SOURCE.replace(
+            '["UP"]', '["UP", "RIGHT", "UP"]'
+        )
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+
+        mouse_source = POLICY_SOURCE.replace(
+            '["UP"]', '["MOUSE", "MOUSE", "MOUSE"]'
+        )
+        with self.assertRaisesRegex(PolicyRuntimeError, "does not execute MOUSE"):
+            agent._policy_validator({"source": mouse_source})
+        with self.assertRaisesRegex(PolicyRuntimeError, "repeat at least one exact"):
+            agent._policy_validator({"source": unique_source})
+        accepted = agent._policy_validator({"source": repeated_source})
+
+        self.assertEqual("static", accepted["solver_type"])
+        agent.close()
+
+    def test_probe_schedule_evidence_ignores_currently_unavailable_actions(
+        self,
+    ) -> None:
+        reduction = reduction_for("level:1:1", title="Compare component motion")
+        subgoals = reduction["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0].update(
+            {
+                "evidence_mode": "contrastive_transition",
+                "action_budget": 4,
+                "minimum_evidence_actions": 3,
+            }
+        )
+        unavailable_source = POLICY_SOURCE.replace(
+            '["UP"]', '["DOWN", "LEFT", "DOWN"]'
+        )
+        partial_source = POLICY_SOURCE.replace(
+            '["UP"]', '["UP", "DOWN", "UP"]'
+        )
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+
+        with self.assertRaisesRegex(
+            PolicyRuntimeError, "no currently executable action"
+        ):
+            agent._policy_validator(
+                {"source": unavailable_source}, valid_actions=("UP",)
+            )
+        with self.assertRaisesRegex(PolicyRuntimeError, "at least 3 actions"):
+            agent._policy_validator(
+                {"source": partial_source}, valid_actions=("UP",)
+            )
+
+        tree.record_action()
+        agent._recent_transitions = [
+            {
+                "objective_id": tree.active_id,
+                "action": "RIGHT",
+                "executed": True,
+            }
+        ]
+        accepted = agent._policy_validator(
+            {"source": partial_source}, valid_actions=("UP",)
+        )
+
+        self.assertEqual("static", accepted["solver_type"])
+        agent.close()
+
+    def test_contrastive_probe_schedule_matches_named_action_roles(self) -> None:
+        reduction = reduction_for(
+            "level:1:1", title="Test RIGHT displacement against DOWN control"
+        )
+        subgoals = reduction["subgoals"]
+        assert isinstance(subgoals, list)
+        subgoals[0].update(
+            {
+                "evidence_mode": "contrastive_transition",
+                "action_budget": 4,
+                "minimum_evidence_actions": 4,
+            }
+        )
+        wrong_positive = POLICY_SOURCE.replace(
+            '["UP"]', '["UP", "LEFT", "UP", "LEFT"]'
+        )
+        missing_control = POLICY_SOURCE.replace(
+            '["UP"]', '["RIGHT", "LEFT", "RIGHT", "LEFT"]'
+        )
+        aligned = POLICY_SOURCE.replace(
+            '["UP"]', '["RIGHT", "DOWN", "RIGHT", "DOWN"]'
+        )
+        agent = self._agent()
+        tree = ObjectiveTree.start_game("game-a", level=1, level_action_budget=20)
+        tree.apply_proposal(
+            ReductionProposal.from_payload(reduction),
+            remaining_level_actions=20,
+        )
+        agent._tree = tree
+
+        with self.assertRaisesRegex(PolicyRuntimeError, "named positive action"):
+            agent._policy_validator({"source": wrong_positive})
+        with self.assertRaisesRegex(PolicyRuntimeError, "named control action"):
+            agent._policy_validator({"source": missing_control})
+        accepted = agent._policy_validator({"source": aligned})
+
+        self.assertEqual("static", accepted["solver_type"])
         agent.close()
 
     def test_reducer_and_coder_payloads_expose_control_horizon_constraints(self) -> None:
@@ -2176,13 +2348,19 @@ class OrchestratedObjectiveAgentTests(unittest.TestCase):
             ),
         ):
             state_path = Path(temp_dir) / "runtime_state.json"
-            write_runtime_state(state_path, current_frame=frame(), history=[])
+            write_runtime_state(
+                state_path,
+                current_frame=frame(
+                    valid_actions=("ACTION1", "ACTION2", "ACTION3", "ACTION4")
+                ),
+                history=[],
+            )
             agent = self._agent()
             agent.model_client = client
             result = agent.analyze(
                 state_path,
                 0,
-                valid_actions=["ACTION1"],
+                valid_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
                 step_env=lambda _payload: {"executed": True, "board_changed": True},
             )
             agent.close()
@@ -3462,7 +3640,10 @@ def decide(observation, memory):
                 policy_for("tactical:1"),
                 policy_for("tactical:1"),
                 replacement,
-                policy_for("tactical:2"),
+                policy_for(
+                    "tactical:2",
+                    source=POLICY_SOURCE.replace('["UP"]', '["UP", "UP"]'),
+                ),
             ]
         )
         runtimes = [

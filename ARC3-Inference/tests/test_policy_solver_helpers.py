@@ -434,6 +434,180 @@ class PolicySolverHelperTests(unittest.TestCase):
             validate_solver_config("navigation", {})
         with self.assertRaisesRegex(ValueError, "target_values"):
             validate_solver_config("marker-coverage", {})
+        with self.assertRaisesRegex(ValueError, r"integer \[row, col\]"):
+            validate_solver_config(
+                "click-interaction", {"mouse_points": [{"row": 3, "col": 4}]}
+            )
+        with self.assertRaisesRegex(ValueError, "between 0 and 63"):
+            validate_solver_config(
+                "click-interaction", {"mouse_points": [[64, 4]]}
+            )
+        with self.assertRaisesRegex(ValueError, "one MOUSE entry"):
+            validate_solver_config(
+                "click-interaction",
+                {
+                    "mouse_points": [[28, 30], [28, 38]],
+                    "probe_actions": ["MOUSE"],
+                },
+            )
+
+    def test_interaction_executes_exact_ordered_mouse_point_schedule(self) -> None:
+        current = observation(valid_actions=("MOUSE",))
+        current.objective = {
+            "objective_id": "tactical:16",
+            "evidence_mode": "contrastive_transition",
+            "execution_mode": "probe",
+            "minimum_evidence_actions": 4,
+        }
+        config = {
+            "mouse_points": [[28, 30], [28, 38], [28, 30], [28, 38]],
+            "probe_actions": ["MOUSE", "MOUSE", "MOUSE", "MOUSE"],
+        }
+        memory: dict = {}
+        points: list[tuple[int, int]] = []
+
+        for _index in range(4):
+            result = solver_decide("click-interaction", current, memory, config)
+            self.assertEqual("continue", result["status"])
+            point = (result["action"]["row"], result["action"]["col"])
+            points.append(point)
+            memory = result["memory"]
+            current.last_transition = {
+                "objective_id": "tactical:16",
+                "action": "MOUSE",
+                "row": point[0],
+                "col": point[1],
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": False,
+                "outcome_class": "exact_noop",
+            }
+
+        self.assertEqual(
+            [(28, 30), (28, 38), (28, 30), (28, 38)], points
+        )
+        exhausted = solver_decide("click-interaction", current, memory, config)
+        self.assertEqual("subgoal_failed", exhausted["status"])
+        self.assertIn("exhausted bounded evidence probes", exhausted["evidence"])
+
+    def test_interaction_reports_exact_deferred_probe_failure(self) -> None:
+        current = observation(valid_actions=("UP",))
+        current.objective = {
+            "objective_id": "tactical:20",
+            "evidence_mode": "engine_progress",
+            "execution_mode": "interact",
+            "minimum_evidence_actions": 1,
+        }
+
+        result = solver_decide(
+            "click-interaction",
+            current,
+            {},
+            {
+                "mouse_points": [[28, 30]],
+                "probe_actions": ["MOUSE"],
+            },
+        )
+
+        self.assertEqual("subgoal_failed", result["status"])
+        self.assertIsNone(result["action"])
+        self.assertIn("MOUSE[0]@(28,30)=invalid", result["evidence"])
+        self.assertEqual(
+            [
+                {
+                    "index": 0,
+                    "action": "MOUSE",
+                    "row": 28,
+                    "col": 30,
+                    "reason": "invalid",
+                }
+            ],
+            result["memory"]["interaction_probe_deferred"],
+        )
+
+    def test_interaction_defers_repeated_noop_mouse_probe_until_after_control(
+        self,
+    ) -> None:
+        current = observation(valid_actions=("MOUSE",))
+        current.objective = {
+            "objective_id": "tactical:17",
+            "evidence_mode": "contrastive_transition",
+            "execution_mode": "probe",
+            "minimum_evidence_actions": 3,
+        }
+        config = {
+            "mouse_points": [[28, 30], [28, 30], [28, 38]],
+            "probe_actions": ["MOUSE", "MOUSE", "MOUSE"],
+        }
+        memory: dict = {}
+        points: list[tuple[int, int]] = []
+
+        for _index in range(3):
+            result = solver_decide("click-interaction", current, memory, config)
+            self.assertEqual("continue", result["status"])
+            point = (result["action"]["row"], result["action"]["col"])
+            points.append(point)
+            memory = result["memory"]
+            current.last_transition = {
+                "objective_id": "tactical:17",
+                "action": "MOUSE",
+                "row": point[0],
+                "col": point[1],
+                "executed": True,
+                "post_action_observed": True,
+                "board_changed": False,
+                "outcome_class": "exact_noop",
+            }
+
+        self.assertEqual([(28, 30), (28, 38), (28, 30)], points)
+        self.assertEqual([], memory["interaction_probe_pending_indices"])
+
+    def test_interaction_restart_consumes_retained_exact_mouse_evidence(self) -> None:
+        positive = {
+            "objective_id": "tactical:18",
+            "action": "MOUSE",
+            "row": 28,
+            "col": 30,
+            "executed": True,
+            "post_action_observed": True,
+            "board_changed": True,
+            "outcome_class": "novel",
+            "cycle_risk": False,
+            "loop_detected": False,
+            "error": "",
+        }
+        control = {
+            "objective_id": "tactical:18",
+            "action": "MOUSE",
+            "row": 28,
+            "col": 38,
+            "executed": True,
+            "post_action_observed": True,
+            "board_changed": False,
+            "outcome_class": "exact_noop",
+            "cycle_risk": False,
+            "loop_detected": False,
+            "error": "",
+        }
+        current = observation(valid_actions=("MOUSE",), last_transition=control)
+        current.objective = {
+            "objective_id": "tactical:18",
+            "evidence_mode": "contrastive_transition",
+            "minimum_evidence_actions": 4,
+        }
+        current.recent_transitions = (positive, control)
+        config = {
+            "mouse_points": [[28, 30], [28, 38], [28, 30], [28, 38]],
+            "probe_actions": ["MOUSE", "MOUSE", "MOUSE", "MOUSE"],
+        }
+
+        result = solver_decide("click-interaction", current, {}, config)
+
+        self.assertEqual({"action": "MOUSE", "row": 28, "col": 30}, result["action"])
+        self.assertEqual(2, result["prediction"]["probe_schedule_preconsumed"])
+        self.assertEqual(
+            [0, 1], result["memory"]["interaction_probe_preconsumed_indices"]
+        )
 
     def test_interaction_avoids_edge_hud_and_exact_no_progress_repeat(self) -> None:
         edge_board = np.zeros((64, 64), dtype=np.uint8)
@@ -616,6 +790,42 @@ class PolicySolverHelperTests(unittest.TestCase):
             current.recent_transitions = tuple(recent)
 
         self.assertEqual(["UP", "RIGHT", "UP"], decisions)
+
+    def test_engine_progress_interaction_ranks_scalar_probe_schedule(self) -> None:
+        current = observation(valid_actions=("SPACE", "RIGHT", "DOWN"))
+        current.objective = {
+            "objective_id": "tactical:9",
+            "evidence_mode": "engine_progress",
+            "minimum_evidence_actions": 1,
+            "level_action_evidence": {
+                "SPACE": {
+                    "executed": 4,
+                    "meaningful_progress": 0,
+                    "stable_changes": 0,
+                    "no_progress": 4,
+                    "saturated": True,
+                },
+                "RIGHT": {
+                    "executed": 2,
+                    "meaningful_progress": 1,
+                    "stable_changes": 1,
+                    "no_progress": 1,
+                    "saturated": False,
+                },
+            },
+        }
+
+        result = solver_decide(
+            "signal",
+            current,
+            {},
+            {"probe_actions": ["SPACE", "DOWN", "RIGHT"]},
+        )
+
+        self.assertEqual("RIGHT", result["action"]["action"])
+        self.assertTrue(
+            result["prediction"]["probe_schedule_ranked_by_level_evidence"]
+        )
 
     def test_interaction_preserves_explicit_mixed_probe_order(self) -> None:
         board = np.zeros((64, 64), dtype=np.uint8)
@@ -1397,9 +1607,268 @@ class PolicySolverHelperTests(unittest.TestCase):
             first["memory"],
             config,
         )
+        third = solver_decide(
+            "static",
+            observation(
+                last_transition={
+                    "action": second["action"]["action"],
+                    "outcome_class": "exact_noop",
+                }
+            ),
+            second["memory"],
+            config,
+        )
 
         self.assertEqual("UP", first["action"]["action"])
         self.assertEqual("RIGHT", second["action"]["action"])
+        self.assertEqual(
+            [
+                {
+                    "index": 1,
+                    "action": "UP",
+                    "reason": "immediate_nonprogress_repeat",
+                }
+            ],
+            second["prediction"]["deferred_probes"],
+        )
+        self.assertEqual("UP", third["action"]["action"])
+        self.assertEqual(1, third["prediction"]["probe_schedule_index"])
+        self.assertEqual(0, third["prediction"]["probe_schedule_remaining"])
+        self.assertEqual([], third["memory"]["probe_pending_indices"])
+
+    def test_observation_probe_schedule_resets_for_new_objective(self) -> None:
+        config = {"probe_actions": ["UP", "RIGHT"]}
+        first_observation = observation()
+        first_observation.objective = {
+            "objective_id": "tactical:1",
+            "evidence_mode": "engine_progress",
+        }
+        first = solver_decide("static", first_observation, {}, config)
+        next_observation = observation()
+        next_observation.objective = {
+            "objective_id": "tactical:2",
+            "evidence_mode": "engine_progress",
+        }
+
+        reset = solver_decide("static", next_observation, first["memory"], config)
+
+        self.assertEqual("UP", reset["action"]["action"])
+        self.assertEqual(
+            "tactical:2", reset["memory"]["probe_schedule"]["objective_id"]
+        )
+
+    def test_engine_progress_probes_prioritize_host_evidence(self) -> None:
+        current = observation()
+        current.objective = {
+            "objective_id": "tactical:2",
+            "evidence_mode": "engine_progress",
+            "minimum_evidence_actions": 1,
+            "level_action_evidence": {
+                "UP": {
+                    "executed": 4,
+                    "meaningful_progress": 0,
+                    "stable_changes": 0,
+                    "no_progress": 4,
+                    "saturated": True,
+                },
+                "RIGHT": {
+                    "executed": 2,
+                    "meaningful_progress": 1,
+                    "stable_changes": 1,
+                    "no_progress": 1,
+                    "saturated": False,
+                },
+            },
+        }
+
+        result = solver_decide(
+            "static",
+            current,
+            {},
+            {"probe_actions": ["UP", "DOWN", "RIGHT"]},
+        )
+
+        self.assertEqual("RIGHT", result["action"]["action"])
+        self.assertTrue(
+            result["prediction"]["probe_schedule_ranked_by_level_evidence"]
+        )
+        self.assertEqual(
+            1,
+            result["prediction"]["selected_action_level_evidence"][
+                "meaningful_progress"
+            ],
+        )
+
+    def test_engine_progress_probe_does_not_execute_saturated_action(self) -> None:
+        current = observation(valid_actions=("UP",))
+        current.objective = {
+            "objective_id": "tactical:2",
+            "evidence_mode": "engine_progress",
+            "minimum_evidence_actions": 1,
+            "level_action_evidence": {
+                "UP": {
+                    "executed": 4,
+                    "meaningful_progress": 0,
+                    "stable_changes": 0,
+                    "no_progress": 4,
+                    "saturated": True,
+                }
+            },
+        }
+
+        result = solver_decide(
+            "static", current, {}, {"probe_actions": ["UP"]}
+        )
+
+        self.assertEqual("subgoal_failed", result["status"])
+        self.assertIsNone(result["action"])
+        self.assertIn("UP[0]=saturated", result["evidence"])
+
+    def test_stable_probe_schedule_ignores_engine_progress_ranking(self) -> None:
+        current = observation()
+        current.objective = {
+            "objective_id": "tactical:2",
+            "evidence_mode": "stable_transition",
+            "minimum_evidence_actions": 3,
+            "level_action_evidence": {
+                "RIGHT": {
+                    "executed": 2,
+                    "meaningful_progress": 2,
+                    "stable_changes": 2,
+                    "no_progress": 0,
+                    "saturated": False,
+                }
+            },
+        }
+
+        result = solver_decide(
+            "static", current, {}, {"probe_actions": ["UP", "RIGHT", "UP"]}
+        )
+
+        self.assertEqual("UP", result["action"]["action"])
+        self.assertFalse(
+            result["prediction"]["probe_schedule_ranked_by_level_evidence"]
+        )
+
+    def test_observation_restart_consumes_only_retained_useful_evidence(self) -> None:
+        positive = {
+            "objective_id": "tactical:3",
+            "action": "UP",
+            "executed": True,
+            "post_action_observed": True,
+            "board_changed": True,
+            "outcome_class": "novel",
+            "cycle_risk": False,
+            "loop_detected": False,
+            "error": "",
+        }
+        control = {
+            "objective_id": "tactical:3",
+            "action": "RIGHT",
+            "executed": True,
+            "post_action_observed": True,
+            "board_changed": False,
+            "outcome_class": "exact_noop",
+            "cycle_risk": False,
+            "loop_detected": False,
+            "error": "",
+        }
+        current = observation(last_transition=control)
+        current.objective = {
+            "objective_id": "tactical:3",
+            "evidence_mode": "contrastive_transition",
+            "minimum_evidence_actions": 4,
+        }
+        current.recent_transitions = (positive, control)
+        config = {"probe_actions": ["UP", "RIGHT", "UP", "RIGHT"]}
+
+        result = solver_decide("static", current, {}, config)
+
+        self.assertEqual("UP", result["action"]["action"])
+        self.assertEqual(2, result["prediction"]["probe_schedule_preconsumed"])
+        self.assertEqual([0, 1], result["memory"]["probe_preconsumed_indices"])
+
+        ambiguous = observation(last_transition=control)
+        ambiguous.objective = current.objective
+        ambiguous.recent_transitions = (control,)
+        not_consumed = solver_decide("static", ambiguous, {}, config)
+
+        self.assertEqual("UP", not_consumed["action"]["action"])
+        self.assertEqual(0, not_consumed["prediction"]["probe_schedule_preconsumed"])
+
+    def test_observation_restart_does_not_mix_probe_modalities(self) -> None:
+        mouse_positive = {
+            "objective_id": "tactical:19",
+            "action": "MOUSE",
+            "row": 28,
+            "col": 30,
+            "executed": True,
+            "post_action_observed": True,
+            "board_changed": True,
+            "outcome_class": "novel",
+            "cycle_risk": False,
+            "loop_detected": False,
+            "error": "",
+        }
+        directional_control = {
+            "objective_id": "tactical:19",
+            "action": "RIGHT",
+            "executed": True,
+            "post_action_observed": True,
+            "board_changed": False,
+            "outcome_class": "exact_noop",
+            "cycle_risk": False,
+            "loop_detected": False,
+            "error": "",
+        }
+        current = observation(last_transition=directional_control)
+        current.objective = {
+            "objective_id": "tactical:19",
+            "evidence_mode": "contrastive_transition",
+            "minimum_evidence_actions": 3,
+        }
+        current.recent_transitions = (mouse_positive, directional_control)
+
+        result = solver_decide(
+            "static",
+            current,
+            {},
+            {"probe_actions": ["UP", "RIGHT", "UP"]},
+        )
+
+        self.assertEqual("UP", result["action"]["action"])
+        self.assertEqual(0, result["prediction"]["probe_schedule_preconsumed"])
+        self.assertEqual([], result["memory"]["probe_preconsumed_indices"])
+
+    def test_observation_restart_credits_last_transition_when_history_is_empty(
+        self,
+    ) -> None:
+        stable = {
+            "objective_id": "tactical:4",
+            "action": "UP",
+            "executed": True,
+            "post_action_observed": True,
+            "board_changed": True,
+            "outcome_class": "novel",
+            "cycle_risk": False,
+            "loop_detected": False,
+            "error": "",
+        }
+        current = observation(last_transition=stable)
+        current.objective = {
+            "objective_id": "tactical:4",
+            "evidence_mode": "stable_transition",
+            "minimum_evidence_actions": 2,
+        }
+        current.recent_transitions = ()
+
+        result = solver_decide(
+            "static", current, {}, {"probe_actions": ["UP", "UP"]}
+        )
+
+        self.assertEqual("UP", result["action"]["action"])
+        self.assertEqual([0], result["memory"]["probe_preconsumed_indices"])
+        self.assertEqual(1, result["prediction"]["probe_schedule_preconsumed"])
 
     def test_observation_solver_honors_contrastive_objective_evidence(self) -> None:
         positive = {

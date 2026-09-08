@@ -11,7 +11,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import requests
@@ -186,6 +186,14 @@ def _rejected_policy_repair_guidance(user_payload: dict[str, Any]) -> str:
             guidance
             + " For contrastive static probes, separate repeated positives with a "
             "same-modality control instead of placing duplicate actions consecutively."
+        )
+    if selected_family == "interaction":
+        return (
+            guidance
+            + " For coordinate-specific clicks, keep probe_actions and "
+            "interaction_actions as scalar action-name strings. Put the ordered "
+            "[row, col] coordinate schedule in mouse_points with one MOUSE "
+            "probe_actions entry per coordinate."
         )
     return guidance
 
@@ -405,7 +413,33 @@ solver_decide(POLICY_SOLVER_TYPE, observation, memory, POLICY_SOLVER_CONFIG).
 The dispatcher returns a complete PolicyDecision-compatible mapping. Configure only
 finite JSON using actor_values, target_values, passable_values, hazard_values,
 interactive_values, source_values, coverage_values, interaction_actions,
-probe_actions, action_sequences, approach_distance, and max_plan_length.
+probe_actions, mouse_points, action_sequences, approach_distance, and max_plan_length.
+probe_actions and interaction_actions contain action-name strings only. For an exact
+click schedule, put JSON integer [row, col] pairs in mouse_points and put one scalar
+"MOUSE" entry in probe_actions for each coordinate. Preserve repeated coordinates and
+their order for contrastive evidence; never put action objects inside an action list.
+Treat probe_actions as a finite evidence schedule, not a preference list. Include at
+least minimum_evidence_actions executable entries. Stable-transition schedules must
+repeat one exact action payload; contrastive schedules must repeat the exact positive
+payload and include a distinct same-modality control. The dispatcher normally preserves
+order, but temporarily defers an exact probe that would immediately repeat a
+non-progress transition, executes the next usable control, then returns to the deferred
+probe. Schedule state is scoped to the objective, so reused policies restart probing
+after an objective handoff. On same-objective repair or resume, retained stable-change
+probes and same-modality supported no-change controls are credited against the
+restarted schedule; a directional probe cannot support a MOUSE control or vice versa.
+Ambiguous, volatile, cyclic, errored, or cross-objective transitions are never credited.
+If an interaction schedule becomes unusable after activation, its terminal evidence
+reports each deferred schedule index, exact coordinate when applicable, and reason;
+use that detail to replace only the invalid, unsafe, or exhausted probes during repair.
+For engine_progress, scalar probe_actions are ranked by host level_action_evidence:
+previously meaningful controls first, then untried controls, then stable-only and
+no-progress controls; saturated controls are not executed. Do not encode a prerequisite
+sequence in probe_actions—use a registered sequence solver with action_sequences when
+order itself is semantically required. Every scheduled probe expected to contribute
+evidence must be present in observation.valid_actions. The host filters unavailable
+entries when checking minimum, stable, and contrastive evidence feasibility, so an
+unavailable control cannot satisfy the objective contract.
 Routing-capable solvers also support clearance_radius from 0 through 8 for multi-cell
 actors. Hybrid
 requires non-hybrid fallback_types and matching fallback_configs. Sequence types
@@ -2727,7 +2761,12 @@ class OrchestratedObjectiveAgent(ToolAgent):
         payload["level_action_evidence"] = self._level_action_evidence_payload()
         return payload
 
-    def _policy_validator(self, raw: dict[str, Any]) -> dict[str, Any]:
+    def _policy_validator(
+        self,
+        raw: dict[str, Any],
+        *,
+        valid_actions: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         if self._tree is None:
             raise PolicyRuntimeError("objective tree is unavailable")
         source = str(raw.get("source") or "")
@@ -2774,36 +2813,217 @@ class OrchestratedObjectiveAgent(ToolAgent):
         _validate_solver_declaration_usage(source)
         declared_family = solver_family(declared_type)
         probes = list(normalized_config["probe_actions"])
+        mouse_points = [
+            tuple(point) for point in normalized_config["mouse_points"]
+        ]
+        if not probes and mouse_points:
+            probes = ["MOUSE"] * len(mouse_points)
+        explicit_probe_payloads: list[tuple[str, int | None, int | None]] = []
+        mouse_index = 0
+        for action in probes:
+            if action != "MOUSE":
+                explicit_probe_payloads.append((action, None, None))
+                continue
+            if mouse_index >= len(mouse_points):
+                explicit_probe_payloads.append(("MOUSE", None, None))
+                continue
+            row, col = mouse_points[mouse_index]
+            mouse_index += 1
+            explicit_probe_payloads.append(("MOUSE", int(row), int(col)))
+        observed_probe_payloads: list[tuple[str, int | None, int | None]] = []
+        for transition in self._recent_transitions:
+            if (
+                str(transition.get("objective_id") or "") != active.objective_id
+                or not bool(transition.get("executed"))
+            ):
+                continue
+            action = str(transition.get("action") or "").strip().upper()
+            if action == "MOUSE":
+                row, col = transition.get("row"), transition.get("col")
+                if type(row) is int and type(col) is int:
+                    observed_probe_payloads.append((action, row, col))
+            elif action in {"UP", "DOWN", "LEFT", "RIGHT", "SPACE"}:
+                observed_probe_payloads.append((action, None, None))
+        reachable_probe_payloads = explicit_probe_payloads[
+            : active.remaining_actions
+        ]
+        normalized_valid_actions = (
+            {
+                str(action or "").strip().upper()
+                for action in valid_actions
+                if str(action or "").strip()
+            }
+            if valid_actions is not None
+            else None
+        )
+        executable_probe_payloads = [
+            payload
+            for payload in reachable_probe_payloads
+            if normalized_valid_actions is None
+            or payload[0] in normalized_valid_actions
+        ]
+        unavailable_probe_actions = sorted(
+            {
+                payload[0]
+                for payload in reachable_probe_payloads
+                if normalized_valid_actions is not None
+                and payload[0] not in normalized_valid_actions
+            }
+        )
+        reachable_unresolved_mouse_payload = any(
+            payload == ("MOUSE", None, None)
+            for payload in executable_probe_payloads
+        )
+        available_probe_payloads = [
+            *observed_probe_payloads,
+            *executable_probe_payloads,
+        ]
         if (
-            active.evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION
-            and probes
-            and len(probes) < active.minimum_evidence_actions
+            "MOUSE" in probes
+            and declared_family in {"observe", "routing"}
+            and active.execution_mode is not TacticalExecutionMode.NAVIGATE
         ):
             raise PolicyRuntimeError(
-                "explicit policy probe_actions must contain at least "
-                f"{active.minimum_evidence_actions} actions to meet the objective's "
-                "minimum evidence count",
+                f"{declared_family} probe execution does not execute MOUSE entries; "
+                "use an interaction-capable solver for coordinate probes",
+                category="policy_solver_contract",
+            )
+        if (
+            probes
+            and normalized_valid_actions is not None
+            and not executable_probe_payloads
+            and (
+                declared_family == "observe"
+                or active.execution_mode is not TacticalExecutionMode.NAVIGATE
+            )
+        ):
+            raise PolicyRuntimeError(
+                "policy probe_actions contain no currently executable action; "
+                f"unavailable={unavailable_probe_actions}, "
+                f"valid={sorted(normalized_valid_actions)}",
+                category="policy_solver_contract",
+            )
+        if (
+            probes
+            and active.evidence_mode
+            in {
+                ObjectiveEvidenceMode.STABLE_TRANSITION,
+                ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION,
+            }
+            and (
+                declared_family == "observe"
+                or active.execution_mode is not TacticalExecutionMode.NAVIGATE
+            )
+            and len(available_probe_payloads) < active.minimum_evidence_actions
+        ):
+            raise PolicyRuntimeError(
+                "the objective's observed evidence plus reachable probe_actions must "
+                f"provide at least {active.minimum_evidence_actions} actions within "
+                "the remaining tactical action budget and current valid-action set; "
+                f"unavailable={unavailable_probe_actions}",
                 category="policy_solver_contract",
             )
         if (
             active.evidence_mode is ObjectiveEvidenceMode.CONTRASTIVE_TRANSITION
-            and declared_family == "observe"
+            and probes
+            and not reachable_unresolved_mouse_payload
         ):
-            repeated = {action for action in probes if probes.count(action) >= 2}
-            modalities = {
-                "direction": {"UP", "DOWN", "LEFT", "RIGHT"},
+            repeated = {
+                payload
+                for payload in available_probe_payloads
+                if available_probe_payloads.count(payload) >= 2
             }
+
+            def same_modality(
+                positive: tuple[str, int | None, int | None],
+                candidate: tuple[str, int | None, int | None],
+            ) -> bool:
+                if positive[0] in {"UP", "DOWN", "LEFT", "RIGHT"}:
+                    return candidate[0] in {"UP", "DOWN", "LEFT", "RIGHT"}
+                return positive[0] == candidate[0] == "MOUSE"
+
             has_same_modality_control = any(
-                positive in actions
-                and any(candidate != positive for candidate in probes if candidate in actions)
+                any(
+                    candidate != positive and same_modality(positive, candidate)
+                    for candidate in available_probe_payloads
+                )
                 for positive in repeated
-                for actions in modalities.values()
             )
             if not repeated or not has_same_modality_control:
                 raise PolicyRuntimeError(
-                    "contrastive observation policy probe_actions must repeat one exact "
+                    "contrastive policy probe_actions must repeat one exact "
                     "positive action and include a distinct same-modality negative control "
-                    "(direction versus direction; SPACE has no distinct button control)",
+                    "(direction versus direction or MOUSE point versus MOUSE point; "
+                    "SPACE has no distinct button control)",
+                    category="policy_solver_contract",
+                )
+            expected_positives, expected_controls = _tactical_action_roles(active)
+            directional_actions = {"UP", "DOWN", "LEFT", "RIGHT"}
+            expected_directional_positives = (
+                expected_positives & directional_actions
+            )
+            expected_directional_controls = expected_controls & directional_actions
+            repeated_directional_actions = {
+                payload[0]
+                for payload in repeated
+                if payload[0] in directional_actions
+            }
+            scheduled_directional_actions = {
+                payload[0]
+                for payload in available_probe_payloads
+                if payload[0] in directional_actions
+            }
+            if expected_directional_positives and not (
+                repeated_directional_actions & expected_directional_positives
+            ):
+                raise PolicyRuntimeError(
+                    "contrastive probe_actions do not repeat the objective's named "
+                    "positive action; expected one of "
+                    f"{sorted(expected_directional_positives)}, repeated "
+                    f"{sorted(repeated_directional_actions)}",
+                    category="policy_solver_contract",
+                )
+            if expected_directional_controls and not (
+                scheduled_directional_actions & expected_directional_controls
+            ):
+                raise PolicyRuntimeError(
+                    "contrastive probe_actions omit the objective's named control "
+                    f"action; expected one of {sorted(expected_directional_controls)}, "
+                    f"scheduled {sorted(scheduled_directional_actions)}",
+                    category="policy_solver_contract",
+                )
+        if (
+            active.evidence_mode is ObjectiveEvidenceMode.STABLE_TRANSITION
+            and available_probe_payloads
+            and not reachable_unresolved_mouse_payload
+            and not any(
+                available_probe_payloads.count(payload) >= 2
+                for payload in available_probe_payloads
+            )
+        ):
+            raise PolicyRuntimeError(
+                "stable-transition policy probe_actions must repeat at least one exact "
+                "action or MOUSE coordinate so repeatability can be measured",
+                category="policy_solver_contract",
+            )
+        if active.evidence_mode is ObjectiveEvidenceMode.STABLE_TRANSITION:
+            directional_actions = {"UP", "DOWN", "LEFT", "RIGHT"}
+            expected_stable_actions = (
+                _tactical_title_actions(active) & directional_actions
+            )
+            repeated_stable_actions = {
+                payload[0]
+                for payload in available_probe_payloads
+                if payload[0] in directional_actions
+                and available_probe_payloads.count(payload) >= 2
+            }
+            if expected_stable_actions and not (
+                expected_stable_actions & repeated_stable_actions
+            ):
+                raise PolicyRuntimeError(
+                    "stable-transition probe_actions do not repeat the objective's "
+                    f"named action; expected one of {sorted(expected_stable_actions)}, "
+                    f"repeated {sorted(repeated_stable_actions)}",
                     category="policy_solver_contract",
                 )
         if (
@@ -3062,6 +3282,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
         objective = self._tree.active
         if objective.kind is not ObjectiveKind.TACTICAL:
             return False
+        model_valid_actions = tuple(to_model_actions(frame.valid_actions))
         contract_hash = _objective_contract_hash(objective)
         for entry in reversed(self._reusable_policies):
             try:
@@ -3089,7 +3310,10 @@ class OrchestratedObjectiveAgent(ToolAgent):
                 continue
             runtime = GameplayPolicyRuntime()
             try:
-                validated = self._policy_validator({"source": source})
+                validated = self._policy_validator(
+                    {"source": source},
+                    valid_actions=model_valid_actions,
+                )
                 if str(validated.get("source_hash") or "") != source_hash:
                     raise PolicyRuntimeError(
                         "reused policy solver validation changed source fingerprint",
@@ -3107,7 +3331,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         board=np.asarray(frame.grid, dtype=np.uint8),
                         level=frame.level,
                         step=frame.step,
-                        valid_actions=tuple(to_model_actions(frame.valid_actions)),
+                        valid_actions=model_valid_actions,
                         last_transition=None,
                         objective=self._policy_objective_payload(objective),
                         recent_transitions=(),
@@ -3198,11 +3422,15 @@ class OrchestratedObjectiveAgent(ToolAgent):
             frame
         ):
             return
+        model_valid_actions = tuple(to_model_actions(frame.valid_actions))
         raw = self._structured_role_call(
             role="coder",
             system_prompt=_CODER_SYSTEM_PROMPT,
             user_payload=self._policy_payload(frame, history, repair_reason),
-            validator=self._policy_validator,
+            validator=lambda candidate: self._policy_validator(
+                candidate,
+                valid_actions=model_valid_actions,
+            ),
             request_deadline=request_deadline,
             should_stop=should_stop,
             rejected_policy_source=self._rejected_policy_source_for_repair(),
@@ -3224,7 +3452,7 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         board=np.asarray(frame.grid, dtype=np.uint8),
                         level=frame.level,
                         step=frame.step,
-                        valid_actions=tuple(to_model_actions(frame.valid_actions)),
+                        valid_actions=model_valid_actions,
                         last_transition=None,
                         objective=self._policy_objective_payload(),
                         recent_transitions=(),
@@ -3320,6 +3548,59 @@ class OrchestratedObjectiveAgent(ToolAgent):
         self._policy_was_reused = False
         self._boundary_reason = reason
         self._reduction_required = self._reduction_required or require_reduction
+
+    def _activate_pending_tactical_after_resolution(
+        self, *, resolved_objective_id: str, outcome: str
+    ) -> bool:
+        """Continue the reducer's existing plan before buying another LLM call."""
+
+        assert self._tree is not None
+        resolved = self._tree.nodes.get(resolved_objective_id)
+        if resolved is None or resolved.kind is not ObjectiveKind.TACTICAL:
+            return False
+        prefer_engine_progress = (
+            resolved.evidence_mode is not ObjectiveEvidenceMode.ENGINE_PROGRESS
+        )
+        activated = self._tree.activate_pending_tactical(
+            prefer_engine_progress=prefer_engine_progress
+        )
+        if activated is None:
+            return False
+        self._reduction_required = False
+        self._boundary_reason = (
+            f"pending_sibling_handoff:{resolved_objective_id}->{activated.objective_id}"
+        )
+        self._orchestration_metrics["pending_tactical_handoffs"] = (
+            int(self._orchestration_metrics.get("pending_tactical_handoffs", 0)) + 1
+        )
+        if prefer_engine_progress and (
+            activated.evidence_mode is ObjectiveEvidenceMode.ENGINE_PROGRESS
+        ):
+            self._orchestration_metrics["calibration_to_execution_handoffs"] = (
+                int(
+                    self._orchestration_metrics.get(
+                        "calibration_to_execution_handoffs", 0
+                    )
+                )
+                + 1
+            )
+        self._emit_event(
+            "objective_handoff",
+            resolved_objective_id=resolved_objective_id,
+            resolved_outcome=outcome,
+            active_objective_id=activated.objective_id,
+            active_title=activated.title,
+            evidence_mode=activated.evidence_mode.value,
+            execution_mode=activated.execution_mode.value,
+            solver_type=(
+                activated.solver_type.value
+                if activated.solver_type is not None
+                else ""
+            ),
+            preferred_engine_progress=prefer_engine_progress,
+            remaining_level_actions=self._tree.remaining_level_actions,
+        )
+        return True
 
     def _restore_policy_if_possible(self) -> bool:
         if (
@@ -3521,6 +3802,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
             # analyze loop retains its independent no-action boundary ceiling.
             self._consecutive_activation_failures = 0
             self._failure_streak_objective_id = ""
+            self._activate_pending_tactical_after_resolution(
+                resolved_objective_id=objective_id, outcome="failed"
+            )
 
     def _tactical_completion_evidence(self) -> tuple[bool, str]:
         """Decide whether host evidence is strong enough to resolve a tactical leaf."""
@@ -3649,6 +3933,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "objective_failed",
             objective_id=objective_id,
             evidence=evidence,
+        )
+        self._activate_pending_tactical_after_resolution(
+            resolved_objective_id=objective_id, outcome="failed"
         )
         return True
 
@@ -3790,6 +4077,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
             "objective_failed",
             objective_id=objective_id,
             evidence=evidence,
+        )
+        self._activate_pending_tactical_after_resolution(
+            resolved_objective_id=objective_id, outcome="failed"
         )
 
     def analyze(
@@ -3947,6 +4237,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         objective_id=objective_id,
                         evidence=evidence,
                     )
+                    self._activate_pending_tactical_after_resolution(
+                        resolved_objective_id=objective_id, outcome="failed"
+                    )
                     no_action_boundaries += 1
                     continue
                 if (
@@ -4043,6 +4336,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         objective_id=objective_id,
                         evidence=decision.evidence,
                     )
+                    self._activate_pending_tactical_after_resolution(
+                        resolved_objective_id=objective_id, outcome="completed"
+                    )
                     no_action_boundaries += 1
                     continue
                 if decision.status is PolicyStatus.SUBGOAL_FAILED:
@@ -4073,6 +4369,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         objective_id=objective_id,
                         evidence=evidence,
                     )
+                    self._activate_pending_tactical_after_resolution(
+                        resolved_objective_id=objective_id, outcome="failed"
+                    )
                     no_action_boundaries += 1
                     continue
 
@@ -4093,6 +4392,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         "objective_failed",
                         objective_id=objective_id,
                         evidence=evidence,
+                    )
+                    self._activate_pending_tactical_after_resolution(
+                        resolved_objective_id=objective_id, outcome="failed"
                     )
                     no_action_boundaries += 1
                     continue
@@ -4148,6 +4450,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         objective_id=objective_id,
                         evidence=evidence,
                     )
+                    self._activate_pending_tactical_after_resolution(
+                        resolved_objective_id=objective_id, outcome="failed"
+                    )
                     no_action_boundaries += 1
                     continue
                 saturation_reason = _action_family_saturation_reason(
@@ -4189,6 +4494,9 @@ class OrchestratedObjectiveAgent(ToolAgent):
                         "objective_failed",
                         objective_id=objective_id,
                         evidence=evidence,
+                    )
+                    self._activate_pending_tactical_after_resolution(
+                        resolved_objective_id=objective_id, outcome="failed"
                     )
                     no_action_boundaries += 1
                     continue

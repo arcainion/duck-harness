@@ -362,6 +362,9 @@ eight directional no-progress guards, and stops after eight consecutive
 cycle-risk actions.
 Its stagnation/cycle windows are 6/4. Add `DEPLOYMENT_WAIT=true` if you want the
 command to block and pull the finished Kaggle output back into the run directory. Set
+`KAGGLE_DUCK_SMOKE_TEST_ONLY=true` to start vLLM, run the notebook's LLM smoke tests,
+skip all game configuration and benchmark execution, and then tear down the server.
+Set
 `KAGGLE_DUCK_DIAGNOSTIC=true` when invoking `kaggle-duck.sh` to first run the
 single-game `ar25-0c556536` diagnostic run at concurrency 1 with a 900-second analyzer timeout.
 The host-owned Orchestrated Objective Reduction analyzer is opt-in. Enable it

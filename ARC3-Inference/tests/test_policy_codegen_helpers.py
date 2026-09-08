@@ -911,6 +911,33 @@ class PolicyCodegenHelperTests(unittest.TestCase):
         self.assertTrue(
             contrastive_transition_evidence_ready(objective, contrasted)
         )
+        differential = [
+            transition("LEFT", changed=True),
+            transition("RIGHT", changed=True),
+            transition("LEFT", changed=True),
+            transition("RIGHT", changed=True),
+        ]
+        for item, shift in zip(
+            differential,
+            ([0, -6], [0, 6], [0, -6], [0, 6]),
+            strict=True,
+        ):
+            item["animation_summary"] = {
+                "object_motion": {
+                    "tracking_available": True,
+                    "salient_distinct_shifts_twice": [shift],
+                }
+            }
+        ready, reason = contrastive_transition_evidence_status(
+            objective, differential
+        )
+        self.assertTrue(ready)
+        self.assertIn("distinct same-family control effect", reason)
+        differential[1]["animation_summary"] = differential[0]["animation_summary"]
+        differential[3]["animation_summary"] = differential[0]["animation_summary"]
+        self.assertFalse(
+            contrastive_transition_evidence_ready(objective, differential)
+        )
         stable_objective = {**objective, "evidence_mode": "stable_transition"}
         self.assertFalse(
             contrastive_transition_evidence_ready(stable_objective, contrasted)
