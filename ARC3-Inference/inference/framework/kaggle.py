@@ -345,7 +345,8 @@ def _validate_model_source(value: str) -> str:
     return "/".join(parts)
 
 
-_DUCK_VLLM_SETUP_SCRIPT = r"""import json
+_DUCK_VLLM_SETUP_SCRIPT = r"""import ast
+import json
 import os
 import shutil
 import subprocess
@@ -724,6 +725,141 @@ solver types, explanations, or copies of the constraints.'''
                 + f'; final model content was {content!r}'
             )
 
+    def assert_generated_policy_contract() -> None:
+        prompt = '''Return exactly one complete Python policy module between BEGIN_POLICY
+and END_POLICY lines, with no Markdown or prose. Generate a navigation policy for actor
+value 1 routing to target value 2 over passable values 0,1,2, approach_distance 1,
+and bounded evidence probes UP then RIGHT. Declare POLICY_API_VERSION = 1,
+SUPPORTED_BACKENDS containing cpu, POLICY_REUSE_SCOPE = "none", literal
+POLICY_SOLVER_TYPE = "navigation", and literal POLICY_SOLVER_CONFIG using the exact
+registered keys actor_values, target_values, passable_values, approach_distance, and
+probe_actions. Define decide(observation, memory) with exactly one return statement
+that directly calls solver_decide(POLICY_SOLVER_TYPE, observation, memory,
+POLICY_SOLVER_CONFIG). Do not implement navigation yourself or emit direct actions.'''
+
+        def validate(content: str) -> list[str]:
+            failures = []
+            if content.count('BEGIN_POLICY') != 1 or content.count('END_POLICY') != 1:
+                return ['policy envelope']
+            begin, remainder = content.split('BEGIN_POLICY', 1)
+            source, end = remainder.split('END_POLICY', 1)
+            if begin.strip() or end.strip():
+                failures.append('policy envelope')
+            try:
+                tree = ast.parse(source.strip())
+            except SyntaxError:
+                return [*failures, 'Python syntax']
+
+            assignments = {}
+            for statement in tree.body:
+                if (
+                    isinstance(statement, ast.Assign)
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)
+                ):
+                    try:
+                        assignments[statement.targets[0].id] = ast.literal_eval(
+                            statement.value
+                        )
+                    except (ValueError, TypeError):
+                        pass
+            if assignments.get('POLICY_API_VERSION') != 1:
+                failures.append('API version')
+            backends = assignments.get('SUPPORTED_BACKENDS')
+            if not isinstance(backends, (list, tuple)) or 'cpu' not in backends:
+                failures.append('CPU backend')
+            if assignments.get('POLICY_REUSE_SCOPE') != 'none':
+                failures.append('reuse scope')
+            if assignments.get('POLICY_SOLVER_TYPE') != 'navigation':
+                failures.append('solver type')
+            config = assignments.get('POLICY_SOLVER_CONFIG')
+
+            def has_exact_values(value, expected):
+                return (
+                    isinstance(value, (list, tuple))
+                    and len(value) == len(expected)
+                    and all(item in expected for item in value)
+                )
+
+            if not isinstance(config, dict) or not (
+                has_exact_values(config.get('actor_values'), (1,))
+                and has_exact_values(config.get('target_values'), (2,))
+                and has_exact_values(config.get('passable_values'), (0, 1, 2))
+                and config.get('approach_distance') == 1
+                and config.get('probe_actions') == ['UP', 'RIGHT']
+            ):
+                failures.append('solver config')
+            decide = next(
+                (
+                    statement
+                    for statement in tree.body
+                    if isinstance(statement, ast.FunctionDef)
+                    and statement.name == 'decide'
+                ),
+                None,
+            )
+            if decide is None or not (
+                not decide.args.posonlyargs
+                and [arg.arg for arg in decide.args.args]
+                == ['observation', 'memory']
+                and decide.args.vararg is None
+                and decide.args.kwarg is None
+                and not decide.args.kwonlyargs
+                and not decide.args.defaults
+                and not decide.args.kw_defaults
+            ):
+                failures.append('decide signature')
+            else:
+                direct_return = (
+                    decide.body[0]
+                    if len(decide.body) == 1
+                    and isinstance(decide.body[0], ast.Return)
+                    else None
+                )
+                call = direct_return.value if direct_return is not None else None
+                expected_args = [
+                    'POLICY_SOLVER_TYPE',
+                    'observation',
+                    'memory',
+                    'POLICY_SOLVER_CONFIG',
+                ]
+                if not (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id == 'solver_decide'
+                    and not call.keywords
+                    and [
+                        arg.id if isinstance(arg, ast.Name) else None
+                        for arg in call.args
+                    ]
+                    == expected_args
+                ):
+                    failures.append('canonical dispatcher call')
+            return failures
+
+        content = request_content(
+            'generated-policy', prompt, 1024, thinking_token_budget=256
+        )
+        failures = validate(content)
+        if failures:
+            content = request_content(
+                'generated-policy-repair',
+                prompt
+                + '\nRepair every failed requirement: '
+                + ', '.join(failures)
+                + '. Return one complete replacement module. Previous answer:\n'
+                + content,
+                1024,
+                thinking_token_budget=256,
+            )
+            failures = validate(content)
+        if failures:
+            raise ValueError(
+                'generated-policy contract check failed for '
+                + ', '.join(failures)
+                + f'; final model content was {content!r}'
+            )
+
     reduction_fixture = (
         'BEGIN_REDUCTION\n'
         '{\n'
@@ -749,6 +885,7 @@ solver types, explanations, or copies of the constraints.'''
         assert_raw_fidelity('reduction', reduction_fixture, 512)
         assert_raw_fidelity('policy', policy_fixture, 512)
         assert_probe_actions_contract()
+        assert_generated_policy_contract()
     except Exception as exc:
         raise RuntimeError(
             server_failure_message(
@@ -761,6 +898,7 @@ solver types, explanations, or copies of the constraints.'''
     print('Raw reduction JSON fidelity: passed', flush=True)
     print('Raw policy source fidelity: passed', flush=True)
     print('LLM probe_actions contract matrix: passed', flush=True)
+    print('LLM generated policy behavior: passed', flush=True)
     print('=' * 88 + '\n', flush=True)
 
 

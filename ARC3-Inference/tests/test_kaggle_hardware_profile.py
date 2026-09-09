@@ -22,6 +22,26 @@ from inference.framework.kaggle import (
 from inference.framework.solver import HarnessSolver
 
 
+GENERATED_NAVIGATION_POLICY = """BEGIN_POLICY
+POLICY_API_VERSION = 1
+SUPPORTED_BACKENDS = ("cpu",)
+POLICY_REUSE_SCOPE = "none"
+POLICY_SOLVER_TYPE = "navigation"
+POLICY_SOLVER_CONFIG = {
+    "actor_values": [1],
+    "target_values": [2],
+    "passable_values": [0, 1, 2],
+    "approach_distance": 1,
+    "probe_actions": ["UP", "RIGHT"],
+}
+
+def decide(observation, memory):
+    return solver_decide(
+        POLICY_SOLVER_TYPE, observation, memory, POLICY_SOLVER_CONFIG
+    )
+END_POLICY"""
+
+
 class KaggleHardwareProfileTests(TestCase):
     def test_default_analyzer_enables_and_preserves_thinking_for_qwen38(self) -> None:
         config_path = Path(__file__).resolve().parents[1] / "configs" / "inference.json"
@@ -151,6 +171,9 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("Raw reduction JSON fidelity: passed", command)
         self.assertIn("Raw policy source fidelity: passed", command)
         self.assertIn("LLM probe_actions contract matrix: passed", command)
+        self.assertIn("LLM generated policy behavior: passed", command)
+        self.assertIn("def assert_generated_policy_contract()", command)
+        self.assertIn("import ast", command)
         self.assertIn("one scalar MOUSE probe_actions entry per coordinate", command)
         self.assertIn("instead of treating probe_actions as the route", command)
         self.assertIn("run_vllm_api_smoke_test()", command)
@@ -240,9 +263,15 @@ class KaggleHardwareProfileTests(TestCase):
                         {"message": {"content": probe_actions_fixture}}
                     ]
                 },
+                {
+                    "choices": [
+                        {"message": {"content": GENERATED_NAVIGATION_POLICY}}
+                    ]
+                },
             ]
         )
         namespace = {
+            "ast": ast,
             "json": json,
             "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
             "SERVED_MODEL_NAME": "unit-test-model",
@@ -253,7 +282,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(3, request_json.call_count)
+        self.assertEqual(4, request_json.call_count)
         reduction_payload = request_json.call_args_list[0].kwargs["payload"]
         self.assertEqual(64, reduction_payload["thinking_token_budget"])
         self.assertEqual(
@@ -278,6 +307,12 @@ class KaggleHardwareProfileTests(TestCase):
         )
         self.assertIn("ordered mouse_points", probe_payload["messages"][0]["content"])
         self.assertIn("not an output field", probe_payload["messages"][0]["content"])
+        policy_payload = request_json.call_args_list[3].kwargs["payload"]
+        self.assertEqual(1024, policy_payload["max_tokens"])
+        self.assertEqual(256, policy_payload["thinking_token_budget"])
+        self.assertIn(
+            "directly calls solver_decide", policy_payload["messages"][0]["content"]
+        )
 
     def test_bounded_reasoning_smoke_fails_on_raw_reduction_corruption(
         self,
@@ -295,6 +330,7 @@ class KaggleHardwareProfileTests(TestCase):
             type_ignores=[],
         )
         namespace = {
+            "ast": ast,
             "json": json,
             "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
             "SERVED_MODEL_NAME": "unit-test-model",
@@ -383,9 +419,15 @@ class KaggleHardwareProfileTests(TestCase):
                         {"message": {"content": json.dumps(repaired_result)}}
                     ]
                 },
+                {
+                    "choices": [
+                        {"message": {"content": GENERATED_NAVIGATION_POLICY}}
+                    ]
+                },
             ]
         )
         namespace = {
+            "ast": ast,
             "json": json,
             "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
             "SERVED_MODEL_NAME": "unit-test-model",
@@ -396,7 +438,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(4, request_json.call_count)
+        self.assertEqual(5, request_json.call_count)
         repair_payload = request_json.call_args_list[3].kwargs["payload"]
         self.assertIn(
             "exact registered field names", repair_payload["messages"][0]["content"]
@@ -410,6 +452,92 @@ class KaggleHardwareProfileTests(TestCase):
             repair_payload["messages"][0]["content"],
         )
         self.assertIn('"actor": 1', repair_payload["messages"][0]["content"])
+
+    def test_bounded_reasoning_smoke_repairs_direct_action_policy(self) -> None:
+        command = duck_kaggle_setup_command()
+        script = command.split("\n", 1)[1].rsplit("\nPYSETUP", 1)[0]
+        parsed = ast.parse(script)
+        functions = ast.Module(
+            body=[
+                node
+                for node in parsed.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "run_vllm_api_smoke_test"
+            ],
+            type_ignores=[],
+        )
+        reduction = (
+            "BEGIN_REDUCTION\n{\n"
+            '  "objective_id": "level:1:1",\n'
+            '  "verdict": "continue",\n'
+            '  "evidence": "board unchanged",\n'
+            '  "rationale": "continue the active probe",\n'
+            '  "selected_index": 0,\n'
+            '  "subgoals": []\n}\nEND_REDUCTION'
+        )
+        raw_policy = (
+            "BEGIN_POLICY\nPOLICY_API_VERSION = 1\n"
+            'SUPPORTED_BACKENDS = ("cpu",)\n'
+            "def decide(observation, memory):\n"
+            '    return {"status": "continue", "action": '
+            '{"action": "ACTION6"}, "memory": memory}\nEND_POLICY'
+        )
+        probe_actions = json.dumps(
+            {
+                "contrastive": {
+                    "probe_actions": ["UP", "RIGHT", "UP", "RIGHT"]
+                },
+                "clicks": {
+                    "mouse_points": [[28, 30], [28, 38], [28, 30]],
+                    "probe_actions": ["MOUSE", "MOUSE", "MOUSE"],
+                },
+                "navigation": {
+                    "actor_values": [1],
+                    "target_values": [2],
+                    "passable_values": [2, 1, 0],
+                    "approach_distance": 1,
+                    "probe_actions": ["UP", "RIGHT"],
+                },
+            }
+        )
+        direct_action_policy = GENERATED_NAVIGATION_POLICY.replace(
+            "    return solver_decide(\n"
+            "        POLICY_SOLVER_TYPE, observation, memory, POLICY_SOLVER_CONFIG\n"
+            "    )",
+            '    return {"status": "continue", "action": {"action": "UP"}}',
+        )
+        request_json = mock.Mock(
+            side_effect=[
+                {"choices": [{"message": {"content": reduction}}]},
+                {"choices": [{"message": {"content": raw_policy}}]},
+                {"choices": [{"message": {"content": probe_actions}}]},
+                {"choices": [{"message": {"content": direct_action_policy}}]},
+                {
+                    "choices": [
+                        {"message": {"content": GENERATED_NAVIGATION_POLICY}}
+                    ]
+                },
+            ]
+        )
+        namespace = {
+            "ast": ast,
+            "json": json,
+            "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
+            "SERVED_MODEL_NAME": "unit-test-model",
+            "request_json": request_json,
+            "server_failure_message": lambda reason: reason,
+        }
+        exec(compile(functions, "<kaggle-vllm-smoke-test>", "exec"), namespace)
+
+        namespace["run_vllm_api_smoke_test"]()
+
+        self.assertEqual(5, request_json.call_count)
+        repair_prompt = request_json.call_args_list[4].kwargs["payload"]["messages"][
+            0
+        ]["content"]
+        self.assertIn("canonical dispatcher call", repair_prompt)
+        self.assertIn("Return one complete replacement module", repair_prompt)
+        self.assertIn(direct_action_policy, repair_prompt)
 
     def test_bounded_reasoning_smoke_fails_on_raw_policy_corruption(self) -> None:
         command = duck_kaggle_setup_command()
@@ -458,6 +586,7 @@ class KaggleHardwareProfileTests(TestCase):
             ]
         )
         namespace = {
+            "ast": ast,
             "json": json,
             "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
             "SERVED_MODEL_NAME": "unit-test-model",
@@ -526,6 +655,7 @@ class KaggleHardwareProfileTests(TestCase):
             ]
         )
         namespace = {
+            "ast": ast,
             "json": json,
             "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
             "SERVED_MODEL_NAME": "unit-test-model",
