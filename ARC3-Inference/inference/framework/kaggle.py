@@ -860,6 +860,106 @@ POLICY_SOLVER_CONFIG). Do not implement navigation yourself or emit direct actio
                 + f'; final model content was {content!r}'
             )
 
+    def assert_pathfinding_policy_behavior() -> None:
+        prompt = '''Return exactly one JSON object and no Markdown or prose. Evaluate five
+independent navigation-policy cases. Boards are row-major grids; actor value is 1,
+target value is 2, passable values are 0,1,2, approach_distance is 1, configured
+probe_actions are UP then RIGHT, valid actions are UP,RIGHT,DOWN,LEFT, and cardinal
+BFS neighbor order is UP,RIGHT,DOWN,LEFT. A route must stop on a passable cell exactly
+one Manhattan step from the target and must never enter value 9. For routed cases,
+path_actions is the complete shortest route and action is its first step.
+
+1. corridor board [[1,0,0,2]].
+2. detour board [[1,9,0,2],[0,0,0,9]].
+3. at_approach board [[1,2]].
+4. unreachable board [[1,9,2],[9,9,9]] with ordinary route evidence.
+5. engine_progress_unreachable uses the same unreachable board, but evidence_mode is
+engine_progress, so route termination must use the first bounded configured probe.
+
+Use exactly the top-level keys corridor, detour, at_approach, unreachable, and
+engine_progress_unreachable. Each value must contain exactly status, path_actions,
+and action. status is continue, subgoal_succeeded, or subgoal_failed; action is a
+cardinal string or null. Do not include explanations or configuration fields.'''
+        expected = {
+            'corridor': {
+                'status': 'continue',
+                'path_actions': ['RIGHT', 'RIGHT'],
+                'action': 'RIGHT',
+            },
+            'detour': {
+                'status': 'continue',
+                'path_actions': ['DOWN', 'RIGHT', 'RIGHT', 'UP'],
+                'action': 'DOWN',
+            },
+            'at_approach': {
+                'status': 'subgoal_succeeded',
+                'path_actions': [],
+                'action': None,
+            },
+            'unreachable': {
+                'status': 'subgoal_failed',
+                'path_actions': [],
+                'action': None,
+            },
+            'engine_progress_unreachable': {
+                'status': 'continue',
+                'path_actions': [],
+                'action': 'UP',
+            },
+        }
+
+        def validate(content: str):
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                return None, list(expected)
+            if not isinstance(result, dict) or set(result) != set(expected):
+                return result if isinstance(result, dict) else None, list(expected)
+            failures = [
+                case for case, decision in expected.items() if result.get(case) != decision
+            ]
+            return result, failures
+
+        content = request_content(
+            'pathfinding-policy', prompt, 1024, thinking_token_budget=256
+        )
+        result, failures = validate(content)
+        if failures:
+            repair_content = request_content(
+                'pathfinding-policy-repair',
+                'Return exactly one raw JSON object containing only these failed '
+                f'top-level cases: {", ".join(failures)}. Correct them from the '
+                'original contract below. Do not return or modify passing cases.\n'
+                + prompt
+                + '\nPrevious answer:\n'
+                + content,
+                1024,
+                thinking_token_budget=256,
+            )
+            try:
+                repaired_cases = json.loads(repair_content)
+            except json.JSONDecodeError:
+                repaired_cases = None
+            if isinstance(repaired_cases, dict):
+                merged = {
+                    case: decision
+                    for case, decision in (result or {}).items()
+                    if case in expected
+                }
+                for case in failures:
+                    if case in repaired_cases:
+                        merged[case] = repaired_cases[case]
+                content = json.dumps(merged)
+            else:
+                content = repair_content
+            _result, failures = validate(content)
+        if failures:
+            raise ValueError(
+                'pathfinding-policy behavior check failed for '
+                + ', '.join(failures)
+                + f'; final model content was {content!r}'
+            )
+
     reduction_fixture = (
         'BEGIN_REDUCTION\n'
         '{\n'
@@ -886,6 +986,7 @@ POLICY_SOLVER_CONFIG). Do not implement navigation yourself or emit direct actio
         assert_raw_fidelity('policy', policy_fixture, 512)
         assert_probe_actions_contract()
         assert_generated_policy_contract()
+        assert_pathfinding_policy_behavior()
     except Exception as exc:
         raise RuntimeError(
             server_failure_message(
@@ -899,6 +1000,7 @@ POLICY_SOLVER_CONFIG). Do not implement navigation yourself or emit direct actio
     print('Raw policy source fidelity: passed', flush=True)
     print('LLM probe_actions contract matrix: passed', flush=True)
     print('LLM generated policy behavior: passed', flush=True)
+    print('LLM pathfinding policy behavior: passed', flush=True)
     print('=' * 88 + '\n', flush=True)
 
 

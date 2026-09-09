@@ -9,6 +9,10 @@ import time
 from pathlib import Path
 from unittest import TestCase, mock
 
+import numpy as np
+
+from inference.agent.gameplay_policy_runtime import PolicyObservation
+from inference.agent.policy_solver_helpers import solver_decide
 from inference.framework.kaggle import (
     DEFAULT_QWEN_MODEL_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
@@ -41,8 +45,125 @@ def decide(observation, memory):
     )
 END_POLICY"""
 
+PATHFINDING_POLICY_BEHAVIOR = {
+    "corridor": {
+        "status": "continue",
+        "path_actions": ["RIGHT", "RIGHT"],
+        "action": "RIGHT",
+    },
+    "detour": {
+        "status": "continue",
+        "path_actions": ["DOWN", "RIGHT", "RIGHT", "UP"],
+        "action": "DOWN",
+    },
+    "at_approach": {
+        "status": "subgoal_succeeded",
+        "path_actions": [],
+        "action": None,
+    },
+    "unreachable": {
+        "status": "subgoal_failed",
+        "path_actions": [],
+        "action": None,
+    },
+    "engine_progress_unreachable": {
+        "status": "continue",
+        "path_actions": [],
+        "action": "UP",
+    },
+}
+
+RAW_REDUCTION_FIXTURE = (
+    "BEGIN_REDUCTION\n{\n"
+    '  "objective_id": "level:1:1",\n'
+    '  "verdict": "continue",\n'
+    '  "evidence": "board unchanged",\n'
+    '  "rationale": "continue the active probe",\n'
+    '  "selected_index": 0,\n'
+    '  "subgoals": []\n}\nEND_REDUCTION'
+)
+RAW_POLICY_FIXTURE = (
+    "BEGIN_POLICY\nPOLICY_API_VERSION = 1\n"
+    'SUPPORTED_BACKENDS = ("cpu",)\n'
+    "def decide(observation, memory):\n"
+    '    return {"status": "continue", "action": '
+    '{"action": "ACTION6"}, "memory": memory}\nEND_POLICY'
+)
+PROBE_ACTIONS_BEHAVIOR = {
+    "contrastive": {"probe_actions": ["UP", "RIGHT", "UP", "RIGHT"]},
+    "clicks": {
+        "mouse_points": [[28, 30], [28, 38], [28, 30]],
+        "probe_actions": ["MOUSE", "MOUSE", "MOUSE"],
+    },
+    "navigation": {
+        "actor_values": [1],
+        "target_values": [2],
+        "passable_values": [0, 1, 2],
+        "approach_distance": 1,
+        "probe_actions": ["UP", "RIGHT"],
+    },
+}
+
 
 class KaggleHardwareProfileTests(TestCase):
+    def test_pathfinding_smoke_answers_match_trusted_navigation_solver(self) -> None:
+        boards = {
+            "corridor": [[1, 0, 0, 2]],
+            "detour": [[1, 9, 0, 2], [0, 0, 0, 9]],
+            "at_approach": [[1, 2]],
+            "unreachable": [[1, 9, 2], [9, 9, 9]],
+            "engine_progress_unreachable": [[1, 9, 2], [9, 9, 9]],
+        }
+        config = {
+            "actor_values": [1],
+            "target_values": [2],
+            "passable_values": [0, 1, 2],
+            "approach_distance": 1,
+            "probe_actions": ["UP", "RIGHT"],
+        }
+        deltas = {
+            (-1, 0): "UP",
+            (0, 1): "RIGHT",
+            (1, 0): "DOWN",
+            (0, -1): "LEFT",
+        }
+
+        for case, small_board in boards.items():
+            with self.subTest(case=case):
+                board = np.full((64, 64), 9, dtype=np.uint8)
+                height = len(small_board)
+                width = len(small_board[0])
+                board[:height, :width] = small_board
+                objective = (
+                    {"evidence_mode": "engine_progress"}
+                    if case == "engine_progress_unreachable"
+                    else {}
+                )
+                observation = PolicyObservation(
+                    board=board,
+                    level=1,
+                    step=0,
+                    valid_actions=("UP", "RIGHT", "DOWN", "LEFT"),
+                    last_transition=None,
+                    objective=objective,
+                    recent_transitions=(),
+                    backend="cpu",
+                )
+
+                decision = solver_decide("navigation", observation, {}, config)
+                path = decision.get("memory", {}).get("path", [])
+                path_actions = [
+                    deltas[(end[0] - start[0], end[1] - start[1])]
+                    for start, end in zip(path, path[1:], strict=False)
+                ]
+                actual = {
+                    "status": decision["status"],
+                    "path_actions": path_actions,
+                    "action": (decision.get("action") or {}).get("action"),
+                }
+
+                self.assertEqual(PATHFINDING_POLICY_BEHAVIOR[case], actual)
+
     def test_default_analyzer_enables_and_preserves_thinking_for_qwen38(self) -> None:
         config_path = Path(__file__).resolve().parents[1] / "configs" / "inference.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -172,7 +293,9 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("Raw policy source fidelity: passed", command)
         self.assertIn("LLM probe_actions contract matrix: passed", command)
         self.assertIn("LLM generated policy behavior: passed", command)
+        self.assertIn("LLM pathfinding policy behavior: passed", command)
         self.assertIn("def assert_generated_policy_contract()", command)
+        self.assertIn("def assert_pathfinding_policy_behavior()", command)
         self.assertIn("import ast", command)
         self.assertIn("one scalar MOUSE probe_actions entry per coordinate", command)
         self.assertIn("instead of treating probe_actions as the route", command)
@@ -268,6 +391,15 @@ class KaggleHardwareProfileTests(TestCase):
                         {"message": {"content": GENERATED_NAVIGATION_POLICY}}
                     ]
                 },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(PATHFINDING_POLICY_BEHAVIOR)
+                            }
+                        }
+                    ]
+                },
             ]
         )
         namespace = {
@@ -282,7 +414,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(4, request_json.call_count)
+        self.assertEqual(5, request_json.call_count)
         reduction_payload = request_json.call_args_list[0].kwargs["payload"]
         self.assertEqual(64, reduction_payload["thinking_token_budget"])
         self.assertEqual(
@@ -313,6 +445,14 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn(
             "directly calls solver_decide", policy_payload["messages"][0]["content"]
         )
+        pathfinding_payload = request_json.call_args_list[4].kwargs["payload"]
+        self.assertEqual(1024, pathfinding_payload["max_tokens"])
+        self.assertEqual(256, pathfinding_payload["thinking_token_budget"])
+        self.assertIn(
+            "engine_progress_unreachable",
+            pathfinding_payload["messages"][0]["content"],
+        )
+        self.assertIn("must never enter value 9", pathfinding_payload["messages"][0]["content"])
 
     def test_bounded_reasoning_smoke_fails_on_raw_reduction_corruption(
         self,
@@ -424,6 +564,15 @@ class KaggleHardwareProfileTests(TestCase):
                         {"message": {"content": GENERATED_NAVIGATION_POLICY}}
                     ]
                 },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(PATHFINDING_POLICY_BEHAVIOR)
+                            }
+                        }
+                    ]
+                },
             ]
         )
         namespace = {
@@ -438,7 +587,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(5, request_json.call_count)
+        self.assertEqual(6, request_json.call_count)
         repair_payload = request_json.call_args_list[3].kwargs["payload"]
         self.assertIn(
             "exact registered field names", repair_payload["messages"][0]["content"]
@@ -517,6 +666,15 @@ class KaggleHardwareProfileTests(TestCase):
                         {"message": {"content": GENERATED_NAVIGATION_POLICY}}
                     ]
                 },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(PATHFINDING_POLICY_BEHAVIOR)
+                            }
+                        }
+                    ]
+                },
             ]
         )
         namespace = {
@@ -531,13 +689,90 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(5, request_json.call_count)
+        self.assertEqual(6, request_json.call_count)
         repair_prompt = request_json.call_args_list[4].kwargs["payload"]["messages"][
             0
         ]["content"]
         self.assertIn("canonical dispatcher call", repair_prompt)
         self.assertIn("Return one complete replacement module", repair_prompt)
         self.assertIn(direct_action_policy, repair_prompt)
+
+    def test_bounded_reasoning_smoke_repairs_pathfinding_behavior(self) -> None:
+        command = duck_kaggle_setup_command()
+        script = command.split("\n", 1)[1].rsplit("\nPYSETUP", 1)[0]
+        parsed = ast.parse(script)
+        functions = ast.Module(
+            body=[
+                node
+                for node in parsed.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "run_vllm_api_smoke_test"
+            ],
+            type_ignores=[],
+        )
+        bad_pathfinding = {
+            **PATHFINDING_POLICY_BEHAVIOR,
+            "detour": {
+                "status": "continue",
+                "path_actions": ["RIGHT", "RIGHT"],
+                "action": "RIGHT",
+            },
+        }
+        request_json = mock.Mock(
+            side_effect=[
+                {"choices": [{"message": {"content": RAW_REDUCTION_FIXTURE}}]},
+                {"choices": [{"message": {"content": RAW_POLICY_FIXTURE}}]},
+                {
+                    "choices": [
+                        {"message": {"content": json.dumps(PROBE_ACTIONS_BEHAVIOR)}}
+                    ]
+                },
+                {
+                    "choices": [
+                        {"message": {"content": GENERATED_NAVIGATION_POLICY}}
+                    ]
+                },
+                {
+                    "choices": [
+                        {"message": {"content": json.dumps(bad_pathfinding)}}
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "detour": PATHFINDING_POLICY_BEHAVIOR[
+                                            "detour"
+                                        ]
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            ]
+        )
+        namespace = {
+            "ast": ast,
+            "json": json,
+            "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
+            "SERVED_MODEL_NAME": "unit-test-model",
+            "request_json": request_json,
+            "server_failure_message": lambda reason: reason,
+        }
+        exec(compile(functions, "<kaggle-vllm-smoke-test>", "exec"), namespace)
+
+        namespace["run_vllm_api_smoke_test"]()
+
+        self.assertEqual(6, request_json.call_count)
+        repair_prompt = request_json.call_args_list[5].kwargs["payload"]["messages"][
+            0
+        ]["content"]
+        self.assertIn("only these failed top-level cases: detour", repair_prompt)
+        self.assertIn("Do not return or modify passing cases", repair_prompt)
+        self.assertIn('"action": "RIGHT"', repair_prompt)
 
     def test_bounded_reasoning_smoke_fails_on_raw_policy_corruption(self) -> None:
         command = duck_kaggle_setup_command()
