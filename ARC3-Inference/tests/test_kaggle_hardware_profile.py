@@ -312,7 +312,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         self.assertIn("complete server log", str(raised.exception))
 
-    def test_bounded_reasoning_smoke_reports_bad_probe_actions_json(self) -> None:
+    def test_bounded_reasoning_smoke_repairs_abbreviated_navigation_keys(self) -> None:
         command = duck_kaggle_setup_command()
         script = command.split("\n", 1)[1].rsplit("\nPYSETUP", 1)[0]
         parsed = ast.parse(script)
@@ -342,27 +342,74 @@ class KaggleHardwareProfileTests(TestCase):
             '{"action": "ACTION6"}, "memory": memory}\nEND_POLICY'
         )
         bad_result = {
-            "contrastive": {"probe_actions": ["UP", "UP", "RIGHT", "RIGHT"]},
-            "clicks": {},
-            "navigation": {},
+            "contrastive": {"probe_actions": ["UP", "RIGHT", "UP", "RIGHT"]},
+            "clicks": {
+                "mouse_points": [[28, 30], [28, 38], [28, 30]],
+                "probe_actions": ["MOUSE", "MOUSE", "MOUSE"],
+            },
+            "navigation": {
+                "actor": 1,
+                "target": 2,
+                "passable": [0, 1, 2],
+                "approach_distance": 1,
+                "probe_actions": ["UP", "RIGHT"],
+            },
         }
+        repaired_result = {
+            **bad_result,
+            "clicks": {
+                "mouse_points": [[28, 30], [28, 38], [28, 30]],
+                "probe_actions": [
+                    {"x": 28, "y": 30},
+                    {"x": 28, "y": 38},
+                    {"x": 28, "y": 30},
+                ],
+            },
+            "navigation": {
+                "actor_values": [1],
+                "target_values": [2],
+                "passable_values": [0, 1, 2],
+                "approach_distance": 1,
+                "probe_actions": ["UP", "RIGHT"],
+            },
+        }
+        request_json = mock.Mock(
+            side_effect=[
+                {"choices": [{"message": {"content": reduction}}]},
+                {"choices": [{"message": {"content": policy}}]},
+                {"choices": [{"message": {"content": json.dumps(bad_result)}}]},
+                {
+                    "choices": [
+                        {"message": {"content": json.dumps(repaired_result)}}
+                    ]
+                },
+            ]
+        )
         namespace = {
             "json": json,
             "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
             "SERVED_MODEL_NAME": "unit-test-model",
-            "request_json": mock.Mock(
-                side_effect=[
-                    {"choices": [{"message": {"content": reduction}}]},
-                    {"choices": [{"message": {"content": policy}}]},
-                    {"choices": [{"message": {"content": json.dumps(bad_result)}}]},
-                ]
-            ),
+            "request_json": request_json,
             "server_failure_message": lambda reason: reason,
         }
         exec(compile(functions, "<kaggle-vllm-smoke-test>", "exec"), namespace)
 
-        with self.assertRaisesRegex(RuntimeError, 'model JSON was.*"contrastive"'):
-            namespace["run_vllm_api_smoke_test"]()
+        namespace["run_vllm_api_smoke_test"]()
+
+        self.assertEqual(4, request_json.call_count)
+        repair_payload = request_json.call_args_list[3].kwargs["payload"]
+        self.assertIn(
+            "exact registered field names", repair_payload["messages"][0]["content"]
+        )
+        self.assertIn(
+            "only these failed top-level cases: navigation",
+            repair_payload["messages"][0]["content"],
+        )
+        self.assertIn(
+            "mouse coordinates belong only in mouse_points",
+            repair_payload["messages"][0]["content"],
+        )
+        self.assertIn('"actor": 1', repair_payload["messages"][0]["content"])
 
     def test_bounded_reasoning_smoke_fails_on_raw_policy_corruption(self) -> None:
         command = duck_kaggle_setup_command()
@@ -474,6 +521,7 @@ class KaggleHardwareProfileTests(TestCase):
                         }
                     ]
                 },
+                {"choices": [{"message": {"content": "{}"}}]},
                 {"choices": [{"message": {"content": "{}"}}]},
             ]
         )

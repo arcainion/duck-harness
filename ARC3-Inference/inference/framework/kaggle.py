@@ -631,57 +631,97 @@ not an output field.
 produce one scalar MOUSE probe_actions entry per coordinate.
 3. navigation: actor value 1 must route to target value 2 over passable values 0,1,2
 with approach_distance 1. UP and RIGHT are only its bounded evidence probes; retain
-all route configuration instead of treating probe_actions as the route.
+all route configuration instead of treating probe_actions as the route. Use the exact
+keys actor_values, target_values, passable_values, approach_distance, and probe_actions;
+never abbreviate them as actor, target, or passable.
 Use exactly the top-level keys contrastive, clicks, and navigation. Each value must be
 a JSON object containing only POLICY_SOLVER_CONFIG fields. Do not emit objective fields,
 solver types, explanations, or copies of the constraints.'''
+        def validate(content: str) -> tuple[dict | None, list[str]]:
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                return None, ['contrastive', 'clicks', 'navigation']
+            if not isinstance(result, dict):
+                return None, ['contrastive', 'clicks', 'navigation']
+            contrastive = result.get('contrastive')
+            clicks = result.get('clicks')
+            navigation = result.get('navigation')
+            failures = []
+            contrastive_actions = (
+                contrastive.get('probe_actions')
+                if isinstance(contrastive, dict)
+                else None
+            )
+            if not (
+                isinstance(contrastive_actions, list)
+                and len(contrastive_actions) >= 4
+                and set(contrastive_actions) == {'UP', 'RIGHT'}
+                and contrastive_actions.count('UP') >= 2
+                and all(
+                    left != right
+                    for left, right in zip(
+                        contrastive_actions, contrastive_actions[1:]
+                    )
+                )
+            ):
+                failures.append('contrastive')
+            if not isinstance(clicks, dict) or (
+                clicks.get('mouse_points') != [[28, 30], [28, 38], [28, 30]]
+                or clicks.get('probe_actions') != ['MOUSE', 'MOUSE', 'MOUSE']
+            ):
+                failures.append('clicks')
+            if not isinstance(navigation, dict) or not (
+                set(navigation.get('actor_values', [])) == {1}
+                and set(navigation.get('target_values', [])) == {2}
+                and set(navigation.get('passable_values', [])) == {0, 1, 2}
+                and navigation.get('approach_distance') == 1
+                and set(navigation.get('probe_actions', [])) == {'UP', 'RIGHT'}
+            ):
+                failures.append('navigation')
+            return result, failures
+
         content = request_content(
             'probe-actions', prompt, 768, thinking_token_budget=256
         )
-        try:
-            result = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f'probe-actions response was not raw JSON; content was {content!r}'
-            ) from exc
-        if not isinstance(result, dict):
-            raise ValueError(f'probe-actions response was not an object: {result!r}')
-        contrastive = result.get('contrastive')
-        clicks = result.get('clicks')
-        navigation = result.get('navigation')
-        failures = []
-        contrastive_actions = (
-            contrastive.get('probe_actions') if isinstance(contrastive, dict) else None
-        )
-        if not (
-            isinstance(contrastive_actions, list)
-            and len(contrastive_actions) >= 4
-            and set(contrastive_actions) == {'UP', 'RIGHT'}
-            and contrastive_actions.count('UP') >= 2
-            and all(
-                left != right
-                for left, right in zip(contrastive_actions, contrastive_actions[1:])
+        result, failures = validate(content)
+        if failures:
+            failed_cases = ', '.join(failures)
+            repair_prompt = (
+                'Return exactly one raw JSON object containing only these failed '
+                f'top-level cases: {failed_cases}. Do not return or modify any other '
+                'case. Correct each failed case using the original contract below and '
+                'the exact registered field names. probe_actions must always be a list '
+                'of scalar action-name strings; mouse coordinates belong only in '
+                'mouse_points.\nOriginal contract:\n'
+                + prompt
+                + '\nPrevious answer:\n'
+                + content
             )
-        ):
-            failures.append('contrastive schedule')
-        if not isinstance(clicks, dict) or (
-            clicks.get('mouse_points') != [[28, 30], [28, 38], [28, 30]]
-            or clicks.get('probe_actions') != ['MOUSE', 'MOUSE', 'MOUSE']
-        ):
-            failures.append('ordered click pairing')
-        if not isinstance(navigation, dict) or not (
-            set(navigation.get('actor_values', [])) == {1}
-            and set(navigation.get('target_values', [])) == {2}
-            and set(navigation.get('passable_values', [])) == {0, 1, 2}
-            and navigation.get('approach_distance') == 1
-            and set(navigation.get('probe_actions', [])) == {'UP', 'RIGHT'}
-        ):
-            failures.append('navigation route fields')
+            repair_content = request_content(
+                'probe-actions-repair',
+                repair_prompt,
+                768,
+                thinking_token_budget=256,
+            )
+            try:
+                repaired_cases = json.loads(repair_content)
+            except json.JSONDecodeError:
+                repaired_cases = None
+            if isinstance(repaired_cases, dict):
+                merged = dict(result or {})
+                for case in failures:
+                    if case in repaired_cases:
+                        merged[case] = repaired_cases[case]
+                content = json.dumps(merged)
+            else:
+                content = repair_content
+            _result, failures = validate(content)
         if failures:
             raise ValueError(
                 'probe-actions contract check failed for '
                 + ', '.join(failures)
-                + f'; model JSON was {json.dumps(result, sort_keys=True)}'
+                + f'; final model content was {content!r}'
             )
 
     reduction_fixture = (
