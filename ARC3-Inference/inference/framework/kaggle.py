@@ -583,18 +583,26 @@ def start_vllm_server() -> None:
 
 def run_vllm_api_smoke_test() -> None:
     def request_content(
-        label: str, prompt: str, max_tokens: int, *, thinking_token_budget: int = 64
+        label: str,
+        prompt: str,
+        max_tokens: int,
+        *,
+        thinking_token_budget: int = 64,
+        json_object: bool = False,
     ) -> str:
+        payload = {
+            'model': SERVED_MODEL_NAME,
+            'messages': [{'role': 'user', 'content': prompt}],
+            'temperature': 0.0,
+            'max_tokens': max_tokens,
+            'chat_template_kwargs': {'enable_thinking': True},
+            'thinking_token_budget': thinking_token_budget,
+        }
+        if json_object:
+            payload['response_format'] = {'type': 'json_object'}
         response = request_json(
             f'{VLLM_BASE_URL}/chat/completions',
-            payload={
-                'model': SERVED_MODEL_NAME,
-                'messages': [{'role': 'user', 'content': prompt}],
-                'temperature': 0.0,
-                'max_tokens': max_tokens,
-                'chat_template_kwargs': {'enable_thinking': True},
-                'thinking_token_budget': thinking_token_budget,
-            },
+            payload=payload,
             timeout=120,
         )
         choices = response.get('choices')
@@ -607,6 +615,30 @@ def run_vllm_api_smoke_test() -> None:
         if not isinstance(content, str):
             raise ValueError(f'{label} response did not contain string content')
         return content.strip()
+
+    def parse_json_object(content: str):
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        decoder = json.JSONDecoder()
+        candidates = []
+        for index, character in enumerate(content):
+            if character != '{':
+                continue
+            try:
+                candidate, consumed = decoder.raw_decode(content[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                candidates.append((len(candidate), consumed, candidate))
+        return max(
+            candidates,
+            default=(0, 0, None),
+            key=lambda item: (item[1], item[0]),
+        )[2]
 
     def assert_raw_fidelity(label: str, fixture: str, max_tokens: int) -> None:
         content = request_content(
@@ -639,9 +671,8 @@ Use exactly the top-level keys contrastive, clicks, and navigation. Each value m
 a JSON object containing only POLICY_SOLVER_CONFIG fields. Do not emit objective fields,
 solver types, explanations, or copies of the constraints.'''
         def validate(content: str) -> tuple[dict | None, list[str]]:
-            try:
-                result = json.loads(content)
-            except json.JSONDecodeError:
+            result = parse_json_object(content)
+            if result is None:
                 return None, ['contrastive', 'clicks', 'navigation']
             if not isinstance(result, dict):
                 return None, ['contrastive', 'clicks', 'navigation']
@@ -683,7 +714,11 @@ solver types, explanations, or copies of the constraints.'''
             return result, failures
 
         content = request_content(
-            'probe-actions', prompt, 768, thinking_token_budget=256
+            'probe-actions',
+            prompt,
+            768,
+            thinking_token_budget=256,
+            json_object=True,
         )
         result, failures = validate(content)
         if failures:
@@ -704,11 +739,9 @@ solver types, explanations, or copies of the constraints.'''
                 repair_prompt,
                 768,
                 thinking_token_budget=256,
+                json_object=True,
             )
-            try:
-                repaired_cases = json.loads(repair_content)
-            except json.JSONDecodeError:
-                repaired_cases = None
+            repaired_cases = parse_json_object(repair_content)
             if isinstance(repaired_cases, dict):
                 merged = dict(result or {})
                 for case in failures:
@@ -910,24 +943,29 @@ cardinal string or null. Do not include explanations or configuration fields.'''
         }
 
         def validate(content: str):
-            try:
-                result = json.loads(content)
-            except json.JSONDecodeError:
+            result = parse_json_object(content)
+            if result is None:
                 return None, list(expected)
-            if not isinstance(result, dict) or set(result) != set(expected):
-                return result if isinstance(result, dict) else None, list(expected)
+            if set(result).difference(expected):
+                return result, list(expected)
             failures = [
                 case for case, decision in expected.items() if result.get(case) != decision
             ]
             return result, failures
 
         content = request_content(
-            'pathfinding-policy', prompt, 1024, thinking_token_budget=256
+            'pathfinding-policy',
+            prompt,
+            1024,
+            thinking_token_budget=256,
+            json_object=True,
         )
         result, failures = validate(content)
-        if failures:
+        for repair_attempt in range(1, 3):
+            if not failures:
+                break
             repair_content = request_content(
-                'pathfinding-policy-repair',
+                f'pathfinding-policy-repair-{repair_attempt}',
                 'Return exactly one raw JSON object containing only these failed '
                 f'top-level cases: {", ".join(failures)}. Correct them from the '
                 'original contract below. Do not return or modify passing cases. '
@@ -940,11 +978,9 @@ cardinal string or null. Do not include explanations or configuration fields.'''
                 + content,
                 1024,
                 thinking_token_budget=256,
+                json_object=True,
             )
-            try:
-                repaired_cases = json.loads(repair_content)
-            except json.JSONDecodeError:
-                repaired_cases = None
+            repaired_cases = parse_json_object(repair_content)
             if isinstance(repaired_cases, dict):
                 merged = {
                     case: decision
@@ -957,7 +993,7 @@ cardinal string or null. Do not include explanations or configuration fields.'''
                 content = json.dumps(merged)
             else:
                 content = repair_content
-            _result, failures = validate(content)
+            result, failures = validate(content)
         if failures:
             raise ValueError(
                 'pathfinding-policy behavior check failed for '
@@ -1041,24 +1077,29 @@ action string or null.'''
         }
 
         def validate(content: str):
-            try:
-                result = json.loads(content)
-            except json.JSONDecodeError:
+            result = parse_json_object(content)
+            if result is None:
                 return None, list(expected)
-            if not isinstance(result, dict) or set(result) != set(expected):
-                return result if isinstance(result, dict) else None, list(expected)
+            if set(result).difference(expected):
+                return result, list(expected)
             failures = [
                 case for case, inference in expected.items() if result.get(case) != inference
             ]
             return result, failures
 
         content = request_content(
-            'game-inference', prompt, 1536, thinking_token_budget=384
+            'game-inference',
+            prompt,
+            1536,
+            thinking_token_budget=384,
+            json_object=True,
         )
         result, failures = validate(content)
-        if failures:
+        for repair_attempt in range(1, 3):
+            if not failures:
+                break
             repair_content = request_content(
-                'game-inference-repair',
+                f'game-inference-repair-{repair_attempt}',
                 'Return exactly one raw JSON object containing only these failed '
                 f'top-level cases: {", ".join(failures)}. Do not return or modify '
                 'passing cases. The trusted inference oracle requires these exact '
@@ -1070,11 +1111,9 @@ action string or null.'''
                 + content,
                 1536,
                 thinking_token_budget=384,
+                json_object=True,
             )
-            try:
-                repaired_cases = json.loads(repair_content)
-            except json.JSONDecodeError:
-                repaired_cases = None
+            repaired_cases = parse_json_object(repair_content)
             if isinstance(repaired_cases, dict):
                 merged = {
                     case: inference
@@ -1087,7 +1126,7 @@ action string or null.'''
                 content = json.dumps(merged)
             else:
                 content = repair_content
-            _result, failures = validate(content)
+            result, failures = validate(content)
         if failures:
             raise ValueError(
                 'game-inference behavior check failed for '

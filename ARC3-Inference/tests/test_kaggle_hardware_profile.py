@@ -485,6 +485,7 @@ class KaggleHardwareProfileTests(TestCase):
         probe_payload = request_json.call_args_list[2].kwargs["payload"]
         self.assertEqual(768, probe_payload["max_tokens"])
         self.assertEqual(256, probe_payload["thinking_token_budget"])
+        self.assertEqual({"type": "json_object"}, probe_payload["response_format"])
         self.assertNotIn("tools", probe_payload)
         self.assertNotIn("tool_choice", probe_payload)
         self.assertIn(
@@ -502,6 +503,9 @@ class KaggleHardwareProfileTests(TestCase):
         pathfinding_payload = request_json.call_args_list[4].kwargs["payload"]
         self.assertEqual(1024, pathfinding_payload["max_tokens"])
         self.assertEqual(256, pathfinding_payload["thinking_token_budget"])
+        self.assertEqual(
+            {"type": "json_object"}, pathfinding_payload["response_format"]
+        )
         self.assertIn(
             "engine_progress_unreachable",
             pathfinding_payload["messages"][0]["content"],
@@ -510,6 +514,9 @@ class KaggleHardwareProfileTests(TestCase):
         inference_payload = request_json.call_args_list[5].kwargs["payload"]
         self.assertEqual(1536, inference_payload["max_tokens"])
         self.assertEqual(384, inference_payload["thinking_token_budget"])
+        self.assertEqual(
+            {"type": "json_object"}, inference_payload["response_format"]
+        )
         self.assertIn("visual_novelty", inference_payload["messages"][0]["content"])
         self.assertIn("inverse_cycle", inference_payload["messages"][0]["content"])
 
@@ -787,14 +794,15 @@ class KaggleHardwareProfileTests(TestCase):
             ],
             type_ignores=[],
         )
-        bad_pathfinding = {
-            **PATHFINDING_POLICY_BEHAVIOR,
-            "engine_progress_unreachable": {
-                "status": "subgoal_failed",
-                "path_actions": [],
-                "action": None,
-            },
+        recovered_pathfinding = {
+            case: PATHFINDING_POLICY_BEHAVIOR[case]
+            for case in ("corridor", "detour")
         }
+        malformed_pathfinding = (
+            '{"corridor":{"status":"continue","path_actions":[\n'
+            "I have to give the solution based on the reasoning directly now.</think>\n"
+            + json.dumps(recovered_pathfinding)
+        )
         request_json = mock.Mock(
             side_effect=[
                 {"choices": [{"message": {"content": RAW_REDUCTION_FIXTURE}}]},
@@ -811,7 +819,25 @@ class KaggleHardwareProfileTests(TestCase):
                 },
                 {
                     "choices": [
-                        {"message": {"content": json.dumps(bad_pathfinding)}}
+                        {"message": {"content": malformed_pathfinding}}
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "at_approach": PATHFINDING_POLICY_BEHAVIOR[
+                                            "at_approach"
+                                        ],
+                                        "unreachable": PATHFINDING_POLICY_BEHAVIOR[
+                                            "unreachable"
+                                        ],
+                                    }
+                                )
+                            }
+                        }
                     ]
                 },
                 {
@@ -854,17 +880,30 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(7, request_json.call_count)
+        self.assertEqual(8, request_json.call_count)
         repair_prompt = request_json.call_args_list[5].kwargs["payload"]["messages"][
             0
         ]["content"]
         self.assertIn(
-            "only these failed top-level cases: engine_progress_unreachable",
+            "only these failed top-level cases: at_approach, unreachable, "
+            "engine_progress_unreachable",
             repair_prompt,
         )
         self.assertIn("Do not return or modify passing cases", repair_prompt)
         self.assertIn("trusted solver oracle", repair_prompt)
         self.assertIn('"action": "UP"', repair_prompt)
+        self.assertIn("</think>", repair_prompt)
+        self.assertEqual(
+            {"type": "json_object"},
+            request_json.call_args_list[5].kwargs["payload"]["response_format"],
+        )
+        second_repair_prompt = request_json.call_args_list[6].kwargs["payload"][
+            "messages"
+        ][0]["content"]
+        self.assertIn(
+            "only these failed top-level cases: engine_progress_unreachable",
+            second_repair_prompt,
+        )
 
     def test_bounded_reasoning_smoke_repairs_game_inference_behavior(self) -> None:
         command = duck_kaggle_setup_command()
