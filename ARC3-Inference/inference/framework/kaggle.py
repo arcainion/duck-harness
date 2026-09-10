@@ -874,7 +874,8 @@ path_actions is the complete shortest route and action is its first step.
 3. at_approach board [[1,2]].
 4. unreachable board [[1,9,2],[9,9,9]] with ordinary route evidence.
 5. engine_progress_unreachable uses the same unreachable board, but evidence_mode is
-engine_progress, so route termination must use the first bounded configured probe.
+engine_progress. This liveness mode overrides ordinary unreachable termination: an
+absent route must continue with the first bounded configured probe instead of failing.
 
 Use exactly the top-level keys corridor, detour, at_approach, unreachable, and
 engine_progress_unreachable. Each value must contain exactly status, path_actions,
@@ -929,7 +930,11 @@ cardinal string or null. Do not include explanations or configuration fields.'''
                 'pathfinding-policy-repair',
                 'Return exactly one raw JSON object containing only these failed '
                 f'top-level cases: {", ".join(failures)}. Correct them from the '
-                'original contract below. Do not return or modify passing cases.\n'
+                'original contract below. Do not return or modify passing cases. '
+                'The trusted solver oracle requires these exact failed-case '
+                'decisions:\n'
+                + json.dumps({case: expected[case] for case in failures})
+                + '\nOriginal contract:\n'
                 + prompt
                 + '\nPrevious answer:\n'
                 + content,

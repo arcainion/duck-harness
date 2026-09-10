@@ -712,10 +712,10 @@ class KaggleHardwareProfileTests(TestCase):
         )
         bad_pathfinding = {
             **PATHFINDING_POLICY_BEHAVIOR,
-            "detour": {
-                "status": "continue",
-                "path_actions": ["RIGHT", "RIGHT"],
-                "action": "RIGHT",
+            "engine_progress_unreachable": {
+                "status": "subgoal_failed",
+                "path_actions": [],
+                "action": None,
             },
         }
         request_json = mock.Mock(
@@ -743,9 +743,11 @@ class KaggleHardwareProfileTests(TestCase):
                             "message": {
                                 "content": json.dumps(
                                     {
-                                        "detour": PATHFINDING_POLICY_BEHAVIOR[
-                                            "detour"
-                                        ]
+                                        "engine_progress_unreachable": (
+                                            PATHFINDING_POLICY_BEHAVIOR[
+                                                "engine_progress_unreachable"
+                                            ]
+                                        )
                                     }
                                 )
                             }
@@ -770,9 +772,13 @@ class KaggleHardwareProfileTests(TestCase):
         repair_prompt = request_json.call_args_list[5].kwargs["payload"]["messages"][
             0
         ]["content"]
-        self.assertIn("only these failed top-level cases: detour", repair_prompt)
+        self.assertIn(
+            "only these failed top-level cases: engine_progress_unreachable",
+            repair_prompt,
+        )
         self.assertIn("Do not return or modify passing cases", repair_prompt)
-        self.assertIn('"action": "RIGHT"', repair_prompt)
+        self.assertIn("trusted solver oracle", repair_prompt)
+        self.assertIn('"action": "UP"', repair_prompt)
 
     def test_bounded_reasoning_smoke_fails_on_raw_policy_corruption(self) -> None:
         command = duck_kaggle_setup_command()
