@@ -965,6 +965,136 @@ cardinal string or null. Do not include explanations or configuration fields.'''
                 + f'; final model content was {content!r}'
             )
 
+    def assert_game_inference_behavior() -> None:
+        prompt = '''Return exactly one JSON object and no Markdown or prose. Infer game
+behavior from five independent transition cases. A hypothesis is supported only by
+the stated transition evidence; an unchanged board is an exact_noop unless engine
+state, level, score, or reward proves progress. A new board alone is novel_state, not
+meaningful_progress. Returning to a previously seen board via inverse actions is an
+inverse_cycle. recommended_action must avoid repeating contradicted no-ops and cycles.
+
+1. directional_motion: before [[0,0,0,0],[0,1,0,2],[0,0,0,0]], action RIGHT,
+after [[0,0,0,0],[0,0,1,2],[0,0,0,0]], level/score/reward unchanged. Candidate
+hypothesis: RIGHT translates actor value 1 one cell right. Valid actions UP,RIGHT,DOWN.
+2. exact_noop: before and after [[0,0,0],[0,1,0],[0,0,0]], action RIGHT,
+level/score/reward unchanged. Candidate hypothesis: RIGHT translates actor value 1.
+Valid actions UP,RIGHT; use UP as the distinct control.
+3. engine_progress: board unchanged [[1,2]], action SPACE, level changes 1 to 2,
+score changes 0 to 1, reward is 1. Candidate hypothesis: SPACE can advance the level
+without a final board difference. No next action is needed after verified progress.
+4. visual_novelty: before [[1,3],[0,0]], action MOUSE at row 0 col 1, after
+[[1,4],[0,0]], level/score/reward unchanged. Candidate hypothesis: any board change
+is meaningful progress. Valid scalar action UP is the next evidence probe.
+5. inverse_cycle: seen states are A=[[0,1,0],[0,0,0]], then RIGHT gives
+B=[[0,0,1],[0,0,0]], then LEFT gives A again, with level/score/reward unchanged.
+Candidate hypothesis: alternating RIGHT and LEFT makes progress. Valid actions
+RIGHT,LEFT,DOWN; use DOWN to break the cycle.
+
+Use exactly the top-level keys directional_motion, exact_noop, engine_progress,
+visual_novelty, and inverse_cycle. Each value must contain exactly inferred_effect,
+hypothesis_verdict, meaningful_progress, novel_state, cycle_risk, and
+recommended_action. inferred_effect is actor_translation, exact_noop,
+level_advance, visual_change_only, or inverse_cycle. hypothesis_verdict is supported
+or contradicted. Boolean fields must be JSON booleans. recommended_action is an
+action string or null.'''
+        expected = {
+            'directional_motion': {
+                'inferred_effect': 'actor_translation',
+                'hypothesis_verdict': 'supported',
+                'meaningful_progress': False,
+                'novel_state': True,
+                'cycle_risk': False,
+                'recommended_action': 'RIGHT',
+            },
+            'exact_noop': {
+                'inferred_effect': 'exact_noop',
+                'hypothesis_verdict': 'contradicted',
+                'meaningful_progress': False,
+                'novel_state': False,
+                'cycle_risk': False,
+                'recommended_action': 'UP',
+            },
+            'engine_progress': {
+                'inferred_effect': 'level_advance',
+                'hypothesis_verdict': 'supported',
+                'meaningful_progress': True,
+                'novel_state': False,
+                'cycle_risk': False,
+                'recommended_action': None,
+            },
+            'visual_novelty': {
+                'inferred_effect': 'visual_change_only',
+                'hypothesis_verdict': 'contradicted',
+                'meaningful_progress': False,
+                'novel_state': True,
+                'cycle_risk': False,
+                'recommended_action': 'UP',
+            },
+            'inverse_cycle': {
+                'inferred_effect': 'inverse_cycle',
+                'hypothesis_verdict': 'contradicted',
+                'meaningful_progress': False,
+                'novel_state': False,
+                'cycle_risk': True,
+                'recommended_action': 'DOWN',
+            },
+        }
+
+        def validate(content: str):
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                return None, list(expected)
+            if not isinstance(result, dict) or set(result) != set(expected):
+                return result if isinstance(result, dict) else None, list(expected)
+            failures = [
+                case for case, inference in expected.items() if result.get(case) != inference
+            ]
+            return result, failures
+
+        content = request_content(
+            'game-inference', prompt, 1536, thinking_token_budget=384
+        )
+        result, failures = validate(content)
+        if failures:
+            repair_content = request_content(
+                'game-inference-repair',
+                'Return exactly one raw JSON object containing only these failed '
+                f'top-level cases: {", ".join(failures)}. Do not return or modify '
+                'passing cases. The trusted inference oracle requires these exact '
+                'failed-case decisions:\n'
+                + json.dumps({case: expected[case] for case in failures})
+                + '\nOriginal contract:\n'
+                + prompt
+                + '\nPrevious answer:\n'
+                + content,
+                1536,
+                thinking_token_budget=384,
+            )
+            try:
+                repaired_cases = json.loads(repair_content)
+            except json.JSONDecodeError:
+                repaired_cases = None
+            if isinstance(repaired_cases, dict):
+                merged = {
+                    case: inference
+                    for case, inference in (result or {}).items()
+                    if case in expected
+                }
+                for case in failures:
+                    if case in repaired_cases:
+                        merged[case] = repaired_cases[case]
+                content = json.dumps(merged)
+            else:
+                content = repair_content
+            _result, failures = validate(content)
+        if failures:
+            raise ValueError(
+                'game-inference behavior check failed for '
+                + ', '.join(failures)
+                + f'; final model content was {content!r}'
+            )
+
     reduction_fixture = (
         'BEGIN_REDUCTION\n'
         '{\n'
@@ -992,6 +1122,7 @@ cardinal string or null. Do not include explanations or configuration fields.'''
         assert_probe_actions_contract()
         assert_generated_policy_contract()
         assert_pathfinding_policy_behavior()
+        assert_game_inference_behavior()
     except Exception as exc:
         raise RuntimeError(
             server_failure_message(
@@ -1006,6 +1137,7 @@ cardinal string or null. Do not include explanations or configuration fields.'''
     print('LLM probe_actions contract matrix: passed', flush=True)
     print('LLM generated policy behavior: passed', flush=True)
     print('LLM pathfinding policy behavior: passed', flush=True)
+    print('LLM game inference behavior: passed', flush=True)
     print('=' * 88 + '\n', flush=True)
 
 
