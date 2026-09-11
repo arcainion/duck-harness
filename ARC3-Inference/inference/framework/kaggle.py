@@ -1134,6 +1134,146 @@ action string or null.'''
                 + f'; final model content was {content!r}'
             )
 
+    def assert_game_safety_behavior() -> None:
+        prompt = '''Return exactly one JSON object and no Markdown or prose. Apply the
+controller safety and liveness rules to six independent cases. Edge-only HUD changes
+are ignored as progress and novelty. A pure translation of the same object without
+engine progress is not rewarded as novel. An exact mouse coordinate is blocked after
+two failed attempts. A direction used at least 12 times in a 16-action no-progress
+window is blocked. An action with post_action_observed=false is pending evidence, not
+a no-op. A completed run is terminal and must not propose another action.
+
+1. edge_hud_flicker: RIGHT changes only edge HUD cell [0,4] from 3 to 4; the interior,
+level, score, and reward are unchanged. ignore_edge_hud_changes=true. Valid actions
+UP,RIGHT; use UP as the distinct control.
+2. pure_translation: RIGHT moves the same two-cell object from columns 1,2 to 2,3 with
+no other board, level, score, or reward change. Valid actions UP,RIGHT; use UP as the
+distinct control.
+3. repeated_click_noop: MOUSE at row 2 col 3 was executed twice with complete
+post-action observations, both exact no-ops. Valid alternate point is row 2 col 4.
+4. directional_saturation: the last 16 complete transitions made no progress; UP was
+used 12 times. Valid actions UP,RIGHT; use RIGHT after guarding UP.
+5. incomplete_observation: RIGHT was executed but post_action_observed=false. No board
+comparison or replacement action is yet justified.
+6. terminal_completion: run_complete=true, level_completed=true, reward=1. No next
+action is permitted.
+
+Use exactly the top-level keys edge_hud_flicker, pure_translation,
+repeated_click_noop, directional_saturation, incomplete_observation, and
+terminal_completion. Each value must contain exactly classification,
+meaningful_progress, novel_state, action_blocked, stop, and recommended_action.
+classification is hud_only, object_translation, repeated_click_noop,
+directional_saturation, awaiting_post_action_observation, or terminal_success.
+recommended_action is null or an object with action and, only for MOUSE, row and col.'''
+        expected = {
+            'edge_hud_flicker': {
+                'classification': 'hud_only',
+                'meaningful_progress': False,
+                'novel_state': False,
+                'action_blocked': False,
+                'stop': False,
+                'recommended_action': {'action': 'UP'},
+            },
+            'pure_translation': {
+                'classification': 'object_translation',
+                'meaningful_progress': False,
+                'novel_state': False,
+                'action_blocked': False,
+                'stop': False,
+                'recommended_action': {'action': 'UP'},
+            },
+            'repeated_click_noop': {
+                'classification': 'repeated_click_noop',
+                'meaningful_progress': False,
+                'novel_state': False,
+                'action_blocked': True,
+                'stop': False,
+                'recommended_action': {'action': 'MOUSE', 'row': 2, 'col': 4},
+            },
+            'directional_saturation': {
+                'classification': 'directional_saturation',
+                'meaningful_progress': False,
+                'novel_state': False,
+                'action_blocked': True,
+                'stop': False,
+                'recommended_action': {'action': 'RIGHT'},
+            },
+            'incomplete_observation': {
+                'classification': 'awaiting_post_action_observation',
+                'meaningful_progress': False,
+                'novel_state': False,
+                'action_blocked': False,
+                'stop': False,
+                'recommended_action': None,
+            },
+            'terminal_completion': {
+                'classification': 'terminal_success',
+                'meaningful_progress': True,
+                'novel_state': False,
+                'action_blocked': False,
+                'stop': True,
+                'recommended_action': None,
+            },
+        }
+
+        def validate(content: str):
+            result = parse_json_object(content)
+            if result is None:
+                return None, list(expected)
+            if set(result).difference(expected):
+                return result, list(expected)
+            failures = [
+                case for case, decision in expected.items() if result.get(case) != decision
+            ]
+            return result, failures
+
+        content = request_content(
+            'game-safety',
+            prompt,
+            1792,
+            thinking_token_budget=384,
+            json_object=True,
+        )
+        result, failures = validate(content)
+        for repair_attempt in range(1, 3):
+            if not failures:
+                break
+            repair_content = request_content(
+                f'game-safety-repair-{repair_attempt}',
+                'Return exactly one raw JSON object containing only these failed '
+                f'top-level cases: {", ".join(failures)}. Do not return or modify '
+                'passing cases. The trusted safety oracle requires these exact '
+                'failed-case decisions:\n'
+                + json.dumps({case: expected[case] for case in failures})
+                + '\nOriginal contract:\n'
+                + prompt
+                + '\nPrevious answer:\n'
+                + content,
+                1792,
+                thinking_token_budget=384,
+                json_object=True,
+            )
+            repaired_cases = parse_json_object(repair_content)
+            if isinstance(repaired_cases, dict):
+                merged = {
+                    case: decision
+                    for case, decision in (result or {}).items()
+                    if case in expected
+                }
+                for case in failures:
+                    if case in repaired_cases:
+                        merged[case] = repaired_cases[case]
+                content = json.dumps(merged)
+            else:
+                content = repair_content
+            result, failures = validate(content)
+        if failures:
+            raise ValueError(
+                'game-safety behavior check failed for '
+                + ', '.join(failures)
+                + f'; final model content was {content!r}'
+            )
+
     reduction_fixture = (
         'BEGIN_REDUCTION\n'
         '{\n'
@@ -1162,6 +1302,7 @@ action string or null.'''
         assert_generated_policy_contract()
         assert_pathfinding_policy_behavior()
         assert_game_inference_behavior()
+        assert_game_safety_behavior()
     except Exception as exc:
         raise RuntimeError(
             server_failure_message(
@@ -1177,6 +1318,7 @@ action string or null.'''
     print('LLM generated policy behavior: passed', flush=True)
     print('LLM pathfinding policy behavior: passed', flush=True)
     print('LLM game inference behavior: passed', flush=True)
+    print('LLM game safety behavior: passed', flush=True)
     print('=' * 88 + '\n', flush=True)
 
 

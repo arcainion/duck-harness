@@ -116,6 +116,57 @@ GAME_INFERENCE_BEHAVIOR = {
     },
 }
 
+GAME_SAFETY_BEHAVIOR = {
+    "edge_hud_flicker": {
+        "classification": "hud_only",
+        "meaningful_progress": False,
+        "novel_state": False,
+        "action_blocked": False,
+        "stop": False,
+        "recommended_action": {"action": "UP"},
+    },
+    "pure_translation": {
+        "classification": "object_translation",
+        "meaningful_progress": False,
+        "novel_state": False,
+        "action_blocked": False,
+        "stop": False,
+        "recommended_action": {"action": "UP"},
+    },
+    "repeated_click_noop": {
+        "classification": "repeated_click_noop",
+        "meaningful_progress": False,
+        "novel_state": False,
+        "action_blocked": True,
+        "stop": False,
+        "recommended_action": {"action": "MOUSE", "row": 2, "col": 4},
+    },
+    "directional_saturation": {
+        "classification": "directional_saturation",
+        "meaningful_progress": False,
+        "novel_state": False,
+        "action_blocked": True,
+        "stop": False,
+        "recommended_action": {"action": "RIGHT"},
+    },
+    "incomplete_observation": {
+        "classification": "awaiting_post_action_observation",
+        "meaningful_progress": False,
+        "novel_state": False,
+        "action_blocked": False,
+        "stop": False,
+        "recommended_action": None,
+    },
+    "terminal_completion": {
+        "classification": "terminal_success",
+        "meaningful_progress": True,
+        "novel_state": False,
+        "action_blocked": False,
+        "stop": True,
+        "recommended_action": None,
+    },
+}
+
 RAW_REDUCTION_FIXTURE = (
     "BEGIN_REDUCTION\n{\n"
     '  "objective_id": "level:1:1",\n'
@@ -338,9 +389,11 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("LLM generated policy behavior: passed", command)
         self.assertIn("LLM pathfinding policy behavior: passed", command)
         self.assertIn("LLM game inference behavior: passed", command)
+        self.assertIn("LLM game safety behavior: passed", command)
         self.assertIn("def assert_generated_policy_contract()", command)
         self.assertIn("def assert_pathfinding_policy_behavior()", command)
         self.assertIn("def assert_game_inference_behavior()", command)
+        self.assertIn("def assert_game_safety_behavior()", command)
         self.assertIn("import ast", command)
         self.assertIn("one scalar MOUSE probe_actions entry per coordinate", command)
         self.assertIn("instead of treating probe_actions as the route", command)
@@ -454,6 +507,11 @@ class KaggleHardwareProfileTests(TestCase):
                         }
                     ]
                 },
+                {
+                    "choices": [
+                        {"message": {"content": json.dumps(GAME_SAFETY_BEHAVIOR)}}
+                    ]
+                },
             ]
         )
         namespace = {
@@ -468,7 +526,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(6, request_json.call_count)
+        self.assertEqual(7, request_json.call_count)
         reduction_payload = request_json.call_args_list[0].kwargs["payload"]
         self.assertEqual(64, reduction_payload["thinking_token_budget"])
         self.assertEqual(
@@ -519,6 +577,16 @@ class KaggleHardwareProfileTests(TestCase):
         )
         self.assertIn("visual_novelty", inference_payload["messages"][0]["content"])
         self.assertIn("inverse_cycle", inference_payload["messages"][0]["content"])
+        safety_payload = request_json.call_args_list[6].kwargs["payload"]
+        self.assertEqual(1792, safety_payload["max_tokens"])
+        self.assertEqual(384, safety_payload["thinking_token_budget"])
+        self.assertEqual(
+            {"type": "json_object"}, safety_payload["response_format"]
+        )
+        self.assertIn("edge_hud_flicker", safety_payload["messages"][0]["content"])
+        self.assertIn(
+            "incomplete_observation", safety_payload["messages"][0]["content"]
+        )
 
     def test_bounded_reasoning_smoke_fails_on_raw_reduction_corruption(
         self,
@@ -648,6 +716,11 @@ class KaggleHardwareProfileTests(TestCase):
                         }
                     ]
                 },
+                {
+                    "choices": [
+                        {"message": {"content": json.dumps(GAME_SAFETY_BEHAVIOR)}}
+                    ]
+                },
             ]
         )
         namespace = {
@@ -662,7 +735,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(7, request_json.call_count)
+        self.assertEqual(8, request_json.call_count)
         repair_payload = request_json.call_args_list[3].kwargs["payload"]
         self.assertIn(
             "exact registered field names", repair_payload["messages"][0]["content"]
@@ -759,6 +832,11 @@ class KaggleHardwareProfileTests(TestCase):
                         }
                     ]
                 },
+                {
+                    "choices": [
+                        {"message": {"content": json.dumps(GAME_SAFETY_BEHAVIOR)}}
+                    ]
+                },
             ]
         )
         namespace = {
@@ -773,7 +851,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(7, request_json.call_count)
+        self.assertEqual(8, request_json.call_count)
         repair_prompt = request_json.call_args_list[4].kwargs["payload"]["messages"][
             0
         ]["content"]
@@ -866,6 +944,11 @@ class KaggleHardwareProfileTests(TestCase):
                         }
                     ]
                 },
+                {
+                    "choices": [
+                        {"message": {"content": json.dumps(GAME_SAFETY_BEHAVIOR)}}
+                    ]
+                },
             ]
         )
         namespace = {
@@ -880,7 +963,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(8, request_json.call_count)
+        self.assertEqual(9, request_json.call_count)
         repair_prompt = request_json.call_args_list[5].kwargs["payload"]["messages"][
             0
         ]["content"]
@@ -968,6 +1051,11 @@ class KaggleHardwareProfileTests(TestCase):
                         }
                     ]
                 },
+                {
+                    "choices": [
+                        {"message": {"content": json.dumps(GAME_SAFETY_BEHAVIOR)}}
+                    ]
+                },
             ]
         )
         namespace = {
@@ -982,7 +1070,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(7, request_json.call_count)
+        self.assertEqual(8, request_json.call_count)
         repair_prompt = request_json.call_args_list[6].kwargs["payload"]["messages"][
             0
         ]["content"]
@@ -990,6 +1078,101 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("trusted inference oracle", repair_prompt)
         self.assertIn('"meaningful_progress": false', repair_prompt)
         self.assertIn('"recommended_action": "UP"', repair_prompt)
+
+    def test_bounded_reasoning_smoke_repairs_game_safety_behavior(self) -> None:
+        command = duck_kaggle_setup_command()
+        script = command.split("\n", 1)[1].rsplit("\nPYSETUP", 1)[0]
+        parsed = ast.parse(script)
+        functions = ast.Module(
+            body=[
+                node
+                for node in parsed.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "run_vllm_api_smoke_test"
+            ],
+            type_ignores=[],
+        )
+        bad_safety = {
+            **GAME_SAFETY_BEHAVIOR,
+            "pure_translation": {
+                "classification": "object_translation",
+                "meaningful_progress": False,
+                "novel_state": True,
+                "action_blocked": False,
+                "stop": False,
+                "recommended_action": {"action": "RIGHT"},
+            },
+        }
+        request_json = mock.Mock(
+            side_effect=[
+                {"choices": [{"message": {"content": RAW_REDUCTION_FIXTURE}}]},
+                {"choices": [{"message": {"content": RAW_POLICY_FIXTURE}}]},
+                {
+                    "choices": [
+                        {"message": {"content": json.dumps(PROBE_ACTIONS_BEHAVIOR)}}
+                    ]
+                },
+                {
+                    "choices": [
+                        {"message": {"content": GENERATED_NAVIGATION_POLICY}}
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(PATHFINDING_POLICY_BEHAVIOR)
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(GAME_INFERENCE_BEHAVIOR)
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"message": {"content": json.dumps(bad_safety)}}]},
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "pure_translation": GAME_SAFETY_BEHAVIOR[
+                                            "pure_translation"
+                                        ]
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            ]
+        )
+        namespace = {
+            "ast": ast,
+            "json": json,
+            "VLLM_BASE_URL": "http://127.0.0.1:1234/v1",
+            "SERVED_MODEL_NAME": "unit-test-model",
+            "request_json": request_json,
+            "server_failure_message": lambda reason: reason,
+        }
+        exec(compile(functions, "<kaggle-vllm-smoke-test>", "exec"), namespace)
+
+        namespace["run_vllm_api_smoke_test"]()
+
+        self.assertEqual(8, request_json.call_count)
+        repair_payload = request_json.call_args_list[7].kwargs["payload"]
+        repair_prompt = repair_payload["messages"][0]["content"]
+        self.assertIn("only these failed top-level cases: pure_translation", repair_prompt)
+        self.assertIn("trusted safety oracle", repair_prompt)
+        self.assertIn('"novel_state": false', repair_prompt)
+        self.assertIn('"action": "UP"', repair_prompt)
+        self.assertEqual({"type": "json_object"}, repair_payload["response_format"])
 
     def test_bounded_reasoning_smoke_fails_on_raw_policy_corruption(self) -> None:
         command = duck_kaggle_setup_command()
