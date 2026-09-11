@@ -872,9 +872,13 @@ class KaggleHardwareProfileTests(TestCase):
             ],
             type_ignores=[],
         )
+        contaminated_detour = dict(PATHFINDING_POLICY_BEHAVIOR["detour"])
+        contaminated_detour[
+            "I have to give the solution based on the reasoning directly now.</think>{ "
+        ] = contaminated_detour.pop("action")
         recovered_pathfinding = {
-            case: PATHFINDING_POLICY_BEHAVIOR[case]
-            for case in ("corridor", "detour")
+            "corridor": PATHFINDING_POLICY_BEHAVIOR["corridor"],
+            "detour": contaminated_detour,
         }
         malformed_pathfinding = (
             '{"corridor":{"status":"continue","path_actions":[\n'
@@ -975,7 +979,7 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("Do not return or modify passing cases", repair_prompt)
         self.assertIn("trusted solver oracle", repair_prompt)
         self.assertIn('"action": "UP"', repair_prompt)
-        self.assertIn("</think>", repair_prompt)
+        self.assertIn("</think>{ ", repair_prompt)
         self.assertEqual(
             {"type": "json_object"},
             request_json.call_args_list[5].kwargs["payload"]["response_format"],

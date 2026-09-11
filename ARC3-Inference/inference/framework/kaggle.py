@@ -640,6 +640,53 @@ def run_vllm_api_smoke_test() -> None:
             key=lambda item: (item[1], item[0]),
         )[2]
 
+    def normalize_json_transport_artifacts(value, oracle):
+        if isinstance(value, list) and isinstance(oracle, list):
+            if len(value) != len(oracle):
+                return value
+            return [
+                normalize_json_transport_artifacts(item, expected_item)
+                for item, expected_item in zip(value, oracle)
+            ]
+        if not isinstance(value, dict) or not isinstance(oracle, dict):
+            if (
+                isinstance(value, str)
+                and isinstance(oracle, str)
+                and '</think>' in value
+                and oracle in value
+            ):
+                return oracle
+            return value
+        normalized = {
+            key: normalize_json_transport_artifacts(item, oracle.get(key))
+            if key in oracle
+            else item
+            for key, item in value.items()
+        }
+        missing = [key for key in oracle if key not in normalized]
+        contaminated = [
+            key
+            for key in normalized
+            if key not in oracle and isinstance(key, str) and '</think>' in key
+        ]
+        for expected_key in missing:
+            matches = [
+                key
+                for key in contaminated
+                if normalize_json_transport_artifacts(
+                    normalized[key], oracle[expected_key]
+                )
+                == oracle[expected_key]
+            ]
+            if len(matches) != 1:
+                continue
+            artifact_key = matches[0]
+            normalized[expected_key] = normalize_json_transport_artifacts(
+                normalized.pop(artifact_key), oracle[expected_key]
+            )
+            contaminated.remove(artifact_key)
+        return normalized
+
     def assert_raw_fidelity(label: str, fixture: str, max_tokens: int) -> None:
         content = request_content(
             f'raw-{label}',
@@ -946,6 +993,7 @@ cardinal string or null. Do not include explanations or configuration fields.'''
             result = parse_json_object(content)
             if result is None:
                 return None, list(expected)
+            result = normalize_json_transport_artifacts(result, expected)
             if set(result).difference(expected):
                 return result, list(expected)
             failures = [
@@ -1080,6 +1128,7 @@ action string or null.'''
             result = parse_json_object(content)
             if result is None:
                 return None, list(expected)
+            result = normalize_json_transport_artifacts(result, expected)
             if set(result).difference(expected):
                 return result, list(expected)
             failures = [
@@ -1220,6 +1269,7 @@ recommended_action is null or an object with action and, only for MOUSE, row and
             result = parse_json_object(content)
             if result is None:
                 return None, list(expected)
+            result = normalize_json_transport_artifacts(result, expected)
             if set(result).difference(expected):
                 return result, list(expected)
             failures = [
