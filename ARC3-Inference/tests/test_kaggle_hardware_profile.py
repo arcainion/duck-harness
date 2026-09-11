@@ -165,6 +165,59 @@ GAME_SAFETY_BEHAVIOR = {
         "stop": True,
         "recommended_action": None,
     },
+    "persistent_direction_guard": {
+        "classification": "persistent_direction_guard",
+        "meaningful_progress": False,
+        "novel_state": False,
+        "action_blocked": True,
+        "stop": False,
+        "recommended_action": {"action": "RIGHT"},
+    },
+    "directional_guard_limit": {
+        "classification": "directional_guard_limit",
+        "meaningful_progress": False,
+        "novel_state": False,
+        "action_blocked": True,
+        "stop": True,
+        "recommended_action": None,
+    },
+    "cycle_risk_limit": {
+        "classification": "cycle_risk_limit",
+        "meaningful_progress": False,
+        "novel_state": False,
+        "action_blocked": True,
+        "stop": True,
+        "recommended_action": None,
+    },
+}
+
+ANALYZER_TOOL_CALL_RESPONSE = {
+    "choices": [
+        {
+            "message": {
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-smoke",
+                        "type": "function",
+                        "function": {
+                            "name": "action",
+                            "arguments": json.dumps(
+                                {
+                                    "actions": [
+                                        "UP",
+                                        {"action": "MOUSE", "row": 2, "col": 4},
+                                    ],
+                                    "dry_run": True,
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+            "finish_reason": "tool_calls",
+        }
+    ]
 }
 
 RAW_REDUCTION_FIXTURE = (
@@ -380,7 +433,7 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("thinking_token_budget: int = 64", command)
         self.assertIn("'thinking_token_budget': thinking_token_budget", command)
         self.assertIn("thinking_token_budget=256", command)
-        self.assertNotIn("'tool_choice': 'required'", command)
+        self.assertIn("'tool_choice': 'required'", command)
         self.assertIn("BEGIN_REDUCTION", command)
         self.assertIn("BEGIN_POLICY", command)
         self.assertIn("Raw reduction JSON fidelity: passed", command)
@@ -390,10 +443,12 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("LLM pathfinding policy behavior: passed", command)
         self.assertIn("LLM game inference behavior: passed", command)
         self.assertIn("LLM game safety behavior: passed", command)
+        self.assertIn("LLM analyzer tool-call behavior: passed", command)
         self.assertIn("def assert_generated_policy_contract()", command)
         self.assertIn("def assert_pathfinding_policy_behavior()", command)
         self.assertIn("def assert_game_inference_behavior()", command)
         self.assertIn("def assert_game_safety_behavior()", command)
+        self.assertIn("def assert_analyzer_tool_call_contract()", command)
         self.assertIn("import ast", command)
         self.assertIn("one scalar MOUSE probe_actions entry per coordinate", command)
         self.assertIn("instead of treating probe_actions as the route", command)
@@ -512,6 +567,7 @@ class KaggleHardwareProfileTests(TestCase):
                         {"message": {"content": json.dumps(GAME_SAFETY_BEHAVIOR)}}
                     ]
                 },
+                ANALYZER_TOOL_CALL_RESPONSE,
             ]
         )
         namespace = {
@@ -526,7 +582,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(7, request_json.call_count)
+        self.assertEqual(8, request_json.call_count)
         reduction_payload = request_json.call_args_list[0].kwargs["payload"]
         self.assertEqual(64, reduction_payload["thinking_token_budget"])
         self.assertEqual(
@@ -587,6 +643,20 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn(
             "incomplete_observation", safety_payload["messages"][0]["content"]
         )
+        self.assertIn(
+            "persistent_direction_guard", safety_payload["messages"][0]["content"]
+        )
+        self.assertIn("cycle_risk_limit", safety_payload["messages"][0]["content"])
+        tool_payload = request_json.call_args_list[7].kwargs["payload"]
+        self.assertEqual("required", tool_payload["tool_choice"])
+        self.assertEqual(
+            ["python", "action", "inspect"],
+            [tool["function"]["name"] for tool in tool_payload["tools"]],
+        )
+        self.assertEqual(128, tool_payload["thinking_token_budget"])
+        self.assertNotIn("response_format", tool_payload)
+        self.assertIn("scalar UP", tool_payload["messages"][0]["content"])
+        self.assertIn("row 2 column 4", tool_payload["messages"][0]["content"])
 
     def test_bounded_reasoning_smoke_fails_on_raw_reduction_corruption(
         self,
@@ -721,6 +791,7 @@ class KaggleHardwareProfileTests(TestCase):
                         {"message": {"content": json.dumps(GAME_SAFETY_BEHAVIOR)}}
                     ]
                 },
+                ANALYZER_TOOL_CALL_RESPONSE,
             ]
         )
         namespace = {
@@ -735,7 +806,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(8, request_json.call_count)
+        self.assertEqual(9, request_json.call_count)
         repair_payload = request_json.call_args_list[3].kwargs["payload"]
         self.assertIn(
             "exact registered field names", repair_payload["messages"][0]["content"]
@@ -837,6 +908,7 @@ class KaggleHardwareProfileTests(TestCase):
                         {"message": {"content": json.dumps(GAME_SAFETY_BEHAVIOR)}}
                     ]
                 },
+                ANALYZER_TOOL_CALL_RESPONSE,
             ]
         )
         namespace = {
@@ -851,7 +923,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(8, request_json.call_count)
+        self.assertEqual(9, request_json.call_count)
         repair_prompt = request_json.call_args_list[4].kwargs["payload"]["messages"][
             0
         ]["content"]
@@ -953,6 +1025,7 @@ class KaggleHardwareProfileTests(TestCase):
                         {"message": {"content": json.dumps(GAME_SAFETY_BEHAVIOR)}}
                     ]
                 },
+                ANALYZER_TOOL_CALL_RESPONSE,
             ]
         )
         namespace = {
@@ -967,7 +1040,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(9, request_json.call_count)
+        self.assertEqual(10, request_json.call_count)
         repair_prompt = request_json.call_args_list[5].kwargs["payload"]["messages"][
             0
         ]["content"]
@@ -1060,6 +1133,7 @@ class KaggleHardwareProfileTests(TestCase):
                         {"message": {"content": json.dumps(GAME_SAFETY_BEHAVIOR)}}
                     ]
                 },
+                ANALYZER_TOOL_CALL_RESPONSE,
             ]
         )
         namespace = {
@@ -1074,7 +1148,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(8, request_json.call_count)
+        self.assertEqual(9, request_json.call_count)
         repair_prompt = request_json.call_args_list[6].kwargs["payload"]["messages"][
             0
         ]["content"]
@@ -1155,6 +1229,7 @@ class KaggleHardwareProfileTests(TestCase):
                         }
                     ]
                 },
+                ANALYZER_TOOL_CALL_RESPONSE,
             ]
         )
         namespace = {
@@ -1169,7 +1244,7 @@ class KaggleHardwareProfileTests(TestCase):
 
         namespace["run_vllm_api_smoke_test"]()
 
-        self.assertEqual(8, request_json.call_count)
+        self.assertEqual(9, request_json.call_count)
         repair_payload = request_json.call_args_list[7].kwargs["payload"]
         repair_prompt = repair_payload["messages"][0]["content"]
         self.assertIn("only these failed top-level cases: pure_translation", repair_prompt)

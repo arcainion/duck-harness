@@ -1185,12 +1185,14 @@ action string or null.'''
 
     def assert_game_safety_behavior() -> None:
         prompt = '''Return exactly one JSON object and no Markdown or prose. Apply the
-controller safety and liveness rules to six independent cases. Edge-only HUD changes
+controller safety and liveness rules to nine independent cases. Edge-only HUD changes
 are ignored as progress and novelty. A pure translation of the same object without
 engine progress is not rewarded as novel. An exact mouse coordinate is blocked after
 two failed attempts. A direction used at least 12 times in a 16-action no-progress
-window is blocked. An action with post_action_observed=false is pending evidence, not
-a no-op. A completed run is terminal and must not propose another action.
+window is guarded, becomes persistently blocked after three guard strikes, and eight
+directional no-progress guards stop the run. Eight consecutive cycle-risk actions also
+stop the run. An action with post_action_observed=false is pending evidence, not a
+no-op. A completed run is terminal and must not propose another action.
 
 1. edge_hud_flicker: RIGHT changes only edge HUD cell [0,4] from 3 to 4; the interior,
 level, score, and reward are unchanged. ignore_edge_hud_changes=true. Valid actions
@@ -1206,13 +1208,21 @@ used 12 times. Valid actions UP,RIGHT; use RIGHT after guarding UP.
 comparison or replacement action is yet justified.
 6. terminal_completion: run_complete=true, level_completed=true, reward=1. No next
 action is permitted.
+7. persistent_direction_guard: UP has reached three directional guard strikes and is
+persistently blocked. Valid actions UP,RIGHT; use RIGHT.
+8. directional_guard_limit: eight directional no-progress guards have fired in this
+level. The run must stop without another action.
+9. cycle_risk_limit: eight consecutive proposed actions were classified as cycle risk.
+The run must stop without another action.
 
 Use exactly the top-level keys edge_hud_flicker, pure_translation,
 repeated_click_noop, directional_saturation, incomplete_observation, and
-terminal_completion. Each value must contain exactly classification,
+terminal_completion, persistent_direction_guard, directional_guard_limit, and
+cycle_risk_limit. Each value must contain exactly classification,
 meaningful_progress, novel_state, action_blocked, stop, and recommended_action.
 classification is hud_only, object_translation, repeated_click_noop,
-directional_saturation, awaiting_post_action_observation, or terminal_success.
+directional_saturation, awaiting_post_action_observation, terminal_success,
+persistent_direction_guard, directional_guard_limit, or cycle_risk_limit.
 recommended_action is null or an object with action and, only for MOUSE, row and col.'''
         expected = {
             'edge_hud_flicker': {
@@ -1260,6 +1270,30 @@ recommended_action is null or an object with action and, only for MOUSE, row and
                 'meaningful_progress': True,
                 'novel_state': False,
                 'action_blocked': False,
+                'stop': True,
+                'recommended_action': None,
+            },
+            'persistent_direction_guard': {
+                'classification': 'persistent_direction_guard',
+                'meaningful_progress': False,
+                'novel_state': False,
+                'action_blocked': True,
+                'stop': False,
+                'recommended_action': {'action': 'RIGHT'},
+            },
+            'directional_guard_limit': {
+                'classification': 'directional_guard_limit',
+                'meaningful_progress': False,
+                'novel_state': False,
+                'action_blocked': True,
+                'stop': True,
+                'recommended_action': None,
+            },
+            'cycle_risk_limit': {
+                'classification': 'cycle_risk_limit',
+                'meaningful_progress': False,
+                'novel_state': False,
+                'action_blocked': True,
                 'stop': True,
                 'recommended_action': None,
             },
@@ -1324,6 +1358,128 @@ recommended_action is null or an object with action and, only for MOUSE, row and
                 + f'; final model content was {content!r}'
             )
 
+    def assert_analyzer_tool_call_contract() -> None:
+        tools = [
+            {
+                'type': 'function',
+                'function': {
+                    'name': 'python',
+                    'description': 'Run bounded Python analysis.',
+                    'strict': True,
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {'code': {'type': 'string'}},
+                        'required': ['code'],
+                        'additionalProperties': False,
+                    },
+                },
+            },
+            {
+                'type': 'function',
+                'function': {
+                    'name': 'action',
+                    'description': 'Submit an ordered game-action batch.',
+                    'strict': True,
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {
+                            'actions': {
+                                'type': 'array',
+                                'minItems': 1,
+                                'items': {
+                                    'anyOf': [
+                                        {'type': 'string'},
+                                        {
+                                            'type': 'object',
+                                            'properties': {
+                                                'action': {'type': 'string'},
+                                                'row': {'type': 'integer'},
+                                                'col': {'type': 'integer'},
+                                            },
+                                            'required': ['action'],
+                                            'additionalProperties': False,
+                                        },
+                                    ]
+                                },
+                            },
+                            'dry_run': {'type': 'boolean'},
+                        },
+                        'required': ['actions'],
+                        'additionalProperties': False,
+                    },
+                },
+            },
+            {
+                'type': 'function',
+                'function': {
+                    'name': 'inspect',
+                    'description': 'Read a compact runtime view.',
+                    'strict': True,
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {
+                            'view': {
+                                'type': 'string',
+                                'enum': ['frame_summary', 'history_summary'],
+                            }
+                        },
+                        'required': ['view'],
+                        'additionalProperties': False,
+                    },
+                },
+            },
+        ]
+        expected_arguments = {
+            'actions': ['UP', {'action': 'MOUSE', 'row': 2, 'col': 4}],
+            'dry_run': True,
+        }
+        payload = {
+            'model': SERVED_MODEL_NAME,
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': (
+                        'Call exactly one available tool. Select the action tool and '
+                        'submit this exact ordered dry-run batch: scalar UP, then MOUSE '
+                        'at row 2 column 4. Do not call python or inspect and do not '
+                        'answer with prose.'
+                    ),
+                }
+            ],
+            'tools': tools,
+            'tool_choice': 'required',
+            'temperature': 0.0,
+            'max_tokens': 512,
+            'chat_template_kwargs': {'enable_thinking': True},
+            'thinking_token_budget': 128,
+        }
+        response = request_json(
+            f'{VLLM_BASE_URL}/chat/completions', payload=payload, timeout=120
+        )
+        choices = response.get('choices')
+        message = (
+            choices[0].get('message')
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            else None
+        )
+        tool_calls = message.get('tool_calls') if isinstance(message, dict) else None
+        if not isinstance(tool_calls, list) or len(tool_calls) != 1:
+            raise ValueError('analyzer tool-call check did not return exactly one call')
+        tool_call = tool_calls[0]
+        function = tool_call.get('function') if isinstance(tool_call, dict) else None
+        if not isinstance(function, dict) or function.get('name') != 'action':
+            raise ValueError('analyzer tool-call check selected the wrong function')
+        arguments = function.get('arguments')
+        try:
+            parsed_arguments = json.loads(arguments) if isinstance(arguments, str) else None
+        except json.JSONDecodeError as exc:
+            raise ValueError('analyzer tool-call arguments were not valid JSON') from exc
+        if parsed_arguments != expected_arguments:
+            raise ValueError(
+                'analyzer tool-call arguments changed the ordered scalar/mouse batch; '
+                f'got {arguments!r}'
+            )
+
     reduction_fixture = (
         'BEGIN_REDUCTION\n'
         '{\n'
@@ -1353,6 +1509,7 @@ recommended_action is null or an object with action and, only for MOUSE, row and
         assert_pathfinding_policy_behavior()
         assert_game_inference_behavior()
         assert_game_safety_behavior()
+        assert_analyzer_tool_call_contract()
     except Exception as exc:
         raise RuntimeError(
             server_failure_message(
@@ -1369,6 +1526,7 @@ recommended_action is null or an object with action and, only for MOUSE, row and
     print('LLM pathfinding policy behavior: passed', flush=True)
     print('LLM game inference behavior: passed', flush=True)
     print('LLM game safety behavior: passed', flush=True)
+    print('LLM analyzer tool-call behavior: passed', flush=True)
     print('=' * 88 + '\n', flush=True)
 
 
