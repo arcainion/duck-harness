@@ -14,10 +14,10 @@ import numpy as np
 from inference.agent.gameplay_policy_runtime import PolicyObservation
 from inference.agent.policy_solver_helpers import solver_decide
 from inference.framework.kaggle import (
+    DEFAULT_QWEN_DRAFT_MODEL_SOURCE,
     DEFAULT_QWEN_MODEL_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
-    DEFAULT_VLLM_REASONING_CONFIG,
     DuckKaggleVllmConfig,
     duck_kaggle_model_sources,
     duck_kaggle_setup_command,
@@ -321,24 +321,38 @@ class KaggleHardwareProfileTests(TestCase):
             config["server"]["default_chat_template_kwargs"]["preserve_thinking"]
         )
 
-    def test_default_model_is_qwen38_fp8_repacked_kaggle_model(self) -> None:
+    def test_default_models_match_franzen_flash_next_submission(self) -> None:
         solver = HarnessSolver()
 
         self.assertEqual(
             solver.kaggle_model_sources,
-            ["foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/pyTorch/hf-fp8/1"],
+            [
+                "dfranzen/intel-qwen3.8-flash-next-w4a16-autoround/"
+                "Transformers/default/1",
+                "dfranzen/albucino-qwen3-8-flash-next-drafter/"
+                "Transformers/default/1",
+            ],
         )
-        self.assertEqual(solver.kaggle_model_sources, [DEFAULT_QWEN_MODEL_SOURCE])
+        self.assertEqual(
+            solver.kaggle_model_sources,
+            [DEFAULT_QWEN_MODEL_SOURCE, DEFAULT_QWEN_DRAFT_MODEL_SOURCE],
+        )
         self.assertEqual(solver.kaggle_served_model_name, DEFAULT_SERVED_MODEL_NAME)
         self.assertEqual(
             solver.kaggle_dataset_sources,
-            ["driessmit1/arc3-vllm-h100-wheelhouse-v3"],
+            ["dfranzen/pennyroyal-v253"],
         )
 
         command = duck_kaggle_setup_command()
         self.assertIn(f"MODEL_SOURCE = {DEFAULT_QWEN_MODEL_SOURCE!r}", command)
+        self.assertIn(
+            f"DRAFT_MODEL_SOURCE = {DEFAULT_QWEN_DRAFT_MODEL_SOURCE!r}", command
+        )
         self.assertIn("kagglehub.model_download(model_source)", command)
         self.assertIn(f"SERVED_MODEL_NAME = {DEFAULT_SERVED_MODEL_NAME!r}", command)
+        self.assertIn("PENNYROYAL_SGLANG", command)
+        self.assertIn("'--speculative-algorithm', 'NEXTN'", command)
+        self.assertIn("'--speculative-draft-model-path', str(draft_view)", command)
 
     def test_solver_propagates_expected_gpu_shape(self) -> None:
         solver = HarnessSolver(
@@ -366,26 +380,16 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertEqual(config.max_num_batched_tokens, 4096)
         self.assertFalse(config.enable_chunked_prefill)
 
-    def test_t4_profile_matches_kaggle_dual_gpu_shape(self) -> None:
-        config = duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
-
-        self.assertEqual(config.expected_gpu_type, "t4")
-        self.assertEqual(config.expected_gpu_count, 2)
-        self.assertEqual(config.tensor_parallel_size, 2)
-        self.assertEqual(config.max_model_len, 8192)
-        self.assertEqual(config.max_num_seqs, 16)
-        self.assertEqual(config.max_num_batched_tokens, 8192)
-
-    def test_t4_accelerator_matching_ignores_case_and_punctuation(self) -> None:
+    def test_t4_profile_is_rejected_for_pennyroyal_flash_next(self) -> None:
         for value in ("nvidia-tesla-t4", "NVIDIA TESLA T4", "NvidiaTeslaT4"):
             with self.subTest(value=value):
-                self.assertEqual(
-                    duck_kaggle_vllm_config_for_accelerator(value).expected_gpu_type,
-                    "t4",
-                )
+                with self.assertRaisesRegex(
+                    ValueError, "RTX PRO 6000.*cannot run on Kaggle's Tesla T4"
+                ):
+                    duck_kaggle_vllm_config_for_accelerator(value)
 
-    def test_t4_setup_clamps_analyzer_context_to_server_limit(self) -> None:
-        config = duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
+    def test_setup_clamps_analyzer_context_to_server_limit(self) -> None:
+        config = DuckKaggleVllmConfig(max_model_len=8192)
         with mock.patch.dict(
             os.environ,
             {
@@ -398,13 +402,12 @@ class KaggleHardwareProfileTests(TestCase):
 
         self.assertIn("VLLM_MAX_MODEL_LEN = 8192", command)
         self.assertIn("ANALYZER_CONTEXT_WINDOW = 8192", command)
-        self.assertIn("VLLM_TENSOR_PARALLEL_SIZE = 2", command)
-        self.assertIn("EXPECTED_GPU_TYPE = 't4'", command)
-        self.assertIn("EXPECTED_GPU_COUNT = 2", command)
+        self.assertIn("VLLM_TENSOR_PARALLEL_SIZE = 1", command)
+        self.assertIn("EXPECTED_GPU_TYPE = 'rtx-pro-6000'", command)
+        self.assertIn("EXPECTED_GPU_COUNT = 1", command)
         self.assertIn("VLLM_MAX_NUM_SEQS = 16", command)
         self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 8192", command)
-        self.assertIn("--enable-chunked-prefill", command)
-        self.assertIn('{"preserve_thinking": true}', command)
+        self.assertIn("'--speculative-algorithm', 'NEXTN'", command)
 
     def test_rtx_pro_6000_profile_uses_single_gpu_defaults(self) -> None:
         config = duck_kaggle_vllm_config_for_accelerator("NvidiaRtxPro6000")
@@ -415,7 +418,7 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertEqual(config.expected_gpu_count, 1)
 
         command = duck_kaggle_setup_command(config)
-        self.assertIn("VLLM_MAX_MODEL_LEN = 65536", command)
+        self.assertIn("VLLM_MAX_MODEL_LEN = 131072", command)
         self.assertIn("VLLM_TENSOR_PARALLEL_SIZE = 1", command)
         self.assertIn("EXPECTED_GPU_TYPE = 'rtx-pro-6000'", command)
         self.assertIn("EXPECTED_GPU_COUNT = 1", command)
@@ -426,9 +429,7 @@ class KaggleHardwareProfileTests(TestCase):
     def test_setup_configures_bounded_reasoning_and_raw_transport_smoke(self) -> None:
         command = duck_kaggle_setup_command()
 
-        self.assertIn("'--reasoning-parser',\n        'qwen3'", command)
-        self.assertIn("'--reasoning-config'", command)
-        self.assertIn(repr(DEFAULT_VLLM_REASONING_CONFIG), command)
+        self.assertIn("'--reasoning-parser', 'qwen3'", command)
         self.assertIn("'chat_template_kwargs': {'enable_thinking': True}", command)
         self.assertIn("thinking_token_budget: int = 64", command)
         self.assertIn("'thinking_token_budget': thinking_token_budget", command)
@@ -1413,9 +1414,7 @@ class KaggleHardwareProfileTests(TestCase):
             },
             clear=False,
         ):
-            command = duck_kaggle_setup_command(
-                duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
-            )
+            command = duck_kaggle_setup_command(DuckKaggleVllmConfig(max_model_len=8192))
 
         self.assertIn("ANALYZER_CONTEXT_WINDOW = 4096", command)
 
@@ -1557,9 +1556,7 @@ class KaggleHardwareProfileTests(TestCase):
                     duck_kaggle_setup_command(config)
 
     def test_setup_detects_server_exit_and_emits_complete_log(self) -> None:
-        command = duck_kaggle_setup_command(
-            duck_kaggle_vllm_config_for_accelerator("NvidiaTeslaT4")
-        )
+        command = duck_kaggle_setup_command()
 
         self.assertIn("def read_server_log() -> str:", command)
         self.assertIn("return VLLM_SERVER_LOG.read_text", command)

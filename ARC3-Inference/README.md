@@ -341,9 +341,15 @@ instead of fetching private dependencies from GitHub.
 
 `make kaggle-duck` runs through TAAF's Kaggle deployment. It packages the
 current TAAF and ARC3-Inference sources into a Kaggle source dataset, pushes a
-private Kaggle notebook, and attaches the vLLM wheelhouse dataset plus the
-version-pinned `Qwen3.8 27B FP8 Repacked` Kaggle Model. The duck solver owns the
-Kaggle setup hooks, so the launcher only chooses the run shape.
+private Kaggle notebook, and attaches Daniel Franzen's version-pinned
+`Qwen3.8-Flash-Next W4A16 AutoRound` target model, its separate `albucino
+Qwen3.8-Flash-Next` MTP draft checkpoint, and the matching
+`dfranzen/pennyroyal-v253` offline SGLang/Pennyroyal wheelhouse. The notebook
+creates the draft metadata view required by that runtime and serves the pair with
+three-step NEXTN speculative decoding. This deployment requires Kaggle's RTX PRO
+6000 profile; the older Tesla T4 profile is rejected before staging an
+incompatible notebook. The duck solver owns the Kaggle setup hooks, so the
+launcher only chooses the run shape.
 
 By default the target uses the 25 official ARC-AGI-3 games, `model=local`, 12
 concurrent games, 132 minutes per game, and a 540-minute Kaggle runtime. The

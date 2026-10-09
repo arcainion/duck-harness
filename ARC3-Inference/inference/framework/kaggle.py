@@ -7,13 +7,17 @@ from dataclasses import dataclass
 
 from inference.utils.openai_compat import normalize_provider
 
-DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE = "driessmit1/arc3-vllm-h100-wheelhouse-v3"
+DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE = "dfranzen/pennyroyal-v253"
 DEFAULT_QWEN_MODEL_SOURCE = (
-    "foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/pyTorch/hf-fp8/1"
+    "dfranzen/intel-qwen3.8-flash-next-w4a16-autoround/Transformers/default/1"
 )
-DEFAULT_SERVED_MODEL_NAME = "Qwen/Qwen3.8-27B-FP8"
+DEFAULT_QWEN_DRAFT_MODEL_SOURCE = (
+    "dfranzen/albucino-qwen3-8-flash-next-drafter/Transformers/default/1"
+)
+DEFAULT_SERVED_MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+DEFAULT_VLLM_SPECULATIVE_NUM_TOKENS = 3
 DEFAULT_VLLM_PORT = 1234
-DEFAULT_VLLM_MAX_MODEL_LEN = 65536
+DEFAULT_VLLM_MAX_MODEL_LEN = 131072
 DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 1
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.92
 DEFAULT_VLLM_MAX_NUM_SEQS = 16
@@ -29,7 +33,7 @@ DEFAULT_EXPECTED_GPU_COUNT = 1
 T4_VLLM_MAX_MODEL_LEN = 8192
 T4_VLLM_MAX_NUM_SEQS = 16
 T4_VLLM_MAX_NUM_BATCHED_TOKENS = 8192
-DEFAULT_WHEELHOUSE_STAMP_TEXT = "vllm==0.19.0 torch==2.10.0 flashinfer==0.6.6\n"
+DEFAULT_WHEELHOUSE_STAMP_TEXT = "pennyroyal-sglang==2.5.3 flash-next-autoround\n"
 
 # The 25 official ARC-AGI-3 games. The first 16 are the original Kaggle duck
 # validation harness order; the remaining 9 complete the official tag set.
@@ -68,7 +72,9 @@ class DuckKaggleVllmConfig:
 
     wheelhouse_dataset_source: str = DEFAULT_VLLM_WHEELHOUSE_DATASET_SOURCE
     model_source: str = DEFAULT_QWEN_MODEL_SOURCE
+    draft_model_source: str = DEFAULT_QWEN_DRAFT_MODEL_SOURCE
     served_model_name: str = DEFAULT_SERVED_MODEL_NAME
+    speculative_num_tokens: int = DEFAULT_VLLM_SPECULATIVE_NUM_TOKENS
     vllm_port: int = DEFAULT_VLLM_PORT
     max_model_len: int = DEFAULT_VLLM_MAX_MODEL_LEN
     tensor_parallel_size: int = DEFAULT_VLLM_TENSOR_PARALLEL_SIZE
@@ -90,15 +96,9 @@ def duck_kaggle_vllm_config_for_accelerator(
         character for character in str(accelerator or "").lower() if character.isalnum()
     )
     if normalized == "nvidiateslat4":
-        # Kaggle's NvidiaTeslaT4 shape exposes two 16 GiB T4s. The 27B FP8
-        # model must be sharded across both, with a bounded KV-cache budget.
-        return DuckKaggleVllmConfig(
-            max_model_len=T4_VLLM_MAX_MODEL_LEN,
-            tensor_parallel_size=2,
-            max_num_seqs=T4_VLLM_MAX_NUM_SEQS,
-            max_num_batched_tokens=T4_VLLM_MAX_NUM_BATCHED_TOKENS,
-            expected_gpu_type="t4",
-            expected_gpu_count=2,
+        raise ValueError(
+            "Qwen3.8-Flash-Next's Pennyroyal runtime targets an RTX PRO 6000 "
+            "(SM120) and cannot run on Kaggle's Tesla T4 profile."
         )
     return DuckKaggleVllmConfig()
 
@@ -114,7 +114,10 @@ def duck_kaggle_model_sources(
     config: DuckKaggleVllmConfig | None = None,
 ) -> list[str]:
     cfg = config or DuckKaggleVllmConfig()
-    return [_validate_model_source(cfg.model_source)]
+    return [
+        _validate_model_source(cfg.model_source),
+        _validate_model_source(cfg.draft_model_source),
+    ]
 
 
 def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str:
@@ -124,6 +127,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         option_name="wheelhouse_dataset_source",
     )
     model_source = _validate_model_source(cfg.model_source)
+    draft_model_source = _validate_model_source(cfg.draft_model_source)
     # Base URL / model are pinned to the local vLLM server below, so reject a
     # provider that disagrees (e.g. openrouter) — it would drop vLLM-only payload
     # fields (top_k, chat_template_kwargs) against a vLLM endpoint.
@@ -137,7 +141,11 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__WHEELHOUSE_OWNER__": repr(wheelhouse_owner),
         "__WHEELHOUSE_SLUG__": repr(wheelhouse_slug),
         "__MODEL_SOURCE__": repr(model_source),
+        "__DRAFT_MODEL_SOURCE__": repr(draft_model_source),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
+        "__VLLM_SPECULATIVE_NUM_TOKENS__": repr(
+            max(1, int(cfg.speculative_num_tokens))
+        ),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
         "__VLLM_MAX_MODEL_LEN__": repr(int(cfg.max_model_len)),
         # The launcher's Makefile exports LOCAL_ANALYZER_CONTEXT_WINDOW from
@@ -353,12 +361,17 @@ import subprocess
 import sys
 import time
 import urllib.request
+import copy
+import hashlib
+import zipfile
 from pathlib import Path
 
 WHEELHOUSE_OWNER = __WHEELHOUSE_OWNER__
 WHEELHOUSE_SLUG = __WHEELHOUSE_SLUG__
 MODEL_SOURCE = __MODEL_SOURCE__
+DRAFT_MODEL_SOURCE = __DRAFT_MODEL_SOURCE__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
+VLLM_SPECULATIVE_NUM_TOKENS = __VLLM_SPECULATIVE_NUM_TOKENS__
 VLLM_HOST = '127.0.0.1'
 VLLM_PORT = __VLLM_PORT__
 VLLM_BASE_URL = f'http://{VLLM_HOST}:{VLLM_PORT}/v1'
@@ -372,10 +385,13 @@ VLLM_ENABLE_CHUNKED_PREFILL = __VLLM_ENABLE_CHUNKED_PREFILL__
 EXPECTED_GPU_TYPE = __EXPECTED_GPU_TYPE__
 EXPECTED_GPU_COUNT = __EXPECTED_GPU_COUNT__
 WORKING_DIR = Path(os.environ['TAAF_KAGGLE_WORKING_DIR'])
-SITE_PACKAGES = WORKING_DIR / 'vllm-site-packages'
-VLLM_SERVER_LOG = WORKING_DIR / 'vllm-openai-server.log'
-VLLM_SERVER_PID = WORKING_DIR / 'vllm-openai-server.pid'
-INSTALL_STAMP = SITE_PACKAGES / f'.{WHEELHOUSE_SLUG}'
+PENNYROYAL_ROOT = WORKING_DIR / 'pennyroyal-v253'
+PENNYROYAL_VENV = PENNYROYAL_ROOT / 'venv'
+PENNYROYAL_PYTHON = PENNYROYAL_VENV / 'bin' / 'python'
+PENNYROYAL_SGLANG = PENNYROYAL_VENV / 'bin' / 'sglang'
+VLLM_SERVER_LOG = WORKING_DIR / 'pennyroyal-openai-server.log'
+VLLM_SERVER_PID = WORKING_DIR / 'pennyroyal-openai-server.pid'
+INSTALL_STAMP = PENNYROYAL_ROOT / f'.{WHEELHOUSE_SLUG}'
 STAMP_TEXT = __WHEELHOUSE_STAMP_TEXT__
 
 GPU_NAME_PATTERNS = {'rtx-pro-6000': ('rtx pro 6000',), 'h100': ('h100',), 'l4': ('l4',), 't4': ('t4',)}
@@ -411,6 +427,7 @@ def resolve_kaggle_model_path(model_source: str) -> Path:
 
 WHEELHOUSE = resolve_kaggle_dataset_path(WHEELHOUSE_OWNER, WHEELHOUSE_SLUG)
 MODEL_PATH = resolve_kaggle_model_path(MODEL_SOURCE)
+DRAFT_MODEL_PATH = resolve_kaggle_model_path(DRAFT_MODEL_SOURCE)
 
 
 def assert_expected_cuda_gpu() -> None:
@@ -431,64 +448,127 @@ def assert_expected_cuda_gpu() -> None:
     print(f'CUDA GPU check passed for {expected_gpu_type} x{expected_count}: {gpu_names}', flush=True)
 
 
-def vllm_env() -> dict[str, str]:
+def pennyroyal_env() -> dict[str, str]:
     env = os.environ.copy()
-    existing = env.get('PYTHONPATH', '')
-    env['PYTHONPATH'] = str(SITE_PACKAGES) if not existing else f'{SITE_PACKAGES}{os.pathsep}{existing}'
     env.update(
         {
             'USE_TF': '0',
             'TRANSFORMERS_NO_TF': '1',
             'TRANSFORMERS_NO_TORCHVISION': '1',
-            'VLLM_NO_USAGE_STATS': '1',
+            'PYTHONNOUSERSITE': '1',
+            'HF_HUB_OFFLINE': '1',
+            'TRANSFORMERS_OFFLINE': '1',
+            'UV_OFFLINE': '1',
+            'UV_PYTHON_DOWNLOADS': 'never',
+            'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
+            'TORCH_CUDA_ARCH_LIST': '12.0',
+            'SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN': '1',
+            'SGLANG_ENABLE_SM120_LOWM_BF16_GEMM': '1',
+            'SGLANG_SM120_ONLINE_MXFP8': '0',
+            'SGLANG_SM120_LOWM_FP8_WEIGHT': '0',
+            'SGLANG_SM120_LM_HEAD_FP8': '0',
+            'SGLANG_MAMBA_CONV_DTYPE': 'bfloat16',
+            'SGLANG_NUMA_BIND_V2': 'false',
+            'TOKENIZERS_PARALLELISM': 'false',
+            'MAX_JOBS': '8',
         }
     )
     return env
+
+
+def find_unique(root: Path, name: str, *, directory: bool = False) -> Path:
+    direct = root if root.name == name else root / name
+    valid = lambda path: path.is_dir() if directory else path.is_file()
+    if valid(direct):
+        return direct
+    matches = sorted(path for path in root.rglob(name) if valid(path))
+    if len(matches) != 1:
+        raise RuntimeError(f'Expected exactly one {name!r} under {root}, found {matches}')
+    return matches[0]
 
 
 def cached_install_is_usable() -> bool:
     if not INSTALL_STAMP.exists() or INSTALL_STAMP.read_text(encoding='utf-8') != STAMP_TEXT:
         return False
     result = subprocess.run(
-        [sys.executable, '-c', "import vllm, torch; print(f'Cached vLLM {vllm.__version__}, torch {torch.__version__}')"],
-        env=vllm_env(),
+        [str(PENNYROYAL_PYTHON), '-c', "import sglang, torch; print(f'Cached Pennyroyal {sglang.__version__}, torch {torch.__version__}')"],
+        env=pennyroyal_env(),
         text=True,
     )
     return result.returncode == 0
 
 
 def install_vllm_wheelhouse() -> None:
-    requirements = WHEELHOUSE / 'requirements.lock'
-    if not requirements.exists():
-        raise FileNotFoundError(f'Missing wheelhouse lock file: {requirements}')
+    wheels = find_unique(WHEELHOUSE, 'wheels', directory=True)
+    requirements = find_unique(WHEELHOUSE, 'requirements.lock')
+    sglang_wheels = sorted(wheels.glob('sglang-*.whl'))
+    if len(sglang_wheels) != 1:
+        raise RuntimeError(f'Expected exactly one Pennyroyal SGLang wheel, found {sglang_wheels}')
     if cached_install_is_usable():
-        print(f'Using cached vLLM target install at {SITE_PACKAGES}', flush=True)
+        print(f'Using cached Pennyroyal install at {PENNYROYAL_VENV}', flush=True)
         return
-    shutil.rmtree(SITE_PACKAGES, ignore_errors=True)
-    SITE_PACKAGES.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        sys.executable,
-        '-m',
-        'pip',
-        'install',
-        '--no-index',
-        '--find-links',
-        str(WHEELHOUSE),
-        '--requirement',
-        str(requirements),
-        '--target',
-        str(SITE_PACKAGES),
-        '--upgrade',
-        '--ignore-installed',
-        '--only-binary',
-        ':all:',
-        '--no-compile',
-        '--disable-pip-version-check',
-        '--no-warn-conflicts',
-    ]
-    print('Installing vLLM wheelhouse into', SITE_PACKAGES, flush=True)
-    subprocess.run(cmd, check=True)
+    shutil.rmtree(PENNYROYAL_ROOT, ignore_errors=True)
+    (PENNYROYAL_ROOT / 'bin').mkdir(parents=True, exist_ok=True)
+    uv_wheels = sorted(wheels.glob('uv-*.whl'))
+    if len(uv_wheels) != 1:
+        raise RuntimeError(f'Expected exactly one bundled uv wheel, found {uv_wheels}')
+    uv_binary = PENNYROYAL_ROOT / 'bin' / 'uv'
+    with zipfile.ZipFile(uv_wheels[0]) as archive:
+        members = [name for name in archive.namelist() if Path(name).name == 'uv' and not name.endswith('/')]
+        if len(members) != 1:
+            raise RuntimeError('Cannot identify the bundled Linux uv executable.')
+        uv_binary.write_bytes(archive.read(members[0]))
+    uv_binary.chmod(0o755)
+    env = pennyroyal_env()
+    subprocess.run([str(uv_binary), 'venv', '--python', sys.executable, str(PENNYROYAL_VENV)], check=True, env=env)
+    install = [str(uv_binary), 'pip', 'install', '--python', str(PENNYROYAL_PYTHON), '--no-index', '--find-links', str(wheels)]
+    print('Installing Pennyroyal wheelhouse into', PENNYROYAL_VENV, flush=True)
+    subprocess.run([*install, '-r', str(requirements)], check=True, env=env)
+    subprocess.run([*install, '--reinstall', '--no-deps', str(sglang_wheels[0])], check=True, env=env)
     INSTALL_STAMP.write_text(STAMP_TEXT, encoding='utf-8')
+
+
+def pennyroyal_runtime_env() -> dict[str, str]:
+    # Expose the CUDA 13 toolkit bundled with the Pennyroyal wheelhouse.
+    cuda_roots = sorted(PENNYROYAL_VENV.glob('lib/python*/site-packages/nvidia/cu13'))
+    if len(cuda_roots) != 1 or not (cuda_roots[0] / 'bin' / 'nvcc').is_file():
+        raise RuntimeError('Bundled Pennyroyal CUDA 13 toolkit is missing.')
+    cuda_home = cuda_roots[0]
+    libdir = cuda_home / 'lib'
+    lib64 = cuda_home / 'lib64'
+    if not lib64.exists() and not lib64.is_symlink():
+        lib64.symlink_to('lib')
+    for versioned in libdir.glob('*.so.*'):
+        unversioned = libdir / versioned.name.split('.so.', 1)[0]
+        if not unversioned.exists() and not unversioned.is_symlink():
+            unversioned.symlink_to(versioned.name)
+    if not (libdir / 'libcuda.so').exists():
+        candidates = []
+        for directory in ('/usr/local/nvidia/lib64', '/usr/local/nvidia/lib', '/usr/lib/x86_64-linux-gnu', '/usr/lib64'):
+            candidates.extend(Path(directory).glob('libcuda.so*'))
+        candidates = [candidate for candidate in candidates if candidate.is_file()]
+        if not candidates:
+            raise RuntimeError('GPU driver libcuda.so was not found for Pennyroyal.')
+        (libdir / 'libcuda.so').symlink_to(candidates[0].resolve())
+    cxx = next((name for name in ('g++-15', 'g++-14', 'g++-13', 'g++-12', 'g++-11', 'g++') if shutil.which(name)), None)
+    if cxx is None:
+        raise RuntimeError('A C++ compiler is required for Pennyroyal CUDA kernels.')
+    cc = cxx.replace('g++', 'gcc')
+    if not shutil.which(cc):
+        raise RuntimeError(f'Matching C compiler {cc!r} was not found.')
+    env = pennyroyal_env()
+    env.update(
+        {
+            'CUDA_HOME': str(cuda_home),
+            'CUDACXX': str(cuda_home / 'bin' / 'nvcc'),
+            'CC': cc,
+            'CXX': cxx,
+            'CUDAHOSTCXX': cxx,
+            'PATH': f'{cuda_home / "bin"}:{PENNYROYAL_VENV / "bin"}:' + env.get('PATH', ''),
+            'LD_LIBRARY_PATH': f'{lib64}:{libdir}:' + env.get('LD_LIBRARY_PATH', ''),
+        }
+    )
+    return env
 
 
 def request_json(url: str, payload: dict | None = None, timeout: int = 30) -> dict:
@@ -530,16 +610,63 @@ def wait_for_vllm_server(process: subprocess.Popen[str], timeout_seconds: int = 
     )
 
 
+def prepare_draft_view() -> Path:
+    # Make Pennyroyal's required metadata view without mutating Kaggle inputs.
+    configs = [path for path in DRAFT_MODEL_PATH.rglob('config.json')]
+    candidates = []
+    for config_path in configs:
+        config = json.loads(config_path.read_text(encoding='utf-8'))
+        quantization = config.get('quantization_config', {})
+        if quantization.get('quant_method') == 'compressed-tensors' and 'mtp_routed_experts' in quantization.get('config_groups', {}):
+            candidates.append((config_path.parent, config))
+    if len(candidates) != 1:
+        raise RuntimeError(f'Expected one INT4 MTP checkpoint under {DRAFT_MODEL_PATH}, found {len(candidates)}.')
+    source, config = candidates[0]
+    index_path = source / 'model.safetensors.index.json'
+    index = json.loads(index_path.read_text(encoding='utf-8'))
+    shard_names = sorted(set(index.get('weight_map', {}).values()))
+    if not shard_names or not any(name.startswith('mtp.layers.0.mlp.experts.') for name in index.get('weight_map', {})):
+        raise RuntimeError('Draft checkpoint is missing the expected MTP expert weights.')
+    config = copy.deepcopy(config)
+    group = config['quantization_config']['config_groups']['mtp_routed_experts']
+    weights = group.get('weights', {})
+    if (weights.get('num_bits'), weights.get('group_size'), weights.get('symmetric')) != (4, 32, True):
+        raise RuntimeError('Expected symmetric INT4 group-32 draft experts.')
+    group['targets'] = [r're:^mtp\\.layers\\.0\\.mlp\\.experts\\.[0-9]+\\.(gate_proj|up_proj|down_proj)$']
+    config['quantization_config']['ignore'] = [r're:^(?!mtp\\.layers\\.0\\.mlp\\.experts(?:\\.|$)).*']
+    identity = json.dumps({'source': str(source), 'config': config}, sort_keys=True).encode('utf-8')
+    view = PENNYROYAL_ROOT / f'draft-view-{hashlib.sha256(identity).hexdigest()[:16]}'
+    view.mkdir(parents=True, exist_ok=True)
+    (view / 'config.json').write_text(json.dumps(config, indent=2) + '\\n', encoding='utf-8')
+    links = {name: source / name for name in shard_names}
+    links['model.safetensors.index.json'] = index_path
+    for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja', 'preprocessor_config.json', 'generation_config.json'):
+        if (MODEL_PATH / name).is_file():
+            links[name] = MODEL_PATH / name
+    for name, target in links.items():
+        destination = view / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists() or destination.is_symlink():
+            if not destination.is_symlink() or destination.resolve() != target.resolve():
+                destination.unlink()
+            else:
+                continue
+        destination.symlink_to(target)
+    return view
+
+
 def start_vllm_server() -> None:
+    # Flash-Next's AutoRound target and MTP checkpoint require the matching
+    # Pennyroyal SGLang build; stock vLLM cannot load this pair correctly.
     install_vllm_wheelhouse()
+    draft_view = prepare_draft_view()
     VLLM_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
     VLLM_SERVER_PID.unlink(missing_ok=True)
     log_handle = VLLM_SERVER_LOG.open('w', encoding='utf-8')
     cmd = [
-        sys.executable,
-        '-m',
-        'vllm.entrypoints.openai.api_server',
-        '--model',
+        str(PENNYROYAL_SGLANG),
+        'serve',
+        '--model-path',
         str(MODEL_PATH),
         '--served-model-name',
         SERVED_MODEL_NAME,
@@ -547,33 +674,40 @@ def start_vllm_server() -> None:
         VLLM_HOST,
         '--port',
         str(VLLM_PORT),
-        '--tensor-parallel-size',
-        str(VLLM_TENSOR_PARALLEL_SIZE),
-        '--enable-auto-tool-choice',
-        '--tool-call-parser',
-        'qwen3_coder',
-        '--generation-config',
-        'vllm',
-        '--enable-prefix-caching',
-        '--default-chat-template-kwargs',
-        '{"preserve_thinking": true}',
-        '--reasoning-parser',
-        'qwen3',
-        '--reasoning-config',
-        __VLLM_REASONING_CONFIG__,
-        '--max-model-len',
+        '--tensor-parallel-size', '1',
+        '--dtype', 'bfloat16',
+        '--quantization', 'auto-round',
+        '--kv-cache-dtype', 'fp8_e4m3',
+        '--mem-fraction-static', str(VLLM_GPU_MEMORY_UTILIZATION),
+        '--context-length',
         str(VLLM_MAX_MODEL_LEN),
-        '--gpu-memory-utilization',
-        str(VLLM_GPU_MEMORY_UTILIZATION),
-        '--max-num-seqs',
+        '--page-size', '64',
+        '--max-running-requests',
         str(VLLM_MAX_NUM_SEQS),
-        '--max-num-batched-tokens',
+        '--chunked-prefill-size',
         str(VLLM_MAX_NUM_BATCHED_TOKENS),
+        '--max-prefill-tokens', str(VLLM_MAX_NUM_BATCHED_TOKENS),
+        '--mamba-ssm-dtype', 'bfloat16',
+        '--mamba-backend', 'flashinfer',
+        '--linear-attn-decode-backend', 'flashinfer',
+        '--linear-attn-prefill-backend', 'flashinfer',
+        '--moe-runner-backend', 'auto',
+        '--ple-offload-embedding',
+        '--trust-remote-code',
+        '--reasoning-parser', 'qwen3',
+        '--tool-call-parser', 'qwen3_coder',
+        '--default-chat-template-kwargs', '{"preserve_thinking":true}',
+        '--speculative-algorithm', 'NEXTN',
+        '--speculative-num-steps', str(VLLM_SPECULATIVE_NUM_TOKENS),
+        '--speculative-eagle-topk', '1',
+        '--speculative-num-draft-tokens', str(VLLM_SPECULATIVE_NUM_TOKENS + 1),
+        '--speculative-draft-model-path', str(draft_view),
+        '--speculative-draft-model-quantization', 'compressed-tensors',
+        '--speculative-moe-runner-backend', 'auto',
+        '--speculative-draft-kv-cache-dtype', 'fp8_e4m3',
     ]
-    if VLLM_ENABLE_CHUNKED_PREFILL:
-        cmd.append('--enable-chunked-prefill')
-    print('Starting vLLM OpenAI server:', ' '.join(cmd), flush=True)
-    process = subprocess.Popen(cmd, env=vllm_env(), stdout=log_handle, stderr=subprocess.STDOUT, text=True)
+    print('Starting Pennyroyal OpenAI server:', ' '.join(cmd), flush=True)
+    process = subprocess.Popen(cmd, env=pennyroyal_runtime_env(), stdout=log_handle, stderr=subprocess.STDOUT, text=True)
     VLLM_SERVER_PID.write_text(str(process.pid), encoding='utf-8')
     try:
         wait_for_vllm_server(process)
@@ -1531,9 +1665,14 @@ recommended_action is null or an object with action and, only for MOUSE, row and
 
 
 print(f'vLLM wheelhouse path: {WHEELHOUSE}', flush=True)
-print(f'Qwen model path: {MODEL_PATH}', flush=True)
+print(f'Qwen Flash-Next model path: {MODEL_PATH}', flush=True)
+print(f'Qwen Flash-Next MTP draft path: {DRAFT_MODEL_PATH}', flush=True)
 assert_expected_cuda_gpu()
-missing = [str(path) for path in (WHEELHOUSE, MODEL_PATH) if not path.exists()]
+missing = [
+    str(path)
+    for path in (WHEELHOUSE, MODEL_PATH, DRAFT_MODEL_PATH)
+    if not path.exists()
+]
 if missing:
     raise FileNotFoundError('Missing attached Kaggle input path(s): ' + ', '.join(missing))
 start_vllm_server()
