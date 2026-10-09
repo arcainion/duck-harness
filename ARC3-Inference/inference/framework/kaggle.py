@@ -487,6 +487,29 @@ def find_unique(root: Path, name: str, *, directory: bool = False) -> Path:
     return matches[0]
 
 
+def pennyroyal_bootstrap_python() -> str:
+    # Locate the CPython ABI for the pinned Pennyroyal wheelhouse.
+    requested = os.getenv('PENNYROYAL_BOOTSTRAP_PYTHON', '').strip()
+    candidates = [requested] if requested else []
+    candidates.extend(['/usr/bin/python3.12', shutil.which('python3.12') or ''])
+    checked: list[str] = []
+    for candidate in candidates:
+        if not candidate or candidate in checked or not Path(candidate).is_file():
+            continue
+        checked.append(candidate)
+        result = subprocess.run(
+            [candidate, '-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip() == '3.12':
+            return candidate
+    raise RuntimeError(
+        'Pennyroyal v2.5.3 requires CPython 3.12 because its offline wheelhouse '
+        f'contains cp312 wheels; checked {checked or candidates}.'
+    )
+
+
 def cached_install_is_usable() -> bool:
     if not INSTALL_STAMP.exists() or INSTALL_STAMP.read_text(encoding='utf-8') != STAMP_TEXT:
         return False
@@ -520,7 +543,8 @@ def install_vllm_wheelhouse() -> None:
         uv_binary.write_bytes(archive.read(members[0]))
     uv_binary.chmod(0o755)
     env = pennyroyal_env()
-    subprocess.run([str(uv_binary), 'venv', '--python', sys.executable, str(PENNYROYAL_VENV)], check=True, env=env)
+    bootstrap_python = pennyroyal_bootstrap_python()
+    subprocess.run([str(uv_binary), 'venv', '--python', bootstrap_python, str(PENNYROYAL_VENV)], check=True, env=env)
     install = [str(uv_binary), 'pip', 'install', '--python', str(PENNYROYAL_PYTHON), '--no-index', '--find-links', str(wheels)]
     print('Installing Pennyroyal wheelhouse into', PENNYROYAL_VENV, flush=True)
     subprocess.run([*install, '-r', str(requirements)], check=True, env=env)
@@ -1681,8 +1705,6 @@ setup_env = {
     'USE_TF': '0',
     'TRANSFORMERS_NO_TF': '1',
     'TRANSFORMERS_NO_TORCHVISION': '1',
-    'VLLM_NO_USAGE_STATS': '1',
-    'PYTHONPATH': str(SITE_PACKAGES) + os.pathsep + os.environ.get('PYTHONPATH', ''),
     'LOCAL_ANALYZER_BASE_URL': VLLM_BASE_URL,
     'OPENAI_BASE_URL': VLLM_BASE_URL,
     'LOCAL_ANALYZER_PROVIDER': __LOCAL_ANALYZER_PROVIDER__,

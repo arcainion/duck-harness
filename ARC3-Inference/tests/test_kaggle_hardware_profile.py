@@ -351,8 +351,12 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("kagglehub.model_download(model_source)", command)
         self.assertIn(f"SERVED_MODEL_NAME = {DEFAULT_SERVED_MODEL_NAME!r}", command)
         self.assertIn("PENNYROYAL_SGLANG", command)
+        self.assertIn("def pennyroyal_bootstrap_python() -> str:", command)
+        self.assertIn("'/usr/bin/python3.12'", command)
+        self.assertIn("contains cp312 wheels", command)
         self.assertIn("'--speculative-algorithm', 'NEXTN'", command)
         self.assertIn("'--speculative-draft-model-path', str(draft_view)", command)
+        self.assertNotIn("SITE_PACKAGES", command)
 
     def test_solver_propagates_expected_gpu_shape(self) -> None:
         solver = HarnessSolver(
