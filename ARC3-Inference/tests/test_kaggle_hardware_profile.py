@@ -18,6 +18,7 @@ from inference.framework.kaggle import (
     DEFAULT_QWEN_MODEL_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
+    DEFAULT_VLLM_SERVER_STARTUP_TIMEOUT_SECONDS,
     DuckKaggleVllmConfig,
     duck_kaggle_model_sources,
     duck_kaggle_setup_command,
@@ -354,6 +355,10 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("def pennyroyal_bootstrap_python() -> str:", command)
         self.assertIn("'/usr/bin/python3.12'", command)
         self.assertIn("contains cp312 wheels", command)
+        self.assertIn(
+            f"VLLM_SERVER_STARTUP_TIMEOUT_SECONDS = {DEFAULT_VLLM_SERVER_STARTUP_TIMEOUT_SECONDS}",
+            command,
+        )
         self.assertIn("'--speculative-algorithm', 'NEXTN'", command)
         self.assertIn("'--speculative-draft-model-path', str(draft_view)", command)
         self.assertNotIn("SITE_PACKAGES", command)
@@ -383,6 +388,11 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertEqual(config.max_num_seqs, 7)
         self.assertEqual(config.max_num_batched_tokens, 4096)
         self.assertFalse(config.enable_chunked_prefill)
+
+    def test_solver_propagates_server_startup_timeout(self) -> None:
+        solver = HarnessSolver(kaggle_vllm_server_startup_timeout_seconds=2400)
+
+        self.assertEqual(solver._kaggle_vllm_config().server_startup_timeout_seconds, 2400)
 
     def test_t4_profile_is_rejected_for_pennyroyal_flash_next(self) -> None:
         for value in ("nvidia-tesla-t4", "NVIDIA TESLA T4", "NvidiaTeslaT4"):
@@ -1565,7 +1575,10 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("def read_server_log() -> str:", command)
         self.assertIn("return VLLM_SERVER_LOG.read_text", command)
         self.assertIn("returncode = process.poll()", command)
-        self.assertIn("wait_for_vllm_server(process)", command)
+        self.assertIn(
+            "wait_for_vllm_server(process, VLLM_SERVER_STARTUP_TIMEOUT_SECONDS)",
+            command,
+        )
         self.assertIn("Complete vLLM server log:", command)
         self.assertNotIn("os.kill(", command)
         self.assertNotIn("splitlines()[-lines:]", command)

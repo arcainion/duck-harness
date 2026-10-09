@@ -17,6 +17,7 @@ DEFAULT_QWEN_DRAFT_MODEL_SOURCE = (
 DEFAULT_SERVED_MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
 DEFAULT_VLLM_SPECULATIVE_NUM_TOKENS = 3
 DEFAULT_VLLM_PORT = 1234
+DEFAULT_VLLM_SERVER_STARTUP_TIMEOUT_SECONDS = 3600
 DEFAULT_VLLM_MAX_MODEL_LEN = 131072
 DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 1
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.92
@@ -75,6 +76,7 @@ class DuckKaggleVllmConfig:
     draft_model_source: str = DEFAULT_QWEN_DRAFT_MODEL_SOURCE
     served_model_name: str = DEFAULT_SERVED_MODEL_NAME
     speculative_num_tokens: int = DEFAULT_VLLM_SPECULATIVE_NUM_TOKENS
+    server_startup_timeout_seconds: int = DEFAULT_VLLM_SERVER_STARTUP_TIMEOUT_SECONDS
     vllm_port: int = DEFAULT_VLLM_PORT
     max_model_len: int = DEFAULT_VLLM_MAX_MODEL_LEN
     tensor_parallel_size: int = DEFAULT_VLLM_TENSOR_PARALLEL_SIZE
@@ -145,6 +147,9 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_SPECULATIVE_NUM_TOKENS__": repr(
             max(1, int(cfg.speculative_num_tokens))
+        ),
+        "__VLLM_SERVER_STARTUP_TIMEOUT_SECONDS__": repr(
+            max(900, int(cfg.server_startup_timeout_seconds))
         ),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
         "__VLLM_MAX_MODEL_LEN__": repr(int(cfg.max_model_len)),
@@ -372,6 +377,7 @@ MODEL_SOURCE = __MODEL_SOURCE__
 DRAFT_MODEL_SOURCE = __DRAFT_MODEL_SOURCE__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
 VLLM_SPECULATIVE_NUM_TOKENS = __VLLM_SPECULATIVE_NUM_TOKENS__
+VLLM_SERVER_STARTUP_TIMEOUT_SECONDS = __VLLM_SERVER_STARTUP_TIMEOUT_SECONDS__
 VLLM_HOST = '127.0.0.1'
 VLLM_PORT = __VLLM_PORT__
 VLLM_BASE_URL = f'http://{VLLM_HOST}:{VLLM_PORT}/v1'
@@ -612,7 +618,10 @@ def server_failure_message(reason: str) -> str:
     return f'{reason}\nComplete vLLM server log:\n{read_server_log()}'
 
 
-def wait_for_vllm_server(process: subprocess.Popen[str], timeout_seconds: int = 900) -> None:
+def wait_for_vllm_server(
+    process: subprocess.Popen[str],
+    timeout_seconds: int = 3600,
+) -> None:
     deadline = time.monotonic() + timeout_seconds
     url = f'{VLLM_BASE_URL}/models'
     while time.monotonic() < deadline:
@@ -661,7 +670,7 @@ def prepare_draft_view() -> Path:
     identity = json.dumps({'source': str(source), 'config': config}, sort_keys=True).encode('utf-8')
     view = PENNYROYAL_ROOT / f'draft-view-{hashlib.sha256(identity).hexdigest()[:16]}'
     view.mkdir(parents=True, exist_ok=True)
-    (view / 'config.json').write_text(json.dumps(config, indent=2) + '\\n', encoding='utf-8')
+    (view / 'config.json').write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
     links = {name: source / name for name in shard_names}
     links['model.safetensors.index.json'] = index_path
     for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja', 'preprocessor_config.json', 'generation_config.json'):
@@ -734,7 +743,7 @@ def start_vllm_server() -> None:
     process = subprocess.Popen(cmd, env=pennyroyal_runtime_env(), stdout=log_handle, stderr=subprocess.STDOUT, text=True)
     VLLM_SERVER_PID.write_text(str(process.pid), encoding='utf-8')
     try:
-        wait_for_vllm_server(process)
+        wait_for_vllm_server(process, VLLM_SERVER_STARTUP_TIMEOUT_SECONDS)
     finally:
         log_handle.close()
 

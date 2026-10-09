@@ -60,6 +60,7 @@ from inference.framework.kaggle import (
     DEFAULT_QWEN_MODEL_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_SPECULATIVE_NUM_TOKENS,
+    DEFAULT_VLLM_SERVER_STARTUP_TIMEOUT_SECONDS,
     DEFAULT_VLLM_MAX_MODEL_LEN,
     DEFAULT_VLLM_GPU_MEMORY_UTILIZATION,
     DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS,
@@ -2054,6 +2055,9 @@ class HarnessSolver(Solver):
     kaggle_vllm_speculative_num_tokens: int = field(
         default=DEFAULT_VLLM_SPECULATIVE_NUM_TOKENS, repr=False
     )
+    kaggle_vllm_server_startup_timeout_seconds: int = field(
+        default=DEFAULT_VLLM_SERVER_STARTUP_TIMEOUT_SECONDS, repr=False
+    )
     kaggle_vllm_port: int = field(default=DEFAULT_VLLM_PORT, repr=False)
     kaggle_vllm_max_model_len: int = field(
         default=DEFAULT_VLLM_MAX_MODEL_LEN, repr=False
@@ -2198,6 +2202,7 @@ class HarnessSolver(Solver):
             draft_model_source=self.kaggle_draft_model_source,
             served_model_name=self.kaggle_served_model_name,
             speculative_num_tokens=self.kaggle_vllm_speculative_num_tokens,
+            server_startup_timeout_seconds=self.kaggle_vllm_server_startup_timeout_seconds,
             vllm_port=self.kaggle_vllm_port,
             max_model_len=self.kaggle_vllm_max_model_len,
             tensor_parallel_size=self.kaggle_vllm_tensor_parallel_size,
