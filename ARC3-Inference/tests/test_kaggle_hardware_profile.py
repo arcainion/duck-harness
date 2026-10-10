@@ -353,6 +353,8 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn(f"SERVED_MODEL_NAME = {DEFAULT_SERVED_MODEL_NAME!r}", command)
         self.assertIn("PENNYROYAL_SGLANG", command)
         self.assertIn("def pennyroyal_bootstrap_python() -> str:", command)
+        self.assertIn("library_dirs = [libdir] if lib64 == libdir else [libdir, lib64]", command)
+        self.assertIn("Bundled Pennyroyal CUDA runtime is missing libcudart.so.", command)
         self.assertIn("'/usr/bin/python3.12'", command)
         self.assertIn("contains cp312 wheels", command)
         self.assertIn(
@@ -421,6 +423,8 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("EXPECTED_GPU_COUNT = 1", command)
         self.assertIn("VLLM_MAX_NUM_SEQS = 16", command)
         self.assertIn("VLLM_MAX_NUM_BATCHED_TOKENS = 8192", command)
+        self.assertIn("'--startup-weight-load-mode', 'parallel'", command)
+        self.assertIn("'--weight-loader-prefetch-num-threads', '16'", command)
         self.assertIn("'--speculative-algorithm', 'NEXTN'", command)
 
     def test_rtx_pro_6000_profile_uses_single_gpu_defaults(self) -> None:
@@ -446,6 +450,7 @@ class KaggleHardwareProfileTests(TestCase):
         self.assertIn("'--reasoning-parser', 'qwen3'", command)
         self.assertIn("'chat_template_kwargs': {'enable_thinking': True}", command)
         self.assertIn("thinking_token_budget: int = 64", command)
+        self.assertIn("enable_thinking: bool = True", command)
         self.assertIn("'thinking_token_budget': thinking_token_budget", command)
         self.assertIn("thinking_token_budget=256", command)
         self.assertIn("'tool_choice': 'required'", command)
@@ -614,6 +619,9 @@ class KaggleHardwareProfileTests(TestCase):
         probe_payload = request_json.call_args_list[2].kwargs["payload"]
         self.assertEqual(768, probe_payload["max_tokens"])
         self.assertEqual(256, probe_payload["thinking_token_budget"])
+        self.assertEqual(
+            {"enable_thinking": False}, probe_payload["chat_template_kwargs"]
+        )
         self.assertEqual({"type": "json_object"}, probe_payload["response_format"])
         self.assertNotIn("tools", probe_payload)
         self.assertNotIn("tool_choice", probe_payload)

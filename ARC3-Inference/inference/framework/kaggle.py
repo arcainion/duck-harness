@@ -17,7 +17,8 @@ DEFAULT_QWEN_DRAFT_MODEL_SOURCE = (
 DEFAULT_SERVED_MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
 DEFAULT_VLLM_SPECULATIVE_NUM_TOKENS = 3
 DEFAULT_VLLM_PORT = 1234
-DEFAULT_VLLM_SERVER_STARTUP_TIMEOUT_SECONDS = 3600
+# Flash-Next weight loading can exceed an hour on a cold Kaggle filesystem.
+DEFAULT_VLLM_SERVER_STARTUP_TIMEOUT_SECONDS = 10800
 DEFAULT_VLLM_MAX_MODEL_LEN = 131072
 DEFAULT_VLLM_TENSOR_PARALLEL_SIZE = 1
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = 0.92
@@ -568,10 +569,18 @@ def pennyroyal_runtime_env() -> dict[str, str]:
     lib64 = cuda_home / 'lib64'
     if not lib64.exists() and not lib64.is_symlink():
         lib64.symlink_to('lib')
-    for versioned in libdir.glob('*.so.*'):
-        unversioned = libdir / versioned.name.split('.so.', 1)[0]
-        if not unversioned.exists() and not unversioned.is_symlink():
-            unversioned.symlink_to(versioned.name)
+    library_dirs = [libdir] if lib64 == libdir else [libdir, lib64]
+    for library_dir in library_dirs:
+        for versioned in library_dir.glob('*.so.*'):
+            unversioned = library_dir / versioned.name.split('.so.', 1)[0]
+            if not unversioned.exists() and not unversioned.is_symlink():
+                unversioned.symlink_to(versioned.name)
+    if not (lib64 / 'libcudart.so').is_file():
+        cudart_candidates = sorted(cuda_home.rglob('libcudart.so.*'))
+        if cudart_candidates:
+            (lib64 / 'libcudart.so').symlink_to(cudart_candidates[0].resolve())
+    if not (lib64 / 'libcudart.so').is_file():
+        raise RuntimeError('Bundled Pennyroyal CUDA runtime is missing libcudart.so.')
     if not (libdir / 'libcuda.so').exists():
         candidates = []
         for directory in ('/usr/local/nvidia/lib64', '/usr/local/nvidia/lib', '/usr/lib/x86_64-linux-gnu', '/usr/lib64'):
@@ -620,7 +629,7 @@ def server_failure_message(reason: str) -> str:
 
 def wait_for_vllm_server(
     process: subprocess.Popen[str],
-    timeout_seconds: int = 3600,
+    timeout_seconds: int = 10800,
 ) -> None:
     deadline = time.monotonic() + timeout_seconds
     url = f'{VLLM_BASE_URL}/models'
@@ -720,6 +729,10 @@ def start_vllm_server() -> None:
         '--chunked-prefill-size',
         str(VLLM_MAX_NUM_BATCHED_TOKENS),
         '--max-prefill-tokens', str(VLLM_MAX_NUM_BATCHED_TOKENS),
+        # Parallel shard prefetch avoids serial reads from Kaggle's mounted
+        # model filesystem during cold startup.
+        '--startup-weight-load-mode', 'parallel',
+        '--weight-loader-prefetch-num-threads', '16',
         '--mamba-ssm-dtype', 'bfloat16',
         '--mamba-backend', 'flashinfer',
         '--linear-attn-decode-backend', 'flashinfer',
@@ -755,6 +768,7 @@ def run_vllm_api_smoke_test() -> None:
         max_tokens: int,
         *,
         thinking_token_budget: int = 64,
+        enable_thinking: bool = True,
         json_object: bool = False,
     ) -> str:
         payload = {
@@ -762,7 +776,7 @@ def run_vllm_api_smoke_test() -> None:
             'messages': [{'role': 'user', 'content': prompt}],
             'temperature': 0.0,
             'max_tokens': max_tokens,
-            'chat_template_kwargs': {'enable_thinking': True},
+            'chat_template_kwargs': {'enable_thinking': enable_thinking},
             'thinking_token_budget': thinking_token_budget,
         }
         if json_object:
@@ -894,6 +908,20 @@ solver types, explanations, or copies of the constraints.'''
             clicks = result.get('clicks')
             navigation = result.get('navigation')
             failures = []
+            def has_values(value, expected):
+                return (
+                    isinstance(value, (list, tuple, set))
+                    and all(isinstance(item, int) for item in value)
+                    and set(value) == expected
+                )
+
+            def has_action_values(value, expected):
+                return (
+                    isinstance(value, list)
+                    and all(isinstance(item, str) for item in value)
+                    and set(value) == expected
+                )
+
             contrastive_actions = (
                 contrastive.get('probe_actions')
                 if isinstance(contrastive, dict)
@@ -901,6 +929,7 @@ solver types, explanations, or copies of the constraints.'''
             )
             if not (
                 isinstance(contrastive_actions, list)
+                and all(isinstance(item, str) for item in contrastive_actions)
                 and len(contrastive_actions) >= 4
                 and set(contrastive_actions) == {'UP', 'RIGHT'}
                 and contrastive_actions.count('UP') >= 2
@@ -918,11 +947,11 @@ solver types, explanations, or copies of the constraints.'''
             ):
                 failures.append('clicks')
             if not isinstance(navigation, dict) or not (
-                set(navigation.get('actor_values', [])) == {1}
-                and set(navigation.get('target_values', [])) == {2}
-                and set(navigation.get('passable_values', [])) == {0, 1, 2}
+                has_values(navigation.get('actor_values'), {1})
+                and has_values(navigation.get('target_values'), {2})
+                and has_values(navigation.get('passable_values'), {0, 1, 2})
                 and navigation.get('approach_distance') == 1
-                and set(navigation.get('probe_actions', [])) == {'UP', 'RIGHT'}
+                and has_action_values(navigation.get('probe_actions'), {'UP', 'RIGHT'})
             ):
                 failures.append('navigation')
             return result, failures
@@ -932,6 +961,7 @@ solver types, explanations, or copies of the constraints.'''
             prompt,
             768,
             thinking_token_budget=256,
+            enable_thinking=False,
             json_object=True,
         )
         result, failures = validate(content)
